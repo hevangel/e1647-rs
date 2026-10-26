@@ -1,1 +1,1 @@
-3:10: error[E0204]: unknown field 'size' in keep constraint
+3:10: error[E0204]: unknown identifier 'size' in keep constraint

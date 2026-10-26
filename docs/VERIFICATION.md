@@ -59,6 +59,64 @@ otherwise):
 - Specman reference-run evidence via EDA Playground is recorded separately
   below when performed; absence of an entry means it has not been done.
 
+## 2026-10-26 — methods, statements and enum types (branch `agent/issue-1-methods-types`)
+
+Scope claimed for this change (nothing broader):
+
+- Parser additions: `type` enumeral declarations (`type color_e: [RED,
+  GREEN];`, optional `= value` per enumeral); method members with parameter
+  lists and optional return types (`f(a: uint): uint is { .. };`, with
+  `is also` / `is first` / `is only`); statement bodies (local `var`
+  declarations with optional initializer, assignment, expression statements,
+  `return`, braced `if`/`else`, `print`, `gen`); call `f(x)` and index
+  `a[i]` postfix expressions; `keep soft` constraints; field name groups
+  (`a, b: uint;` declares one field per name). Lowercase `true`/`false`
+  now parse as boolean literals. The former E0114 rejections (method
+  calls, `soft`, name groups) are gone — `E0114` is reserved, `E0115`
+  (expected `is` in a method) is new, `E0109` is now the `(` expectation.
+- Checks additions: duplicate parameters and local variables share one
+  scope per method (E0206); duplicate enumerals within a `type` (E0206);
+  unknown named types now also reported in method parameter/return/local
+  types and inside `list of` elements (E0203); `keep` constraint roots
+  accept declared enumerals and `me`/`self`, and call callees no longer
+  count as field roots (E0204 message is now "unknown identifier").
+- AST: `MethodDecl`, `Param`, `MethodModifier`, `Enumeral`, `Stmt`;
+  `Expr` gained `Call` and `Index`; `KeepConstraint` gained `is_soft`.
+- Examples: `examples/methods_types.e` (parses clean).
+- 5 new golden diagnostic fixtures: duplicate_local, duplicate_param,
+  unknown_method_type, duplicate_enumeral, keep_unknown_enumeral (16
+  fixture pairs total).
+
+Not in this change: `when` declarations, loops (`while`/`for each` are
+rejected with E0113), the single-statement `if ... do ...` form, method
+block scoping (parameters and locals are one flat scope per method), and
+any semantics — statements are parsed, not interpreted.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`, run locally
+on Windows; identical commands run in CI on ubuntu-latest via
+`.github/workflows/ci.yml`):
+
+```
+$ cargo fmt --all -- --check
+(no output — pass)
+
+$ cargo clippy --all-targets -- -D warnings
+    Checking e1647-rs v0.1.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.29s
+(pass, zero warnings)
+
+$ cargo test --all-targets
+test result: ok. 0 passed;  0 failed  (unittests src/lib.rs)
+test result: ok. 0 passed;  0 failed  (unittests src/main.rs)
+test result: ok. 1 passed;  0 failed  (test fixtures.rs — 16 golden pairs)
+test result: ok. 12 passed; 0 failed  (test lexer.rs)
+test result: ok. 16 passed; 0 failed  (test parser.rs)
+
+$ cargo run -- parse examples/methods_types.e    # prints the AST, exit 0
+$ cargo run -- parse examples/reference_subset.e # exit 1 — `extend sys`
+  is not declared in that file (E0203); pre-existing behavior, unchanged
+```
+
 ## Reference-simulator runs (EDA Playground)
 
 - **2026-10-25 — first attempt blocked.** Automated login to

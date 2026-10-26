@@ -3,24 +3,28 @@
 //! This is **not** full symbol/type checking: there is no type system, no
 //! cross-file scope, and no elaboration yet. Checks, all single-file scope:
 //!
-//! - `E0201` two base declarations (`struct`/`unit`) share a name
+//! - `E0201` two base declarations (`struct`/`unit`/`type`) share a name
 //! - `E0202` a declaration declares the same field name twice
-//! - `E0203` a field type or an `extend` target names a type not declared
-//!   in this file (external declarations are a later milestone)
+//! - `E0203` a field type, a method parameter/return/local-variable type,
+//!   or an `extend`/`like` target names a type not declared in this file
+//!   (external declarations are a later milestone)
 //! - `E0204` a `keep` constraint in a `struct`/`unit` references an
-//!   identifier that is not one of its fields (base fields of `extend`
-//!   targets are unknown here, so `extend` declarations are skipped)
+//!   identifier that is neither one of its fields nor a declared enumeral
+//!   (`me`/`self` are accepted; base fields of `extend` targets are unknown
+//!   here, so `extend` declarations are skipped)
 //! - `E0205` a `uint`/`int` width literal is zero
+//! - `E0206` duplicate name in an inner scope: method parameter, local
+//!   variable, or enumeral
 
-use crate::ast::{Declaration, DeclarationKind, Expr, TypeExpr};
+use crate::ast::{Declaration, DeclarationKind, Expr, KeepConstraint, Member, Stmt, TypeExpr};
 use crate::diagnostic::Diagnostic;
 use std::collections::BTreeSet;
 
 pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    // Single-file scope: base `struct`/`unit` declarations are the visible
-    // type universe. Multiple `extend` blocks of the same target are legal,
-    // so duplicates are checked only among base declarations.
+    // Single-file scope: base `struct`/`unit`/`type` declarations are the
+    // visible type universe. Multiple `extend` blocks of the same target are
+    // legal, so duplicates are checked only among base declarations.
     let mut declared: BTreeSet<&str> = BTreeSet::new();
     for declaration in declarations {
         if declaration.kind == DeclarationKind::Extend {
@@ -35,22 +39,35 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             ));
         }
     }
+    // Enumerals live in the file-global namespace once their `type` is
+    // declared, so any `keep` constraint may reference them.
+    let enumerals: BTreeSet<&str> = declarations
+        .iter()
+        .filter(|declaration| declaration.kind == DeclarationKind::Type)
+        .flat_map(|declaration| declaration.members.iter())
+        .filter_map(|member| match member {
+            Member::Enumeral(enumeral) => Some(enumeral.name.as_str()),
+            _ => None,
+        })
+        .collect();
     for declaration in declarations {
         check_extend_target(declaration, &declared, &mut diagnostics);
         check_like_target(declaration, &declared, &mut diagnostics);
         check_fields(declaration, &declared, &mut diagnostics);
+        check_enumerals(declaration, &mut diagnostics);
+        check_methods(declaration, &declared, &mut diagnostics);
         if declaration.kind != DeclarationKind::Extend {
             let field_names: BTreeSet<&str> = declaration
                 .members
                 .iter()
                 .filter_map(|member| match member {
-                    crate::ast::Member::Field(field) => Some(field.name.as_str()),
-                    crate::ast::Member::Constraint(_) => None,
+                    Member::Field(field) => Some(field.name.as_str()),
+                    _ => None,
                 })
                 .collect();
             for member in &declaration.members {
-                if let crate::ast::Member::Constraint(constraint) = member {
-                    check_constraint_fields(constraint, &field_names, &mut diagnostics);
+                if let Member::Constraint(constraint) = member {
+                    check_constraint_fields(constraint, &field_names, &enumerals, &mut diagnostics);
                 }
             }
         }
@@ -105,7 +122,7 @@ fn check_fields(
 ) {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for member in &declaration.members {
-        let crate::ast::Member::Field(field) = member else {
+        let Member::Field(field) = member else {
             continue;
         };
         if !seen.insert(field.name.as_str()) {
@@ -116,16 +133,7 @@ fn check_fields(
                 field.name_span.1,
             ));
         }
-        if let TypeExpr::Named { name, span } = &field.ty
-            && !declared.contains(name.as_str())
-        {
-            diagnostics.push(Diagnostic::new(
-                "E0203",
-                format!("unknown type '{name}'"),
-                span.0,
-                span.1,
-            ));
-        }
+        check_named_type(&field.ty, declared, diagnostics);
         if let TypeExpr::Scalar {
             base: crate::ast::ScalarBase::Uint | crate::ast::ScalarBase::Int,
             width: Some(width),
@@ -134,6 +142,126 @@ fn check_fields(
         {
             check_width(width, diagnostics);
         }
+    }
+}
+
+/// A `type` declaration may not name the same enumeral twice.
+fn check_enumerals(declaration: &Declaration, diagnostics: &mut Vec<Diagnostic>) {
+    if declaration.kind != DeclarationKind::Type {
+        return;
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for member in &declaration.members {
+        let Member::Enumeral(enumeral) = member else {
+            continue;
+        };
+        if !seen.insert(enumeral.name.as_str()) {
+            diagnostics.push(Diagnostic::new(
+                "E0206",
+                format!(
+                    "duplicate enumeral '{}' in type '{}'",
+                    enumeral.name, declaration.name
+                ),
+                enumeral.name_span.0,
+                enumeral.name_span.1,
+            ));
+        }
+    }
+}
+
+fn check_methods(
+    declaration: &Declaration,
+    declared: &BTreeSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for member in &declaration.members {
+        let Member::Method(method) = member else {
+            continue;
+        };
+        // Parameters and local variables share one namespace in this subset;
+        // block scoping is a later milestone.
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for param in &method.params {
+            if !seen.insert(param.name.as_str()) {
+                diagnostics.push(Diagnostic::new(
+                    "E0206",
+                    format!(
+                        "duplicate parameter '{}' in method '{}'",
+                        param.name, method.name
+                    ),
+                    param.name_span.0,
+                    param.name_span.1,
+                ));
+            }
+            check_named_type(&param.ty, declared, diagnostics);
+        }
+        if let Some(return_type) = &method.return_type {
+            check_named_type(return_type, declared, diagnostics);
+        }
+        check_statements(&method.body, &mut seen, declared, &method.name, diagnostics);
+    }
+}
+
+/// Walk a statement list. `seen` accumulates local variable names across
+/// nested `if` bodies — they are treated as one flat scope for now.
+fn check_statements<'a>(
+    statements: &'a [Stmt],
+    seen: &mut BTreeSet<&'a str>,
+    declared: &BTreeSet<&str>,
+    method_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        match statement {
+            Stmt::VarDecl {
+                name,
+                name_span,
+                ty,
+                ..
+            } => {
+                if !seen.insert(name.as_str()) {
+                    diagnostics.push(Diagnostic::new(
+                        "E0206",
+                        format!("duplicate local variable '{name}' in method '{method_name}'"),
+                        name_span.0,
+                        name_span.1,
+                    ));
+                }
+                check_named_type(ty, declared, diagnostics);
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                check_statements(then_body, seen, declared, method_name, diagnostics);
+                if let Some(else_body) = else_body {
+                    check_statements(else_body, seen, declared, method_name, diagnostics);
+                }
+            }
+            Stmt::Assign { .. }
+            | Stmt::ExprStmt { .. }
+            | Stmt::Return { .. }
+            | Stmt::Print { .. }
+            | Stmt::Gen { .. } => {}
+        }
+    }
+}
+
+fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut Vec<Diagnostic>) {
+    match ty {
+        TypeExpr::Named { name, span } => {
+            if !declared.contains(name.as_str()) {
+                diagnostics.push(Diagnostic::new(
+                    "E0203",
+                    format!("unknown type '{name}'"),
+                    span.0,
+                    span.1,
+                ));
+            }
+        }
+        TypeExpr::List { element, .. } => check_named_type(element, declared, diagnostics),
+        TypeExpr::Scalar { .. } => {}
     }
 }
 
@@ -153,20 +281,26 @@ fn check_width(width: &Expr, diagnostics: &mut Vec<Diagnostic>) {
     }
 }
 
-/// Report root identifiers of the constraint expression that are not fields
-/// of the enclosing declaration.
+/// Report root identifiers of the constraint expression that are neither
+/// fields of the enclosing declaration nor declared enumerals. A call's
+/// callee names a method rather than a field, so only its arguments
+/// contribute roots.
 fn check_constraint_fields(
-    constraint: &crate::ast::KeepConstraint,
+    constraint: &KeepConstraint,
     field_names: &BTreeSet<&str>,
+    enumerals: &BTreeSet<&str>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut roots = Vec::new();
     collect_root_identifiers(&constraint.expr, &mut roots);
     for (name, span) in roots {
-        if !field_names.contains(name.as_str()) {
+        if name == "me" || name == "self" {
+            continue;
+        }
+        if !field_names.contains(name.as_str()) && !enumerals.contains(name.as_str()) {
             diagnostics.push(Diagnostic::new(
                 "E0204",
-                format!("unknown field '{name}' in keep constraint"),
+                format!("unknown identifier '{name}' in keep constraint"),
                 span.0,
                 span.1,
             ));
@@ -178,6 +312,15 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
     match expr {
         Expr::Ident { name, span } => roots.push((name.clone(), *span)),
         Expr::MemberAccess { object, .. } => collect_root_identifiers(object, roots),
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_root_identifiers(arg, roots);
+            }
+        }
+        Expr::Index { base, index, .. } => {
+            collect_root_identifiers(base, roots);
+            collect_root_identifiers(index, roots);
+        }
         Expr::Binary { lhs, rhs, .. } => {
             collect_root_identifiers(lhs, roots);
             collect_root_identifiers(rhs, roots);

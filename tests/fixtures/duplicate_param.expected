@@ -1,0 +1,1 @@
+2:18: error[E0206]: duplicate parameter 'a' in method 'add'

@@ -1,0 +1,2 @@
+2:10: error[E0203]: unknown type 'weird_t'
+2:20: error[E0203]: unknown type 'bogus_t'
