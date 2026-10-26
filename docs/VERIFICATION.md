@@ -219,6 +219,80 @@ test result: ok. 20 passed; 0 failed  (test parser.rs)
 $ cargo run -- elab examples/methods_types.e   # prints the composed types, exit 0
 ```
 
+## 2026-10-26 — execution: interpreter, builtins, gen (same branch, fourth increment)
+
+Scope claimed for this change (nothing broader):
+
+- Lexer: the e code-block delimiters are recognized and skipped as trivia —
+  `<'` opens and `'>` closes (the closing delimiter is quote-then-`>`; the
+  first implementation attempt had the pair reversed and was caught by the
+  new lexer test before any commit). Their contents are ordinary code.
+- Builtins (`src/builtins.rs`): the predeclared `sys` unit and `out`
+  routine. `extend sys` no longer reports E0203; the elaborator synthesizes
+  a `sys` type from its extend blocks.
+- Parser fix: number-token classification no longer misreads `0xE5` (hex
+  `E`) as a real literal — `looks_like_real` requires a fraction or a
+  decimal-digits-then-exponent shape.
+- Interpreter (`src/interp.rs`, codes `E0401`–`E0407`): value model
+  (unbounded integers — widths are NOT truncated, documented), expression
+  evaluation including based literals and short-circuit logic, statement
+  execution (`var`, assignment including list slots, `if`/`while`/
+  `break`/`continue`, `return`, `print`), method calls (all composed blocks
+  run in order; last returned value wins), `list of` with `size()`/`push()`,
+  struct instances, and `gen` — a seeded rejection sampler over top-level
+  `keep` constraints (soft/`when` constraints not enforced; not a solver;
+  1000 attempts then E0407). Entry point: `sys.run()`.
+- CLI: `e1647 run [--seed N] <file>`; parse and elaboration diagnostics
+  fail the run before execution.
+- Examples are now runnable programs: `methods_types.e` gained an
+  `extend sys run()` entry point (and `frame_s` a `keep pixels.size() > 0`
+  so `pick` is safe after gen); `reference_subset.e` runs unchanged;
+  `packet.e` runs with no output (declarations only — sys has no `run()`).
+- Tests: 12 new interpreter tests (tests/interp.rs) incl. determinism and
+  E0407; 1 new elaborator test (builtin sys synthesis); 1 updated lexer
+  test (code delimiters now skipped, not rejected). Totals: 10 elab, 1
+  fixtures, 12 interp, 13 lexer, 20 parser = 56.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`, local
+Windows; identical commands run in CI on ubuntu-latest via
+`.github/workflows/ci.yml`):
+
+```
+$ cargo fmt --all -- --check
+(no output — pass)
+
+$ cargo clippy --all-targets -- -D warnings
+    Checking e1647-rs v0.1.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.46s
+(pass, zero warnings)
+
+$ cargo test --all-targets
+test result: ok. 0 passed;  0 failed  (unittests src/lib.rs)
+test result: ok. 0 passed;  0 failed  (unittests src/main.rs)
+test result: ok. 10 passed; 0 failed  (test elab.rs)
+test result: ok. 1 passed;  0 failed  (test fixtures.rs — 18 golden pairs)
+test result: ok. 12 passed; 0 failed  (test interp.rs)
+test result: ok. 13 passed; 0 failed  (test lexer.rs)
+test result: ok. 20 passed; 0 failed  (test parser.rs)
+
+$ cargo run -- run examples/packet.e
+(no output, exit 0 — declarations only, no sys.run())
+
+$ cargo run -- run --seed 1 examples/reference_subset.e
+p = packet_s{addr: 100, data: 132, tag: 12, par: [7]}
+based literals: 8'hFF=255 0b1010=10 0o17=15e1647-rs subset constructs accepted by Specman
+(exit 0 — gen satisfied keep addr < 128, keep addr > 0, keep data != 0)
+
+$ cargo run -- run --seed 1 examples/methods_types.e
+165
+165
+255
+219
+methods_types.e ran to completion
+(exit 0 — gen pixel + frame (list element gen), method calls, the
+if-clamp in scale() reduced 165*2=330 to 255)
+```
+
 ## Reference-simulator runs (EDA Playground)
 
 - **2026-10-25 — first attempt blocked.** Automated login to

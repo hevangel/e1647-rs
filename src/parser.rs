@@ -124,6 +124,18 @@ pub fn parse(source: &str) -> ParseResult {
     }
 }
 
+/// Whether a number token denotes a real: a fraction, or an exponent whose
+/// digits-before part is plain decimal (so `0xE5` stays an integer).
+fn looks_like_real(text: &str) -> bool {
+    if text.contains('.') {
+        return true;
+    }
+    match text.find(['e', 'E']) {
+        Some(pos) => !text[..pos].is_empty() && text[..pos].chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -961,7 +973,7 @@ impl Parser {
                         text,
                         span: (start, end),
                     }
-                } else if text.contains('.') || text.contains(['e', 'E']) {
+                } else if looks_like_real(&text) {
                     Expr::RealLiteral {
                         text,
                         span: (start, end),

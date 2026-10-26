@@ -159,3 +159,13 @@ fn type_declarations_pass_through_enumerals() {
     assert!(result.types[0].enumerals[1].value.is_some());
     assert!(result.types[0].fields.is_empty());
 }
+
+#[test]
+fn builtin_sys_is_synthesized_from_its_extends() {
+    let result = elaborated("extend sys {\n    started: bool;\n    run() is also { };\n};\n");
+    let sys = find(&result, "sys");
+    assert_eq!(sys.kind, DeclarationKind::Unit);
+    assert_eq!(field_names(sys), vec!["started"]);
+    assert_eq!(sys.methods.len(), 1);
+    assert_eq!(sys.methods[0].name, "run");
+}

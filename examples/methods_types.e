@@ -37,6 +37,7 @@ extend pixel_s {
 
 struct frame_s {
     pixels: list of pixel_s;
+    keep pixels.size() > 0;
     pick(i: uint): pixel_s is {
         return pixels[i];
     };
@@ -58,5 +59,21 @@ struct channel_s {
         while i < 4 {
             i = i + 1;
         };
+    };
+};
+
+// The entry point: with the file run (`e1647 run --seed 1
+// examples/methods_types.e`), the built-in sys unit's run() executes.
+extend sys {
+    run() is also {
+        var p: pixel_s;
+        gen p;
+        print p.intensity;
+        print p.gray();
+        print p.scale(2);
+        var f: frame_s;
+        gen f;
+        print f.pick(0).intensity;
+        out("methods_types.e ran to completion\n");
     };
 };

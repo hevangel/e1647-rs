@@ -310,9 +310,17 @@ fn subtype_modifier_quote_tokenizes_standalone() {
 }
 
 #[test]
-fn rejects_code_literal_delimiters() {
-    let error = tokenize("<' extend foo '>").unwrap_err();
-    assert_eq!(error.message, "code literals (<') are not supported yet");
+fn code_literal_delimiters_are_skipped() {
+    // <' .. '> wrap e code blocks; their contents are ordinary code.
+    let tokens = tokenize("<' extend foo '>").unwrap();
+    assert_eq!(
+        kinds("<' extend foo '>"),
+        vec![
+            TokenKind::Keyword("extend".into()),
+            TokenKind::Identifier("foo".into())
+        ]
+    );
+    assert_eq!(tokens.len(), 2);
 }
 
 #[test]

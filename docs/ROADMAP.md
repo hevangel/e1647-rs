@@ -41,11 +41,21 @@
       unmodified-method-redefinition diagnostics; `when` subtypes are
       carried, not resolved, and there are no semantics yet
 - [ ] Constraint IR for `keep` expressions
+- [~] Reproducible seeded randomized objects — started: `gen` is a seeded
+      rejection sampler over top-level `keep` constraints
+      (`src/interp.rs`, `e1647 run --seed`); not a solver — no SMT/pluggable
+      solver yet, soft and `when` constraints are not enforced
 - [ ] Pluggable SMT/constraint solver
 - [ ] Reproducible seeded randomized objects
 
 ## M3 — Behavioral execution
-- [ ] Interpreter and method calling conventions
+- [~] Interpreter and method calling conventions — started: the
+      non-temporal statement subset executes (`src/interp.rs`): expressions,
+      `var`, assignment, calls, `if`/`while`/`break`/`continue`, `return`,
+      `print`/`out`, lists with `size()`/`push()`, struct instances, `gen`;
+      entry point is the built-in `sys` unit's `run()` methods. No
+      events/temporal semantics, no time-consuming methods, no width
+      truncation of integer arithmetic
 - [ ] Events, temporal expressions and time-consuming methods
 - [ ] Coverage data model and reports
 

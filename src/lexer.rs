@@ -6,8 +6,10 @@
 //! `external/` (see docs/REFERENCES.md). A bare `'` followed by an
 //! identifier is the subtype modifier quote (`read'kind`), tokenized as a
 //! standalone punctuation token like the reference grammar's `SNG_QUOTE`.
-//! Character literals and `<' .. '>` code literals are deliberately not
-//! supported yet and produce explicit errors.
+//! The e code-block delimiters `<'` (open) and `'>` (close) are recognized
+//! and skipped as trivia; their contents are ordinary code in this subset.
+//! Character literals are deliberately not supported yet and produce
+//! explicit errors.
 
 use std::fmt;
 
@@ -309,6 +311,13 @@ impl<'a> Cursor<'a> {
                         });
                     }
                 }
+                // e code-block delimiters: `<'` opens and `'>` closes;
+                // recognized and skipped, their contents are ordinary code
+                // in this subset.
+                (Some('<'), Some('\'')) | (Some('\''), Some('>')) => {
+                    self.bump();
+                    self.bump();
+                }
                 _ => return Ok(()),
             }
         }
@@ -510,11 +519,6 @@ impl<'a> Cursor<'a> {
                     });
                 }
             }
-        } else if (first == '<' || first == '>') && self.peek_second() == Some('\'') {
-            return Err(LexError {
-                position: start,
-                message: "code literals (<') are not supported yet",
-            });
         } else {
             self.read_operator()
         };

@@ -8,6 +8,8 @@
 //! Composition is order-independent on declarations (e allows an `extend`
 //! before its target) and deterministic: base-most `like` members first,
 //! then the declaring members, then each `extend` block in source order.
+//! The built-in `sys` unit is extended without being declared and is
+//! synthesized from its `extend` blocks alone.
 //!
 //! ## Diagnostics (on top of the parser's)
 //!
@@ -143,6 +145,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             DeclarationKind::Extend => {}
         }
     }
+    elaborator.compose_builtin_units(&mut types);
     Elaborated {
         types,
         diagnostics: elaborator.diagnostics,
@@ -150,6 +153,46 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
 }
 
 impl<'a> Elaborator<'a> {
+    /// A built-in unit (`sys`) is extended without being declared: fold its
+    /// extend blocks into a synthesized type appended after the declared
+    /// types.
+    fn compose_builtin_units(&mut self, types: &mut Vec<ElaboratedType>) {
+        for &builtin in crate::builtins::BUILTIN_UNITS {
+            if self.base_by_name.contains_key(builtin) {
+                continue;
+            }
+            let Some(extend_indices) = self.extends_by_target.get(builtin).cloned() else {
+                continue;
+            };
+            let mut composed = Composed::default();
+            for extend_index in &extend_indices {
+                let extend = &self.declarations[*extend_index];
+                Self::push_members(extend, *extend_index, &mut composed);
+            }
+            self.check_duplicate_fields(builtin, &composed);
+            self.check_method_redefinitions(builtin, &composed);
+            types.push(ElaboratedType {
+                kind: DeclarationKind::Unit,
+                name: builtin.to_owned(),
+                base: None,
+                fields: composed
+                    .fields
+                    .into_iter()
+                    .map(|(field, _)| field.clone())
+                    .collect(),
+                constraints: composed.constraints.into_iter().cloned().collect(),
+                methods: composed
+                    .methods
+                    .into_iter()
+                    .map(|(method, _)| method.clone())
+                    .collect(),
+                whens: composed.whens.into_iter().cloned().collect(),
+                enumerals: Vec::new(),
+                span: self.declarations[extend_indices[0]].span,
+            });
+        }
+    }
+
     fn compose(&mut self, name: &'a str, stack: &mut Vec<&'a str>) -> Composed<'a> {
         let Some(&index) = self.base_by_name.get(name) else {
             return Composed::default();

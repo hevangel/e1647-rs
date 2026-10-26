@@ -2,9 +2,9 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-const USAGE: &str = "Usage: e1647 <command> <source.e>\nCommands:\n  tokens  tokenize the source (does not parse)\n  parse   parse the source and print the AST or diagnostics\n  elab    parse and fold like/extend into elaborated types";
+const USAGE: &str = "Usage: e1647 <command> <source.e> [--seed N]\nCommands:\n  tokens  tokenize the source (does not parse)\n  parse   parse the source and print the AST or diagnostics\n  elab    parse and fold like/extend into elaborated types\n  run     parse, elaborate and execute sys.run() (--seed N for reproducible gen)";
 
-fn run(command: &str, path: &str) -> ExitCode {
+fn run(command: &str, path: &str, seed: u64) -> ExitCode {
     let source = match fs::read_to_string(path) {
         Ok(source) => source,
         Err(err) => {
@@ -60,8 +60,34 @@ fn run(command: &str, path: &str) -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        "run" => {
+            let result = e1647::parser::parse(&source);
+            for diagnostic in &result.diagnostics {
+                eprintln!("{path}:{}", diagnostic.render());
+            }
+            if !result.diagnostics.is_empty() {
+                return ExitCode::FAILURE;
+            }
+            let elaborated = e1647::elab::elaborate(&result.declarations);
+            for diagnostic in &elaborated.diagnostics {
+                eprintln!("{path}:{}", diagnostic.render());
+            }
+            if !elaborated.diagnostics.is_empty() {
+                return ExitCode::FAILURE;
+            }
+            let outcome = e1647::interp::run(&elaborated, seed);
+            for diagnostic in &outcome.diagnostics {
+                eprintln!("{path}:{}", diagnostic.render());
+            }
+            print!("{}", outcome.output);
+            if outcome.diagnostics.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         _ => {
-            eprintln!("Unknown command: {command}. Supported: tokens, parse, elab");
+            eprintln!("Unknown command: {command}. Supported: tokens, parse, elab, run");
             ExitCode::FAILURE
         }
     }
@@ -77,15 +103,41 @@ fn main() -> ExitCode {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-    let Some(path) = args.next() else {
+    let mut seed: u64 = 1;
+    let mut path: Option<String> = None;
+    while let Some(arg) = args.next() {
+        if arg == "--seed" {
+            let Some(value) = args.next() else {
+                eprintln!("--seed requires a value");
+                return ExitCode::FAILURE;
+            };
+            match value.parse() {
+                Ok(parsed) => seed = parsed,
+                Err(_) => {
+                    eprintln!("invalid seed: {value}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else if let Some(value) = arg.strip_prefix("--seed=") {
+            match value.parse() {
+                Ok(parsed) => seed = parsed,
+                Err(_) => {
+                    eprintln!("invalid seed: {value}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else if path.is_none() {
+            path = Some(arg);
+        } else {
+            eprintln!("Too many arguments");
+            return ExitCode::FAILURE;
+        }
+    }
+    let Some(path) = path else {
         eprintln!("{USAGE}");
         return ExitCode::FAILURE;
     };
-    if args.next().is_some() {
-        eprintln!("Too many arguments");
-        return ExitCode::FAILURE;
-    }
-    run(&command, &path)
+    run(&command, &path, seed)
 }
 
 fn render_type(ty: &e1647::ast::TypeExpr) -> String {

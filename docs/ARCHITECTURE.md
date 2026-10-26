@@ -43,10 +43,18 @@
   cross-declaration duplicate-field and unmodified-method-redefinition
   diagnostics; codes `E03xx`). **Not** full elaboration: `when` subtypes
   are carried, not resolved; no semantics.
-- `src/main.rs` — `e1647 tokens`, `e1647 parse` and `e1647 elab` CLI
-  commands; `parse` and `elab` print diagnostics to stderr
-  (`path:line:col: error[code]: message`) and their results on success.
+- `src/builtins.rs` — the predeclared environment names the executed subset
+  relies on: the `sys` unit and the `out` routine.
+- `src/interp.rs` — interpreter for the non-temporal statement subset with
+  a seeded rejection-sampling `gen` (codes `E04xx`). Entry: the built-in
+  `sys` unit's `run()` methods. Integers are unbounded `i128` (widths are
+  not truncated); `gen` enforces only top-level `keep` constraints via
+  sampling — it is not a solver.
+- `src/main.rs` — `e1647 tokens`, `e1647 parse`, `e1647 elab` and
+  `e1647 run [--seed N]` CLI commands; `parse`, `elab` and `run` print
+  diagnostics to stderr (`path:line:col: error[code]: message`) and their
+  results on success.
 
 Deliberately not implemented yet: `when`-subtype resolution, constraint
-solving, randomization, events/temporal, coverage, statement execution
-(statements are parsed, not interpreted) and any HDL bridge.
+solving (`gen` samples and rejects; it does not solve), events/temporal,
+coverage, integer width truncation, character literals, and any HDL bridge.

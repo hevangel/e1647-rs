@@ -7,7 +7,8 @@
 //! - `E0202` a declaration declares the same field name twice
 //! - `E0203` a field type, a method parameter/return/local-variable type,
 //!   or an `extend`/`like` target names a type not declared in this file
-//!   (external declarations are a later milestone)
+//!   (built-in units such as `sys` are accepted; other external
+//!   declarations are a later milestone)
 //! - `E0204` a `keep` constraint in a `struct`/`unit` references an
 //!   identifier that is neither one of its fields nor a declared enumeral
 //!   (`me`/`self` are accepted; base fields of `extend` targets are unknown
@@ -84,7 +85,9 @@ fn check_extend_target(
     if declaration.kind != DeclarationKind::Extend {
         return;
     }
-    if !declared.contains(declaration.name.as_str()) {
+    if !declared.contains(declaration.name.as_str())
+        && !crate::builtins::is_builtin_unit(declaration.name.as_str())
+    {
         diagnostics.push(Diagnostic::new(
             "E0203",
             format!(
