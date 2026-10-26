@@ -61,16 +61,23 @@ otherwise):
 
 ## Reference-simulator runs (EDA Playground)
 
-- **2026-10-25 — attempted, not completed.** Automated login to
+- **2026-10-25 — first attempt blocked.** Automated login to
   edaplayground.com with the `.env` account was blocked by reCAPTCHA
-  Enterprise: two legitimate attempts (checkbox interaction + form submit)
-  both returned `loginpage?error=captcha`. No CAPTCHA-solving is performed by
-  policy, so no Specman reference run was executed in this session.
-  Consequence: the `'h`-style hexadecimal spelling accepted by our lexer is
-  confirmed against the pinned MIT-licensed editor grammar
-  (`external/vscode-specman-grammar`: sized hex `[hHxX]`; the
-  `external/specman-e-parser` flex accepts `[xXfF]`; our lexer accepts the
-  union and is lenient) but is **not yet confirmed against real Specman**.
-  Follow-up (needs the owner): log in manually in the automation browser
-  once, or provide a pre-authenticated browser profile; then run the
-  independently authored subset example and record its log here.
+  Enterprise (`loginpage?error=captcha` twice). No CAPTCHA solving is
+  performed by policy. Recorded in full in the PR #2 description.
+- **2026-10-26 — example prepared and saved; run blocked by account
+  validation.** The owner logged in manually in the automation browser.
+  Independently authored example `examples/reference_subset.e` (struct with
+  `uint(bits: 8)` / `nibble` / `list of` fields and `keep` constraints,
+  `extend` with a constraint, `struct ... like`, `gen`/`print`, based
+  literals `8'hFF`, `0b1010`, `0o17` in `out()`) was entered into the
+  testbench editor with language **Specman e + SV/Verilog** and simulator
+  **Cadence Xcelium 25.03** (Specman 2025.03), and saved at
+  <https://www.edaplayground.com/x/7Jrh>. Clicking Run opens
+  `validatedAccessRequiredModal`: **"Your account is not validated"** —
+  commercial simulators require a validated account. The confirmation email
+  resend (`/resendConfirmation`) was requested. **Run output is therefore
+  still not available**; the follow-up is owner-only: click the validation
+  link in the mailbox of the `.env` account (check spam), then re-run the
+  saved playground and record the log here. `'h`/`'x` hex and `0o` remain
+  grammar-confirmed only until that run happens.
