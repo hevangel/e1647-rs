@@ -5,3 +5,14 @@
 .idea/
 .vscode/
 *.log
+
+# Local secrets (EDA Playground credentials). Never commit.
+.env
+
+# Lawfully obtained copyrighted reference material (e.g. the IEEE 1647
+# standard downloaded for personal use). Never redistribute; see
+# docs/REFERENCES.md.
+local/
+
+# Local Mimosa security-scanner state
+.mimosa/

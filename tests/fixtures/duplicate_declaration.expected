@@ -1,0 +1,1 @@
+2:8: error[E0201]: duplicate declaration 'packet'

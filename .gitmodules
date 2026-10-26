@@ -1,0 +1,15 @@
+[submodule "external/specman-e-parser"]
+	path = external/specman-e-parser
+	url = https://github.com/k-sparrow/specman-e-parser.git
+[submodule "external/uvm-ml-open-architecture"]
+	path = external/uvm-ml-open-architecture
+	url = https://github.com/doswellf/combinator-uvm.git
+[submodule "external/vscode-specman-grammar"]
+	path = external/vscode-specman-grammar
+	url = https://github.com/tsvi/specman-vscode-grammar.git
+[submodule "external/vscode-specman-support"]
+	path = external/vscode-specman-support
+	url = https://github.com/ErickSancho/vscode-specman-support.git
+[submodule "external/specman-e-support"]
+	path = external/specman-e-support
+	url = https://github.com/k-sparrow/specman-e-support.git

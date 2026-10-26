@@ -1,0 +1,3 @@
+extend missing {
+    x: uint;
+};
