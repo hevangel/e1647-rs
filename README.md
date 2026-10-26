@@ -2,7 +2,13 @@
 
 **An experimental, open-source Rust implementation of tooling for the IEEE 1647 _e_ hardware verification language.**
 
-> **Status: pre-alpha.** Currently implements a small source tokenizer and a `tokens` CLI command. It does **not** yet parse complete e programs, solve constraints, compile e code, or run testbenches. No IEEE conformance is claimed.
+> **Status: pre-alpha.** Implements a source tokenizer and a parser for a
+> small declared subset of the language (struct/unit/extend declarations,
+> fields, basic types, `keep` constraints and expressions) with diagnostic
+> fixtures. It does **not** yet do full type checking, `extend`/`when`
+> elaboration, constraint solving, randomization, temporal evaluation,
+> coverage, HDL bridging or testbench execution. No IEEE conformance is
+> claimed. See [docs/ROADMAP.md](docs/ROADMAP.md) for the staged plan.
 
 ## Goals
 
@@ -17,25 +23,40 @@ Requires a recent stable Rust toolchain supporting edition 2024.
 
 ```sh
 cargo test
-cargo run -- tokens examples/packet.e
+cargo run -- tokens examples/packet.e   # tokenize (does not parse)
+cargo run -- parse examples/packet.e    # parse and print the AST or diagnostics
 ```
 
-This command **tokenizes** the example; it does not execute it.
+## Repository layout
 
-## Architecture
+| Path | Contents |
+| --- | --- |
+| `src/` | The Rust crate (`lexer`, `ast`, `diagnostic`, `parser`) and the `e1647` CLI |
+| `tests/` | Integration tests and `tests/fixtures/` diagnostic fixtures |
+| `examples/` | Small e-language sources used by tests and the CLI |
+| `docs/` | Architecture, roadmap, references and the verification log |
+| `external/` | Pinned read-only reference repositories (see [external/README.md](external/README.md)) |
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+## Working on this repository
 
-Initial milestones:
+**Humans do not edit files here.** All changes are made by AI coding agents
+and land through reviewed pull requests — see
+[CONTRIBUTING.md](CONTRIBUTING.md). Agents follow
+[AGENTS.md](AGENTS.md).
 
-1. A lexer with precise source locations and regression fixtures.
-2. Parser and typed AST for basic declarations, types, units, and expressions.
-3. `extend` / `when` elaboration and constraints.
-4. Constraint-solving interface and deterministic seeded generation.
-5. Event scheduler, time-consuming methods, and HDL adapters.
-6. Functional coverage, temporal expressions, and broader standards compatibility.
+Verification before any pull request:
 
-The roadmap is aspirational and does not imply feature support today.
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+```
+
+Reference runs against the Cadence Specman implementation use
+[EDA Playground](https://www.edaplayground.com). Credentials are read from a
+gitignored `.env` file (copy `.env.example`); they must never be committed.
+Reference rules and lawful access to the IEEE 1647 standard are described in
+[docs/REFERENCES.md](docs/REFERENCES.md).
 
 ## Standards and trademarks
 
