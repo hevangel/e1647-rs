@@ -1,0 +1,19 @@
+[package]
+name = "e1647-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Experimental Rust tooling for the IEEE 1647 e verification language"
+license = "Apache-2.0"
+repository = "https://github.com/hevangel/e1647-rs"
+readme = "README.md"
+keywords = ["verification", "eda", "parser", "language", "ieee1647"]
+categories = ["development-tools", "parser-implementations"]
+publish = false
+
+[lib]
+name = "e1647"
+path = "src/lib.rs"
+
+[[bin]]
+name = "e1647"
+path = "src/main.rs"
