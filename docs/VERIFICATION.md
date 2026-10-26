@@ -169,6 +169,56 @@ test result: ok. 20 passed; 0 failed  (test parser.rs)
 $ cargo run -- parse examples/methods_types.e    # prints the AST, exit 0
 ```
 
+## 2026-10-26 — like/extend elaboration (same branch, third increment)
+
+Scope claimed for this change (nothing broader):
+
+- New `src/elab.rs`: `like` chains and `extend` blocks fold into one
+  composed member list per `struct`/`unit` (base-most `like` members
+  first, then the declaring members, then each `extend` block in source
+  order; order-independent on declarations — an `extend` may precede its
+  target). `type` declarations pass through with their enumerals; `when`
+  members are carried, ancestor types first, not resolved.
+- New diagnostics: `E0301` like inheritance cycle (once per type), `E0302`
+  field name contributed by two different declarations/extend blocks (once
+  per name; within one declaration remains the parser's `E0202`), `E0303`
+  method redefined without `is also`/`is first`/`is only` (once per name).
+- New library API `e1647::elab::elaborate(&[Declaration]) -> Elaborated`;
+  parsing (`parse()`) is unchanged and elaboration does not run inside it.
+- CLI: new `e1647 elab <file>` command printing the elaborated types
+  (enumerals, fields with rendered types, constraints, method signatures,
+  `when` blocks) or diagnostics; exit 1 on any diagnostic.
+- 9 new tests in `tests/elab.rs` (composition order, forward extends,
+  carried `when` members, cycles, duplicate fields across extends/like,
+  method redefinition, type pass-through).
+
+Not in this change: `when`-subtype resolution, type checking, constraint
+IR, and any semantics.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`, run locally
+on Windows; identical commands run in CI on ubuntu-latest via
+`.github/workflows/ci.yml`):
+
+```
+$ cargo fmt --all -- --check
+(no output — pass)
+
+$ cargo clippy --all-targets -- -D warnings
+    Checking e1647-rs v0.1.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.82s
+(pass, zero warnings)
+
+$ cargo test --all-targets
+test result: ok. 0 passed;  0 failed  (unittests src/lib.rs)
+test result: ok. 0 passed;  0 failed  (unittests src/main.rs)
+test result: ok. 9 passed;  0 failed  (test elab.rs)
+test result: ok. 1 passed;  0 failed  (test fixtures.rs — 18 golden pairs)
+test result: ok. 13 passed; 0 failed  (test lexer.rs)
+test result: ok. 20 passed; 0 failed  (test parser.rs)
+
+$ cargo run -- elab examples/methods_types.e   # prints the composed types, exit 0
+```
+
 ## Reference-simulator runs (EDA Playground)
 
 - **2026-10-25 — first attempt blocked.** Automated login to

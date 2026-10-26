@@ -38,10 +38,15 @@
   declaration/field/parameter/local/enumeral names, unknown type names,
   `keep` identifier roots, zero widths). **Not** a symbol/type checker yet:
   no type system, no cross-file scope, no elaboration.
-- `src/main.rs` — `e1647 tokens` and `e1647 parse` CLI commands; `parse`
-  prints diagnostics to stderr (`path:line:col: error[code]: message`) and
-  the debug AST on success.
+- `src/elab.rs` — member composition: `like` chains and `extend` blocks fold
+  into one composed member list per `struct`/`unit` (inheritance-cycle,
+  cross-declaration duplicate-field and unmodified-method-redefinition
+  diagnostics; codes `E03xx`). **Not** full elaboration: `when` subtypes
+  are carried, not resolved; no semantics.
+- `src/main.rs` — `e1647 tokens`, `e1647 parse` and `e1647 elab` CLI
+  commands; `parse` and `elab` print diagnostics to stderr
+  (`path:line:col: error[code]: message`) and their results on success.
 
-Deliberately not implemented yet: elaboration (`extend`/`when` composition),
-constraint solving, randomization, events/temporal, coverage, statement
-execution (statements are parsed, not interpreted) and any HDL bridge.
+Deliberately not implemented yet: `when`-subtype resolution, constraint
+solving, randomization, events/temporal, coverage, statement execution
+(statements are parsed, not interpreted) and any HDL bridge.

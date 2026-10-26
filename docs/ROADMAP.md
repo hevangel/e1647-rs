@@ -34,7 +34,12 @@
       recorded in docs/VERIFICATION.md; no automated differential harness yet)
 
 ## M2 — Elaboration and randomization
-- [ ] `extend`, `when`, units, structs and inheritance
+- [~] `extend`, `when`, units, structs and inheritance — elaboration
+      started: `like` chains and `extend` blocks fold into one composed
+      member list per type (`src/elab.rs`, `e1647 elab`), with
+      inheritance-cycle, cross-declaration duplicate-field and
+      unmodified-method-redefinition diagnostics; `when` subtypes are
+      carried, not resolved, and there are no semantics yet
 - [ ] Constraint IR for `keep` expressions
 - [ ] Pluggable SMT/constraint solver
 - [ ] Reproducible seeded randomized objects

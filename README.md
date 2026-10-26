@@ -8,11 +8,12 @@
 > constraints and expressions, `when` subtype members, and methods with
 > parameter lists and statement bodies (`var`, assignment, calls, indexing,
 > `return`, braced `if`/`else`, `while`/`break`/`continue`, `print`,
-> `gen`), with diagnostic fixtures. It does **not** yet do full type
-> checking, `extend`/`when` elaboration, statement execution, constraint
-> solving, randomization, temporal evaluation, coverage, HDL bridging or
-> testbench execution. No IEEE conformance is claimed. See
-> [docs/ROADMAP.md](docs/ROADMAP.md) for the staged plan.
+> `gen`), with diagnostic fixtures; plus member composition that folds
+> `like` chains and `extend` blocks into per-type member lists. It does
+> **not** yet do full type checking, `when`-subtype resolution, statement
+> execution, constraint solving, randomization, temporal evaluation,
+> coverage, HDL bridging or testbench execution. No IEEE conformance is
+> claimed. See [docs/ROADMAP.md](docs/ROADMAP.md) for the staged plan.
 
 ## Goals
 
@@ -29,13 +30,14 @@ Requires a recent stable Rust toolchain supporting edition 2024.
 cargo test
 cargo run -- tokens examples/packet.e   # tokenize (does not parse)
 cargo run -- parse examples/packet.e    # parse and print the AST or diagnostics
+cargo run -- elab examples/methods_types.e  # fold like/extend, print the types
 ```
 
 ## Repository layout
 
 | Path | Contents |
 | --- | --- |
-| `src/` | The Rust crate (`lexer`, `ast`, `diagnostic`, `parser`) and the `e1647` CLI |
+| `src/` | The Rust crate (`lexer`, `ast`, `diagnostic`, `parser`, `check`, `elab`) and the `e1647` CLI |
 | `tests/` | Integration tests and `tests/fixtures/` diagnostic fixtures |
 | `examples/` | Small e-language sources used by tests and the CLI |
 | `docs/` | Architecture, roadmap, references and the verification log |
