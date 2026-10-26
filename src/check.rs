@@ -15,8 +15,15 @@
 //! - `E0205` a `uint`/`int` width literal is zero
 //! - `E0206` duplicate name in an inner scope: method parameter, local
 //!   variable, or enumeral
+//!
+//! Fields, methods and constraints are collected through `when` subtype
+//! members as well. A `keep` constraint sees every field of the enclosing
+//! declaration, including fields of sibling `when` blocks — subtype-aware
+//! scoping is elaboration and a later milestone.
 
-use crate::ast::{Declaration, DeclarationKind, Expr, KeepConstraint, Member, Stmt, TypeExpr};
+use crate::ast::{
+    Declaration, DeclarationKind, Expr, Field, KeepConstraint, Member, MethodDecl, Stmt, TypeExpr,
+};
 use crate::diagnostic::Diagnostic;
 use std::collections::BTreeSet;
 
@@ -57,19 +64,13 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
         check_enumerals(declaration, &mut diagnostics);
         check_methods(declaration, &declared, &mut diagnostics);
         if declaration.kind != DeclarationKind::Extend {
-            let field_names: BTreeSet<&str> = declaration
-                .members
-                .iter()
-                .filter_map(|member| match member {
-                    Member::Field(field) => Some(field.name.as_str()),
-                    _ => None,
-                })
-                .collect();
-            for member in &declaration.members {
-                if let Member::Constraint(constraint) = member {
-                    check_constraint_fields(constraint, &field_names, &enumerals, &mut diagnostics);
-                }
-            }
+            let mut field_names: BTreeSet<&str> = BTreeSet::new();
+            for_each_field(&declaration.members, &mut |field| {
+                field_names.insert(field.name.as_str());
+            });
+            for_each_constraint(&declaration.members, &mut |constraint| {
+                check_constraint_fields(constraint, &field_names, &enumerals, &mut diagnostics);
+            });
         }
     }
     diagnostics
@@ -121,10 +122,7 @@ fn check_fields(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
-    for member in &declaration.members {
-        let Member::Field(field) = member else {
-            continue;
-        };
+    for_each_field(&declaration.members, &mut |field| {
         if !seen.insert(field.name.as_str()) {
             diagnostics.push(Diagnostic::new(
                 "E0202",
@@ -142,7 +140,7 @@ fn check_fields(
         {
             check_width(width, diagnostics);
         }
-    }
+    });
 }
 
 /// A `type` declaration may not name the same enumeral twice.
@@ -174,10 +172,7 @@ fn check_methods(
     declared: &BTreeSet<&str>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for member in &declaration.members {
-        let Member::Method(method) = member else {
-            continue;
-        };
+    for_each_method(&declaration.members, &mut |method| {
         // Parameters and local variables share one namespace in this subset;
         // block scoping is a later milestone.
         let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -199,7 +194,7 @@ fn check_methods(
             check_named_type(return_type, declared, diagnostics);
         }
         check_statements(&method.body, &mut seen, declared, &method.name, diagnostics);
-    }
+    });
 }
 
 /// Walk a statement list. `seen` accumulates local variable names across
@@ -242,6 +237,9 @@ fn check_statements<'a>(
             Stmt::Assign { .. }
             | Stmt::ExprStmt { .. }
             | Stmt::Return { .. }
+            | Stmt::While { .. }
+            | Stmt::Break { .. }
+            | Stmt::Continue { .. }
             | Stmt::Print { .. }
             | Stmt::Gen { .. } => {}
         }
@@ -333,5 +331,39 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
         | Expr::BitLiteral { .. }
         | Expr::BoolLiteral { .. }
         | Expr::StringLiteral { .. } => {}
+    }
+}
+
+/// Visit every field of the declaration, descending into `when` subtype
+/// members.
+fn for_each_field<'a>(members: &'a [Member], f: &mut impl FnMut(&'a Field)) {
+    for member in members {
+        match member {
+            Member::Field(field) => f(field),
+            Member::When(when) => for_each_field(&when.members, f),
+            _ => {}
+        }
+    }
+}
+
+/// Visit every method, descending into `when` subtype members.
+fn for_each_method<'a>(members: &'a [Member], f: &mut impl FnMut(&'a MethodDecl)) {
+    for member in members {
+        match member {
+            Member::Method(method) => f(method),
+            Member::When(when) => for_each_method(&when.members, f),
+            _ => {}
+        }
+    }
+}
+
+/// Visit every `keep` constraint, descending into `when` subtype members.
+fn for_each_constraint<'a>(members: &'a [Member], f: &mut impl FnMut(&'a KeepConstraint)) {
+    for member in members {
+        match member {
+            Member::Constraint(constraint) => f(constraint),
+            Member::When(when) => for_each_constraint(&when.members, f),
+            _ => {}
+        }
     }
 }

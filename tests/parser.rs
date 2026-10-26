@@ -338,7 +338,7 @@ fn diagnostics_are_reported_with_positions() {
 
 #[test]
 fn lex_errors_become_diagnostics() {
-    let result = parse("struct s { keep x < 'z1; };");
+    let result = parse("struct s { keep x < ''; };");
     assert_eq!(result.declarations.len(), 0);
     assert_eq!(result.diagnostics.len(), 1);
     assert_eq!(result.diagnostics[0].code, "E0001");
@@ -378,7 +378,7 @@ fn unsupported_members_report_explicitly() {
 #[test]
 fn unsupported_statements_report_explicitly() {
     let result = parse(
-        "struct s {\n    run() is {\n        while true {\n            out(1);\n        };\n    };\n};\n",
+        "struct s {\n    run() is {\n        repeat {\n            out(1);\n        };\n    };\n};\n",
     );
     let codes: Vec<&str> = result
         .diagnostics
@@ -386,4 +386,83 @@ fn unsupported_statements_report_explicitly() {
         .map(|d| d.code)
         .collect::<Vec<_>>();
     assert_eq!(codes.first().copied(), Some("E0113"), "codes: {codes:?}");
+}
+
+#[test]
+fn when_subtype_members_parse() {
+    let declarations = expect_clean(
+        "type mode_e: [IDLE, BUSY];\n\
+         struct channel_s {\n    mode: mode_e;\n    fill: uint(bits: 8);\n    \
+         when BUSY'kind channel_s {\n        payload: list of uint(bits: 8);\n        keep fill < 200;\n    };\n};\n",
+    );
+    assert_eq!(declarations.len(), 2);
+    let Member::When(when) = &declarations[1].members[2] else {
+        panic!("expected a when member");
+    };
+    assert_eq!(when.modifiers.len(), 2);
+    assert_eq!(when.modifiers[0].value, "BUSY");
+    assert_eq!(
+        when.modifiers[0].id.as_ref().map(|(id, _)| id.as_str()),
+        Some("kind")
+    );
+    // The base struct name is the optional trailing bare-id modifier.
+    assert_eq!(when.modifiers[1].value, "channel_s");
+    assert!(when.modifiers[1].id.is_none());
+    assert_eq!(when.members.len(), 2);
+}
+
+#[test]
+fn when_bare_and_chained_modifiers_parse() {
+    let declarations = expect_clean(
+        "struct s {\n    when fast'kind s'kind quick {\n        x: uint;\n    };\n};\n",
+    );
+    let Member::When(when) = &declarations[0].members[0] else {
+        panic!("expected a when member");
+    };
+    assert_eq!(when.modifiers.len(), 3);
+    assert_eq!(when.modifiers[0].value, "fast");
+    assert_eq!(
+        when.modifiers[0].id.as_ref().map(|(id, _)| id.as_str()),
+        Some("kind")
+    );
+    assert!(when.modifiers[2].id.is_none());
+    assert_eq!(when.modifiers[2].value, "quick");
+}
+
+#[test]
+fn when_blocks_are_searched_for_fields_and_constraints() {
+    // A duplicate field inside a when block is diagnosed against the
+    // declaration's other fields (including sibling when blocks).
+    let result =
+        parse("struct s {\n    a: uint;\n    when fast'kind s {\n        a: uint;\n    };\n};\n");
+    let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
+    assert_eq!(rendered, vec!["4:9: error[E0202]: duplicate field 'a'"]);
+}
+
+#[test]
+fn while_break_and_continue_parse() {
+    let declarations = expect_clean(
+        "struct s {\n    i: uint;\n    run() is {\n        while i < 4 {\n            i = i + 1;\n            if i == 2 {\n                continue;\n            };\n            if i == 3 {\n                break;\n            };\n        };\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[1] else {
+        panic!("expected a method");
+    };
+    let Some(Stmt::While { cond, body, .. }) = run.body.first() else {
+        panic!("expected a while statement");
+    };
+    let Expr::Binary {
+        op: BinaryOp::Lt, ..
+    } = cond
+    else {
+        panic!("expected a '<' condition");
+    };
+    assert_eq!(body.len(), 3);
+    let Stmt::If { then_body, .. } = &body[1] else {
+        panic!("expected an if statement");
+    };
+    assert!(matches!(then_body[0], Stmt::Continue { .. }));
+    let Stmt::If { then_body, .. } = &body[2] else {
+        panic!("expected an if statement");
+    };
+    assert!(matches!(then_body[0], Stmt::Break { .. }));
 }

@@ -1,6 +1,7 @@
 // A small tour of the supported subset: enumeral type declarations,
 // enum-typed fields, soft constraints, methods with statement bodies,
-// calls, indexing, `gen` and `print`.
+// calls, indexing, `gen`, `print`, `when` subtype members and `while`
+// loops.
 //
 // Parse it with: cargo run -- parse examples/methods_types.e
 //
@@ -38,5 +39,24 @@ struct frame_s {
     pixels: list of pixel_s;
     pick(i: uint): pixel_s is {
         return pixels[i];
+    };
+};
+
+type mode_e: [IDLE, BUSY];
+
+struct channel_s {
+    mode: mode_e;
+    fill: uint(bits: 8);
+
+    when BUSY'kind channel_s {
+        payload: list of uint(bits: 8);
+        keep fill < 200;
+    };
+
+    drain() is {
+        var i: uint = 0;
+        while i < 4 {
+            i = i + 1;
+        };
     };
 };

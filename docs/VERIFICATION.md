@@ -117,6 +117,58 @@ $ cargo run -- parse examples/reference_subset.e # exit 1 — `extend sys`
   is not declared in that file (E0203); pre-existing behavior, unchanged
 ```
 
+## 2026-10-26 — when subtypes and while loops (same branch, second increment)
+
+Scope claimed for this change (nothing broader):
+
+- Lexer: a bare `'` followed by an identifier is now a standalone
+  punctuation token (the `read'kind` subtype modifier quote), matching the
+  reference grammar's `SNG_QUOTE`. Base letters after `'` still start based
+  literals. The invalid_lex fixture and the lex-error unit test switched
+  from `'q1`/`'z1` to `''` (a quote followed by an identifier is no longer
+  a lexical error).
+- Parser: `when` subtype members — one or more `value'id` / bare `id`
+  modifiers per the reference grammar's `struct_type_modifier` (the base
+  struct name, when present, is the trailing bare-id modifier), then a
+  member body — and `while` loops with `break`/`continue` statements.
+  Member lists are shared between declaration bodies and `when` bodies.
+- Checks: fields, methods and constraints are collected through `when`
+  members. Duplicate fields are diagnosed across the whole declaration
+  including `when` blocks; a `keep` inside a `when` may reference any field
+  of the declaration. Subtype-aware scoping is elaboration and stays
+  undone (documented in check.rs).
+- 2 new golden fixtures (when_bad_quote, when_missing_modifier — the
+  latter deliberately documents the recovery cascade into E0101), 4 new
+  parser tests, 1 new lexer test. Totals: 18 fixture pairs, 13 lexer tests,
+  20 parser tests.
+
+Not in this change: `when` elaboration semantics, `for`/`repeat` loops,
+`when` in covergroups, single-statement `if ... do`, and any semantics —
+statements are parsed, not interpreted.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`, run locally
+on Windows; identical commands run in CI on ubuntu-latest via
+`.github/workflows/ci.yml`):
+
+```
+$ cargo fmt --all -- --check
+(no output — pass)
+
+$ cargo clippy --all-targets -- -D warnings
+    Checking e1647-rs v0.1.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.92s
+(pass, zero warnings)
+
+$ cargo test --all-targets
+test result: ok. 0 passed;  0 failed  (unittests src/lib.rs)
+test result: ok. 0 passed;  0 failed  (unittests src/main.rs)
+test result: ok. 1 passed;  0 failed  (test fixtures.rs — 18 golden pairs)
+test result: ok. 13 passed; 0 failed  (test lexer.rs)
+test result: ok. 20 passed; 0 failed  (test parser.rs)
+
+$ cargo run -- parse examples/methods_types.e    # prints the AST, exit 0
+```
+
 ## Reference-simulator runs (EDA Playground)
 
 - **2026-10-25 — first attempt blocked.** Automated login to

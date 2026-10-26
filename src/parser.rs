@@ -4,16 +4,18 @@
 //! optional `like` inheritance, field declarations (single names and `a, b:`
 //! name groups) with scalar (`uint(bits: 8)`-style widths included), `list
 //! of`, and named types, enumeral type declarations, `keep` and `keep soft`
-//! constraint expressions, and method members with parameter lists and
-//! statement bodies (local `var` declarations, assignments, expression
-//! statements including calls and indexing, `return`, braced `if`/`else`,
-//! `print` and `gen`).
+//! constraint expressions, `when` subtype members (`value'id` modifiers per
+//! the reference grammar's `struct_type_modifier`), and method members with
+//! parameter lists and statement bodies (local `var` declarations,
+//! assignments, expression statements including calls and indexing,
+//! `return`, braced `if`/`else`, `while` with `break`/`continue`, `print`
+//! and `gen`).
 //!
-//! Everything else (`when`, events, temporal expressions, coverage, the
-//! single-statement `if ... do` form, loops) is a later roadmap stage: the
-//! parser reports an explicit diagnostic and recovers at declaration,
-//! member or statement boundaries. Under errors the AST is partial —
-//! constructs that failed to parse are omitted, and the recorded
+//! Everything else (events, temporal expressions, coverage, the
+//! single-statement `if ... do` form, `for`/`repeat` loops) is a later
+//! roadmap stage: the parser reports an explicit diagnostic and recovers at
+//! declaration, member or statement boundaries. Under errors the AST is
+//! partial — constructs that failed to parse are omitted, and the recorded
 //! diagnostics are authoritative.
 //!
 //! ## Diagnostic codes
@@ -45,7 +47,8 @@
 
 use crate::ast::{
     BinaryOp, Declaration, DeclarationKind, Enumeral, Expr, Field, KeepConstraint, Member,
-    MethodDecl, MethodModifier, Param, ScalarBase, Stmt, TypeExpr, UnaryOp,
+    MethodDecl, MethodModifier, Param, ScalarBase, Stmt, SubtypeModifier, TypeExpr, UnaryOp,
+    WhenDecl,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Position, Token, TokenKind};
@@ -427,6 +430,25 @@ impl Parser {
                 span: (start, self.eof),
             });
         }
+        let members = self.parse_member_list();
+        // e convention writes the closing brace as `};`; the semicolon is
+        // accepted but not required.
+        self.eat_punct(";");
+        let end = self.last_end();
+        Some(Declaration {
+            kind,
+            name,
+            name_span,
+            like,
+            like_span,
+            members,
+            span: (start, end),
+        })
+    }
+
+    /// Members up to (and including) the closing `}` of the enclosing
+    /// declaration or `when` body.
+    fn parse_member_list(&mut self) -> Vec<Member> {
         let mut members = Vec::new();
         loop {
             if self.peek().is_none() {
@@ -441,19 +463,7 @@ impl Parser {
                 members.append(&mut parsed);
             }
         }
-        // e convention writes the closing brace as `};`; the semicolon is
-        // accepted but not required.
-        self.eat_punct(";");
-        let end = self.last_end();
-        Some(Declaration {
-            kind,
-            name,
-            name_span,
-            like,
-            like_span,
-            members,
-            span: (start, end),
-        })
+        members
     }
 
     /// One member often produces several AST members (`a, b: uint;` is two
@@ -470,15 +480,71 @@ impl Parser {
             Some(TokenKind::Keyword(k)) if k == "keep" => {
                 self.parse_keep().map(|c| vec![Member::Constraint(c)])
             }
+            Some(TokenKind::Keyword(k)) if k == "when" => self.parse_when(),
             _ => {
                 self.error_here(
                     "E0113",
-                    "expected a field, method or 'keep' declaration (other members are not supported yet)",
+                    "expected a field, method, 'when' or 'keep' declaration (other members are not supported yet)",
                 );
                 self.recover_to_member_boundary();
                 None
             }
         }
+    }
+
+    /// `when <modifier> [<modifier> ..] { members };` — a modifier is
+    /// `value'id` or a bare `id` (the reference grammar's
+    /// `struct_type_modifier`); the base-struct id, when present, is the
+    /// last modifier.
+    fn parse_when(&mut self) -> Option<Vec<Member>> {
+        let start = self.current_span().0;
+        self.bump(); // 'when'
+        let mut modifiers = Vec::new();
+        while self.at_identifier() {
+            let (value, value_span) = self.take_identifier();
+            // A missing identifier after `'` is recorded by
+            // expect_identifier; keep parsing the when body with `id: None`.
+            let id = if self.at_punct("'") {
+                self.bump();
+                self.expect_identifier(
+                    "E0102",
+                    "expected an identifier after \"'\" in the subtype modifier",
+                )
+            } else {
+                None
+            };
+            modifiers.push(SubtypeModifier {
+                value,
+                value_span,
+                id,
+            });
+        }
+        if modifiers.is_empty() {
+            self.error_here("E0102", "expected a subtype modifier after 'when'");
+            self.recover_to_member_boundary();
+            return None;
+        }
+        if self
+            .expect_punct("{", "E0106", "expected '{' to open the 'when' body")
+            .is_none()
+        {
+            self.recover_to_member_boundary();
+            return Some(vec![Member::When(WhenDecl {
+                modifiers,
+                members: Vec::new(),
+                span: (start, self.last_end()),
+            })]);
+        }
+        let members = self.parse_member_list();
+        let end = self.last_end();
+        // e convention writes the closing brace as `};`; the semicolon is
+        // accepted but not required.
+        self.eat_punct(";");
+        Some(vec![Member::When(WhenDecl {
+            modifiers,
+            members,
+            span: (start, end),
+        })])
     }
 
     /// `name, name: type;` — a name group declares one field per name.
@@ -677,6 +743,19 @@ impl Parser {
                 })
             }
             Some(TokenKind::Keyword(k)) if k == "if" => self.parse_if_statement(),
+            Some(TokenKind::Keyword(k)) if k == "while" => self.parse_while_statement(),
+            Some(TokenKind::Keyword(k)) if k == "break" => {
+                self.bump();
+                self.expect_punct(";", "E0105", "expected ';' after 'break'")?;
+                let end = self.last_end();
+                Some(Stmt::Break { span: (start, end) })
+            }
+            Some(TokenKind::Keyword(k)) if k == "continue" => {
+                self.bump();
+                self.expect_punct(";", "E0105", "expected ';' after 'continue'")?;
+                let end = self.last_end();
+                Some(Stmt::Continue { span: (start, end) })
+            }
             Some(TokenKind::Keyword(k)) if k == "return" => {
                 self.bump();
                 let value = if self.at_punct(";") {
@@ -782,6 +861,30 @@ impl Parser {
             cond,
             then_body,
             else_body,
+            span: (start, end),
+        })
+    }
+
+    /// `while cond { statements };` — other loop forms are a later
+    /// milestone.
+    fn parse_while_statement(&mut self) -> Option<Stmt> {
+        let start = self.current_span().0;
+        self.bump(); // 'while'
+        let cond = self.parse_expr()?;
+        if self
+            .expect_punct("{", "E0106", "expected '{' to open the 'while' body")
+            .is_none()
+        {
+            self.recover_to_member_boundary();
+            return None;
+        }
+        let body = self.parse_statements();
+        self.expect_punct("}", "E0107", "expected '}' to close the 'while' body")?;
+        self.expect_punct(";", "E0105", "expected ';' after the 'while' statement")?;
+        let end = self.last_end();
+        Some(Stmt::While {
+            cond,
+            body,
             span: (start, end),
         })
     }

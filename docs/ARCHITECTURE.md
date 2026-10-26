@@ -26,9 +26,9 @@
   e operators with longest-match, IEEE 1647-style numerals (sized/unsized
   based literals, `0x`/`0b`, reals, ranges kept intact at `..`), strings,
   comments. Reports the first lexical error; later stages collect many.
-- `src/ast.rs` — typed AST for declarations (including `type` enumerals),
-  fields, type expressions, constraint expressions, methods and statements,
-  all carrying byte/line/column spans.
+- `src/ast.rs` — typed AST for declarations (including `type` enumerals and
+  `when` subtypes), fields, type expressions, constraint expressions,
+  methods and statements, all carrying byte/line/column spans.
 - `src/parser.rs` — recursive-descent parser for the declared subset with
   C-style operator precedence and error recovery at declaration, member and
   statement boundaries. Diagnostics are collected (codes `E01xx` syntax,

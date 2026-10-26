@@ -3,9 +3,11 @@
 //! Keyword recognition, multi-character operators and IEEE 1647-style
 //! numerals (sized/unsized based literals, `0x`/`0b` prefixes, reals) were
 //! cross-checked against the MIT-licensed grammars pinned under
-//! `external/` (see docs/REFERENCES.md). Character literals and `<' .. '>`
-//! code literals are deliberately not supported yet and produce explicit
-//! errors.
+//! `external/` (see docs/REFERENCES.md). A bare `'` followed by an
+//! identifier is the subtype modifier quote (`read'kind`), tokenized as a
+//! standalone punctuation token like the reference grammar's `SNG_QUOTE`.
+//! Character literals and `<' .. '>` code literals are deliberately not
+//! supported yet and produce explicit errors.
 
 use std::fmt;
 
@@ -486,14 +488,20 @@ impl<'a> Cursor<'a> {
             }
             TokenKind::StringLiteral(value)
         } else if first == '\'' {
-            // Either a based literal (`'hFF`) or, until a later milestone,
-            // an unsupported character/code literal.
+            // Either a based literal (`'hFF`), the subtype modifier quote
+            // (`read'kind`; a standalone token, like the reference grammar's
+            // `SNG_QUOTE`), or — until a later milestone — an unsupported
+            // character literal.
             match self.peek_second() {
                 Some(base) if Self::based_base_letter(base) => {
                     self.bump();
                     self.bump();
                     self.read_based_digits(base, start)?;
                     TokenKind::Number(self.source[start.byte..self.byte].to_owned())
+                }
+                Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                    self.bump();
+                    TokenKind::Punctuation("'".to_owned())
                 }
                 _ => {
                     return Err(LexError {

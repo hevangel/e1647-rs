@@ -285,7 +285,7 @@ fn reals_and_ranges() {
 
 #[test]
 fn rejects_bad_based_literals() {
-    let error = tokenize("'q12").unwrap_err();
+    let error = tokenize("''").unwrap_err();
     assert_eq!(error.message, "character literals are not supported yet");
     let error = tokenize("8'xZZ").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
@@ -293,6 +293,20 @@ fn rejects_bad_based_literals() {
     assert_eq!(error.message, "invalid based literal");
     let error = tokenize("8'").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
+}
+
+#[test]
+fn subtype_modifier_quote_tokenizes_standalone() {
+    assert_eq!(
+        kinds("BUSY'kind"),
+        vec![
+            TokenKind::Identifier("BUSY".into()),
+            TokenKind::Punctuation("'".into()),
+            TokenKind::Identifier("kind".into()),
+        ]
+    );
+    // A base letter right after `'` still starts a based literal.
+    assert_eq!(kinds("'hFF"), vec![TokenKind::Number("'hFF".into())]);
 }
 
 #[test]

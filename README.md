@@ -5,13 +5,14 @@
 > **Status: pre-alpha.** Implements a source tokenizer and a parser for a
 > declared subset of the language: struct/unit/extend/type declarations,
 > fields, scalar/list/named and enumeral types, `keep`/`keep soft`
-> constraints and expressions, and methods with parameter lists and
-> statement bodies (`var`, assignment, calls, indexing, `return`, braced
-> `if`/`else`, `print`, `gen`), with diagnostic fixtures. It does **not**
-> yet do full type checking, `extend`/`when` elaboration, statement
-> execution, constraint solving, randomization, temporal evaluation,
-> coverage, HDL bridging or testbench execution. No IEEE conformance is
-> claimed. See [docs/ROADMAP.md](docs/ROADMAP.md) for the staged plan.
+> constraints and expressions, `when` subtype members, and methods with
+> parameter lists and statement bodies (`var`, assignment, calls, indexing,
+> `return`, braced `if`/`else`, `while`/`break`/`continue`, `print`,
+> `gen`), with diagnostic fixtures. It does **not** yet do full type
+> checking, `extend`/`when` elaboration, statement execution, constraint
+> solving, randomization, temporal evaluation, coverage, HDL bridging or
+> testbench execution. No IEEE conformance is claimed. See
+> [docs/ROADMAP.md](docs/ROADMAP.md) for the staged plan.
 
 ## Goals
 

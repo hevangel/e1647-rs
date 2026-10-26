@@ -16,11 +16,13 @@
 - [x] Build AST and parser for a declared subset: `struct`/`unit`/`extend`/
       `type` with `like`, fields (including name groups), scalar/list/named
       types and enumeral types, `keep`/`keep soft` constraints with C-style
-      precedence, methods with parameter lists and statement bodies (local
-      `var`, assignment, calls, indexing, `return`, braced `if`/`else`,
-      `print`, `gen`), spanned diagnostics and declaration/member/statement
-      -level recovery (not yet: `when`, loops, single-statement `if ... do`,
-      temporal expressions, coverage)
+      precedence, `when` subtype members (`value'id` modifiers), methods with
+      parameter lists and statement bodies (local `var`, assignment, calls,
+      indexing, `return`, braced `if`/`else`, `while` with `break`/
+      `continue`, `print`, `gen`), spanned diagnostics and declaration/
+      member/statement-level recovery (not yet: `when` elaboration,
+      `for`/`repeat` loops, single-statement `if ... do`, temporal
+      expressions, coverage)
 - [~] Add symbol resolution, types, diagnostics — minimal single-file
       well-formedness checks only (duplicate declaration/field names,
       duplicate parameters/local variables/enumerals, unknown named/`like`/

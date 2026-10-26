@@ -2,10 +2,10 @@
 //!
 //! The subset covers `struct` / `unit` / `extend` / `type` declarations with
 //! fields (single names and name groups), `like` inheritance clauses, `keep`
-//! constraint expressions, enumeral type declarations, and methods with
-//! parameter lists and statement bodies. `when` inheritance, temporal
-//! expressions, events and coverage are later milestones and not
-//! representable here.
+//! constraint expressions, enumeral type declarations, `when` subtype
+//! members, and methods with parameter lists and statement bodies (including
+//! `while`/`break`/`continue`). Temporal expressions, events and coverage
+//! are later milestones and not representable here.
 
 use crate::lexer::Position;
 
@@ -39,6 +39,27 @@ pub enum Member {
     Method(MethodDecl),
     /// One enumerand of a `type` declaration.
     Enumeral(Enumeral),
+    /// A `when <modifier> .. { members };` subtype member.
+    When(WhenDecl),
+}
+
+/// A `when` subtype member: one or more `value'id` (or bare `id`) modifiers
+/// followed by the members that apply under that subtype.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhenDecl {
+    pub modifiers: Vec<SubtypeModifier>,
+    pub members: Vec<Member>,
+    pub span: Span,
+}
+
+/// One subtype modifier: `BUSY'kind` (the conventional form) or a bare
+/// identifier. The reference grammar's `struct_type_modifier`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtypeModifier {
+    pub value: String,
+    pub value_span: Span,
+    /// The identifier after `'`, e.g. `kind`.
+    pub id: Option<(String, Span)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +115,8 @@ pub struct Enumeral {
 
 /// A statement in a method body. The subset covers local variable
 /// declarations, assignments, expression statements (including method
-/// calls), `return`, braced `if`/`else`, `print` and `gen`.
+/// calls), `return`, braced `if`/`else`, `while` loops with `break`/
+/// `continue`, `print` and `gen`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
     VarDecl {
@@ -123,6 +145,17 @@ pub enum Stmt {
         else_body: Option<Vec<Stmt>>,
         span: Span,
     },
+    While {
+        cond: Expr,
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    Break {
+        span: Span,
+    },
+    Continue {
+        span: Span,
+    },
     Print {
         exprs: Vec<Expr>,
         span: Span,
@@ -141,6 +174,9 @@ impl Stmt {
             | Stmt::ExprStmt { span, .. }
             | Stmt::Return { span, .. }
             | Stmt::If { span, .. }
+            | Stmt::While { span, .. }
+            | Stmt::Break { span }
+            | Stmt::Continue { span }
             | Stmt::Print { span, .. }
             | Stmt::Gen { span, .. } => *span,
         }
