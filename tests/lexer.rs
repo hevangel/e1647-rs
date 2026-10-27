@@ -285,7 +285,7 @@ fn reals_and_ranges() {
 
 #[test]
 fn rejects_bad_based_literals() {
-    let error = tokenize("'q12").unwrap_err();
+    let error = tokenize("''").unwrap_err();
     assert_eq!(error.message, "character literals are not supported yet");
     let error = tokenize("8'xZZ").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
@@ -296,9 +296,31 @@ fn rejects_bad_based_literals() {
 }
 
 #[test]
-fn rejects_code_literal_delimiters() {
-    let error = tokenize("<' extend foo '>").unwrap_err();
-    assert_eq!(error.message, "code literals (<') are not supported yet");
+fn subtype_modifier_quote_tokenizes_standalone() {
+    assert_eq!(
+        kinds("BUSY'kind"),
+        vec![
+            TokenKind::Identifier("BUSY".into()),
+            TokenKind::Punctuation("'".into()),
+            TokenKind::Identifier("kind".into()),
+        ]
+    );
+    // A base letter right after `'` still starts a based literal.
+    assert_eq!(kinds("'hFF"), vec![TokenKind::Number("'hFF".into())]);
+}
+
+#[test]
+fn code_literal_delimiters_are_skipped() {
+    // <' .. '> wrap e code blocks; their contents are ordinary code.
+    let tokens = tokenize("<' extend foo '>").unwrap();
+    assert_eq!(
+        kinds("<' extend foo '>"),
+        vec![
+            TokenKind::Keyword("extend".into()),
+            TokenKind::Identifier("foo".into())
+        ]
+    );
+    assert_eq!(tokens.len(), 2);
 }
 
 #[test]

@@ -1,0 +1,2 @@
+2:10: error[E0102]: expected a subtype modifier after 'when'
+5:1: error[E0101]: expected 'struct', 'unit', 'extend' or 'type' declaration

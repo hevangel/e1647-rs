@@ -3,12 +3,20 @@
 **An experimental, open-source Rust implementation of tooling for the IEEE 1647 _e_ hardware verification language.**
 
 > **Status: pre-alpha.** Implements a source tokenizer and a parser for a
-> small declared subset of the language (struct/unit/extend declarations,
-> fields, basic types, `keep` constraints and expressions) with diagnostic
-> fixtures. It does **not** yet do full type checking, `extend`/`when`
-> elaboration, constraint solving, randomization, temporal evaluation,
-> coverage, HDL bridging or testbench execution. No IEEE conformance is
-> claimed. See [docs/ROADMAP.md](docs/ROADMAP.md) for the staged plan.
+> declared subset of the language: struct/unit/extend/type declarations,
+> fields, scalar/list/named and enumeral types, `keep`/`keep soft`
+> constraints and expressions, `when` subtype members, and methods with
+> parameter lists and statement bodies, with diagnostic fixtures; member
+> composition that folds `like` chains and `extend` blocks into per-type
+> member lists; and an interpreter that executes the non-temporal subset
+> (`e1647 run`): method calls, statements, `print`/`out`, and `gen` — a
+> seeded rejection sampler by default, or a seeded solve of conjunctive
+> linear constraints via the Pumpkin CP solver when the `solver-pumpkin`
+> cargo feature is enabled. It does **not** yet do full type checking,
+> `when`-subtype resolution, temporal evaluation, events, coverage,
+> non-linear or disjunctive constraint solving, HDL bridging or testbench
+> execution. No IEEE conformance is claimed. See
+> [docs/ROADMAP.md](docs/ROADMAP.md) for the staged plan.
 
 ## Goals
 
@@ -25,13 +33,20 @@ Requires a recent stable Rust toolchain supporting edition 2024.
 cargo test
 cargo run -- tokens examples/packet.e   # tokenize (does not parse)
 cargo run -- parse examples/packet.e    # parse and print the AST or diagnostics
+cargo run -- elab examples/methods_types.e  # fold like/extend, print the types
+cargo run -- run --seed 1 examples/reference_subset.e  # execute sys.run()
 ```
+
+`run` executes the built-in `sys` unit's `run()` methods. Every run takes
+an explicit `--seed` and is fully deterministic; `gen` is a rejection
+sampler, not a constraint solver (see `src/interp.rs` for the exact
+semantics and its honest limits).
 
 ## Repository layout
 
 | Path | Contents |
 | --- | --- |
-| `src/` | The Rust crate (`lexer`, `ast`, `diagnostic`, `parser`) and the `e1647` CLI |
+| `src/` | The Rust crate (`lexer`, `ast`, `diagnostic`, `parser`, `check`, `elab`, `builtins`, `interp`) and the `e1647` CLI |
 | `tests/` | Integration tests and `tests/fixtures/` diagnostic fixtures |
 | `examples/` | Small e-language sources used by tests and the CLI |
 | `docs/` | Architecture, roadmap, references and the verification log |
@@ -55,7 +70,9 @@ cargo test --all-targets
 Reference runs against the Cadence Specman implementation use
 [EDA Playground](https://www.edaplayground.com). Credentials are read from a
 gitignored `.env` file (copy `.env.example`); they must never be committed.
-Reference rules and lawful access to the IEEE 1647 standard are described in
+The automation playbook (login, run setup, reading logs, saving) lives at
+[skills/edaplayground/SKILL.md](skills/edaplayground/SKILL.md); reference
+rules and lawful access to the IEEE 1647 standard are described in
 [docs/REFERENCES.md](docs/REFERENCES.md).
 
 ## Standards and trademarks

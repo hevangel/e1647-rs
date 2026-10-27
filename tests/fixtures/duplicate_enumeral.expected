@@ -1,0 +1,1 @@
+1:28: error[E0206]: duplicate enumeral 'IDLE' in type 'state_e'

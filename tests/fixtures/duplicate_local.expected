@@ -1,0 +1,1 @@
+4:13: error[E0206]: duplicate local variable 'total' in method 'bump'

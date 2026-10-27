@@ -24,6 +24,7 @@ Read the documents that cover your task before changing anything:
 | What is implemented and what is deliberately not | [README.md](README.md), [docs/ROADMAP.md](docs/ROADMAP.md) |
 | Design and stage boundaries | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | IEEE 1647 access, Specman reference runs, external references | [docs/REFERENCES.md](docs/REFERENCES.md), [external/README.md](external/README.md) |
+| Driving EDA Playground (login, run setup, reading logs, saving) | [skills/edaplayground/SKILL.md](skills/edaplayground/SKILL.md) |
 
 ## Essential rules
 

@@ -3,9 +3,13 @@
 //! Keyword recognition, multi-character operators and IEEE 1647-style
 //! numerals (sized/unsized based literals, `0x`/`0b` prefixes, reals) were
 //! cross-checked against the MIT-licensed grammars pinned under
-//! `external/` (see docs/REFERENCES.md). Character literals and `<' .. '>`
-//! code literals are deliberately not supported yet and produce explicit
-//! errors.
+//! `external/` (see docs/REFERENCES.md). A bare `'` followed by an
+//! identifier is the subtype modifier quote (`read'kind`), tokenized as a
+//! standalone punctuation token like the reference grammar's `SNG_QUOTE`.
+//! The e code-block delimiters `<'` (open) and `'>` (close) are recognized
+//! and skipped as trivia; their contents are ordinary code in this subset.
+//! Character literals are deliberately not supported yet and produce
+//! explicit errors.
 
 use std::fmt;
 
@@ -307,6 +311,13 @@ impl<'a> Cursor<'a> {
                         });
                     }
                 }
+                // e code-block delimiters: `<'` opens and `'>` closes;
+                // recognized and skipped, their contents are ordinary code
+                // in this subset.
+                (Some('<'), Some('\'')) | (Some('\''), Some('>')) => {
+                    self.bump();
+                    self.bump();
+                }
                 _ => return Ok(()),
             }
         }
@@ -332,8 +343,8 @@ impl<'a> Cursor<'a> {
 
     /// Digits legal for a based literal, validated per base. Hexadecimal
     /// spellings: `x`/`X` per the reference grammar, `h`/`H` per common
-    /// Specman usage (to be confirmed against the reference simulator),
-    /// `f`/`F` per the reference grammar.
+    /// Specman usage (confirmed by the Specman 2025.03 reference run,
+    /// docs/VERIFICATION.md 2026-10-27), `f`/`F` per the reference grammar.
     fn read_based_digits(&mut self, base: char, start: Position) -> Result<(), LexError> {
         let accepted = match base {
             'b' | 'B' => |c: char| matches!(c, '0' | '1' | '_'),
@@ -486,14 +497,20 @@ impl<'a> Cursor<'a> {
             }
             TokenKind::StringLiteral(value)
         } else if first == '\'' {
-            // Either a based literal (`'hFF`) or, until a later milestone,
-            // an unsupported character/code literal.
+            // Either a based literal (`'hFF`), the subtype modifier quote
+            // (`read'kind`; a standalone token, like the reference grammar's
+            // `SNG_QUOTE`), or — until a later milestone — an unsupported
+            // character literal.
             match self.peek_second() {
                 Some(base) if Self::based_base_letter(base) => {
                     self.bump();
                     self.bump();
                     self.read_based_digits(base, start)?;
                     TokenKind::Number(self.source[start.byte..self.byte].to_owned())
+                }
+                Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                    self.bump();
+                    TokenKind::Punctuation("'".to_owned())
                 }
                 _ => {
                     return Err(LexError {
@@ -502,11 +519,6 @@ impl<'a> Cursor<'a> {
                     });
                 }
             }
-        } else if (first == '<' || first == '>') && self.peek_second() == Some('\'') {
-            return Err(LexError {
-                position: start,
-                message: "code literals (<') are not supported yet",
-            });
         } else {
             self.read_operator()
         };

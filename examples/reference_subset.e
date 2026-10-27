@@ -5,9 +5,12 @@
 // expressions, `TRUE`/`FALSE`-free simple literals, and sized/unsized based
 // literals in expressions (`8'hFF`, `0b1010`, `0o17`).
 //
-// Saved on EDA Playground at https://www.edaplayground.com/x/7Jrh
-// (language "Specman e + SV/Verilog", simulator Cadence Xcelium 25.03 with
-// Specman 2025.03). Run output is recorded in docs/VERIFICATION.md.
+// Reference runs: the original save is
+// https://www.edaplayground.com/x/7Jrh (previous account; fails with
+// xmelab *F,NOTOP because its Design pane is empty). The working copy with
+// a minimal `module design` top and the successful Specman 2025.03 /
+// Xcelium 25.03 run of 2026-10-27 is
+// https://www.edaplayground.com/x/kvcS — see docs/VERIFICATION.md.
 <'
 struct packet_s {
     addr: uint(bits: 8);

@@ -14,3 +14,16 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
+
+  # The pumpkin solver backend is verified here: it is a pure-Rust crate,
+  # but its build script needs a C compiler, which the local windows-gnu
+  # toolchain does not have.
+  check-solver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets --all-features
