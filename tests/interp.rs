@@ -195,3 +195,12 @@ fn hdl_path_access_without_a_session_is_e0408() {
         vec!["E0408"]
     );
 }
+
+#[test]
+fn case_ternary_and_outf_execute() {
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var x: uint = 2;\n        case x {\n            1: { out(\"one\\n\"); };\n            [2, 7]: { out(\"two-or-seven\\n\"); };\n            default: { out(\"other\\n\"); };\n        };\n        var verdict: string = x > 1 ? \"big\" : \"small\";\n        out(verdict, \"\\n\");\n        outf(\"hex=%x dec=%d str=%s 100%%\\n\", 255, 42, \"tag\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "two-or-seven\nbig\nhex=ff dec=42 str=tag 100%\n");
+}

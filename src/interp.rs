@@ -403,6 +403,31 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             Stmt::Gen { expr, span } => self.exec_gen(expr, frame, me, *span),
+            Stmt::Case {
+                scrutinee,
+                arms,
+                default,
+                span,
+            } => {
+                let value = self.eval(scrutinee, frame, me)?;
+                let mut matched: Option<&Vec<Stmt>> = None;
+                'arms: for (alternatives, body) in arms {
+                    for alternative in alternatives {
+                        let alt_value = self.eval(alternative, frame, me)?;
+                        if matches!(
+                            self.apply_binary(BinaryOp::Eq, value.clone(), alt_value, *span)?,
+                            Value::Bool(true)
+                        ) {
+                            matched = Some(body);
+                            break 'arms;
+                        }
+                    }
+                }
+                match matched.or(default.as_ref()) {
+                    Some(body) => self.exec_block(body, frame, me),
+                    None => Ok(Flow::Normal),
+                }
+            }
         }
     }
 
@@ -806,10 +831,64 @@ impl<'a> Interp<'a> {
             self.output.push_str(&text);
             return Ok(Value::Void);
         }
+        if name == "outf" {
+            return self.call_outf(values, span);
+        }
         if name.starts_with("hdl_") {
             return self.call_hdl(name, values, span);
         }
         Err(self.error("E0405", format!("routine '{name}' is not supported"), span))
+    }
+
+    /// `outf("format %x", args)` — printf-style output; specs `%x`/`%X`
+    /// (hex), `%d` (decimal) and `%s` (value as text) consume arguments in
+    /// order; `%%` is a literal percent.
+    fn call_outf(
+        &mut self,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let Some((format, arguments)) = values.split_first() else {
+            return Err(self.error(
+                "E0402",
+                "'outf' expects a format string and arguments",
+                span,
+            ));
+        };
+        let Value::Str(format) = format else {
+            return Err(self.error("E0402", "'outf' expects a format string first", span));
+        };
+        let mut argument_index = 0usize;
+        let mut rendered = String::new();
+        let mut chars = format.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                rendered.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('%') => rendered.push('%'),
+                Some(spec) => {
+                    let Some(value) = arguments.get(argument_index) else {
+                        return Err(self.error(
+                            "E0402",
+                            format!("'outf': no argument for '%{spec}'"),
+                            span,
+                        ));
+                    };
+                    argument_index += 1;
+                    rendered.push_str(&match (spec, value) {
+                        ('x', Value::Int(i)) => format!("{i:x}"),
+                        ('X', Value::Int(i)) => format!("{i:X}"),
+                        ('d', Value::Int(i)) => format!("{i}"),
+                        (_, value) => self.format_value(value),
+                    });
+                }
+                None => rendered.push('%'),
+            }
+        }
+        self.output.push_str(&rendered);
+        Ok(Value::Void)
     }
 
     /// The `hdl_*` routines: drive the external SystemVerilog simulator
@@ -1151,6 +1230,21 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::Paren { expr, .. } => self.eval(expr, frame, me),
+            Expr::Ternary {
+                cond,
+                then_expr,
+                else_expr,
+                span,
+            } => {
+                let Value::Bool(cond_value) = self.eval(cond, frame, me)? else {
+                    return Err(self.error("E0402", "ternary condition is not a boolean", *span));
+                };
+                if cond_value {
+                    self.eval(then_expr, frame, me)
+                } else {
+                    self.eval(else_expr, frame, me)
+                }
+            }
             Expr::HdlPath { path, span } => {
                 if self.hdl.is_none() {
                     return Err(self.error(

@@ -243,6 +243,7 @@ fn check_statements<'a>(
             | Stmt::While { .. }
             | Stmt::Break { .. }
             | Stmt::Continue { .. }
+            | Stmt::Case { .. }
             | Stmt::Print { .. }
             | Stmt::Gen { .. } => {}
         }
@@ -330,6 +331,16 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
             collect_root_identifiers(expr, roots)
         }
         // Quoted HDL paths are simulator signals, not struct fields.
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            collect_root_identifiers(cond, roots);
+            collect_root_identifiers(then_expr, roots);
+            collect_root_identifiers(else_expr, roots);
+        }
         Expr::HdlPath { .. } => {}
         Expr::IntLiteral { .. }
         | Expr::RealLiteral { .. }

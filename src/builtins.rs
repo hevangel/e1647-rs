@@ -18,6 +18,7 @@ pub const BUILTIN_UNITS: &[&str] = &["sys"];
 /// path, `hdl_run` advances time, `hdl_finish` ends the simulation.
 pub const BUILTIN_ROUTINES: &[&str] = &[
     "out",
+    "outf",
     "hdl_load",
     "hdl_set",
     "hdl_get",

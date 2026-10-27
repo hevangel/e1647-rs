@@ -494,3 +494,69 @@ fn while_break_and_continue_parse() {
     };
     assert!(matches!(then_body[0], Stmt::Break { .. }));
 }
+
+#[test]
+fn case_statements_parse() {
+    let declarations = expect_clean(
+        "struct s {\n    opcode: uint;\n    run() is {\n        case opcode {\n            3: { out(3); };\n            [1, 2]: { out(12); };\n            default: { out(0); };\n        };\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[1] else {
+        panic!("expected a method");
+    };
+    let Some(Stmt::Case {
+        scrutinee,
+        arms,
+        default,
+        ..
+    }) = run.body.first()
+    else {
+        panic!("expected a case statement");
+    };
+    let Expr::Ident { name, .. } = scrutinee else {
+        panic!("expected an identifier scrutinee");
+    };
+    assert_eq!(name, "opcode");
+    assert_eq!(arms.len(), 2);
+    assert_eq!(arms[0].0.len(), 1);
+    assert_eq!(arms[1].0.len(), 2, "the grouped alternative");
+    assert!(default.is_some());
+}
+
+#[test]
+fn ternary_expressions_parse() {
+    let declarations = expect_clean(
+        "struct s {\n    run() is {\n        var v: uint = a > 3 ? 10 : 20;\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    let Some(Stmt::VarDecl {
+        init: Some(init), ..
+    }) = run.body.first()
+    else {
+        panic!("expected a var with initializer");
+    };
+    let Expr::Ternary {
+        cond,
+        then_expr,
+        else_expr,
+        ..
+    } = init
+    else {
+        panic!("expected a ternary");
+    };
+    assert!(matches!(cond.as_ref(), Expr::Binary { .. }));
+    assert!(matches!(then_expr.as_ref(), Expr::IntLiteral { .. }));
+    assert!(matches!(else_expr.as_ref(), Expr::IntLiteral { .. }));
+}
+
+#[test]
+fn if_then_variant_parses() {
+    let declarations = expect_clean(
+        "struct s {\n    run() is {\n        if 1 < 2 then {\n            out(1);\n        };\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    assert!(matches!(&run.body[0], Stmt::If { .. }));
+}

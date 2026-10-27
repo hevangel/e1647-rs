@@ -164,6 +164,14 @@ pub enum Stmt {
         expr: Expr,
         span: Span,
     },
+    /// `case expr { val: {..}; [a, b]: {..}; default: {..}; };`
+    Case {
+        scrutinee: Expr,
+        /// Each arm carries its alternative expressions (one or more).
+        arms: Vec<(Vec<Expr>, Vec<Stmt>)>,
+        default: Option<Vec<Stmt>>,
+        span: Span,
+    },
 }
 
 impl Stmt {
@@ -178,7 +186,8 @@ impl Stmt {
             | Stmt::Break { span }
             | Stmt::Continue { span }
             | Stmt::Print { span, .. }
-            | Stmt::Gen { span, .. } => *span,
+            | Stmt::Gen { span, .. }
+            | Stmt::Case { span, .. } => *span,
         }
     }
 }
@@ -342,6 +351,13 @@ pub enum Expr {
         expr: Box<Expr>,
         span: Span,
     },
+    /// `cond ? then_expr : else_expr`
+    Ternary {
+        cond: Box<Expr>,
+        then_expr: Box<Expr>,
+        else_expr: Box<Expr>,
+        span: Span,
+    },
     /// A quoted hierarchical HDL path (`'memory_tb.address'`) — read or
     /// assigned through the simulator bridge ([`crate::hdl`]).
     HdlPath {
@@ -365,6 +381,7 @@ impl Expr {
             | Expr::Binary { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Paren { span, .. }
+            | Expr::Ternary { span, .. }
             | Expr::HdlPath { span, .. } => *span,
         }
     }

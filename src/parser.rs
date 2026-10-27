@@ -810,6 +810,7 @@ impl Parser {
                     span: (start, end),
                 })
             }
+            Some(TokenKind::Keyword(k)) if k == "case" => self.parse_case_statement(),
             Some(TokenKind::Keyword(_)) => {
                 self.error_here("E0113", "this statement kind is not supported yet");
                 self.recover_to_member_boundary();
@@ -844,6 +845,8 @@ impl Parser {
         let start = self.current_span().0;
         self.bump(); // 'if'
         let cond = self.parse_expr()?;
+        // Both `if cond { .. }` and `if cond then { .. }` are accepted.
+        self.eat_keyword("then");
         if self
             .expect_punct("{", "E0106", "expected '{' to open the 'if' body")
             .is_none()
@@ -901,10 +904,83 @@ impl Parser {
         })
     }
 
+    /// `case expr { alt: {..}; [a, b]: {..}; default: {..}; };` — the
+    /// statement form; alternatives may be grouped with `[a, b]` or
+    /// chained with `|`, and the trailing `;` is accepted but not
+    /// required after arm bodies.
+    fn parse_case_statement(&mut self) -> Option<Stmt> {
+        let start = self.current_span().0;
+        self.bump(); // 'case'
+        let scrutinee = self.parse_expr()?;
+        self.expect_punct("{", "E0106", "expected '{' to open the 'case' body")?;
+        let mut arms: Vec<(Vec<Expr>, Vec<Stmt>)> = Vec::new();
+        let mut default: Option<Vec<Stmt>> = None;
+        while self.peek().is_some() && !self.at_punct("}") {
+            let mut alternatives = Vec::new();
+            if self.eat_keyword("default") {
+                // the default arm: empty alternatives marks it
+            } else {
+                loop {
+                    if self.eat_punct("[") {
+                        loop {
+                            alternatives.push(self.parse_expr()?);
+                            if !self.eat_punct(",") {
+                                break;
+                            }
+                        }
+                        self.expect_punct(
+                            "]",
+                            "E0107",
+                            "expected ']' to close the alternative group",
+                        )?;
+                    } else {
+                        alternatives.push(self.parse_expr()?);
+                    }
+                    if !self.eat_punct("|") {
+                        break;
+                    }
+                }
+            }
+            self.expect_punct(":", "E0103", "expected ':' after the 'case' alternative")?;
+            self.expect_punct("{", "E0106", "expected '{' to open the 'case' arm")?;
+            let body = self.parse_statements();
+            self.expect_punct("}", "E0107", "expected '}' to close the 'case' arm")?;
+            self.eat_punct(";");
+            if alternatives.is_empty() {
+                default = Some(body);
+            } else {
+                arms.push((alternatives, body));
+            }
+        }
+        self.expect_punct("}", "E0107", "expected '}' to close the 'case' body")?;
+        self.eat_punct(";");
+        let end = self.last_end();
+        Some(Stmt::Case {
+            scrutinee,
+            arms,
+            default,
+            span: (start, end),
+        })
+    }
+
     // ---- expressions, loosest to tightest binding ----
 
     fn parse_expr(&mut self) -> Option<Expr> {
-        self.parse_binary_level(0)
+        let cond = self.parse_binary_level(0)?;
+        if self.eat_punct("?") {
+            let then_expr = self.parse_expr()?;
+            self.expect_punct(":", "E0103", "expected ':' in the ternary expression")?;
+            let else_expr = self.parse_expr()?;
+            let start = cond.span().0;
+            let end = else_expr.span().1;
+            return Some(Expr::Ternary {
+                cond: Box::new(cond),
+                then_expr: Box::new(then_expr),
+                else_expr: Box::new(else_expr),
+                span: (start, end),
+            });
+        }
+        Some(cond)
     }
 
     fn parse_binary_level(&mut self, level: usize) -> Option<Expr> {
