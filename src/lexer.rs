@@ -343,8 +343,8 @@ impl<'a> Cursor<'a> {
 
     /// Digits legal for a based literal, validated per base. Hexadecimal
     /// spellings: `x`/`X` per the reference grammar, `h`/`H` per common
-    /// Specman usage (to be confirmed against the reference simulator),
-    /// `f`/`F` per the reference grammar.
+    /// Specman usage (confirmed by the Specman 2025.03 reference run,
+    /// docs/VERIFICATION.md 2026-10-27), `f`/`F` per the reference grammar.
     fn read_based_digits(&mut self, base: char, start: Position) -> Result<(), LexError> {
         let accepted = match base {
             'b' | 'B' => |c: char| matches!(c, '0' | '1' | '_'),

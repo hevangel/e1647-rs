@@ -307,11 +307,56 @@ if-clamp in scale() reduced 165*2=330 to 255)
   literals `8'hFF`, `0b1010`, `0o17` in `out()`) was entered into the
   testbench editor with language **Specman e + SV/Verilog** and simulator
   **Cadence Xcelium 25.03** (Specman 2025.03), and saved at
-  <https://www.edaplayground.com/x/7Jrh>. Clicking Run opens
+  <https://www.edaplayground.com/x/7Jrh>. Clicking Run opened
   `validatedAccessRequiredModal`: **"Your account is not validated"** —
   commercial simulators require a validated account. The confirmation email
-  resend (`/resendConfirmation`) was requested. **Run output is therefore
-  still not available**; the follow-up is owner-only: click the validation
-  link in the mailbox of the `.env` account (check spam), then re-run the
-  saved playground and record the log here. `'h`/`'x` hex and `0o` remain
-  grammar-confirmed only until that run happens.
+  resend (`/resendConfirmation`) was requested.
+- **2026-10-27 — reference run succeeded (Specman 2025.03, Xcelium
+  25.03).** New credentials were placed in `.env` (gitignored; never
+  quoted here). Automated login via the built-in browser succeeded on the
+  first attempt (form fill + reCAPTCHA coordinate click; no
+  `error=captcha` redirect), and the previously validation-gated
+  commercial flow ran without the `validatedAccessRequiredModal`.
+  Run 1 failed with `xmelab: *F,NOTOP: A top level design unit was not
+  precalculated …` — a pure-e playground needs at least a trivial SV top
+  in the Design pane. After adding a minimal `module design; endmodule`,
+  the run completed (exit 0). Tool log, trimmed to the relevant lines:
+
+  ```
+  xrun -Q -unbuffered '-timescale' '1ns/1ns' '-sysv' '-access' '+rw' design.sv testbench.e
+  TOOL:	xrun	25.03-s001: Started on Oct 27, 2026 at 02:28:44 EDT
+  Loading snapshot worklib.design:sv .................... Done
+  Initializing Xcelium testbench (25.03 Build 426593)
+  Checking license ... OK
+  Doing setup ...
+  Generating the test with IntelliGen using seed 1...
+  Starting the test ...
+  Running the test ...
+    p = packet_s-@1: packet_s   of unit: sys
+  0	addr:                           115
+  1	data:                           137
+  2	tag:                            14
+  3	par:                            (24 items)
+  based literals: 8'hFF=255 0b1010=10 0o17=15
+  e1647-rs subset constructs accepted by Specman
+  Checking the test ...
+  Checking is complete - 0 DUT errors, 0 DUT warnings.
+  xmsim: *W,RNQUIE: Simulation is complete.
+  TOOL:	xrun	25.03-s001: Exiting on Oct 27, 2026 at 02:29:03 EDT  (total: 00:00:19)
+  ```
+
+  Conclusions for this project:
+  - Specman (IntelliGen, seed 1) compiled and ran the example: `gen p`
+    produced addr=115, data=137, tag=14, par=(24 items) — every `keep`
+    constraint of the example holds (addr < 128, addr > 0, data != 0).
+  - Based-literal spellings are now **Specman-confirmed**: `8'hFF`=255,
+    `0b1010`=10, `0o17`=15. The lexer's `h`/`H` hex and `0o` octal support
+    no longer rests on grammar cross-checks alone.
+  - The saved playground now lives at
+    <https://www.edaplayground.com/x/kvcS> (copy of `/x/7Jrh` under the new
+    account, including the minimal `design.sv` top; the original `/x/7Jrh`
+    remains with the previous account and still fails with NOTOP).
+  - Not yet cross-checked against this run: the full keyword set, error
+    recovery shapes, and the interpreter's sampling semantics (Specman's
+    IntelliGen is a solver, our `gen` is a rejection sampler — values are
+    not expected to match, only constraint satisfaction).
