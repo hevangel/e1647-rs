@@ -360,3 +360,54 @@ if-clamp in scale() reduced 165*2=330 to 255)
     recovery shapes, and the interpreter's sampling semantics (Specman's
     IntelliGen is a solver, our `gen` is a rejection sampler — values are
     not expected to match, only constraint satisfaction).
+
+- **2026-10-27 (2) — deterministic output comparison: 16/16 lines
+  identical.** New example `examples/reference_check.e`: a fully
+  deterministic program (arithmetic and precedence, shifts, bitwise ops,
+  sized/prefixed based literals, comparisons, logic, unary, `mod`,
+  division, method calls with loops, `while`/`break`/`continue`, list
+  `push`/`size`/index/index-assign, enumeral comparison, string escapes).
+  Run on both implementations with the identical file:
+
+  - e1647-rs: `cargo run -- run --seed 1 examples/reference_check.e`
+    (exit 0).
+  - Specman: playground <https://www.edaplayground.com/x/8Fjd>
+    (Specman 2025.03, Xcelium 25.03, exit 0, 0 DUT errors).
+
+  Both print the same 16 labeled lines, including both probes:
+
+  ```
+  arith=7 / paren=9 / shift=16 32 / bits=8 14 6
+  lits=255 171 10 15 170      (8'hFF 0xAB 0b1010 0o17 8'b1010_1010)
+  cmp=TRUE TRUE FALSE / logic=TRUE TRUE / unary=3 / mod=2
+  int_div=3                   (probe: `/` on two ints is integer division)
+  bitnot=-1                   (probe: `~0` is -1)
+  call=42 21                  (sys methods with params/returns/while-loop)
+  loop=1 3 4                  (continue skips 2, break stops at 5)
+  list=2 42                   (push/size/index/index-assign)
+  enum=TRUE / end=str-check-complete
+  ```
+
+  (The Specman log wraps lines between `out()` calls; the emitted text is
+  the same.)
+
+  Divergences found while building the comparison (both are e1647-rs
+  being more permissive, not less):
+
+  1. **Unsized based literals are rejected by Specman.**
+     `'h10`, `'b1010`, `'o17` in expression position produce
+     `*** Error: Unrecognized exp [Unrecognized expression ''h10']` on
+     Specman 2025.03. e1647-rs lexes/parses/evaluates them (16/10/15).
+     Kept as a documented superset; the comparison file uses only sized
+     and `0x`/`0b`/`0o` prefixed literals.
+  2. **Unallocated struct references crash Specman.** A bare
+     `var m: math_s;` followed by a method call `m.add(...)` killed the
+     simulator (`Exit code 137` after Specman crash-symbolization
+     warnings) — real e requires the instance to be allocated (`gen` or
+     `new`) first. e1647-rs auto-allocates a default instance for struct
+     types. Follow-up: model `new` and null-reference semantics
+     (roadmap); methods under test were moved onto `sys` so both
+     implementations run the identical file.
+
+  Also confirmed: e string escapes (`"\n"`) compile and behave as expected
+  on Specman, and `out()` concatenates its arguments with no separator.

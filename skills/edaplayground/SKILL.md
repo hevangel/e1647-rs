@@ -128,3 +128,8 @@ snapshots, coordinate clicks) use the `browser-use:control-browser` skill.
   will not show their values; read them with `evaluate`.
 - Save vs Copy is ownership-based; a saved URL under one account cannot be
   updated from another.
+- Pasting code through a tool-call transport can turn `\n` escapes inside
+  e strings into real newlines (Specman then fails with
+  `Unterminated '"'`). Build the editor content with a placeholder split
+  on `String.fromCharCode(92) + "n"` and verify a sample line contains a
+  literal backslash before running.
