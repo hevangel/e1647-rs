@@ -472,3 +472,17 @@ test result: ok. 20 passed; 0 failed  (test parser.rs)
 
 $ cargo test --all-targets --all-features   # CI (ubuntu) only: + 4 pumpkin tests
 ```
+
+CI verification (the authoritative check for the feature path): the
+`check-solver` job first failed on three of our API mistakes, each caught
+and fixed in its own commit — a match on `Unknown` against a variant the
+final enum no longer has, two missing trait imports
+(`ProblemSolution`/`TransformableVariable`, then `NegatableConstraint`),
+and a match whose arms mixed the distinct opaque `impl NegatableConstraint`
+types returned by different builders (restructured to post per arm). The
+final run of commit `dcffd5c` is green: `cargo clippy --all-targets
+--all-features -- -D warnings` and `cargo test --all-targets
+--all-features` pass on ubuntu-latest, including the four pumpkin-gated
+tests (UNSAT for `a+b==100 && b==2*a`, deterministic solve of
+`a+b==100 && a>=40`, `2a-b==21` with coefficients, UNSAT detection for
+`a>100` on a 4-bit domain).
