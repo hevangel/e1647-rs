@@ -37,6 +37,16 @@ cargo run -- elab examples/methods_types.e  # fold like/extend, print the types
 cargo run -- run --seed 1 examples/reference_subset.e  # execute sys.run()
 ```
 
+With Docker, no local Rust toolchain is needed, and the pumpkin solver
+feature can be verified on machines without a C compiler:
+
+```sh
+docker compose build               # build the toolchain image
+docker compose run --rm verify     # fmt + clippy + tests, all features
+docker compose run --rm demo       # run and elaborate the example programs
+docker compose run --rm toolchain  # interactive shell in the container
+```
+
 `run` executes the built-in `sys` unit's `run()` methods. Every run takes
 an explicit `--seed` and is fully deterministic; `gen` is a rejection
 sampler, not a constraint solver (see `src/interp.rs` for the exact

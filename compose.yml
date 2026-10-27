@@ -1,0 +1,43 @@
+# Toolchain container for e1647-rs (see Dockerfile). The repository is
+# bind-mounted at /workspace; compiled artifacts go to /opt/target inside
+# the container, reusing the warm dependency cache baked into the image and
+# keeping the host tree clean.
+#
+#   docker compose build                       # build the toolchain image
+#   docker compose run --rm verify             # fmt + clippy + tests, all features
+#   docker compose run --rm test               # tests, default features
+#   docker compose run --rm demo               # run and elaborate the examples
+#   docker compose run --rm toolchain          # interactive shell
+
+services:
+  toolchain: &toolchain
+    build: .
+    image: e1647-rs-toolchain:latest
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    environment:
+      CARGO_TARGET_DIR: /opt/target
+    command: ["bash"]
+
+  # Full verification with every cargo feature — this is the pumpkin-path
+  # check the local windows-gnu toolchain cannot run.
+  verify:
+    <<: *toolchain
+    command: >
+      bash -c "cargo fmt --all -- --check
+      && cargo clippy --all-targets --all-features -- -D warnings
+      && cargo test --all-targets --all-features"
+
+  test:
+    <<: *toolchain
+    command: ["cargo", "test", "--all-targets"]
+
+  # Build and run the example programs, then print the elaborated types.
+  demo:
+    <<: *toolchain
+    command: >
+      bash -c "cargo run --quiet -- run --seed 1 examples/packet.e
+      && cargo run --quiet -- run --seed 1 examples/reference_subset.e
+      && cargo run --quiet -- run --seed 1 examples/methods_types.e
+      && cargo run --quiet -- elab examples/methods_types.e"

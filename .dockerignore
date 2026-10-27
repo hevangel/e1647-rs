@@ -1,0 +1,12 @@
+# Never bake credentials or local state into the image.
+.env
+.env.*
+local/
+
+# Build output and version-control state are not part of the context.
+target/
+.git
+
+# Pinned read-only reference repositories are not needed to build the
+# image (they stay available through the /workspace bind mount).
+external/

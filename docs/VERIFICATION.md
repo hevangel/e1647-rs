@@ -480,9 +480,56 @@ final enum no longer has, two missing trait imports
 (`ProblemSolution`/`TransformableVariable`, then `NegatableConstraint`),
 and a match whose arms mixed the distinct opaque `impl NegatableConstraint`
 types returned by different builders (restructured to post per arm). The
-final run of commit `dcffd5c` is green: `cargo clippy --all-targets
---all-features -- -D warnings` and `cargo test --all-targets
---all-features` pass on ubuntu-latest, including the four pumpkin-gated
-tests (UNSAT for `a+b==100 && b==2*a`, deterministic solve of
-`a+b==100 && a>=40`, `2a-b==21` with coefficients, UNSAT detection for
-`a>100` on a 4-bit domain).
+  final run of commit `dcffd5c` is green: `cargo clippy --all-targets
+  --all-features -- -D warnings` and `cargo test --all-targets
+  --all-features` pass on ubuntu-latest, including the four pumpkin-gated
+  tests (UNSAT for `a+b==100 && b==2*a`, deterministic solve of
+  `a+b==100 && a>=40`, `2a-b==21` with coefficients, UNSAT detection for
+  `a>100` on a 4-bit domain).
+
+## 2026-10-27 (4) — containerized toolchain (Docker Compose)
+
+`Dockerfile` + `compose.yml` + `.dockerignore` provide the full toolchain
+as a container: `rust:1-slim` plus gcc/g++/pkg-config/git and the
+rustfmt/clippy components, `CARGO_TARGET_DIR=/opt/target` (warm cache
+outside the bind mount), and `cargo fetch --locked` at build time. The
+compose services: `toolchain` (shell), `verify` (fmt + clippy + tests with
+`--all-features`), `test` (default features), `demo` (run + elaborate the
+examples). `.dockerignore` keeps `.env`, `local/`, `external/`, `target/`
+and `.git` out of the build context — **no credentials enter the image**.
+
+Two image-build findings, fixed in place:
+
+1. pumpkin-solver's `build.rs` also compiles a **C++** proof checker
+   (`maxsat-checker.cc`), so `g++` is required — gcc alone fails with a
+   misleading `No such file or directory` from the cc crate.
+2. The slim image ships the minimal Rust profile — `rustup component add
+   rustfmt clippy` is required for the verification suite.
+
+A placeholder-compile warm-up (building the dependency graph against dummy
+sources at image build time) was deliberately removed: bind-mount mtime
+skew made cargo reuse the stale placeholder-lib artifact instead of the
+mounted sources.
+
+Verification performed locally with Docker Desktop (linux containers):
+
+```
+$ docker compose build
+Image e1647-rs-toolchain:latest Built
+
+$ docker compose run --rm verify
+cargo fmt --all -- --check                (pass)
+cargo clippy --all-targets --all-features -- -D warnings   (pass, zero warnings)
+cargo test --all-targets --all-features
+test result: ok. 10 passed; 0 failed  (test solve.rs — incl. the 4
+                                      pumpkin-gated tests)
+(all other suites green; 66 tests total)
+
+$ docker compose run --rm demo
+165 / 165 / 255 / 219 / methods_types.e ran to completion
+(elaborated types printed, incl. the synthesized `unit sys`)
+```
+
+This is the **first local execution of the pumpkin solver path** — until
+now that path was verified only by CI (the local windows-gnu toolchain
+cannot build it).
