@@ -696,3 +696,27 @@ cycle`, `+=`. This is the precise delta for the M3 slice; the
 comparison table (Specman log vs e1647-rs output) will be filled here
 once the owner login unblocks the Playground run and the events/TCM
 slice is implemented.
+
+## 2026-10-27 (9) — language slice: `case`, ternary, `if … then`, `outf`
+
+First slice toward running the SN-CPU-Tutorial golden testbench (and the
+asic-world corpus): four construct families from the measured delta.
+
+- `case expr { val: {..}; [a, b]: {..}; default: {..}; };` — statement
+  form with grouped alternatives and a default arm; executed by
+  comparing the scrutinee against each alternative.
+- Ternary expressions `cond ? a : b` (loosest binding).
+- `if cond then { .. }` accepted alongside `if cond { .. }`.
+- `outf(fmt, args)` builtin: `%x`/`%X`/`%d`/`%s` and `%%`; missing
+  arguments are a diagnostic.
+- 4 new tests (3 parser + 1 execution test covering case/ternary/outf
+  together). Totals: 71 local tests + 4 pumpkin-gated on CI.
+
+Measured honestly: the assembled SN-CPU golden file still shows 103
+diagnostics — its parse fails on `simple_port`/events/TCM members before
+any `case`/ternary is reached, so this slice shrinks the language delta
+but not yet that count. The remaining gate is unchanged: events, TCMs
+(`start`/`wait`), and `simple_port` members — the next slice.
+
+Verification: fmt/clippy/test green locally; container `verify` green
+(all features); container `mixed` green (5/5 cycles, quoted-path style).
