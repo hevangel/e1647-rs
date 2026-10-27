@@ -333,6 +333,20 @@ fn comments_and_source_locations() {
 }
 
 #[test]
+fn dash_dash_comments_are_skipped() {
+    // e's native line comment: `--` to end of line.
+    let tokens = tokenize("-- a comment\nfoo -- trailing\nbar").unwrap();
+    assert_eq!(
+        kinds("-- a comment\nfoo -- trailing\nbar"),
+        vec![
+            TokenKind::Identifier("foo".into()),
+            TokenKind::Identifier("bar".into()),
+        ]
+    );
+    assert_eq!(tokens[0].start.line, 2);
+}
+
+#[test]
 fn reports_unterminated_comment() {
     let error = tokenize("foo /* not closed").unwrap_err();
     assert_eq!(error.message, "unterminated block comment");

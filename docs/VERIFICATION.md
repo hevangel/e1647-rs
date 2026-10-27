@@ -530,9 +530,35 @@ $ docker compose run --rm demo
 (elaborated types printed, incl. the synthesized `unit sys`)
 ```
 
-This is the **first local execution of the pumpkin solver path** — until
-now that path was verified only by CI (the local windows-gnu toolchain
-cannot build it).
+$ docker compose run --rm verify   # fmt + clippy + tests, all features: green
+$ cargo fmt / clippy / test (host, default features): green (66 tests)
+```
+
+## 2026-10-27 (6) — EDA Playground curated Specman-e examples: baseline
+
+The four curated "Specman e + SV/Verilog" playgrounds (listed at
+`/playgrounds?...&language=Specman+e+%2B+SV%2FVerilog&curated=true`) were
+extracted into `local/eda-examples/` (gitignored — third-party code is not
+committed) and measured against the front-end. **Result: 0 of 4 runnable
+today, as expected for a pre-alpha subset** — all four are full
+verification environments. What each one needs beyond the implemented
+subset (from parse diagnostics plus source inspection):
+
+| playground | diagnostics | first blockers / missing constructs |
+| --- | --- | --- |
+| `D6W` Hello e World | 37 | top-level `import`; `!` do-not-generate fields; `signal_map`/`simple_port` members; events (`is only cycle @p_smp.clock_f`); TCMs (`reset()@clock`), `wait [1]`, `emit`, `start`; `sequence ... using` + `extend MAIN`; objections |
+| `Pfq` e XOR | 30 | port declarations (`in simple_port of bit is instance`), `keep bind(...)`/`hdl_path()`, `clk$` port reads, events (`fall(clk$) @sim`), TCM `verify() @xor_clk`, `for each in ... do`, `pack()`, `%`/`!` field modifiers, `check that ... else dut_error`, `start`, `stop_run()` |
+| `5Wj` e SER | 15 | `package` + `import`, enumeral extension (`extend kind_t : [NEW]`), UVC env (`is a ACTIVE TX_agent`), `in [1..8]` constraints, `for i from 0 to n`, `wait [n] * cycle`, `specman("...")`, `set_config`, `pkg::Type` |
+| `ZFqZ` UART agent | 15 | `import`, `!p_smp` fields, `@p_smp.clk` events, `when ACTIVE'active_passive agent` (when inheritance), TLM `port.connect()`, `on clk { emit ... }` |
+
+This inventory is the concrete M2/M3 roadmap input (ports/signal maps,
+events and TCMs, sequences, packages, `when` elaboration). One lexical gap
+found and fixed in the same change: **e's native `--` line comments** now
+lex (previously only `//` and `/* */`), with a lexer test. With that fix
+the examples tokenize cleanly up to their first unsupported construct.
+
+Regression after the lexer change: fmt/clippy/test all green (67 tests —
+14 lexer tests now).
 
 ## 2026-10-27 (5) — mixed e + SystemVerilog testcases via xezim
 

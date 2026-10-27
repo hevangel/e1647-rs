@@ -292,6 +292,15 @@ impl<'a> Cursor<'a> {
                         self.bump();
                     }
                 }
+                // e's native line comment: `--` to end of line (IEEE 1647).
+                (Some('-'), Some('-')) => {
+                    while let Some(ch) = self.peek() {
+                        if ch == '\n' {
+                            break;
+                        }
+                        self.bump();
+                    }
+                }
                 (Some('/'), Some('*')) => {
                     let start = self.position();
                     self.bump();
