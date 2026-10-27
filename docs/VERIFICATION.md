@@ -533,3 +533,54 @@ $ docker compose run --rm demo
 This is the **first local execution of the pumpkin solver path** — until
 now that path was verified only by CI (the local windows-gnu toolchain
 cannot build it).
+
+## 2026-10-27 (5) — mixed e + SystemVerilog testcases via xezim
+
+Xezim (github.com/aionhw/xezim, the ecosystem's Rust SystemVerilog
+simulator, pinned rev `058f2bba…` — the same baseline the
+ai_hw_engineer toolchain image records) simulates the HDL side; the e
+interpreter stays the master of verification and drives it through a VPI
+control bridge — the same simulator-master architecture Specman uses for
+simulator integration.
+
+- `c/xezim_bridge.c`: VPI module. After elaboration it reads one command
+  per line from stdin and answers exactly one line per command:
+  `SET path value` (vpi_put_value, vpiNoDelay), `GET path` (vpiIntVal),
+  `RUN delay` (cbAfterDelay; `READY` when the loop re-enters), `FINISH`
+  (vpi_control(vpiFinish)).
+- `src/hdl.rs`: `HdlSession` spawns `xezim --simulate --vpi-lib <bridge>
+  -s <top> <file>` — the program name is fixed and every argument is
+  validated against a character allowlist; the spawn is an argv list
+  with no shell.
+- Interp: new builtins `hdl_load` / `hdl_set` / `hdl_get` / `hdl_run` /
+  `hdl_finish` (diagnostic `E0408` for bridge errors).
+- `examples/mixed/counter.sv` + `examples/mixed_counter.e`: the e code
+  resets an 8-bit counter DUT, clocks it five times and checks the count
+  sequence — the Specman-style structure with an SV DUT.
+- Docker: a `xezim-build` stage (pinned rev; autotools required by
+  libffi-sys; built without the jit feature), the bridge compiled with cc
+  against the xezim include directory; compose `mixed` service.
+
+Findings along the way: the slim Rust image lacks git and the
+rustfmt/clippy components (added); libffi-sys needs autotools
+(build-essential + autoconf/automake/libtool added); the IEEE 1647
+keyword `expect` cannot be a variable name in our own testcases; and the
+first mixed run exposed an off-by-one in the testcase's expected
+sequence (reads happen after each incrementing edge) — the bridge
+itself worked from the first clean parse.
+
+Verification performed (Docker Desktop, linux containers):
+
+```
+$ docker compose build        # image incl. xezim (pinned rev) + bridge.so
+$ docker compose run --rm mixed
+cycle 0: count=1 OK
+cycle 1: count=2 OK
+cycle 2: count=3 OK
+cycle 3: count=4 OK
+cycle 4: count=5 OK
+mixed testcase complete
+
+$ docker compose run --rm verify   # fmt + clippy + tests, all features: green
+$ cargo fmt / clippy / test (host, default features): green (66 tests)
+```

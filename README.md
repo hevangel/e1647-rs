@@ -44,6 +44,7 @@ feature can be verified on machines without a C compiler:
 docker compose build               # build the toolchain image
 docker compose run --rm verify     # fmt + clippy + tests, all features
 docker compose run --rm demo       # run and elaborate the example programs
+docker compose run --rm mixed      # mixed e + SystemVerilog testcase (xezim)
 docker compose run --rm toolchain  # interactive shell in the container
 ```
 
@@ -56,7 +57,9 @@ semantics and its honest limits).
 
 | Path | Contents |
 | --- | --- |
-| `src/` | The Rust crate (`lexer`, `ast`, `diagnostic`, `parser`, `check`, `elab`, `builtins`, `interp`) and the `e1647` CLI |
+| `src/` | The Rust crate (`lexer`, `ast`, `diagnostic`, `parser`, `check`, `elab`, `builtins`, `interp`, `solve`, `hdl`) and the `e1647` CLI |
+| `c/` | The VPI control bridge for mixed e + SystemVerilog testcases (simulated by xezim; see `examples/mixed_counter.e`) |
+| `Dockerfile`, `compose.yml` | The toolchain container (see Quick start) |
 | `tests/` | Integration tests and `tests/fixtures/` diagnostic fixtures |
 | `examples/` | Small e-language sources used by tests and the CLI |
 | `docs/` | Architecture, roadmap, references and the verification log |

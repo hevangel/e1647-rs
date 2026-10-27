@@ -41,3 +41,9 @@ services:
       && cargo run --quiet -- run --seed 1 examples/reference_subset.e
       && cargo run --quiet -- run --seed 1 examples/methods_types.e
       && cargo run --quiet -- elab examples/methods_types.e"
+
+  # Mixed e + SystemVerilog testcase: the e interpreter drives the counter
+  # DUT simulated by xezim through the VPI bridge.
+  mixed:
+    <<: *toolchain
+    command: ["cargo", "run", "--quiet", "--", "run", "--seed", "1", "examples/mixed_counter.e"]

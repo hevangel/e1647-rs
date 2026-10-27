@@ -32,6 +32,7 @@
 //! - `E0405` call to an unsupported routine or list method
 //! - `E0406` recursion too deep
 //! - `E0407` no solution found for the constraints (1000 attempts)
+//! - `E0408` simulator bridge error from the `hdl_*` routines
 
 use crate::ast::{
     BinaryOp, DeclarationKind, Expr, MethodDecl, ScalarBase, Stmt, TypeExpr, UnaryOp,
@@ -138,6 +139,8 @@ struct Interp<'a> {
     seed: u64,
     output: String,
     depth: usize,
+    /// Live simulator session for the `hdl_*` builtins.
+    hdl: Option<crate::hdl::HdlSession>,
 }
 
 /// Instantiate the built-in `sys` unit and execute its `run()` methods.
@@ -149,6 +152,7 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
         seed,
         output: String::new(),
         depth: 0,
+        hdl: None,
     };
     let types: &[crate::elab::ElaboratedType] = interp.types;
     let Some(sys) = types
@@ -769,6 +773,165 @@ impl<'a> Interp<'a> {
         Ok(result)
     }
 
+    /// Dispatch a built-in routine call.
+    fn call_builtin(
+        &mut self,
+        name: &str,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        if name == "out" {
+            let text: String = values.iter().map(|v| self.format_value(v)).collect();
+            self.output.push_str(&text);
+            return Ok(Value::Void);
+        }
+        if name.starts_with("hdl_") {
+            return self.call_hdl(name, values, span);
+        }
+        Err(self.error("E0405", format!("routine '{name}' is not supported"), span))
+    }
+
+    /// The `hdl_*` routines: drive the external SystemVerilog simulator
+    /// through [`crate::hdl`]. See examples/mixed_counter.e.
+    fn call_hdl(
+        &mut self,
+        name: &str,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        // Diagnostics are built inline (no closure holds a borrow of
+        // `self` across the mutable session accesses).
+        let not_loaded = || {
+            Diagnostic::new(
+                "E0408",
+                "no simulator loaded — call hdl_load first",
+                span.0,
+                span.1,
+            )
+        };
+        match name {
+            "hdl_load" => {
+                if values.len() != 2 {
+                    return Err(self.error(
+                        "E0402",
+                        format!("'hdl_load' expects 2 arguments, got {}", values.len()),
+                        span,
+                    ));
+                }
+                let [file, top] = values.as_slice() else {
+                    unreachable!("checked the count");
+                };
+                let Value::Str(file) = file else {
+                    return Err(self.error("E0402", "hdl_load expects a design file string", span));
+                };
+                let Value::Str(top) = top else {
+                    return Err(self.error(
+                        "E0402",
+                        "hdl_load expects a top module name string",
+                        span,
+                    ));
+                };
+                match crate::hdl::HdlSession::load(file, top) {
+                    Ok(session) => {
+                        self.hdl = Some(session);
+                        Ok(Value::Void)
+                    }
+                    Err(msg) => Err(self.error("E0408", msg, span)),
+                }
+            }
+            "hdl_set" => {
+                if values.len() != 2 {
+                    return Err(self.error(
+                        "E0402",
+                        format!("'hdl_set' expects 2 arguments, got {}", values.len()),
+                        span,
+                    ));
+                }
+                let [path, value] = values.as_slice() else {
+                    unreachable!("checked the count");
+                };
+                let Value::Str(path) = path else {
+                    return Err(self.error("E0402", "hdl_set expects a signal path string", span));
+                };
+                let Some(value) = as_i64(value) else {
+                    return Err(self.error(
+                        "E0402",
+                        "hdl_set expects an integer (or boolean) value",
+                        span,
+                    ));
+                };
+                if self.hdl.is_none() {
+                    return Err(not_loaded());
+                }
+                match self.hdl.as_mut().unwrap().set(path, value) {
+                    Ok(()) => Ok(Value::Void),
+                    Err(msg) => Err(self.error("E0408", msg, span)),
+                }
+            }
+            "hdl_get" => {
+                if values.len() != 1 {
+                    return Err(self.error(
+                        "E0402",
+                        format!("'hdl_get' expects 1 argument, got {}", values.len()),
+                        span,
+                    ));
+                }
+                let [path] = values.as_slice() else {
+                    unreachable!("checked the count");
+                };
+                let Value::Str(path) = path else {
+                    return Err(self.error("E0402", "hdl_get expects a signal path string", span));
+                };
+                if self.hdl.is_none() {
+                    return Err(not_loaded());
+                }
+                match self.hdl.as_mut().unwrap().get(path) {
+                    Ok(value) => Ok(Value::Int(value)),
+                    Err(msg) => Err(self.error("E0408", msg, span)),
+                }
+            }
+            "hdl_run" => {
+                if values.len() != 1 {
+                    return Err(self.error(
+                        "E0402",
+                        format!("'hdl_run' expects 1 argument, got {}", values.len()),
+                        span,
+                    ));
+                }
+                let [delay] = values.as_slice() else {
+                    unreachable!("checked the count");
+                };
+                let Some(delay) = as_i64(delay) else {
+                    return Err(self.error("E0402", "hdl_run expects an integer delay", span));
+                };
+                if delay < 0 {
+                    return Err(self.error("E0402", "hdl_run expects a non-negative delay", span));
+                }
+                if self.hdl.is_none() {
+                    return Err(not_loaded());
+                }
+                match self.hdl.as_mut().unwrap().run(delay as u64) {
+                    Ok(()) => Ok(Value::Void),
+                    Err(msg) => Err(self.error("E0408", msg, span)),
+                }
+            }
+            "hdl_finish" => {
+                if !values.is_empty() {
+                    return Err(self.error(
+                        "E0402",
+                        format!("'hdl_finish' expects no arguments, got {}", values.len()),
+                        span,
+                    ));
+                }
+                if let Some(mut session) = self.hdl.take() {
+                    session.finish();
+                }
+                Ok(Value::Void)
+            }
+            _ => Err(self.error("E0405", format!("routine '{name}' is not supported"), span)),
+        }
+    }
+
     fn eval(
         &mut self,
         expr: &Expr,
@@ -861,17 +1024,7 @@ impl<'a> Interp<'a> {
                 match callee.as_ref() {
                     Expr::Ident { name, .. } => {
                         if crate::builtins::is_builtin_routine(name) {
-                            if name == "out" {
-                                let text: String =
-                                    values.iter().map(|v| self.format_value(v)).collect();
-                                self.output.push_str(&text);
-                                return Ok(Value::Void);
-                            }
-                            return Err(self.error(
-                                "E0405",
-                                format!("routine '{name}' is not supported"),
-                                *span,
-                            ));
+                            return self.call_builtin(name, values, *span);
                         }
                         let Some(index) = me else {
                             return Err(self.error(
@@ -1250,6 +1403,16 @@ fn width_bits(width: &Option<Box<Expr>>, default_bits: u32) -> u32 {
             .map(|v| v.clamp(1, 64) as u32)
             .unwrap_or(default_bits),
         _ => default_bits,
+    }
+}
+
+/// Integer view of a value for the `hdl_*` routines: integers pass
+/// through, booleans become 0/1 (handy for clock and reset pins).
+fn as_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Int(i) => i64::try_from(*i).ok(),
+        Value::Bool(b) => Some(i64::from(*b)),
+        _ => None,
     }
 }
 
