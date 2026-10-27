@@ -358,9 +358,9 @@ mod pumpkin_backend {
     use pumpkin_solver::core::proof::ProofLog;
     use pumpkin_solver::core::rand::SeedableRng;
     use pumpkin_solver::core::rand::rngs::SmallRng;
-    use pumpkin_solver::core::results::SatisfactionResult;
+    use pumpkin_solver::core::results::{ProblemSolution, SatisfactionResult};
     use pumpkin_solver::core::termination::Indefinite;
-    use pumpkin_solver::core::variables::DomainId;
+    use pumpkin_solver::core::variables::{DomainId, TransformableVariable};
     use std::collections::BTreeMap;
 
     /// Everything the backend works with fits comfortably in i32; wider
