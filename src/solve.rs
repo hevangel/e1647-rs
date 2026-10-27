@@ -360,7 +360,7 @@ mod pumpkin_backend {
     use pumpkin_solver::core::rand::rngs::SmallRng;
     use pumpkin_solver::core::results::SatisfactionResult;
     use pumpkin_solver::core::termination::Indefinite;
-    use pumpkin_solver::core::variables::{DomainId, IntegerVariable};
+    use pumpkin_solver::core::variables::DomainId;
     use std::collections::BTreeMap;
 
     /// Everything the backend works with fits comfortably in i32; wider

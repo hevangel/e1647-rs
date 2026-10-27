@@ -455,8 +455,7 @@ impl<'a> Interp<'a> {
                             span,
                         ));
                     }
-                    crate::solve::SolveOutcome::Unknown
-                    | crate::solve::SolveOutcome::Unsupported => {}
+                    crate::solve::SolveOutcome::Unsupported => {}
                 }
             }
         }
@@ -649,9 +648,7 @@ impl<'a> Interp<'a> {
                 format!("the constraints of '{type_name}' are unsatisfiable"),
                 span,
             )),
-            crate::solve::SolveOutcome::Unknown | crate::solve::SolveOutcome::Unsupported => {
-                Ok(None)
-            }
+            crate::solve::SolveOutcome::Unsupported => Ok(None),
         }
     }
 
