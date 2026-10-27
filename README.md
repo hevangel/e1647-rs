@@ -68,7 +68,9 @@ cargo test --all-targets
 Reference runs against the Cadence Specman implementation use
 [EDA Playground](https://www.edaplayground.com). Credentials are read from a
 gitignored `.env` file (copy `.env.example`); they must never be committed.
-Reference rules and lawful access to the IEEE 1647 standard are described in
+The automation playbook (login, run setup, reading logs, saving) lives at
+[skills/edaplayground/SKILL.md](skills/edaplayground/SKILL.md); reference
+rules and lawful access to the IEEE 1647 standard are described in
 [docs/REFERENCES.md](docs/REFERENCES.md).
 
 ## Standards and trademarks
