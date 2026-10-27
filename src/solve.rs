@@ -473,44 +473,70 @@ mod pumpkin_backend {
             }
         }
         let tag = solver.new_constraint_tag();
-        let scaled_terms: Vec<_> = linear
-            .terms
-            .iter()
-            .map(|(name, coefficient)| variables[name.as_str()].scaled(*coefficient as i32))
-            .collect();
-        let constraint = match linear.cmp {
-            Cmp::Eq => pumpkin_constraints::equals(scaled_terms, linear.rhs as i32, tag),
+        // Each builder returns its own opaque `impl NegatableConstraint`,
+        // so every arm posts directly instead of producing one value.
+        match linear.cmp {
+            Cmp::Eq => {
+                solver
+                    .add_constraint(pumpkin_constraints::equals(
+                        scaled_terms,
+                        linear.rhs as i32,
+                        tag,
+                    ))
+                    .post();
+            }
             Cmp::Ne => {
-                let equals_constraint =
-                    pumpkin_constraints::equals(scaled_terms, linear.rhs as i32, tag);
-                solver.add_constraint(equals_constraint.negation()).post();
-                return Ok(());
+                solver
+                    .add_constraint(
+                        pumpkin_constraints::equals(scaled_terms, linear.rhs as i32, tag)
+                            .negation(),
+                    )
+                    .post();
             }
             Cmp::Le => {
-                pumpkin_constraints::less_than_or_equals(scaled_terms, linear.rhs as i32, tag)
+                solver
+                    .add_constraint(pumpkin_constraints::less_than_or_equals(
+                        scaled_terms,
+                        linear.rhs as i32,
+                        tag,
+                    ))
+                    .post();
             }
             Cmp::Lt => {
-                pumpkin_constraints::less_than_or_equals(scaled_terms, (linear.rhs - 1) as i32, tag)
+                solver
+                    .add_constraint(pumpkin_constraints::less_than_or_equals(
+                        scaled_terms,
+                        (linear.rhs - 1) as i32,
+                        tag,
+                    ))
+                    .post();
             }
-            // Σ c·x ≥ r  ⟺  Σ (-c)·x ≤ -r  (and strictly for Gt with r+1).
-            Cmp::Ge => pumpkin_constraints::less_than_or_equals(
-                scaled_terms
-                    .into_iter()
-                    .map(|t| t.scaled(-1))
-                    .collect::<Vec<_>>(),
-                (-linear.rhs) as i32,
-                tag,
-            ),
-            Cmp::Gt => pumpkin_constraints::less_than_or_equals(
-                scaled_terms
-                    .into_iter()
-                    .map(|t| t.scaled(-1))
-                    .collect::<Vec<_>>(),
-                (-(linear.rhs + 1)) as i32,
-                tag,
-            ),
-        };
-        solver.add_constraint(constraint).post();
+            // Σ c·x ≥ r  ⟺  Σ (-c)·x ≤ -r  (strictly: ≤ -r-1 for Gt).
+            Cmp::Ge => {
+                solver
+                    .add_constraint(pumpkin_constraints::less_than_or_equals(
+                        scaled_terms
+                            .into_iter()
+                            .map(|t| t.scaled(-1))
+                            .collect::<Vec<_>>(),
+                        (-linear.rhs) as i32,
+                        tag,
+                    ))
+                    .post();
+            }
+            Cmp::Gt => {
+                solver
+                    .add_constraint(pumpkin_constraints::less_than_or_equals(
+                        scaled_terms
+                            .into_iter()
+                            .map(|t| t.scaled(-1))
+                            .collect::<Vec<_>>(),
+                        (-(linear.rhs + 1)) as i32,
+                        tag,
+                    ))
+                    .post();
+            }
+        }
         Ok(())
     }
 }
