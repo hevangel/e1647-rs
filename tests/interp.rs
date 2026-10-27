@@ -204,3 +204,29 @@ fn case_ternary_and_outf_execute() {
     );
     assert_eq!(output, "two-or-seven\nbig\nhex=ff dec=42 str=tag 100%\n");
 }
+
+#[test]
+fn start_runs_tcm_inline_and_waits_advance() {
+    let output = clean_output(
+        "unit counter_u {\n    ticks: uint;\n    tick() @sys.any is {\n        var i: uint = 0;\n        while i < 3 {\n            i = i + 1;\n            ticks = ticks + 1;\n            wait cycle;\n        };\n    };\n};\nextend sys {\n    c: counter_u is instance;\n    run() is also {\n        start c.tick();\n        print c.ticks;\n        emit sys.done;\n    };\n};\n",
+        1,
+    );
+    // The inline-started TCM mutated the instance across its waits.
+    assert!(output.contains("3\n"), "output: {output}");
+}
+
+#[test]
+fn runaway_tcm_hits_the_wait_budget() {
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        while TRUE {\n            wait cycle;\n        };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>(),
+        vec!["E0409"]
+    );
+}

@@ -335,7 +335,7 @@ impl<'a> Elaborator<'a> {
                 Member::Method(method) => composed.methods.push((method, block)),
                 Member::When(when) => composed.whens.push(when),
                 Member::Port(port) => composed.ports.push((port, block)),
-                Member::Enumeral(_) => {}
+                Member::Event(_) | Member::Enumeral(_) => {}
             }
         }
     }

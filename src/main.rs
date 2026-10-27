@@ -201,6 +201,9 @@ fn print_members(members: &[e1647::ast::Member], indent: &str) {
                     render_type(&port.element)
                 );
             }
+            Member::Event(event) => {
+                println!("{indent}event {} (line {})", event.name, event.span.0.line)
+            }
             Member::Constraint(constraint) => println!(
                 "{indent}keep{} (line {})",
                 if constraint.is_soft { " soft" } else { "" },

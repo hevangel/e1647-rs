@@ -244,6 +244,9 @@ fn check_statements<'a>(
             | Stmt::Break { .. }
             | Stmt::Continue { .. }
             | Stmt::Case { .. }
+            | Stmt::Wait { .. }
+            | Stmt::Emit { .. }
+            | Stmt::Start { .. }
             | Stmt::Print { .. }
             | Stmt::Gen { .. } => {}
         }

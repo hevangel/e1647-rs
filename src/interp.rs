@@ -33,6 +33,7 @@
 //! - `E0406` recursion too deep
 //! - `E0407` no solution found for the constraints (1000 attempts)
 //! - `E0408` simulator bridge error from the `hdl_*` routines
+//! - `E0409` cycle budget exceeded (runaway TCM)
 
 use crate::ast::{
     BinaryOp, DeclarationKind, Expr, MethodDecl, ScalarBase, Stmt, TypeExpr, UnaryOp,
@@ -151,7 +152,16 @@ struct Interp<'a> {
     depth: usize,
     /// Live simulator session for the `hdl_*` builtins.
     hdl: Option<crate::hdl::HdlSession>,
+    /// Virtual simulation time in cycles, advanced by `wait` statements.
+    cycle: u64,
+    /// Remaining `wait` statements before a runaway TCM is stopped.
+    wait_budget: u64,
+    /// Events fired by `emit`, keyed by their path as written.
+    emitted: std::collections::BTreeSet<String>,
 }
+
+/// How many `wait` statements one run may execute (the runaway-TCM guard).
+const WAIT_BUDGET: u64 = 100_000;
 
 /// Instantiate the built-in `sys` unit and execute its `run()` methods.
 pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
@@ -163,6 +173,9 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
         output: String::new(),
         depth: 0,
         hdl: None,
+        cycle: 0,
+        wait_budget: WAIT_BUDGET,
+        emitted: std::collections::BTreeSet::new(),
     };
     let types: &[crate::elab::ElaboratedType] = interp.types;
     let Some(sys) = types
@@ -420,6 +433,62 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             Stmt::Gen { expr, span } => self.exec_gen(expr, frame, me, *span),
+            Stmt::Wait { cycles, span } => {
+                let Value::Int(n) = self.eval(cycles, frame, me)? else {
+                    return Err(self.error("E0402", "wait count must be an integer", *span));
+                };
+                if n < 0 {
+                    return Err(self.error("E0402", "wait count must be non-negative", *span));
+                }
+                if self.wait_budget == 0 {
+                    return Err(self.error(
+                        "E0409",
+                        format!("cycle budget exceeded at cycle {}", self.cycle),
+                        *span,
+                    ));
+                }
+                self.wait_budget -= 1;
+                self.cycle = self.cycle.saturating_add(n as u64);
+                Ok(Flow::Normal)
+            }
+            Stmt::Emit { target, .. } => {
+                let path = self.event_path(target)?;
+                self.emitted.insert(path);
+                Ok(Flow::Normal)
+            }
+            Stmt::Start { call, span } => {
+                // TCM start: executed inline (synchronously) in this
+                // milestone — event-triggered suspension is a later
+                // milestone; waits inside the body advance virtual time.
+                let Expr::Call { callee, args, .. } = call else {
+                    return Err(self.error("E0402", "start expects a method call", *span));
+                };
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.eval(arg, frame, me)?);
+                }
+                match callee.as_ref() {
+                    Expr::Ident { name, .. } => {
+                        let Some(index) = me else {
+                            return Err(self.error(
+                                "E0402",
+                                format!("start of '{name}' without an enclosing instance"),
+                                *span,
+                            ));
+                        };
+                        self.call_method(index, name, values, *span)?;
+                    }
+                    Expr::MemberAccess { object, name, .. } => {
+                        let object_value = self.eval(object, frame, me)?;
+                        let Value::Object(index) = object_value else {
+                            return Err(self.error("E0402", "start requires an object", *span));
+                        };
+                        self.call_method(index, name, values, *span)?;
+                    }
+                    _ => return Err(self.error("E0402", "start target not supported", *span)),
+                }
+                Ok(Flow::Normal)
+            }
             Stmt::Case {
                 scrutinee,
                 arms,
@@ -906,6 +975,20 @@ impl<'a> Interp<'a> {
         }
         self.output.push_str(&rendered);
         Ok(Value::Void)
+    }
+
+    /// Resolve an `emit`/event target expression to its path key.
+    fn event_path(&mut self, target: &Expr) -> Result<String, Diagnostic> {
+        match target {
+            Expr::Ident { name, .. } => Ok(name.clone()),
+            Expr::MemberAccess { object, name, .. } => {
+                let mut prefix = self.event_path(object)?;
+                prefix.push('.');
+                prefix.push_str(name);
+                Ok(prefix)
+            }
+            _ => Err(self.error("E0402", "unsupported event target", target.span())),
+        }
     }
 
     /// The `hdl_*` routines: drive the external SystemVerilog simulator

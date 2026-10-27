@@ -41,9 +41,10 @@ pub enum Member {
     Enumeral(Enumeral),
     /// A `when <modifier> .. { members };` subtype member.
     When(WhenDecl),
-    /// A `name: <dir> simple_port of <type> is instance;` member — a
-    /// handle onto an HDL signal, accessed through the simulator bridge.
+    /// A `simple_port` member.
     Port(PortDecl),
+    /// An `event` member.
+    Event(EventDecl),
 }
 
 /// A `when` subtype member: one or more `value'id` (or bare `id`) modifiers
@@ -71,6 +72,18 @@ pub enum PortDirection {
     In,
     Out,
     Inout,
+}
+
+/// An `event` member: `event name;` (explicitly emitted) or
+/// `event name is <trigger>;` (e.g. `is fall(clk$) @sim`,
+/// `is cycle @p_smp.clock_f`, `is @sys.any`). The trigger is stored as
+/// written; edge scheduling is a later milestone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub trigger: Option<Expr>,
+    pub span: Span,
 }
 
 /// A `simple_port` member: `name: inout simple_port of bit is instance;`.
@@ -108,6 +121,9 @@ pub struct MethodDecl {
     pub name_span: Span,
     pub params: Vec<Param>,
     pub return_type: Option<TypeExpr>,
+    /// `@event` suffix of a time-consuming method (TCM); the event
+    /// expression as written (e.g. `@sys.any`, `@driver.clock`).
+    pub tcm_event: Option<Expr>,
     /// `is also` / `is first` / `is only` extension modifier.
     pub modifier: Option<MethodModifier>,
     pub body: Vec<Stmt>,
@@ -187,6 +203,24 @@ pub enum Stmt {
         expr: Expr,
         span: Span,
     },
+    /// `wait cycle;` / `wait [n];` / `wait [n] * cycle;` — advances
+    /// simulation time by the evaluated cycle count.
+    Wait {
+        cycles: Expr,
+        span: Span,
+    },
+    /// `emit <target>;` — fires an event.
+    Emit {
+        target: Expr,
+        span: Span,
+    },
+    /// `start <call>;` — starts a TCM. Executed inline (synchronously)
+    /// with a shared cycle budget in this milestone; event-triggered
+    /// suspension is a later milestone.
+    Start {
+        call: Expr,
+        span: Span,
+    },
     /// `case expr { val: {..}; [a, b]: {..}; default: {..}; };`
     Case {
         scrutinee: Expr,
@@ -210,6 +244,9 @@ impl Stmt {
             | Stmt::Continue { span }
             | Stmt::Print { span, .. }
             | Stmt::Gen { span, .. }
+            | Stmt::Wait { span, .. }
+            | Stmt::Emit { span, .. }
+            | Stmt::Start { span, .. }
             | Stmt::Case { span, .. } => *span,
         }
     }

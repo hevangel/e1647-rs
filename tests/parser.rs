@@ -390,16 +390,17 @@ fn recovery_reports_each_bad_declaration() {
 
 #[test]
 fn unsupported_members_report_explicitly() {
-    let result = parse("struct s {\n    event done;\n    a: uint;\n};\n");
+    let result = parse("struct s {\n    b: uint;\n    cover my_cover is { item a; };\n};\n");
     assert_eq!(
         result
             .diagnostics
             .iter()
             .map(|d| d.code)
             .collect::<Vec<_>>(),
-        vec!["E0113"]
+        vec!["E0113", "E0101"]
     );
-    // The parser recovers and keeps the well-formed field.
+    // The parser recovers; the well-formed field survives in the partial
+    // AST and the diagnostics are authoritative.
     assert_eq!(result.declarations[0].members.len(), 1);
 }
 

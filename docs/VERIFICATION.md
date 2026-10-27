@@ -720,3 +720,35 @@ but not yet that count. The remaining gate is unchanged: events, TCMs
 
 Verification: fmt/clippy/test green locally; container `verify` green
 (all features); container `mixed` green (5/5 cycles, quoted-path style).
+
+## 2026-10-27 (10) — rung 2a: events, TCM syntax, start/wait/emit, case/ternary/outf
+
+Rung 1 (previous entry set) landed `simple_port` members with `hdl_path()`
+binding and `port$` access (commit caffbf4). Rung 2a adds the events/TCM
+syntax and a deterministic single-threaded execution model:
+
+- Event members: `event clk;` and `event dutclk is <trigger>;` — the
+  trigger expression (`fall(clk$) @sim`, `cycle @p_smp.clock_f`,
+  `@sys.any`) is stored as written; edge scheduling is rung 2b.
+- TCM methods: `name() @event is { .. }` (also `name(): type @event`);
+  the event expression is stored on the method.
+- Statements: `wait cycle;` / `wait [n];` / `wait [n] * cycle;` (v1
+  kernel: time units and cycles advance the same counter), `emit e;`,
+  `start m(...);` — `start` executes the TCM body inline with a shared
+  cycle budget (`WAIT_BUDGET` 100_000 waits; runaway TCMs stop with the
+  new `E0409`).
+- Also landed: `case`/ternary/`if … then`/`outf` (see the sibling slice
+  in this session).
+
+Golden delta re-measured (`local/sn-cpu-tutorial/golden-combined.e`):
+**103 → 83 diagnostics** — events, TCM methods, ports, `case` and
+ternaries now parse; the remaining 83 are dominated by `import`/`define`
+top-level statements, `when` inheritance, `%`/`!` field modifiers,
+`as_a()` casts, bit slices, `in [ranges]`, `message`/`specman`/
+`set_config` and `for each in` — the rung 2b/3 list.
+
+Verification: fmt/clippy/test green locally (75 tests — 14 interp incl.
+inline-TCM execution and the E0409 budget test, 24 parser, 15 lexer,
+10 elab, 10 solve, 1 fixtures(18 pairs), 6 solve-translations); container
+`verify` green with all features; container `mixed-port` green (5/5
+cycles, signal-map style).

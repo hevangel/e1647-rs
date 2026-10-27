@@ -495,6 +495,7 @@ impl Parser {
                 self.parse_keep().map(|c| vec![Member::Constraint(c)])
             }
             Some(TokenKind::Keyword(k)) if k == "when" => self.parse_when(),
+            Some(TokenKind::Keyword(k)) if k == "event" => self.parse_event().map(|e| vec![e]),
             _ => {
                 self.error_here(
                     "E0113",
@@ -629,6 +630,15 @@ impl Parser {
         } else {
             None
         };
+        // TCM suffix: `name() @event [also|first|only] is { .. }` — the
+        // event expression is stored as written (e.g. `@sys.any`,
+        // `@driver.clock`).
+        let tcm_event = if self.at_punct("@") {
+            self.bump();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         if !self.eat_keyword("is") {
             self.error_here("E0115", "expected 'is' to start the method body");
             self.recover_to_member_boundary();
@@ -653,6 +663,7 @@ impl Parser {
             name_span,
             params,
             return_type,
+            tcm_event,
             modifier,
             body,
             span: (start, end),
@@ -740,6 +751,29 @@ impl Parser {
             name_span,
             direction,
             element,
+            span: (start, end),
+        }))
+    }
+
+    /// `event name;` or `event name is <trigger>;` — the trigger
+    /// expression is stored as written (e.g. `fall(clk$) @sim`,
+    /// `cycle @p_smp.clock_f`, `@sys.any`); edge scheduling is a later
+    /// milestone.
+    fn parse_event(&mut self) -> Option<Member> {
+        let start = self.current_span().0;
+        self.bump(); // 'event'
+        let (name, name_span) = self.expect_identifier("E0102", "expected event name")?;
+        let trigger = if self.eat_keyword("is") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        self.expect_punct(";", "E0105", "expected ';' after the event declaration")?;
+        let end = self.last_end();
+        Some(Member::Event(crate::ast::EventDecl {
+            name,
+            name_span,
+            trigger,
             span: (start, end),
         }))
     }
@@ -904,6 +938,27 @@ impl Parser {
                 })
             }
             Some(TokenKind::Keyword(k)) if k == "case" => self.parse_case_statement(),
+            Some(TokenKind::Keyword(k)) if k == "wait" => self.parse_wait_statement(),
+            Some(TokenKind::Keyword(k)) if k == "emit" => {
+                self.bump();
+                let target = self.parse_expr()?;
+                self.expect_punct(";", "E0105", "expected ';' after 'emit'")?;
+                let end = self.last_end();
+                Some(Stmt::Emit {
+                    target,
+                    span: (start, end),
+                })
+            }
+            Some(TokenKind::Keyword(k)) if k == "start" => {
+                self.bump();
+                let call = self.parse_expr()?;
+                self.expect_punct(";", "E0105", "expected ';' after 'start'")?;
+                let end = self.last_end();
+                Some(Stmt::Start {
+                    call,
+                    span: (start, end),
+                })
+            }
             Some(TokenKind::Keyword(_)) => {
                 self.error_here("E0113", "this statement kind is not supported yet");
                 self.recover_to_member_boundary();
@@ -1052,6 +1107,35 @@ impl Parser {
             scrutinee,
             arms,
             default,
+            span: (start, end),
+        })
+    }
+
+    /// `wait cycle;` / `wait [n];` / `wait [n] * cycle;` — normalized to
+    /// a cycle-count expression. In this v1 kernel time units and cycles
+    /// advance the same counter (documented in the interpreter).
+    fn parse_wait_statement(&mut self) -> Option<Stmt> {
+        let start = self.current_span().0;
+        self.bump(); // 'wait'
+        let cycles = if self.eat_keyword("cycle") {
+            Expr::IntLiteral {
+                text: "1".to_owned(),
+                span: (start, self.last_end()),
+            }
+        } else {
+            self.expect_punct("[", "E0106", "expected 'cycle' or '[n]' after 'wait'")?;
+            let count = self.parse_expr()?;
+            self.expect_punct("]", "E0107", "expected ']' to close the wait count")?;
+            if self.eat_punct("*") && !self.eat_keyword("cycle") {
+                self.error_here("E0113", "expected 'cycle' after the wait multiplier");
+                return None;
+            }
+            count
+        };
+        self.expect_punct(";", "E0105", "expected ';' after 'wait'")?;
+        let end = self.last_end();
+        Some(Stmt::Wait {
+            cycles,
             span: (start, end),
         })
     }
