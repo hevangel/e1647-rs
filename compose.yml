@@ -47,3 +47,9 @@ services:
   mixed:
     <<: *toolchain
     command: ["cargo", "run", "--quiet", "--", "run", "--seed", "1", "examples/mixed_counter.e"]
+
+  # The signal-map style variant: simple_port members + port$ access
+  # (the SN-CPU-Tutorial pattern).
+  mixed-port:
+    <<: *toolchain
+    command: ["cargo", "run", "--quiet", "--", "run", "--seed", "1", "examples/mixed_port.e"]

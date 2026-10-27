@@ -334,9 +334,10 @@ impl<'a> Cursor<'a> {
 
     fn read_word(&mut self) -> String {
         let start_byte = self.byte;
+        // `$` extends identifiers: `port$` is the simple_port value access.
         while self
             .peek()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
         {
             self.bump();
         }

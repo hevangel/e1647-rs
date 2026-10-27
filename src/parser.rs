@@ -485,6 +485,8 @@ impl Parser {
             Some(TokenKind::Identifier(_)) => {
                 if matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == "(") {
                     self.parse_method().map(|m| vec![m])
+                } else if self.peek_is_port_declaration() {
+                    self.parse_port().map(|p| vec![p])
                 } else {
                     self.parse_fields()
                 }
@@ -570,6 +572,12 @@ impl Parser {
         }
         self.expect_punct(":", "E0103", "expected ':' after field name")?;
         let ty = self.parse_type()?;
+        // `is instance` / `is inline` suffixes are syntactic in this
+        // subset.
+        if self.eat_keyword("is") && !self.eat_keyword("instance") && !self.eat_keyword("inline") {
+            self.error_here("E0104", "expected 'instance' or 'inline' after 'is'");
+            return None;
+        }
         self.expect_punct(";", "E0105", "expected ';' after field declaration")?;
         Some(
             names
@@ -647,6 +655,91 @@ impl Parser {
             return_type,
             modifier,
             body,
+            span: (start, end),
+        }))
+    }
+
+    /// `name: <dir> simple_port of <type> is instance;` — the direction
+    /// spellings are identifiers in the pinned reference grammar, so the
+    /// declaration is detected positionally.
+    fn peek_is_port_declaration(&self) -> bool {
+        let Some(TokenKind::Punctuation(colon)) = self.peek_second_kind() else {
+            return false;
+        };
+        if colon != ":" {
+            return false;
+        }
+        let Some(Token {
+            kind: TokenKind::Identifier(direction),
+            ..
+        }) = self.tokens.get(self.pos + 2)
+        else {
+            return false;
+        };
+        matches!(direction.as_str(), "in" | "out" | "inout")
+            && matches!(
+                self.tokens.get(self.pos + 3).map(|t| &t.kind),
+                Some(TokenKind::Identifier(id)) if id == "simple_port"
+            )
+    }
+
+    fn parse_port(&mut self) -> Option<Member> {
+        use crate::ast::{PortDecl, PortDirection};
+        let start = self.current_span().0;
+        let (name, name_span) = self.take_identifier();
+        self.expect_punct(":", "E0103", "expected ':' after the port name")?;
+        let direction = match self.peek_kind() {
+            Some(TokenKind::Identifier(id)) => match id.as_str() {
+                "in" => {
+                    self.bump();
+                    PortDirection::In
+                }
+                "out" => {
+                    self.bump();
+                    PortDirection::Out
+                }
+                "inout" => {
+                    self.bump();
+                    PortDirection::Inout
+                }
+                other => {
+                    let message =
+                        format!("unknown port direction '{other}' (expected in, out or inout)");
+                    self.error_here("E0104", &message);
+                    return None;
+                }
+            },
+            _ => {
+                self.error_here("E0104", "expected a port direction (in, out or inout)");
+                return None;
+            }
+        };
+        match self.peek_kind() {
+            Some(TokenKind::Identifier(id)) if id == "simple_port" => {
+                self.bump();
+            }
+            _ => {
+                self.error_here("E0104", "expected 'simple_port'");
+                return None;
+            }
+        }
+        if !self.eat_keyword("of") {
+            self.error_here("E0112", "expected 'of' after 'simple_port'");
+            return None;
+        }
+        let element = self.parse_type()?;
+        // The `is instance` suffix is syntactic in this subset: every
+        // simple_port member is treated as an instance.
+        if self.eat_keyword("is") {
+            self.eat_keyword("instance");
+        }
+        self.expect_punct(";", "E0105", "expected ';' after the port declaration")?;
+        let end = self.last_end();
+        Some(Member::Port(PortDecl {
+            name,
+            name_span,
+            direction,
+            element,
             span: (start, end),
         }))
     }

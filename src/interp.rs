@@ -66,6 +66,8 @@ struct ObjectInstance {
     type_name: String,
     /// Declaration order preserved; `gen` and formatting rely on it.
     fields: Vec<(String, Value)>,
+    /// `simple_port` members: port name → HDL location for the bridge.
+    ports: Vec<(String, String)>,
 }
 
 impl ObjectInstance {
@@ -84,6 +86,14 @@ impl ObjectInstance {
             }
         }
         false
+    }
+
+    /// The HDL location bound to a port, if any.
+    fn port_path(&self, name: &str) -> Option<&str> {
+        self.ports
+            .iter()
+            .find(|(port, _)| port == name)
+            .map(|(_, path)| path.as_str())
     }
 }
 
@@ -207,16 +217,23 @@ fn origin_span() -> crate::ast::Span {
 impl<'a> Interp<'a> {
     fn instantiate(&mut self, type_name: &str) -> usize {
         let mut fields = Vec::new();
+        let mut ports = Vec::new();
         let types: &[crate::elab::ElaboratedType] = self.types;
         if let Some(ty) = types.iter().find(|t| t.name == type_name) {
             for field in &ty.fields {
                 let default = self.default_for(&field.ty);
                 fields.push((field.name.clone(), default));
             }
+            for port in &ty.ports {
+                if let Some(hdl_path) = &port.hdl_path {
+                    ports.push((port.name.clone(), hdl_path.clone()));
+                }
+            }
         }
         self.instances.push(ObjectInstance {
             type_name: type_name.to_owned(),
             fields,
+            ports,
         });
         self.instances.len() - 1
     }
@@ -1077,6 +1094,10 @@ impl<'a> Interp<'a> {
                         None => Err(self.error("E0402", "no enclosing instance for 'me'", *span)),
                     };
                 }
+                // `port$` — simple_port value access through the bridge.
+                if let Some(port) = name.strip_suffix('$') {
+                    return self.read_port_value(port, me, *span);
+                }
                 if let Some(value) = frame.locals.get(name) {
                     return Ok(value.clone());
                 }
@@ -1102,6 +1123,11 @@ impl<'a> Interp<'a> {
                 let object_value = self.eval(object, frame, me)?;
                 match object_value {
                     Value::Object(index) => {
+                        // `unit.port$` — simple_port value access.
+                        if let Some(port) = name.strip_suffix('$') {
+                            let port = port.to_owned();
+                            return self.read_port_value(&port, Some(index), *span);
+                        }
                         self.instances[index].get(name).cloned().ok_or_else(|| {
                             self.error("E0401", format!("unknown field '{name}'"), *span)
                         })
@@ -1404,6 +1430,10 @@ impl<'a> Interp<'a> {
     ) -> Result<Value, Diagnostic> {
         match target {
             Expr::Ident { name, .. } => {
+                if let Some(port) = name.strip_suffix('$') {
+                    let port = port.to_owned();
+                    return self.read_port_value(&port, me, target.span());
+                }
                 if let Some(value) = frame.locals.get(name) {
                     return Ok(value.clone());
                 }
@@ -1445,6 +1475,10 @@ impl<'a> Interp<'a> {
     ) -> Result<(), Diagnostic> {
         match target {
             Expr::Ident { name, .. } => {
+                if let Some(port) = name.strip_suffix('$') {
+                    let port = port.to_owned();
+                    return self.write_port_value(&port, value, me, span);
+                }
                 if frame.locals.contains_key(name) {
                     frame.locals.insert(name.clone(), value);
                     return Ok(());
@@ -1458,6 +1492,19 @@ impl<'a> Interp<'a> {
                 Err(self.error("E0401", format!("unknown identifier '{name}'"), span))
             }
             Expr::MemberAccess { object, name, .. } => {
+                // `unit.port$ = value` — simple_port write.
+                if let Some(port) = name.strip_suffix('$') {
+                    let port = port.to_owned();
+                    let object_value = self.eval(object, frame, me)?;
+                    let Value::Object(index) = object_value else {
+                        return Err(self.error(
+                            "E0402",
+                            "port assignment requires an object",
+                            span,
+                        ));
+                    };
+                    return self.write_port_value(&port, value, Some(index), span);
+                }
                 let object_value = self.eval(object, frame, me)?;
                 let Value::Object(index) = object_value else {
                     return Err(self.error("E0402", "member assignment requires an object", span));
@@ -1469,6 +1516,60 @@ impl<'a> Interp<'a> {
                 }
             }
             _ => Err(self.error("E0402", "unsupported assignment target", span)),
+        }
+    }
+
+    /// `port$` read through the simulator bridge.
+    fn read_port_value(
+        &mut self,
+        port: &str,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let Some(index) = me else {
+            return Err(self.error("E0402", "port access requires an enclosing instance", span));
+        };
+        let Some(path) = self.instances[index].port_path(port).map(str::to_owned) else {
+            return Err(self.error("E0401", format!("unknown port '{port}'"), span));
+        };
+        if self.hdl.is_none() {
+            return Err(self.error("E0408", "no simulator loaded — call hdl_load first", span));
+        }
+        let session = self.hdl.as_mut().unwrap();
+        match session.get(&path) {
+            Ok(value) => Ok(Value::Int(value)),
+            Err(msg) => Err(self.error("E0408", msg, span)),
+        }
+    }
+
+    /// `port$ = value` write through the simulator bridge.
+    fn write_port_value(
+        &mut self,
+        port: &str,
+        value: Value,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        let Some(index) = me else {
+            return Err(self.error("E0402", "port access requires an enclosing instance", span));
+        };
+        let Some(path) = self.instances[index].port_path(port).map(str::to_owned) else {
+            return Err(self.error("E0401", format!("unknown port '{port}'"), span));
+        };
+        let Some(int_value) = as_i64(&value) else {
+            return Err(self.error(
+                "E0402",
+                "port assignment expects an integer (or boolean) value",
+                span,
+            ));
+        };
+        if self.hdl.is_none() {
+            return Err(self.error("E0408", "no simulator loaded — call hdl_load first", span));
+        }
+        let session = self.hdl.as_mut().unwrap();
+        match session.set(&path, int_value) {
+            Ok(()) => Ok(()),
+            Err(msg) => Err(self.error("E0408", msg, span)),
         }
     }
 

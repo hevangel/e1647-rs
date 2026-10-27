@@ -182,11 +182,24 @@ fn print_method(method: &e1647::ast::MethodDecl, indent: &str) {
 }
 
 fn print_members(members: &[e1647::ast::Member], indent: &str) {
-    use e1647::ast::{Expr, Member};
+    use e1647::ast::{Expr, Member, PortDirection};
     for member in members {
         match member {
             Member::Field(field) => {
                 println!("{indent}field {}: {}", field.name, render_type(&field.ty));
+            }
+            Member::Port(port) => {
+                let direction = match port.direction {
+                    PortDirection::In => "in",
+                    PortDirection::Out => "out",
+                    PortDirection::Inout => "inout",
+                };
+                println!(
+                    "{indent}port {}: {} simple_port of {}",
+                    port.name,
+                    direction,
+                    render_type(&port.element)
+                );
             }
             Member::Constraint(constraint) => println!(
                 "{indent}keep{} (line {})",

@@ -41,6 +41,9 @@ pub enum Member {
     Enumeral(Enumeral),
     /// A `when <modifier> .. { members };` subtype member.
     When(WhenDecl),
+    /// A `name: <dir> simple_port of <type> is instance;` member — a
+    /// handle onto an HDL signal, accessed through the simulator bridge.
+    Port(PortDecl),
 }
 
 /// A `when` subtype member: one or more `value'id` (or bare `id`) modifiers
@@ -60,6 +63,26 @@ pub struct SubtypeModifier {
     pub value_span: Span,
     /// The identifier after `'`, e.g. `kind`.
     pub id: Option<(String, Span)>,
+}
+
+/// Port direction of a [`PortDecl`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortDirection {
+    In,
+    Out,
+    Inout,
+}
+
+/// A `simple_port` member: `name: inout simple_port of bit is instance;`.
+/// The HDL location comes from a `keep name.hdl_path() == "path"`
+/// constraint and is resolved during elaboration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub direction: PortDirection,
+    pub element: TypeExpr,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

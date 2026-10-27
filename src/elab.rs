@@ -40,7 +40,18 @@ pub struct ElaboratedType {
     /// `when` subtype members, ancestor types first.
     pub whens: Vec<WhenDecl>,
     pub enumerals: Vec<Enumeral>,
+    /// `simple_port` members with the HDL location resolved from their
+    /// `keep name.hdl_path() == "path"` constraints.
+    pub ports: Vec<PortInfo>,
     pub span: crate::ast::Span,
+}
+
+/// A `simple_port` member resolved for simulation: the port name and the
+/// HDL location its `hdl_path()` constraint declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortInfo {
+    pub name: String,
+    pub hdl_path: Option<String>,
 }
 
 /// Outcome of elaborating one file's declarations.
@@ -60,6 +71,7 @@ struct Composed<'a> {
     constraints: Vec<&'a KeepConstraint>,
     methods: Vec<(&'a MethodDecl, usize)>,
     whens: Vec<&'a WhenDecl>,
+    ports: Vec<(&'a crate::ast::PortDecl, usize)>,
 }
 
 struct Elaborator<'a> {
@@ -104,6 +116,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             DeclarationKind::Struct | DeclarationKind::Unit => {
                 let mut stack = Vec::new();
                 let composed = elaborator.compose(declaration.name.as_str(), &mut stack);
+                let port_paths = elaborator.extract_port_paths(declaration);
                 types.push(ElaboratedType {
                     kind: declaration.kind,
                     name: declaration.name.clone(),
@@ -121,6 +134,14 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                         .collect(),
                     whens: composed.whens.into_iter().cloned().collect(),
                     enumerals: Vec::new(),
+                    ports: composed
+                        .ports
+                        .into_iter()
+                        .map(|(port, _)| PortInfo {
+                            name: port.name.clone(),
+                            hdl_path: port_paths.get(port.name.as_str()).cloned(),
+                        })
+                        .collect(),
                     span: declaration.span,
                 });
             }
@@ -132,6 +153,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 constraints: Vec::new(),
                 methods: Vec::new(),
                 whens: Vec::new(),
+                ports: Vec::new(),
                 enumerals: declaration
                     .members
                     .iter()
@@ -165,9 +187,11 @@ impl<'a> Elaborator<'a> {
                 continue;
             };
             let mut composed = Composed::default();
+            let mut port_paths: BTreeMap<String, String> = BTreeMap::new();
             for extend_index in &extend_indices {
                 let extend = &self.declarations[*extend_index];
                 Self::push_members(extend, *extend_index, &mut composed);
+                port_paths.extend(self.extract_port_paths(extend));
             }
             self.check_duplicate_fields(builtin, &composed);
             self.check_method_redefinitions(builtin, &composed);
@@ -188,9 +212,76 @@ impl<'a> Elaborator<'a> {
                     .collect(),
                 whens: composed.whens.into_iter().cloned().collect(),
                 enumerals: Vec::new(),
+                ports: composed
+                    .ports
+                    .into_iter()
+                    .map(|(port, _)| PortInfo {
+                        name: port.name.clone(),
+                        hdl_path: port_paths.get(port.name.as_str()).cloned(),
+                    })
+                    .collect(),
                 span: self.declarations[extend_indices[0]].span,
             });
         }
+    }
+
+    /// Resolve `keep <port>.hdl_path() == "path"` constraints of one
+    /// declaration into a port-name → HDL-location map.
+    fn extract_port_paths(&self, declaration: &'a Declaration) -> BTreeMap<String, String> {
+        use crate::ast::{BinaryOp, Expr};
+        let port_names: Vec<&str> = declaration
+            .members
+            .iter()
+            .filter_map(|member| match member {
+                Member::Port(port) => Some(port.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        if port_names.is_empty() {
+            return BTreeMap::new();
+        }
+        let mut paths = BTreeMap::new();
+        for member in &declaration.members {
+            let Member::Constraint(constraint) = member else {
+                continue;
+            };
+            let Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs,
+                rhs,
+                ..
+            } = &constraint.expr
+            else {
+                continue;
+            };
+            // Either orientation of `<port>.hdl_path() == "<path>"`.
+            for (call, literal) in [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())] {
+                let Expr::Call { callee, args, .. } = call else {
+                    continue;
+                };
+                if !args.is_empty() {
+                    continue;
+                }
+                let Expr::MemberAccess {
+                    object,
+                    name: method,
+                    ..
+                } = callee.as_ref()
+                else {
+                    continue;
+                };
+                let Expr::Ident { name: port, .. } = object.as_ref() else {
+                    continue;
+                };
+                if method != "hdl_path" || !port_names.contains(&port.as_str()) {
+                    continue;
+                }
+                if let Expr::StringLiteral { value, .. } = literal {
+                    paths.insert(port.to_string(), value.clone());
+                }
+            }
+        }
+        paths
     }
 
     fn compose(&mut self, name: &'a str, stack: &mut Vec<&'a str>) -> Composed<'a> {
@@ -243,6 +334,7 @@ impl<'a> Elaborator<'a> {
                 Member::Constraint(constraint) => composed.constraints.push(constraint),
                 Member::Method(method) => composed.methods.push((method, block)),
                 Member::When(when) => composed.whens.push(when),
+                Member::Port(port) => composed.ports.push((port, block)),
                 Member::Enumeral(_) => {}
             }
         }
