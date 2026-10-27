@@ -473,6 +473,11 @@ mod pumpkin_backend {
             }
         }
         let tag = solver.new_constraint_tag();
+        let scaled_terms: Vec<_> = linear
+            .terms
+            .iter()
+            .map(|(name, coefficient)| variables[name.as_str()].scaled(*coefficient as i32))
+            .collect();
         // Each builder returns its own opaque `impl NegatableConstraint`,
         // so every arm posts directly instead of producing one value.
         match linear.cmp {
