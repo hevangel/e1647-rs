@@ -1064,6 +1064,38 @@ impl Parser {
                 }
                 Some(expr)
             }
+            Some(TokenKind::Punctuation(p)) if p == "'" => {
+                // Quoted hierarchical HDL path: 'path.to.signal'.
+                self.bump();
+                let (first, _) = self.expect_identifier(
+                    "E0102",
+                    "expected a path segment after the opening quote",
+                )?;
+                let mut path = first;
+                loop {
+                    if self.at_punct(".") {
+                        self.bump();
+                        let (segment, _) =
+                            self.expect_identifier("E0102", "expected a path segment after '.'")?;
+                        path.push('.');
+                        path.push_str(&segment);
+                    } else if self.at_punct("'") {
+                        self.bump();
+                        break;
+                    } else {
+                        self.error_here(
+                            "E0102",
+                            "expected '.' or a closing quote in the quoted path",
+                        );
+                        return None;
+                    }
+                }
+                let end = self.last_end();
+                Some(Expr::HdlPath {
+                    path,
+                    span: (start, end),
+                })
+            }
             Some(TokenKind::Punctuation(p)) if p == "(" => {
                 self.bump();
                 let inner = self.parse_expr()?;

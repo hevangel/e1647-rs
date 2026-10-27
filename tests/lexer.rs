@@ -285,14 +285,25 @@ fn reals_and_ranges() {
 
 #[test]
 fn rejects_bad_based_literals() {
-    let error = tokenize("''").unwrap_err();
-    assert_eq!(error.message, "character literals are not supported yet");
     let error = tokenize("8'xZZ").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
     let error = tokenize("'d").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
     let error = tokenize("8'").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
+}
+
+#[test]
+fn bare_quotes_tokenize_standalone() {
+    // Non-literal quotes are standalone punctuation; the parser decides
+    // what they delimit (quoted paths, subtype modifiers).
+    assert_eq!(
+        kinds("''"),
+        vec![
+            TokenKind::Punctuation("'".into()),
+            TokenKind::Punctuation("'".into()),
+        ]
+    );
 }
 
 #[test]

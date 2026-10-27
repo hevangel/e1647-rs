@@ -342,6 +342,12 @@ pub enum Expr {
         expr: Box<Expr>,
         span: Span,
     },
+    /// A quoted hierarchical HDL path (`'memory_tb.address'`) — read or
+    /// assigned through the simulator bridge ([`crate::hdl`]).
+    HdlPath {
+        path: String,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -358,7 +364,8 @@ impl Expr {
             | Expr::Index { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Unary { span, .. }
-            | Expr::Paren { span, .. } => *span,
+            | Expr::Paren { span, .. }
+            | Expr::HdlPath { span, .. } => *span,
         }
     }
 }

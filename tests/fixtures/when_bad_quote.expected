@@ -1,1 +1,1 @@
-2:13: error[E0001]: character literals are not supported yet
+2:15: error[E0102]: expected an identifier after "'" in the subtype modifier

@@ -610,3 +610,56 @@ mixed testcase complete
 $ docker compose run --rm verify   # fmt + clippy + tests, all features: green
 $ cargo fmt / clippy / test (host, default features): green (66 tests)
 ```
+
+## 2026-10-27 (7) — real-example corpora baseline; quoted-path signal access
+
+Two additional real-example corpora were inventoried per the owner's
+direction, plus one language primitive landed to close the first gap.
+
+Corpora:
+
+- **asic-world Specman examples** (asic-world.com/examples/specman):
+  memory / fifo / uart are multi-file projects (24 code blocks extracted
+  into `local/asic-world/`, gitignored — third-party code is not
+  committed); **arbiter is stub-only upstream** (Part I–III pages contain
+  no code). These are old-school Specman testbenches: signal access via
+  quoted paths (`'memory_tb.address' = object.addr;`), events
+  (`event clk is rise('memory_tb.clk') @sim`), TCMs (`gen_cmds()@clk`),
+  `outf("…%x…")`, ternaries, keyed lists (`list(key:addr) of …` with
+  `.add/.key_exists/.key`), `start`, `wait cycle`.
+- **uobdv/Design-Verification** — added as the submodule
+  `external/design-verification` (read-only reference, pinned at
+  `0a48307`). Its SN-CPU-Tutorial (`cpu/e/src`, 14 files: signal map,
+  driver, refmodel, checker, coverage, tests) parse-probes at 1–29
+  diagnostics per file; blockers are the same set: `simple_port`
+  members (`inout simple_port of bit is instance`, `hdl_path()`,
+  `delayed()`), events (`@sys.any`, `rise/fall('path') @sim`), TCMs
+  (`clkgen() @sys.any`, `wait cycle`).
+
+Gap inventory across all three corpora (EDA Playground curated +
+asic-world + SN-CPU-Tutorial) now forms the M2/M3 roadmap input:
+ports/signal maps, events, TCMs (+`start`/`wait`), sequences, packages,
+`when` elaboration, keyed lists, `outf`/ternaries, `import`.
+
+Landed in this change — **quoted-path signal access**, the core
+primitive of the asic-world style, backed by the xezim bridge:
+
+- Lexer: non-literal `'` quotes are standalone punctuation tokens (the
+  closing quote of a path no longer raises a lexical error); character
+  literals move from a lexical to a parse-level concern (fixtures
+  `invalid_lex` and `when_bad_quote` updated; the based-literal error
+  path is unchanged).
+- AST/parser: `Expr::HdlPath` — `'path.to.signal'` parses as an
+  expression and as an assignment target.
+- Interp: reads and assignments route to the simulator session
+  (`E0408` without `hdl_load`).
+- `examples/mixed_counter.e` now drives the counter DUT in the
+  asic-world style (`'counter.clk' = 1;`, `var seen: uint =
+  'counter.count';`) — passes 5/5 cycles in the container.
+- Tests: parser quoted-path AST test; interp E0408-without-session
+  test; lexer bare-quote test. Totals: 67 tests (10 elab, 1 fixtures,
+  13 interp, 15 lexer, 21 parser, 6 solve) + 4 pumpkin-gated on CI.
+
+Verification performed: fmt/clippy/test green locally (default
+features); container `verify` green with all features; container
+`mixed` green using the quoted-path style.

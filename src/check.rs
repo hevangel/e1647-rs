@@ -329,6 +329,8 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
         Expr::Unary { expr, .. } | Expr::Paren { expr, .. } => {
             collect_root_identifiers(expr, roots)
         }
+        // Quoted HDL paths are simulator signals, not struct fields.
+        Expr::HdlPath { .. } => {}
         Expr::IntLiteral { .. }
         | Expr::RealLiteral { .. }
         | Expr::BitLiteral { .. }

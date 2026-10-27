@@ -338,10 +338,38 @@ fn diagnostics_are_reported_with_positions() {
 
 #[test]
 fn lex_errors_become_diagnostics() {
-    let result = parse("struct s { keep x < ''; };");
+    let result = parse("struct s { keep x < 8'xZZ; };");
     assert_eq!(result.declarations.len(), 0);
     assert_eq!(result.diagnostics.len(), 1);
     assert_eq!(result.diagnostics[0].code, "E0001");
+}
+
+#[test]
+fn quoted_hdl_paths_parse() {
+    let declarations = expect_clean(
+        "struct s {\n    run() is {\n        'memory_tb.address' = 8'hFF;\n        var v: uint = 'memory_tb.data_out';\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    assert_eq!(run.body.len(), 2);
+    assert!(
+        matches!(
+            &run.body[0],
+            Stmt::Assign {
+                target: Expr::HdlPath { path, .. },
+                ..
+            } if path == "memory_tb.address"
+        ),
+        "expected an HdlPath assignment target"
+    );
+    assert!(matches!(
+        &run.body[1],
+        Stmt::VarDecl {
+            init: Some(Expr::HdlPath { path, .. }),
+            ..
+        } if path == "memory_tb.data_out"
+    ));
 }
 
 #[test]

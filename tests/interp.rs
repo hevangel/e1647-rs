@@ -177,3 +177,21 @@ fn enumeral_fields_and_comparisons_execute() {
     );
     assert!(output == "busy\n" || output == "idle\n", "output: {output}");
 }
+
+#[test]
+fn hdl_path_access_without_a_session_is_e0408() {
+    // Quoted HDL paths parse (asic-world driver style) but require a
+    // simulator session started with hdl_load.
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        'tb.sig' = 1;\n        print 'tb.sig';\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>(),
+        vec!["E0408"]
+    );
+}

@@ -13,3 +13,6 @@
 [submodule "external/specman-e-support"]
 	path = external/specman-e-support
 	url = https://github.com/k-sparrow/specman-e-support.git
+[submodule "external/design-verification"]
+	path = external/design-verification
+	url = https://github.com/uobdv/Design-Verification.git

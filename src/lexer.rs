@@ -507,9 +507,12 @@ impl<'a> Cursor<'a> {
             TokenKind::StringLiteral(value)
         } else if first == '\'' {
             // Either a based literal (`'hFF`), the subtype modifier quote
-            // (`read'kind`; a standalone token, like the reference grammar's
-            // `SNG_QUOTE`), or — until a later milestone — an unsupported
-            // character literal.
+            // (`read'kind`), the opening or closing quote of a quoted
+            // hierarchical path (`'memory_tb.address'`), or — until a
+            // later milestone — an unsupported character literal. All
+            // non-literal quotes become standalone punctuation tokens
+            // (like the reference grammar's `SNG_QUOTE`); the parser
+            // decides what they delimit.
             match self.peek_second() {
                 Some(base) if Self::based_base_letter(base) => {
                     self.bump();
@@ -517,15 +520,9 @@ impl<'a> Cursor<'a> {
                     self.read_based_digits(base, start)?;
                     TokenKind::Number(self.source[start.byte..self.byte].to_owned())
                 }
-                Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                _ => {
                     self.bump();
                     TokenKind::Punctuation("'".to_owned())
-                }
-                _ => {
-                    return Err(LexError {
-                        position: start,
-                        message: "character literals are not supported yet",
-                    });
                 }
             }
         } else {

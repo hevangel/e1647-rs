@@ -286,6 +286,27 @@ impl<'a> Interp<'a> {
             Stmt::Assign { target, value, .. } => {
                 let value = self.eval(value, frame, me)?;
                 match target {
+                    Expr::HdlPath { path, span } => {
+                        if self.hdl.is_none() {
+                            return Err(self.error(
+                                "E0408",
+                                "no simulator loaded — call hdl_load first",
+                                *span,
+                            ));
+                        }
+                        let Some(int_value) = as_i64(&value) else {
+                            return Err(self.error(
+                                "E0402",
+                                "signal assignment expects an integer (or boolean) value",
+                                *span,
+                            ));
+                        };
+                        let session = self.hdl.as_mut().unwrap();
+                        match session.set(path, int_value) {
+                            Ok(()) => Ok(Flow::Normal),
+                            Err(msg) => Err(self.error("E0408", msg, *span)),
+                        }
+                    }
                     Expr::Index { base, index, span } => {
                         let index_value = self.eval(index, frame, me)?;
                         let Value::Int(i) = index_value else {
@@ -1130,6 +1151,20 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::Paren { expr, .. } => self.eval(expr, frame, me),
+            Expr::HdlPath { path, span } => {
+                if self.hdl.is_none() {
+                    return Err(self.error(
+                        "E0408",
+                        "no simulator loaded — call hdl_load first",
+                        *span,
+                    ));
+                }
+                let session = self.hdl.as_mut().unwrap();
+                match session.get(path) {
+                    Ok(value) => Ok(Value::Int(value)),
+                    Err(msg) => Err(self.error("E0408", msg, *span)),
+                }
+            }
         }
     }
 
