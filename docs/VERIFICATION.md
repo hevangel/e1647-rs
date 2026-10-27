@@ -663,3 +663,36 @@ primitive of the asic-world style, backed by the xezim bridge:
 Verification performed: fmt/clippy/test green locally (default
 features); container `verify` green with all features; container
 `mixed` green using the quoted-path style.
+
+## 2026-10-27 (8) — SN-CPU-Tutorial golden testbench: Playground attempt blocked; our baseline
+
+The SN-CPU-Tutorial golden environment (`cpu/e/gold`, 11 files) is **pure
+e**: the CPU itself is modeled in e (`cpu_dut_s` with a signal map, an
+edge event `dutclk is fall(smp.clk_p$) @sys.any` and the `run_DUT()
+@dutclk` TCM) — no Verilog DUT exists, so a Specman-only run suffices.
+The 11 files were concatenated in dependency order (import hubs removed:
+`cpu_top.e` and the `import cpu_top;` line of `cpu_tst1.e`;
+`local/sn-cpu-tutorial/golden-combined.e`, 796 lines, kept out of the
+repository as third-party code).
+
+EDA Playground attempt (Specman e + SV/Verilog, Xcelium 25.03, minimal
+`module design` top): **blocked before submit** — the session had expired
+and the reCAPTCHA checkbox refused to tick on two coordinate clicks
+(measured rect, elementFromPoint confirms the iframe is the hit target;
+the widget just does not acknowledge the automated environment this
+time). Per policy no CAPTCHA solving is attempted; the login fallback is
+an owner login in the automation browser, after which the assembled
+playground is ready to save and run. (Morning runs today logged in fine
+with the same method; this rejection is a new observation.)
+
+Our side, measured on the same assembled file
+(`local/sn-cpu-tutorial/golden-combined.e`): **103 diagnostics** —
+E0113×52 (unsupported members: `simple_port` fields, events, TCM
+`@event` methods, `case` statements), E0105×14 / E0103×14 (port and
+`define` syntax), E0101×10 (top-level `import`/`define`), plus
+`as_a()` casts, bit slices (`alures[7:0]`), implication constraints
+(`=>`), `in [ADD .. XORI]` ranges, `outf`/`append`, `start`, `wait [1] *
+cycle`, `+=`. This is the precise delta for the M3 slice; the
+comparison table (Specman log vs e1647-rs output) will be filled here
+once the owner login unblocks the Playground run and the events/TCM
+slice is implemented.
