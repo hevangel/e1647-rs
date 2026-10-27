@@ -354,6 +354,7 @@ mod pumpkin_backend {
     use super::{BoolNode, Cmp, Problem, SolveOutcome};
     use pumpkin_conflict_resolvers::resolvers::ResolutionResolver;
     use pumpkin_solver::Solver;
+    use pumpkin_solver::core::constraints::NegatableConstraint;
     use pumpkin_solver::core::options::SolverOptions;
     use pumpkin_solver::core::proof::ProofLog;
     use pumpkin_solver::core::rand::SeedableRng;
