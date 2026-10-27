@@ -40,11 +40,22 @@
       inheritance-cycle, cross-declaration duplicate-field and
       unmodified-method-redefinition diagnostics; `when` subtypes are
       carried, not resolved, and there are no semantics yet
-- [ ] Constraint IR for `keep` expressions
+- [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
+      translates conjunctions of linear comparisons over bounded integer
+      fields into a solver problem; unsupported shapes fall back to
+      rejection sampling. No disjunctions, negation trees, global
+      constraints or set membership yet
+- [~] Pluggable SMT/constraint solver — started: the Pumpkin CP solver
+      (pure Rust, consol-lab) is integrated behind the `solver-pumpkin`
+      cargo feature and is deterministic per seed; CI verifies the feature
+      on ubuntu. Candidates for further/alternative backends: z3.rs (needs
+      the native Z3 library), oxiz (young pure-Rust SMT), rustsat (SAT
+      toolkit). Note: the crates.io `pcp` is an unrelated Post
+      Correspondence Problem searcher, not a CP solver
 - [~] Reproducible seeded randomized objects — started: `gen` is a seeded
-      rejection sampler over top-level `keep` constraints
-      (`src/interp.rs`, `e1647 run --seed`); not a solver — no SMT/pluggable
-      solver yet, soft and `when` constraints are not enforced
+      rejection sampler by default and, with `solver-pumpkin`, a seeded
+      Pumpkin solve; values may differ between backends for the same seed
+      (different algorithms), but runs are deterministic per backend
 - [ ] Pluggable SMT/constraint solver
 - [ ] Reproducible seeded randomized objects
 

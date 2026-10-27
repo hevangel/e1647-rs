@@ -9,11 +9,13 @@
 > parameter lists and statement bodies, with diagnostic fixtures; member
 > composition that folds `like` chains and `extend` blocks into per-type
 > member lists; and an interpreter that executes the non-temporal subset
-> (`e1647 run`): method calls, statements, `print`/`out`, and `gen` as a
-> seeded rejection sampler over top-level `keep` constraints. It does
-> **not** yet do full type checking, `when`-subtype resolution, temporal
-> evaluation, events, coverage, real constraint solving, HDL bridging or
-> testbench execution. No IEEE conformance is claimed. See
+> (`e1647 run`): method calls, statements, `print`/`out`, and `gen` — a
+> seeded rejection sampler by default, or a seeded solve of conjunctive
+> linear constraints via the Pumpkin CP solver when the `solver-pumpkin`
+> cargo feature is enabled. It does **not** yet do full type checking,
+> `when`-subtype resolution, temporal evaluation, events, coverage,
+> non-linear or disjunctive constraint solving, HDL bridging or testbench
+> execution. No IEEE conformance is claimed. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for the staged plan.
 
 ## Goals

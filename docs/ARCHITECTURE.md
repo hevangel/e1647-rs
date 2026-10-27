@@ -46,15 +46,22 @@
 - `src/builtins.rs` — the predeclared environment names the executed subset
   relies on: the `sys` unit and the `out` routine.
 - `src/interp.rs` — interpreter for the non-temporal statement subset with
-  a seeded rejection-sampling `gen` (codes `E04xx`). Entry: the built-in
-  `sys` unit's `run()` methods. Integers are unbounded `i128` (widths are
-  not truncated); `gen` enforces only top-level `keep` constraints via
-  sampling — it is not a solver.
+  a seeded `gen` (codes `E0401`–`E0407`). Entry: the built-in `sys` unit's
+  `run()` methods. Integers are unbounded `i128` (widths are not
+  truncated). `gen` uses the constraint-solver backend when that compiles
+  in, and rejection sampling otherwise.
+- `src/solve.rs` — constraint IR and the pluggable solver seam: the
+  top-level `keep` constraints of one type translate (conservatively) into
+  bounded-integer variables plus a conjunction of linear comparisons.
+  Backend: Pumpkin (pure-Rust CP solver) behind the `solver-pumpkin`
+  cargo feature — seeded, deterministic; without the feature `solve`
+  reports unsupported and `gen` falls back to rejection sampling.
 - `src/main.rs` — `e1647 tokens`, `e1647 parse`, `e1647 elab` and
   `e1647 run [--seed N]` CLI commands; `parse`, `elab` and `run` print
   diagnostics to stderr (`path:line:col: error[code]: message`) and their
   results on success.
 
-Deliberately not implemented yet: `when`-subtype resolution, constraint
-solving (`gen` samples and rejects; it does not solve), events/temporal,
+Deliberately not implemented yet: `when`-subtype resolution, non-linear,
+disjunctive or temporal constraint solving (the solver backend covers
+conjunctive linear constraints over bounded integers), events/temporal,
 coverage, integer width truncation, character literals, and any HDL bridge.

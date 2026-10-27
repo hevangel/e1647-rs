@@ -17,3 +17,18 @@ path = "src/lib.rs"
 [[bin]]
 name = "e1647"
 path = "src/main.rs"
+
+[features]
+# Constraint-solver backend for `gen` (Pumpkin, pure Rust CP solver).
+# Off by default: the crate's build script needs a C compiler, which the
+# local windows-gnu toolchain lacks; CI verifies the feature on ubuntu.
+solver-pumpkin = [
+    "dep:pumpkin-solver",
+    "dep:pumpkin-constraints",
+    "dep:pumpkin-conflict-resolvers",
+]
+
+[dependencies]
+pumpkin-conflict-resolvers = { version = "0.5", optional = true }
+pumpkin-constraints = { version = "0.5", optional = true }
+pumpkin-solver = { version = "0.5", optional = true }

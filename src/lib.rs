@@ -17,3 +17,4 @@ pub mod elab;
 pub mod interp;
 pub mod lexer;
 pub mod parser;
+pub mod solve;

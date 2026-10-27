@@ -411,3 +411,64 @@ if-clamp in scale() reduced 165*2=330 to 255)
 
   Also confirmed: e string escapes (`"\n"`) compile and behave as expected
   on Specman, and `out()` concatenates its arguments with no separator.
+
+## 2026-10-27 (3) — constraint-solver backend (Pumpkin) behind a feature
+
+Decision recorded (per the owner's direction to reuse existing solver
+algorithms rather than hand-rolling):
+
+| crate | verdict |
+| --- | --- |
+| `pumpkin-solver` 0.5 (consol-lab, MIT) | **chosen.** Pure-Rust lazy-clause-generation CP solver; bounded integers + linear (in)equalities map directly onto e randomization; API: `new_bounded_integer`, affine `scaled` views, `equals`/`less_than_or_equals` + negation, `satisfy`; `SolverOptions.random_generator` seeds determinism. |
+| `z3` 0.21 (prove-rs, MIT) | capable SMT bindings, but require the native Z3 library — heavier dependency and CI story; kept as a future backend behind the same seam. |
+| `oxiz` 0.3 (pure-Rust SMT) | young; revisit if pure-Rust SMT is needed (non-linear etc.). |
+| `rustsat` 0.7 | SAT toolkit — would need our own order encoding; a CP/SMT API fits e constraints better. |
+| `pcp` on crates.io | unrelated (Post Correspondence Problem searcher, 2016). |
+
+Scope claimed for this change (nothing broader):
+
+- New `src/solve.rs` (no dependencies): constraint IR (`Problem` =
+  bounded integers + conjunction of linear comparisons), a conservative
+  translator from the top-level `keep` constraints of one type over its
+  integer scalar fields (bounds from the declared widths, capped at 31
+  bits for the solver domain), and the backend seam. Unsupported shapes
+  (non-integer fields, `||`, `!`, method calls, non-linear arithmetic)
+  make the translation report unsupported.
+- Pumpkin backend behind the `solver-pumpkin` cargo feature (default
+  off): seeded `SolverOptions`, coefficients via affine `scaled` views,
+  `!=` via constraint negation, `>=`/`>` via negated `≤` encodings;
+  UNSAT reported as `SolveOutcome::Unsat`. `gen` prefers the solver and
+  falls back to the rejection sampler on unsupported/unknown.
+- `Interp` carries the run seed; `gen_object`/scalar `gen` gain the
+  solver path (non-integer fields are still sampled).
+- CI: new `check-solver` job running clippy + tests with
+  `--all-features` on ubuntu. The local windows-gnu toolchain cannot
+  build pumpkin (its build script needs a C compiler, and getrandom
+  needs dlltool — neither exists locally), so the feature path is
+  verified by CI, not locally; this is stated, not assumed.
+- 6 always-on translation/seam tests (`tests/solve.rs`) + 4
+  pumpkin-gated tests (UNSAT for `a+b==100 && b==2a`, deterministic
+  solve of `a+b==100 && a>=40`, coefficient solve, UNSAT detection).
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`, local
+Windows, default features — CI runs the same plus `--all-features` on
+ubuntu-latest):
+
+```
+$ cargo fmt --all -- --check
+(no output — pass)
+
+$ cargo clippy --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.71s
+(pass, zero warnings)
+
+$ cargo test --all-targets
+test result: ok. 6 passed;  0 failed  (test solve.rs — translation + seam)
+test result: ok. 10 passed; 0 failed  (test elab.rs)
+test result: ok. 1 passed;  0 failed  (test fixtures.rs — 18 golden pairs)
+test result: ok. 12 passed; 0 failed  (test interp.rs)
+test result: ok. 13 passed; 0 failed  (test lexer.rs)
+test result: ok. 20 passed; 0 failed  (test parser.rs)
+
+$ cargo test --all-targets --all-features   # CI (ubuntu) only: + 4 pumpkin tests
+```

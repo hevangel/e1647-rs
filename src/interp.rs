@@ -13,14 +13,15 @@
 //! variables, assignments, `if`/`else`, `while` with `break`/`continue`,
 //! `return`, `print`, the built-in `out` routine, and `gen`.
 //!
-//! `gen` is a rejection sampler, **not** a constraint solver: fields are
+//! `gen` is backed by [`crate::solve`]: with the `solver-pumpkin` feature
+//! the type's conjunctive linear `keep` constraints are solved (seeded,
+//! deterministic Pumpkin CP solve) and unsupported shapes fall back to the
+//! rejection sampler, **not** a general constraint solver: fields are
 //! sampled inside their declared bounds, a candidate is accepted only when
 //! every top-level `keep` constraint of the enclosing type evaluates to
 //! TRUE, and after 1000 failed attempts a diagnostic is reported. Soft
-//! constraints and `when` blocks are not enforced. This solves only the
-//! constraint shapes rejection sampling can solve; the SMT-based solver is
-//! a later roadmap item. Every run takes an explicit seed and is fully
-//! deterministic.
+//! constraints and `when` blocks are not enforced. Every run takes an
+//! explicit seed and is fully deterministic per backend.
 //!
 //! ## Diagnostic codes
 //!
@@ -131,6 +132,10 @@ struct Interp<'a> {
     types: &'a [crate::elab::ElaboratedType],
     instances: Vec<ObjectInstance>,
     rng: Rng,
+    /// The run's seed, handed to the constraint-solver backend for `gen`.
+    /// Only read with the `solver-pumpkin` feature.
+    #[cfg_attr(not(feature = "solver-pumpkin"), allow(dead_code))]
+    seed: u64,
     output: String,
     depth: usize,
 }
@@ -141,6 +146,7 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
         types: elaborated.types.as_slice(),
         instances: Vec::new(),
         rng: Rng::new(seed),
+        seed,
         output: String::new(),
         depth: 0,
     };
@@ -418,6 +424,42 @@ impl<'a> Interp<'a> {
             .find(|t| t.name == obj_type_name)
             .map(|t| t.constraints.iter().map(|c| c.expr.clone()).collect())
             .unwrap_or_default();
+        // Solver-backed path (feature `solver-pumpkin`).
+        #[cfg(feature = "solver-pumpkin")]
+        {
+            let bounds: std::collections::BTreeMap<String, (i64, i64)> =
+                crate::solve::int_bounds(&declared_ty)
+                    .map(|b| (name.clone(), b))
+                    .into_iter()
+                    .collect();
+            if !bounds.is_empty()
+                && let Ok(problem) = crate::solve::translate(&constraints, &bounds)
+            {
+                match crate::solve::solve(&problem, self.seed) {
+                    crate::solve::SolveOutcome::Solved(mut assignment) => {
+                        let value = assignment.remove(0);
+                        self.store(
+                            slot_is_local,
+                            name,
+                            Value::Int(value),
+                            frame,
+                            me_index,
+                            span,
+                        )?;
+                        return Ok(Flow::Normal);
+                    }
+                    crate::solve::SolveOutcome::Unsat => {
+                        return Err(self.error(
+                            "E0407",
+                            format!("the constraints of '{obj_type_name}' are unsatisfiable"),
+                            span,
+                        ));
+                    }
+                    crate::solve::SolveOutcome::Unknown
+                    | crate::solve::SolveOutcome::Unsupported => {}
+                }
+            }
+        }
         let mut solved = false;
         for _ in 0..1000 {
             let candidate = self.sample_type(&declared_ty)?;
@@ -518,6 +560,25 @@ impl<'a> Interp<'a> {
             .iter()
             .map(|constraint| constraint.expr.clone())
             .collect();
+        // Solver-backed path (feature `solver-pumpkin`): the integer
+        // scalar fields are solved, the remaining fields are sampled.
+        #[cfg(feature = "solver-pumpkin")]
+        if let Some(assignment) =
+            self.try_solve_fields(&field_types, &constraints, &type_name, type_span)?
+        {
+            for (name, field_ty) in &field_types {
+                match assignment.iter().find(|(assigned, _)| assigned == name) {
+                    Some((_, value)) => {
+                        self.instances[index].set(name, Value::Int(*value));
+                    }
+                    None => {
+                        let value = self.sample_type(field_ty)?;
+                        self.instances[index].set(name, value);
+                    }
+                }
+            }
+            return Ok(());
+        }
         for _ in 0..1000 {
             for (name, field_ty) in &field_types {
                 let value = self.sample_type(field_ty)?;
@@ -549,6 +610,49 @@ impl<'a> Interp<'a> {
             format!("no solution found for the constraints of '{type_name}' after 1000 attempts"),
             type_span,
         ))
+    }
+
+    /// Translate the type's `keep` constraints over its integer scalar
+    /// fields and solve them with the constraint-solver backend (pumpkin).
+    /// `Ok(None)` means the caller must use the rejection sampler:
+    /// translation unsupported, backend unavailable, or search unknown.
+    #[cfg(feature = "solver-pumpkin")]
+    fn try_solve_fields(
+        &self,
+        field_types: &[(String, TypeExpr)],
+        constraints: &[Expr],
+        type_name: &str,
+        span: crate::ast::Span,
+    ) -> Result<Option<Vec<(String, i128)>>, Diagnostic> {
+        let bounds: std::collections::BTreeMap<String, (i64, i64)> = field_types
+            .iter()
+            .filter_map(|(name, ty)| crate::solve::int_bounds(ty).map(|b| (name.clone(), b)))
+            .collect();
+        if bounds.is_empty() {
+            return Ok(None);
+        }
+        let problem = match crate::solve::translate(constraints, &bounds) {
+            Ok(problem) => problem,
+            Err(_) => return Ok(None),
+        };
+        match crate::solve::solve(&problem, self.seed) {
+            crate::solve::SolveOutcome::Solved(assignment) => Ok(Some(
+                problem
+                    .vars
+                    .iter()
+                    .map(|var| var.name.clone())
+                    .zip(assignment)
+                    .collect(),
+            )),
+            crate::solve::SolveOutcome::Unsat => Err(self.error(
+                "E0407",
+                format!("the constraints of '{type_name}' are unsatisfiable"),
+                span,
+            )),
+            crate::solve::SolveOutcome::Unknown | crate::solve::SolveOutcome::Unsupported => {
+                Ok(None)
+            }
+        }
     }
 
     /// Sample one value of the declared type within its bounds. Struct
@@ -1163,7 +1267,7 @@ fn as_f64(value: &Value) -> Option<f64> {
 /// Parse an integer literal: decimal, `0x`/`0b`/`0o` prefixed, or a sized/
 /// unsized based literal (`8'hFF`, `'hFF`). Underscores are ignored; the
 /// size prefix is ignored (widths are not truncated yet).
-fn parse_int_literal(text: &str) -> Option<i128> {
+pub(crate) fn parse_int_literal(text: &str) -> Option<i128> {
     let lower = text.to_ascii_lowercase();
     let cleaned: String = lower.chars().filter(|c| *c != '_').collect();
     for (prefix, radix) in [("0x", 16u32), ("0b", 2), ("0o", 8)] {
