@@ -247,6 +247,9 @@ fn check_statements<'a>(
             | Stmt::Wait { .. }
             | Stmt::Emit { .. }
             | Stmt::Start { .. }
+            | Stmt::StopRun { .. }
+            | Stmt::ForEach { .. }
+            | Stmt::ForTo { .. }
             | Stmt::Print { .. }
             | Stmt::Gen { .. } => {}
         }
@@ -266,7 +269,7 @@ fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut 
             }
         }
         TypeExpr::List { element, .. } => check_named_type(element, declared, diagnostics),
-        TypeExpr::Scalar { .. } => {}
+        TypeExpr::Scalar { .. } | TypeExpr::InlineEnum { .. } => {}
     }
 }
 
@@ -343,6 +346,31 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
             collect_root_identifiers(cond, roots);
             collect_root_identifiers(then_expr, roots);
             collect_root_identifiers(else_expr, roots);
+        }
+        Expr::CastAs { expr, .. } => collect_root_identifiers(expr, roots),
+        Expr::BitSlice { base, high, low, .. } => {
+            collect_root_identifiers(base, roots);
+            collect_root_identifiers(high, roots);
+            collect_root_identifiers(low, roots);
+        }
+        Expr::InSet {
+            element,
+            set: crate::ast::InSetExpr::Items(items),
+            ..
+        } => {
+            collect_root_identifiers(element, roots);
+            for item in items {
+                collect_root_identifiers(item, roots);
+            }
+        }
+        Expr::InSet {
+            element,
+            set: crate::ast::InSetExpr::Range(low, high),
+            ..
+        } => {
+            collect_root_identifiers(element, roots);
+            collect_root_identifiers(low, roots);
+            collect_root_identifiers(high, roots);
         }
         Expr::HdlPath { .. } => {}
         Expr::IntLiteral { .. }

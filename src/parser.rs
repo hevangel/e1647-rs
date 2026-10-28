@@ -482,6 +482,10 @@ impl Parser {
     /// fields), hence the vector.
     fn parse_member(&mut self) -> Option<Vec<Member>> {
         match self.peek_kind() {
+            Some(TokenKind::Keyword(k)) if k == "import" => self.parse_import(),
+            Some(TokenKind::Keyword(k)) if k == "define" => {
+                self.parse_define().map(|m| vec![m])
+            }
             Some(TokenKind::Identifier(_)) => {
                 if matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == "(") {
                     self.parse_method().map(|m| vec![m])
@@ -505,6 +509,50 @@ impl Parser {
                 None
             }
         }
+    }
+
+    /// `import a, b.c;` — records the imported module names; cross-file
+    /// resolution is a later milestone.
+    fn parse_import(&mut self) -> Option<Vec<Member>> {
+        let start = self.current_span().0;
+        self.bump(); // 'import'
+        let mut names = Vec::new();
+        loop {
+            let (name, _) = self.expect_identifier("E0102", "expected a module name after 'import'")?;
+            names.push(name);
+            if !self.eat_punct(",") {
+                break;
+            }
+        }
+        self.expect_punct(";", "E0105", "expected ';' after the import list")?;
+        let end = self.last_end();
+        Some(vec![Member::Import {
+            names,
+            span: (start, end),
+        }])
+    }
+
+    /// `define name value;` — a compile-time constant.
+    fn parse_define(&mut self) -> Option<Member> {
+        let start = self.current_span().0;
+        self.bump(); // 'define'
+        let (name, name_span) = self.expect_identifier("E0102", "expected a name after 'define'")?;
+        let value = if self.at_punct(";") {
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
+        self.expect_punct(";", "E0105", "expected ';' after the define value")?;
+        let end = self.last_end();
+        Some(Member::Define {
+            name,
+            value,
+            span: (start, name_span.1),
+        })
+        .map(|member| {
+            let _ = end;
+            member
+        })
     }
 
     /// `when <modifier> [<modifier> ..] { members };` — a modifier is
@@ -564,6 +612,9 @@ impl Parser {
 
     /// `name, name: type;` — a name group declares one field per name.
     fn parse_fields(&mut self) -> Option<Vec<Member>> {
+        // `%name` physical / `!name` do-not-generate prefixes.
+        let physical = self.eat_punct("%");
+        let no_gen = if !physical { self.eat_punct("!") } else { false };
         let (first, first_span) = self.expect_identifier("E0102", "expected field name")?;
         let mut names = vec![(first, first_span)];
         while self.eat_punct(",") {
@@ -588,6 +639,8 @@ impl Parser {
                         name,
                         name_span,
                         ty: ty.clone(),
+                        physical,
+                        no_gen,
                     })
                 })
                 .collect(),
@@ -794,6 +847,24 @@ impl Parser {
 
     fn parse_type(&mut self) -> Option<TypeExpr> {
         let (start, _) = self.current_span();
+        if self.at_punct("[") {
+            // Inline enumeral list type: [imm, reg].
+            self.bump();
+            let mut names = Vec::new();
+            loop {
+                let (name, _) = self.expect_identifier("E0102", "expected an enumeral name")?;
+                names.push(name);
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            self.expect_punct("]", "E0107", "expected ']' to close the enumeral list")?;
+            let end = self.last_end();
+            return Some(TypeExpr::InlineEnum {
+                names,
+                span: (start, end),
+            });
+        }
         if self.at_identifier() {
             let (name, span) = self.take_identifier();
             return Some(TypeExpr::Named { name, span });
@@ -939,6 +1010,7 @@ impl Parser {
             }
             Some(TokenKind::Keyword(k)) if k == "case" => self.parse_case_statement(),
             Some(TokenKind::Keyword(k)) if k == "wait" => self.parse_wait_statement(),
+            Some(TokenKind::Keyword(k)) if k == "for" => self.parse_for_statement(),
             Some(TokenKind::Keyword(k)) if k == "emit" => {
                 self.bump();
                 let target = self.parse_expr()?;
@@ -1140,24 +1212,98 @@ impl Parser {
         })
     }
 
+    /// `for each in <list> do { .. };` and
+    /// `for <var> from <a> to <b> { .. };`
+    fn parse_for_statement(&mut self) -> Option<Stmt> {
+        let start = self.current_span().0;
+        self.bump(); // 'for'
+        if self.eat_keyword("each") {
+            self.expect_keyword_word("in")?;
+            let list = self.parse_expr()?;
+            self.expect_keyword_word("do")?;
+            self.expect_punct("{", "E0106", "expected '{' to open the for-each body")?;
+            let body = self.parse_statements();
+            self.expect_punct("}", "E0107", "expected '}' to close the for-each body")?;
+            self.expect_punct(";", "E0105", "expected ';' after the for-each statement")?;
+            let end = self.last_end();
+            return Some(Stmt::ForEach {
+                list,
+                body,
+                span: (start, end),
+            });
+        }
+        let (var, _) = self.expect_identifier("E0102", "expected the loop variable after 'for'")?;
+        self.expect_keyword_word("from")?;
+        let from = self.parse_expr()?;
+        self.expect_keyword_word("to")?;
+        let to = self.parse_expr()?;
+        self.expect_punct("{", "E0106", "expected '{' to open the for body")?;
+        let body = self.parse_statements();
+        self.expect_punct("}", "E0107", "expected '}' to close the for body")?;
+        self.expect_punct(";", "E0105", "expected ';' after the for statement")?;
+        let end = self.last_end();
+        Some(Stmt::ForTo {
+            var,
+            from,
+            to,
+            body,
+            span: (start, end),
+        })
+    }
+
+    /// Consume a keyword-word (e.g. `in`, `do`, `from`, `to`) or record
+    /// a diagnostic and fail.
+    fn expect_keyword_word(&mut self, word: &str) -> Option<()> {
+        if self.eat_keyword(word) {
+            Some(())
+        } else {
+            self.error_here("E0102", &format!("expected '{word}'"));
+            None
+        }
+    }
+
     // ---- expressions, loosest to tightest binding ----
 
     fn parse_expr(&mut self) -> Option<Expr> {
-        let cond = self.parse_binary_level(0)?;
+        let first = self.parse_binary_level(0)?;
+        // `expr in [a, b]` / `expr in [low .. high]` membership.
+        if self.eat_keyword("in") {
+            self.expect_punct("[", "E0106", "expected '[' after 'in'")?;
+            let first_item = self.parse_expr()?;
+            let set = if self.eat_punct("..") {
+                let high = self.parse_expr()?;
+                self.expect_punct("]", "E0107", "expected ']' to close the range")?;
+                crate::ast::InSetExpr::Range(Box::new(first_item), Box::new(high))
+            } else {
+                let mut items = vec![first_item];
+                while self.eat_punct(",") {
+                    items.push(self.parse_expr()?);
+                }
+                self.expect_punct("]", "E0107", "expected ']' to close the set")?;
+                crate::ast::InSetExpr::Items(items)
+            };
+            let start = first.span().0;
+            let end = self.last_end();
+            return Some(Expr::InSet {
+                element: Box::new(first),
+                set,
+                span: (start, end),
+            });
+        }
         if self.eat_punct("?") {
             let then_expr = self.parse_expr()?;
             self.expect_punct(":", "E0103", "expected ':' in the ternary expression")?;
             let else_expr = self.parse_expr()?;
-            let start = cond.span().0;
+            let start = first.span().0;
             let end = else_expr.span().1;
             return Some(Expr::Ternary {
-                cond: Box::new(cond),
+                cond: Box::new(first),
                 then_expr: Box::new(then_expr),
                 else_expr: Box::new(else_expr),
                 span: (start, end),
             });
         }
-        Some(cond)
+        Some(first)
     }
 
     fn parse_binary_level(&mut self, level: usize) -> Option<Expr> {
@@ -1271,6 +1417,22 @@ impl Parser {
                         self.bump();
                         let (member, member_span) =
                             self.expect_identifier("E0102", "expected member name after '.'")?;
+                        // `expr.as_a(type)` cast.
+                        if member == "as_a" && self.at_punct("(") {
+                            self.bump();
+                            let ty = self.parse_type()?;
+                            self.expect_punct(
+                                ")",
+                                "E0110",
+                                "expected ')' to close the cast",
+                            )?;
+                            expr = Expr::CastAs {
+                                expr: Box::new(expr),
+                                ty,
+                                span: (start, self.last_end()),
+                            };
+                            continue;
+                        }
                         expr = Expr::MemberAccess {
                             object: Box::new(expr),
                             name: member,
@@ -1300,17 +1462,33 @@ impl Parser {
                         };
                     } else if self.at_punct("[") {
                         self.bump();
-                        let index = self.parse_expr()?;
-                        self.expect_punct(
-                            "]",
-                            "E0107",
-                            "expected ']' to close the index expression",
-                        )?;
-                        expr = Expr::Index {
-                            base: Box::new(expr),
-                            index: Box::new(index),
-                            span: (start, self.last_end()),
-                        };
+                        let first = self.parse_expr()?;
+                        if self.eat_punct(":") {
+                            // Bit slice: base[high:low].
+                            let low = self.parse_expr()?;
+                            self.expect_punct(
+                                "]",
+                                "E0107",
+                                "expected ']' to close the bit slice",
+                            )?;
+                            expr = Expr::BitSlice {
+                                base: Box::new(expr),
+                                high: Box::new(first),
+                                low: Box::new(low),
+                                span: (start, self.last_end()),
+                            };
+                        } else {
+                            self.expect_punct(
+                                "]",
+                                "E0107",
+                                "expected ']' to close the index expression",
+                            )?;
+                            expr = Expr::Index {
+                                base: Box::new(expr),
+                                index: Box::new(first),
+                                span: (start, self.last_end()),
+                            };
+                        }
                     } else {
                         break;
                     }

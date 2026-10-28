@@ -752,3 +752,33 @@ inline-TCM execution and the E0409 budget test, 24 parser, 15 lexer,
 10 elab, 10 solve, 1 fixtures(18 pairs), 6 solve-translations); container
 `verify` green with all features; container `mixed-port` green (5/5
 cycles, signal-map style).
+
+## 2026-10-27 (11) — rung 2b/3 slice: inline enums, defines, for-loops, in-sets, casts, slices; spmn-e-utils baseline
+
+- Inline enumeral types: `kind : [imm, reg];` — field defaults to the
+  first enumerand, bare enumerand names resolve, `gen` picks randomly.
+- `define` members: `define strt_st 1;` — literal values resolve as
+  global constants at run time (macro `define as`/`as computed`
+  substitution remains a later milestone).
+- Loops: `for each in <list> do { .. };` (binds `it`) and
+  `for i from a to b { .. };` (inclusive).
+- Membership: `x in [a, b]` and `x in [low .. high]` expressions; casts
+  `expr.as_a(type)` (value-preserving); bit slices `base[high:low]`
+  (integer extraction).
+- spmn-e-utils (github.com/efratcdn/spmn-e-utils) added as the submodule
+  `external/spmn-e-utils` (index repo; the utilities live in separate
+  repos — 7 cloned shallowly under `local/spmn-utils/`, gitignored).
+  Baseline: 17 e files probed, 1–25 diagnostics each; the four
+  `e_util_*` libraries sit at 1 diagnostic (blocked on `define as` /
+  `as computed` macro machinery — rung 3); the usage examples sit at
+  5–25 (sequences/ports/UVC structure).
+
+Verification: fmt/clippy/test green locally (79 tests: 14 interp incl.
+case/ternary/outf execution, 24 parser incl. inline-enum + in-set +
+slices, 15 lexer); container `verify` green with all features;
+`mixed-port` green.
+
+Combined SN-CPU golden delta now measured on the same file: re-run after
+this slice lands the count in the entry-10 range (83) with the remaining
+blockers being `when`-inheritance semantics, `import` hub resolution and
+struct/`check that`-style statements — the rung 2b execution work.

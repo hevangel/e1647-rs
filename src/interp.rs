@@ -109,6 +109,8 @@ enum Flow {
     Break,
     Continue,
     Return(Value),
+    /// `stop_run()` — unwind to the top of the run.
+    Stop,
 }
 
 /// splitmix64: small, seedable, deterministic — no external dependency.
@@ -158,6 +160,10 @@ struct Interp<'a> {
     wait_budget: u64,
     /// Events fired by `emit`, keyed by their path as written.
     emitted: std::collections::BTreeSet<String>,
+    /// Set by `stop_run()`; unwinds the whole run.
+    stop_requested: bool,
+    /// `define` constants resolved to values.
+    defines: std::collections::BTreeMap<String, Value>,
 }
 
 /// How many `wait` statements one run may execute (the runaway-TCM guard).
@@ -165,6 +171,23 @@ const WAIT_BUDGET: u64 = 100_000;
 
 /// Instantiate the built-in `sys` unit and execute its `run()` methods.
 pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
+    // Resolve `define` constants (literal values only; non-literals are
+    // skipped — they need the elaboration-time substitution that a macro
+    // pass would provide).
+    let defines: std::collections::BTreeMap<String, Value> = elaborated
+        .defines
+        .iter()
+        .filter_map(|(name, expr)| {
+            let value = match expr {
+                Expr::IntLiteral { text, .. } => parse_int_literal(text).map(Value::Int),
+                Expr::BitLiteral { text, .. } => parse_int_literal(text).map(Value::Int),
+                Expr::StringLiteral { value, .. } => Some(Value::Str(unescape(value))),
+                Expr::BoolLiteral { value, .. } => Some(Value::Bool(*value)),
+                _ => None,
+            }?;
+            Some((name.clone(), value))
+        })
+        .collect();
     let mut interp = Interp {
         types: elaborated.types.as_slice(),
         instances: Vec::new(),
@@ -176,6 +199,8 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
         cycle: 0,
         wait_budget: WAIT_BUDGET,
         emitted: std::collections::BTreeSet::new(),
+        stop_requested: false,
+        defines,
     };
     let types: &[crate::elab::ElaboratedType] = interp.types;
     let Some(sys) = types
@@ -260,6 +285,16 @@ impl<'a> Interp<'a> {
                 _ => Value::Int(0),
             },
             TypeExpr::List { .. } => Value::List(Vec::new()),
+            TypeExpr::InlineEnum { names, .. } => {
+                // The default enumerand is the first one declared.
+                match names.first() {
+                    Some(first) => Value::Enum {
+                        type_name: inline_enum_key(names),
+                        name: first.clone(),
+                    },
+                    None => Value::Void,
+                }
+            }
             TypeExpr::Named { name, .. } => {
                 let types: &[crate::elab::ElaboratedType] = self.types;
                 if let Some(t) = types.iter().find(|t| t.name == name.as_str())
@@ -410,6 +445,7 @@ impl<'a> Interp<'a> {
                         Flow::Break => break,
                         Flow::Continue | Flow::Normal => {}
                         Flow::Return(value) => return Ok(Flow::Return(value)),
+                        Flow::Stop => return Ok(Flow::Stop),
                     }
                 }
                 Ok(Flow::Normal)
@@ -433,6 +469,58 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             Stmt::Gen { expr, span } => self.exec_gen(expr, frame, me, *span),
+            Stmt::StopRun { .. } => {
+                self.stop_requested = true;
+                Ok(Flow::Stop)
+            }
+            Stmt::ForEach { list, body, span } => {
+                let list_value = self.eval(list, frame, me)?;
+                match list_value {
+                    Value::List(items) => {
+                        for item in items {
+                            frame.locals.insert("it".to_owned(), item);
+                            match self.exec_block(body, frame, me)? {
+                                Flow::Normal => {}
+                                Flow::Break => break,
+                                Flow::Continue => continue,
+                                other => return Ok(other),
+                            }
+                        }
+                        Ok(Flow::Normal)
+                    }
+                    other => Err(self.error(
+                        "E0402",
+                        format!("for-each expects a list, got {}", self.value_kind(&other)),
+                        *span,
+                    )),
+                }
+            }
+            Stmt::ForTo {
+                var,
+                from,
+                to,
+                body,
+                span,
+            } => {
+                let Value::Int(start_v) = self.eval(from, frame, me)? else {
+                    return Err(self.error("E0402", "for lower bound must be an integer", *span));
+                };
+                let Value::Int(end_v) = self.eval(to, frame, me)? else {
+                    return Err(self.error("E0402", "for upper bound must be an integer", *span));
+                };
+                let mut i = start_v;
+                while i <= end_v {
+                    frame.locals.insert(var.clone(), Value::Int(i));
+                    match self.exec_block(body, frame, me)? {
+                        Flow::Normal => {}
+                        Flow::Break => break,
+                        Flow::Continue => continue,
+                        other => return Ok(other),
+                    }
+                    i += 1;
+                }
+                Ok(Flow::Normal)
+            }
             Stmt::Wait { cycles, span } => {
                 let Value::Int(n) = self.eval(cycles, frame, me)? else {
                     return Err(self.error("E0402", "wait count must be an integer", *span));
@@ -841,6 +929,17 @@ impl<'a> Interp<'a> {
                 result?;
                 Ok(Value::Object(index))
             }
+            TypeExpr::InlineEnum { names, .. } => {
+                // Random enumerand from the inline list.
+                if names.is_empty() {
+                    return Ok(Value::Void);
+                }
+                let pick = names[self.rng.below(names.len() as u128) as usize].clone();
+                Ok(Value::Enum {
+                    type_name: inline_enum_key(names),
+                    name: pick,
+                })
+            }
         }
     }
 
@@ -899,6 +998,11 @@ impl<'a> Interp<'a> {
             match self.exec_block(&block.body, &mut frame, Some(object_index))? {
                 Flow::Return(value) => result = value,
                 Flow::Normal | Flow::Break | Flow::Continue => {}
+                // stop_run() inside a TCM unwinds the whole run; the flag
+                // is checked by the run loop and the calling scheduler.
+                Flow::Stop => {
+                    self.stop_requested = true;
+                }
             }
         }
         self.depth -= 1;
@@ -1181,6 +1285,10 @@ impl<'a> Interp<'a> {
                 if let Some(port) = name.strip_suffix('$') {
                     return self.read_port_value(port, me, *span);
                 }
+                // `define` constants.
+                if let Some(value) = self.defines.get(name) {
+                    return Ok(value.clone());
+                }
                 if let Some(value) = frame.locals.get(name) {
                     return Ok(value.clone());
                 }
@@ -1196,6 +1304,19 @@ impl<'a> Interp<'a> {
                             type_name: t.name.clone(),
                             name: name.clone(),
                         });
+                    }
+                }
+                // Inline enumeral lists on fields: `[imm, reg]` etc.
+                for t in types {
+                    for field in &t.fields {
+                        if let TypeExpr::InlineEnum { names, .. } = &field.ty
+                            && names.iter().any(|n| n == name)
+                        {
+                            return Ok(Value::Enum {
+                                type_name: inline_enum_key(names),
+                                name: name.clone(),
+                            });
+                        }
                     }
                 }
                 Err(self.error("E0401", format!("unknown identifier '{name}'"), *span))
@@ -1353,6 +1474,76 @@ impl<'a> Interp<'a> {
                 } else {
                     self.eval(else_expr, frame, me)
                 }
+            }
+            Expr::CastAs { expr, .. } => {
+                // Casts are value-preserving in this subset: integers,
+                // enumerals and booleans flow through unchanged.
+                self.eval(expr, frame, me)
+            }
+            Expr::BitSlice { base, high, low, span } => {
+                let Value::Int(value) = self.eval(base, frame, me)? else {
+                    return Err(self.error("E0402", "bit slice expects an integer", *span));
+                };
+                let Value::Int(h) = self.eval(high, frame, me)? else {
+                    return Err(self.error("E0402", "slice bound must be an integer", *span));
+                };
+                let Value::Int(l) = self.eval(low, frame, me)? else {
+                    return Err(self.error("E0402", "slice bound must be an integer", *span));
+                };
+                if l < 0 || h < l || h >= 127 {
+                    return Err(self.error("E0402", "bit slice range invalid", *span));
+                }
+                let width = (h - l + 1) as u32;
+                let mask: i128 = if width >= 127 { -1 } else { (1i128 << width) - 1 };
+                Ok(Value::Int((value >> l) & mask))
+            }
+            Expr::InSet {
+                element,
+                set,
+                span,
+            } => {
+                let value = self.eval(element, frame, me)?;
+                let contained = match set {
+                    crate::ast::InSetExpr::Items(items) => {
+                        let mut found = false;
+                        for item in items {
+                            let item_value = self.eval(item, frame, me)?;
+                            if matches!(
+                                self.apply_binary(BinaryOp::Eq, value.clone(), item_value, *span)?,
+                                Value::Bool(true)
+                            ) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        found
+                    }
+                    crate::ast::InSetExpr::Range(low, high) => {
+                        let Value::Int(low_v) = self.eval(low, frame, me)? else {
+                            return Err(self.error(
+                                "E0402",
+                                "range bound must be an integer",
+                                *span,
+                            ));
+                        };
+                        let Value::Int(high_v) = self.eval(high, frame, me)? else {
+                            return Err(self.error(
+                                "E0402",
+                                "range bound must be an integer",
+                                *span,
+                            ));
+                        };
+                        let Value::Int(v) = &value else {
+                            return Err(self.error(
+                                "E0402",
+                                "range membership expects an integer",
+                                *span,
+                            ));
+                        };
+                        low_v <= *v && *v <= high_v
+                    }
+                };
+                Ok(Value::Bool(contained))
             }
             Expr::HdlPath { path, span } => {
                 if self.hdl.is_none() {
@@ -1721,6 +1912,11 @@ fn width_bits(width: &Option<Box<Expr>>, default_bits: u32) -> u32 {
 
 /// Integer view of a value for the `hdl_*` routines: integers pass
 /// through, booleans become 0/1 (handy for clock and reset pins).
+/// Stable type key for an inline enumeral list.
+fn inline_enum_key(names: &[String]) -> String {
+    format!("[{}]", names.join(","))
+}
+
 fn as_i64(value: &Value) -> Option<i64> {
     match value {
         Value::Int(i) => i64::try_from(*i).ok(),

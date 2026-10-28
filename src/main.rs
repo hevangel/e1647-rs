@@ -150,6 +150,7 @@ fn render_type(ty: &e1647::ast::TypeExpr) -> String {
         },
         TypeExpr::List { element, .. } => format!("list of {}", render_type(element)),
         TypeExpr::Named { name, .. } => name.clone(),
+        TypeExpr::InlineEnum { names, .. } => format!("[{}]", names.join(", ")),
     }
 }
 
@@ -204,6 +205,10 @@ fn print_members(members: &[e1647::ast::Member], indent: &str) {
             Member::Event(event) => {
                 println!("{indent}event {} (line {})", event.name, event.span.0.line)
             }
+            Member::Import { names, .. } => {
+                println!("{indent}import {}", names.join(", "));
+            }
+            Member::Define { name, .. } => println!("{indent}define {name}"),
             Member::Constraint(constraint) => println!(
                 "{indent}keep{} (line {})",
                 if constraint.is_soft { " soft" } else { "" },

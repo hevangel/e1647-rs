@@ -60,6 +60,8 @@ pub struct Elaborated {
     /// In declaration order; `extend` blocks are folded into their targets
     /// and do not appear separately.
     pub types: Vec<ElaboratedType>,
+    /// `define` constants by name (literal values only).
+    pub defines: BTreeMap<String, crate::ast::Expr>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -168,8 +170,19 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         }
     }
     elaborator.compose_builtin_units(&mut types);
+    let mut defines = BTreeMap::new();
+    for declaration in declarations {
+        for member in &declaration.members {
+            if let Member::Define { name, value, .. } = member
+                && let Some(value) = value
+            {
+                defines.insert(name.clone(), value.clone());
+            }
+        }
+    }
     Elaborated {
         types,
+        defines,
         diagnostics: elaborator.diagnostics,
     }
 }
@@ -335,6 +348,7 @@ impl<'a> Elaborator<'a> {
                 Member::Method(method) => composed.methods.push((method, block)),
                 Member::When(when) => composed.whens.push(when),
                 Member::Port(port) => composed.ports.push((port, block)),
+                Member::Import { .. } | Member::Define { .. } => {}
                 Member::Event(_) | Member::Enumeral(_) => {}
             }
         }

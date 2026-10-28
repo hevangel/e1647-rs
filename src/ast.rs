@@ -45,6 +45,15 @@ pub enum Member {
     Port(PortDecl),
     /// An `event` member.
     Event(EventDecl),
+    /// `import a, b;` — recorded; no cross-file resolution yet.
+    Import { names: Vec<String>, span: Span },
+    /// `define name value;` — a compile-time constant; the name resolves
+    /// to the value's literal in the interpreter.
+    Define {
+        name: String,
+        value: Option<Expr>,
+        span: Span,
+    },
 }
 
 /// A `when` subtype member: one or more `value'id` (or bare `id`) modifiers
@@ -103,6 +112,10 @@ pub struct Field {
     pub name: String,
     pub name_span: Span,
     pub ty: TypeExpr,
+    /// `%name` physical field (packing-relevant).
+    pub physical: bool,
+    /// `!name` do-not-generate field (skipped by `gen`).
+    pub no_gen: bool,
 }
 
 /// A `keep <expr>;` or `keep soft <expr>;` constraint. The expression is
@@ -203,6 +216,24 @@ pub enum Stmt {
         expr: Expr,
         span: Span,
     },
+    /// `stop_run();` — ends the simulation run.
+    StopRun {
+        span: Span,
+    },
+    /// `for each in list do { .. };` — binds `it` to each element.
+    ForEach {
+        list: Expr,
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    /// `for i from a to b { .. };` — inclusive bounds.
+    ForTo {
+        var: String,
+        from: Expr,
+        to: Expr,
+        body: Vec<Stmt>,
+        span: Span,
+    },
     /// `wait cycle;` / `wait [n];` / `wait [n] * cycle;` — advances
     /// simulation time by the evaluated cycle count.
     Wait {
@@ -244,6 +275,9 @@ impl Stmt {
             | Stmt::Continue { span }
             | Stmt::Print { span, .. }
             | Stmt::Gen { span, .. }
+            | Stmt::StopRun { span }
+            | Stmt::ForEach { span, .. }
+            | Stmt::ForTo { span, .. }
             | Stmt::Wait { span, .. }
             | Stmt::Emit { span, .. }
             | Stmt::Start { span, .. }
@@ -308,6 +342,8 @@ pub enum TypeExpr {
     List { element: Box<TypeExpr>, span: Span },
     /// A user-defined type name.
     Named { name: String, span: Span },
+    /// An inline enumeral list type: `[imm, reg]`.
+    InlineEnum { names: Vec<String>, span: Span },
 }
 
 impl TypeExpr {
@@ -315,6 +351,7 @@ impl TypeExpr {
         match self {
             TypeExpr::Scalar { span, .. } | TypeExpr::List { span, .. } => *span,
             TypeExpr::Named { span, .. } => *span,
+            TypeExpr::InlineEnum { span, .. } => *span,
         }
     }
 }
@@ -424,6 +461,34 @@ pub enum Expr {
         path: String,
         span: Span,
     },
+    /// `expr.as_a(type)` cast.
+    CastAs {
+        expr: Box<Expr>,
+        ty: TypeExpr,
+        span: Span,
+    },
+    /// Bit slice `base[high:low]` (integer extraction).
+    BitSlice {
+        base: Box<Expr>,
+        high: Box<Expr>,
+        low: Box<Expr>,
+        span: Span,
+    },
+    /// `element in [a, b]` / `element in [low .. high]` membership.
+    InSet {
+        element: Box<Expr>,
+        set: InSetExpr,
+        span: Span,
+    },
+}
+
+/// The right-hand side of an `in` membership expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InSetExpr {
+    /// `[a, b, c]` — any match.
+    Items(Vec<Expr>),
+    /// `[low .. high]` — inclusive numeric range.
+    Range(Box<Expr>, Box<Expr>),
 }
 
 impl Expr {
@@ -442,6 +507,9 @@ impl Expr {
             | Expr::Unary { span, .. }
             | Expr::Paren { span, .. }
             | Expr::Ternary { span, .. }
+            | Expr::CastAs { span, .. }
+            | Expr::BitSlice { span, .. }
+            | Expr::InSet { span, .. }
             | Expr::HdlPath { span, .. } => *span,
         }
     }
