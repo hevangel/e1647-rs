@@ -54,12 +54,15 @@ use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Position, Token, TokenKind};
 
 /// Binary operators from loosest to tightest binding (C-style precedence;
-/// all left-associative in this subset).
+/// all left-associative in this subset). The word spellings (`and`, `or`,
+/// `xor`) share the level of their symbol twins, as in the reference
+/// grammar.
 const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
-    &[("||", BinaryOp::LogicalOr)],
-    &[("&&", BinaryOp::LogicalAnd)],
+    &[("=>", BinaryOp::Imply)],
+    &[("||", BinaryOp::LogicalOr), ("or", BinaryOp::LogicalOr)],
+    &[("&&", BinaryOp::LogicalAnd), ("and", BinaryOp::LogicalAnd)],
     &[("|", BinaryOp::BitOr)],
-    &[("^", BinaryOp::BitXor)],
+    &[("^", BinaryOp::BitXor), ("xor", BinaryOp::BitXor)],
     &[("&", BinaryOp::BitAnd)],
     &[
         ("==", BinaryOp::Eq),
@@ -498,6 +501,11 @@ impl Parser {
             }
             Some(TokenKind::Keyword(k)) if k == "when" => self.parse_when(),
             Some(TokenKind::Keyword(k)) if k == "event" => self.parse_event().map(|e| vec![e]),
+            // The explicit `method name() …` spelling; the bare
+            // `name() …` init style is handled by the identifier arm.
+            Some(TokenKind::Keyword(k)) if k == "method" => self.parse_method().map(|m| vec![m]),
+            // `%name` physical / `!name` do-not-generate field prefixes.
+            Some(TokenKind::Punctuation(p)) if p == "%" || p == "!" => self.parse_fields(),
             _ => {
                 self.error_here(
                     "E0113",
@@ -650,6 +658,8 @@ impl Parser {
     /// `name(params): return_type is [also|first|only] { statements };`
     fn parse_method(&mut self) -> Option<Member> {
         let start = self.current_span().0;
+        // Optional explicit `method` keyword (`method name() is { .. }`).
+        self.eat_keyword("method");
         let (name, name_span) = self.take_identifier();
         self.expect_punct(
             "(",
@@ -706,6 +716,21 @@ impl Parser {
         } else {
             None
         };
+        // `is empty;` — a body-less method (no-op by declaration).
+        if self.eat_keyword("empty") {
+            self.expect_punct(";", "E0105", "expected ';' after the method declaration")?;
+            let end = self.last_end();
+            return Some(Member::Method(MethodDecl {
+                name,
+                name_span,
+                params,
+                return_type,
+                tcm_event,
+                modifier,
+                body: Vec::new(),
+                span: (start, end),
+            }));
+        }
         self.expect_punct("{", "E0106", "expected '{' to open the method body")?;
         let body = self.parse_statements();
         self.expect_punct("}", "E0107", "expected '}' to close the method body")?;
@@ -808,16 +833,16 @@ impl Parser {
         }))
     }
 
-    /// `event name;` or `event name is <trigger>;` — the trigger
-    /// expression is stored as written (e.g. `fall(clk$) @sim`,
-    /// `cycle @p_smp.clock_f`, `@sys.any`); edge scheduling is a later
-    /// milestone.
+    /// `event name;` or `event name is <trigger>;` — the trigger grammar
+    /// covers `@path` attachments (dotted, `or`-composed, with `only`/
+    /// `unexp` and `cycle` forms) and `rise(cond) @path`-style edge
+    /// samples; edge scheduling itself is a later milestone.
     fn parse_event(&mut self) -> Option<Member> {
         let start = self.current_span().0;
         self.bump(); // 'event'
         let (name, name_span) = self.expect_identifier("E0102", "expected event name")?;
         let trigger = if self.eat_keyword("is") {
-            Some(self.parse_expr()?)
+            Some(self.parse_event_trigger()?)
         } else {
             None
         };
@@ -831,16 +856,191 @@ impl Parser {
         }))
     }
 
+    /// `[only|unexp] [cycle] item (`or` item)*` where an item is
+    /// `@dotted.path` or `routine(cond) @dotted.path`.
+    fn parse_event_trigger(&mut self) -> Option<crate::ast::EventTrigger> {
+        let modifier = if self.eat_word("only") {
+            Some("only".to_owned())
+        } else if self.eat_word("unexp") {
+            Some("unexp".to_owned())
+        } else {
+            None
+        };
+        // `cycle` is a keyword only in this position; `event x is cycle`
+        // without a following `@` is not a valid trigger, so the lookahead
+        // keeps `cycle` usable as an identifier elsewhere.
+        let cycle = self.peek_word_is("cycle")
+            && matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == "@");
+        if cycle {
+            self.bump();
+        }
+        let mut items = Vec::new();
+        loop {
+            let condition = if self.peek_is_edge_routine() {
+                let routine = self.take_word()?;
+                if !matches!(routine.as_str(), "rise" | "fall" | "change" | "true") {
+                    self.error_here("E0102", &format!("unknown edge routine '{routine}'"));
+                    return None;
+                }
+                self.expect_punct("(", "E0108", "expected '(' after the edge routine")?;
+                let condition = self.parse_expr()?;
+                self.expect_punct(")", "E0108", "expected ')' after the edge condition")?;
+                Some(condition)
+            } else {
+                None
+            };
+            self.expect_punct("@", "E0108", "expected '@' in the event trigger")?;
+            let path = self.parse_dotted_path()?;
+            items.push(crate::ast::EventTriggerItem { path, condition });
+            if !self.eat_keyword("or") {
+                break;
+            }
+        }
+        Some(crate::ast::EventTrigger {
+            modifier,
+            cycle,
+            items,
+        })
+    }
+
+    /// A dotted identifier path whose segments may end in the HDL `$`
+    /// suffix (`p_smp.clk`, `off_p$`).
+    fn parse_dotted_path(&mut self) -> Option<Vec<String>> {
+        let mut segments = Vec::new();
+        loop {
+            let (segment, _) =
+                self.expect_identifier("E0102", "expected a path segment in the trigger")?;
+            segments.push(segment);
+            if !self.eat_punct(".") {
+                break;
+            }
+        }
+        Some(segments)
+    }
+
+    /// Consume tokens up to (not including) the terminating `;` and
+    /// return their concatenated text as an HDL path. Used for `keep
+    /// bind … to <hdl_path>` targets, which are simulator-side paths
+    /// rather than e expressions.
+    fn parse_raw_path_tokens(&mut self) -> Expr {
+        let start = self.current_span().0;
+        let mut path = String::new();
+        while let Some(token) = self.peek() {
+            match &token.kind {
+                TokenKind::Punctuation(p) if p == ";" => break,
+                TokenKind::Identifier(text)
+                | TokenKind::Keyword(text)
+                | TokenKind::Number(text)
+                | TokenKind::Punctuation(text) => path.push_str(text),
+                TokenKind::StringLiteral(text) => {
+                    path.push('"');
+                    path.push_str(text);
+                    path.push('"');
+                }
+            }
+            self.bump();
+        }
+        Expr::HdlPath {
+            path,
+            span: (start, self.last_end()),
+        }
+    }
+
+    /// The keyword or identifier text at the cursor, if any.
+    fn peek_word(&self) -> Option<&str> {
+        match self.peek_kind() {
+            Some(TokenKind::Keyword(k)) => Some(k.as_str()),
+            Some(TokenKind::Identifier(s)) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    fn peek_word_is(&self, word: &str) -> bool {
+        self.peek_word() == Some(word)
+    }
+
+    fn eat_word(&mut self, word: &str) -> bool {
+        if self.peek_word_is(word) {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume and return the keyword or identifier text at the cursor.
+    fn take_word(&mut self) -> Option<String> {
+        match self.peek_kind() {
+            Some(TokenKind::Keyword(k)) => {
+                let text = k.clone();
+                self.bump();
+                Some(text)
+            }
+            Some(TokenKind::Identifier(s)) => {
+                let text = s.clone();
+                self.bump();
+                Some(text)
+            }
+            _ => None,
+        }
+    }
+
+    /// `rise`/`fall`/`change`/`true` immediately followed by `(` — the
+    /// distinguishing lookahead against an `@path` item.
+    fn peek_is_edge_routine(&self) -> bool {
+        matches!(
+            self.peek_word(),
+            Some("rise") | Some("fall") | Some("change") | Some("true")
+        ) && matches!(
+            self.peek_second_kind(),
+            Some(TokenKind::Punctuation(p)) if p == "("
+        )
+    }
+
     fn parse_keep(&mut self) -> Option<KeepConstraint> {
         let start = self.current_span().0;
         self.bump(); // 'keep'
         let is_soft = self.eat_keyword("soft");
-        let expr = self.parse_expr()?;
+        // `keep bind (port, hdl_kind);` — hierarchical HDL binding,
+        // recorded as a `bind(a, b)` call and skipped by checking/gen.
+        // The template form inside `define … as` bodies is macro
+        // machinery and still fails here.
+        let is_bind = self.eat_keyword("bind");
+        let expr = if is_bind {
+            // Both corpus shapes: `keep bind (port, kind);` and the UVM-e
+            // `keep bind bfm to hdl_instance;`.
+            let first = if self.eat_punct("(") {
+                let first = self.parse_expr()?;
+                self.expect_punct(",", "E0108", "expected ',' between the bind operands")?;
+                let second = self.parse_expr()?;
+                self.expect_punct(")", "E0108", "expected ')' after the bind operands")?;
+                vec![first, second]
+            } else {
+                let first = self.parse_expr()?;
+                self.expect_keyword_word("to")?;
+                // The bind target is an HDL instance path (`~/dut/u0`);
+                // store it as written rather than forcing it into the e
+                // expression grammar.
+                let second = self.parse_raw_path_tokens();
+                vec![first, second]
+            };
+            Expr::Call {
+                callee: Box::new(Expr::Ident {
+                    name: "bind".to_owned(),
+                    span: (start, start),
+                }),
+                args: first,
+                span: (start, self.last_end()),
+            }
+        } else {
+            self.parse_expr()?
+        };
         self.expect_punct(";", "E0105", "expected ';' after keep constraint")?;
         let end = self.last_end();
         Some(KeepConstraint {
             expr,
             is_soft,
+            is_bind,
             span: (start, end),
         })
     }
@@ -1317,6 +1517,10 @@ impl Parser {
                     .iter()
                     .find(|(text, _)| text == symbol)
                     .map(|(_, op)| *op),
+                Some(TokenKind::Keyword(word)) => operators
+                    .iter()
+                    .find(|(text, _)| *text == word.as_str())
+                    .map(|(_, op)| *op),
                 _ => None,
             };
             let Some(op) = op else { break };
@@ -1336,6 +1540,28 @@ impl Parser {
 
     fn parse_unary(&mut self) -> Option<Expr> {
         let (start, _) = self.current_span();
+        // `not` is the word-spelled logical negation.
+        if self.eat_keyword("not") {
+            let inner = self.parse_unary()?;
+            let end = inner.span().1;
+            return Some(Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(inner),
+                span: (start, end),
+            });
+        }
+        // A mid-expression `soft` prefix (`a => soft b == 2`) marks the
+        // implied constraint as soft; softness inside compound
+        // constraints is not modeled yet, so it parses transparently.
+        if self.at_keyword("soft") {
+            self.bump();
+            let inner = self.parse_unary()?;
+            let end = inner.span().1;
+            return Some(Expr::Paren {
+                expr: Box::new(inner),
+                span: (start, end),
+            });
+        }
         let op = match self.peek_kind() {
             Some(TokenKind::Punctuation(p)) => match p.as_str() {
                 "!" => Some(UnaryOp::Not),

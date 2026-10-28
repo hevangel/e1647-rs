@@ -230,3 +230,29 @@ fn runaway_tcm_hits_the_wait_budget() {
         vec!["E0409"]
     );
 }
+
+#[test]
+fn implication_and_not_evaluate_in_constraints() {
+    // `a => b` with a held TRUE forces b to gen TRUE; `not b` excludes
+    // FALSE from the second field.
+    let output = clean_output(
+        "struct s {\n    a: bool;\n    b: bool;\n    keep a == TRUE => b == TRUE;\n    \
+         keep not (b == FALSE);\n};\n\
+         extend sys {\n    run() is {\n        var x: s;\n        gen x;\n        print x.a, x.b;\n    };\n};\n",
+        7,
+    );
+    assert!(output.contains("TRUE"), "output: {output}");
+}
+
+#[test]
+fn bind_constraints_are_skipped_by_gen() {
+    // A bind constraint names HDL-side signals; gen must not treat it as
+    // a rejection predicate over e fields.
+    let output = clean_output(
+        "struct s {\n    v: uint(bits: 8);\n    keep bind (sig_clk, external);\n    \
+         keep v < 10;\n};\n\
+         extend sys {\n    run() is {\n        var x: s;\n        gen x;\n        print x.v;\n    };\n};\n",
+        3,
+    );
+    assert!(output.contains('\n'), "output: {output}");
+}

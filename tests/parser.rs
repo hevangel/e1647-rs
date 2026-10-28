@@ -561,3 +561,112 @@ fn if_then_variant_parses() {
     };
     assert!(matches!(&run.body[0], Stmt::If { .. }));
 }
+
+#[test]
+fn method_keyword_spelling_parses() {
+    let declarations = expect_clean(
+        "struct s {\n    method run() is {\n        out(1);\n    };\n    method calc(x: uint): uint is empty;\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method member");
+    };
+    assert_eq!(run.name, "run");
+    let Member::Method(calc) = &declarations[0].members[1] else {
+        panic!("expected a method member");
+    };
+    assert_eq!(calc.name, "calc");
+    assert!(calc.body.is_empty(), "is empty must give an empty body");
+}
+
+#[test]
+fn event_trigger_forms_parse() {
+    let declarations = expect_clean(
+        "unit u {\n    event clk is @sys.any;\n    event sampled is only cycle @p_sync.clk_e;\n    \
+         event edge is change(dut.sig$) @sim;\n    event both is fall(clk$ == 1) @sim or rise(clk$) @sim;\n    \
+         event port_edge is @off_p$;\n};\n",
+    );
+    let unit = &declarations[0];
+    let Member::Event(event) = &unit.members[1] else {
+        panic!("expected an event member");
+    };
+    let Some(trigger) = &event.trigger else {
+        panic!("expected a trigger");
+    };
+    assert_eq!(trigger.modifier.as_deref(), Some("only"));
+    assert!(trigger.cycle);
+    assert_eq!(trigger.items[0].path, vec!["p_sync", "clk_e"]);
+
+    let Member::Event(edge) = &unit.members[2] else {
+        panic!("expected an event member");
+    };
+    let edge_trigger = edge.trigger.as_ref().unwrap();
+    assert_eq!(edge_trigger.items[0].path, vec!["sim"]);
+    assert!(edge_trigger.items[0].condition.is_some());
+
+    let Member::Event(both) = &unit.members[3] else {
+        panic!("expected an event member");
+    };
+    let both_trigger = both.trigger.as_ref().unwrap();
+    assert_eq!(both_trigger.items.len(), 2, "or-composed items");
+}
+
+#[test]
+fn keep_bind_constraints_parse() {
+    let declarations = expect_clean(
+        "unit u {\n    keep bind (sig_clk, external);\n    keep bind bfm0 to ~/dut/u0;\n};\n",
+    );
+    let Member::Constraint(first) = &declarations[0].members[0] else {
+        panic!("expected a keep constraint");
+    };
+    assert!(first.is_bind);
+    let Expr::Call { args, .. } = &first.expr else {
+        panic!("expected a bind call");
+    };
+    assert_eq!(args.len(), 2);
+    let Member::Constraint(second) = &declarations[0].members[1] else {
+        panic!("expected a keep constraint");
+    };
+    assert!(second.is_bind);
+}
+
+#[test]
+fn implication_not_and_soft_rhs_parse() {
+    let declarations = expect_clean(
+        "struct s {\n    a: bool;\n    b: bool;\n    keep a == TRUE => soft b == TRUE;\n    \
+         keep not a and not b;\n};\n",
+    );
+    let Member::Constraint(first) = &declarations[0].members[2] else {
+        panic!("expected a keep constraint");
+    };
+    let Expr::Binary {
+        op: BinaryOp::Imply,
+        ..
+    } = first.expr
+    else {
+        panic!("expected an implication");
+    };
+    let Member::Constraint(second) = &declarations[0].members[3] else {
+        panic!("expected a keep constraint");
+    };
+    assert!(matches!(
+        second.expr,
+        Expr::Binary {
+            op: BinaryOp::LogicalAnd,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn prefixed_field_declarations_parse() {
+    let declarations =
+        expect_clean("struct s {\n    !do_not_gen: bool;\n    %packed: uint(bits: 8);\n};\n");
+    let Member::Field(no_gen) = &declarations[0].members[0] else {
+        panic!("expected a field");
+    };
+    assert!(no_gen.no_gen && !no_gen.physical);
+    let Member::Field(physical) = &declarations[0].members[1] else {
+        panic!("expected a field");
+    };
+    assert!(physical.physical && !physical.no_gen);
+}

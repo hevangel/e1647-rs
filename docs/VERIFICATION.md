@@ -782,3 +782,56 @@ Combined SN-CPU golden delta now measured on the same file: re-run after
 this slice lands the count in the entry-10 range (83) with the remaining
 blockers being `when`-inheritance semantics, `import` hub resolution and
 struct/`check that`-style statements — the rung 2b execution work.
+
+## 2026-10-27 (12) — efratcdn + amiq corpora baselines; explicit `method`, event triggers, `keep bind`, `=>`, word operators
+
+- Corpora added (cloned shallowly under gitignored `local/`, never
+  committed): the remaining efratcdn utility repos (`cover_callback`,
+  `cover_cb_report_hit`, `cover_cb_report_progress`, `e-utils`,
+  `e2hdl_check_alignment`, `etl`, `list_mult_delete`,
+  `parallel_for_each`, `reflection_examples`, `save_restart_demo`,
+  `type_min_max` (empty), `hello-world`) alongside the seven from
+  entry (11), and `amiq-eda/example-projects-uvm_ref_flow_1.1`
+  `soc_verification_lib` (167 e files: apb/ahb/uart/spi/gpio UVCs,
+  apb_subsystem, uart_ctrl). One amiq file (`uart_g5.e`) is binary
+  content, not e source, and is excluded from parse probing.
+- Baseline probe (`cargo build --bin e1647; e1647 parse <file>` per
+  file, counting `error[` lines): 219 efratcdn+amiq files probed,
+  2326 diagnostics total, down from 2609 measured before this
+  entry's grammar slice. The largest per-file buckets before the
+  slice were `keep bind` (82 — nearly every amiq BFM), explicit
+  `method` members, `event … is @…` triggers (43), `=>` implication
+  keeps (27), and `!`/`%`-prefixed fields that the member dispatcher
+  never routed to the field parser.
+- Grammar landed for those (parse + check + interp subset):
+  explicit `method` keyword spelling and `is empty` bodies; the full
+  event-trigger grammar (`@dotted.path`, `only`/`unexp`, `cycle`,
+  `rise`/`fall`/`change`/`true(cond)` edge samples, `or`-composed
+  items) stored as a structured `EventTrigger`; `keep bind (a, b)` /
+  `keep bind x to <hdl path>` recorded as bind constraints that
+  checking and `gen` skip; `=>` implication (parser + evaluation,
+  short-circuiting); word-spelled `and`/`or`/`xor`/`not` operators at
+  their symbol twins' precedence levels; mid-expression `soft`
+  prefixes parse transparently (softness inside compound constraints
+  is not modeled yet).
+- Whole-library measure: concatenating each amiq UVC into one parse
+  unit (approximating cross-file `import` resolution, which per-file
+  probing cannot do) yields uart 253, apb 328, spi 116, ahb 183,
+  gpio 100 diagnostics; the `etl` library is 22 and
+  `reflection_examples` 1. Remaining construct families are ranked
+  and unchanged: `on <event> { … }` actions, `cover` groups with
+  `item`/`using` options, `scbd_port` members, `keep for each`,
+  weighted `select` constraints, when-modifier-qualified extends and
+  field types (`extend ACTIVE TX uart_agent_u`), `package` units,
+  `wait until`, and `define`-macro templates.
+- SN-CPU golden delta on the same combined file: 83 → 65 diagnostics
+  (entry-10/11 baseline 83).
+
+Verification: fmt/clippy clean; `cargo test` green (89 tests: 18
+interp incl. implication evaluation and bind-skipping-by-gen, 29
+parser incl. the five new-construct tests, 15 lexer, 10 elab, 10
+solve, 6 solve-translations, 1 fixtures). Baselines above are
+reproducible with `e1647 parse` per file; the concatenation measure
+is `find <uvc> -name '*.e' -exec cat {} + | e1647 parse /dev/stdin`
+equivalent (probe used a temporary file). The SN-CPU Playground
+reference run (goal) remains parked on the manual reCAPTCHA login.

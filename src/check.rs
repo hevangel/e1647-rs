@@ -299,6 +299,10 @@ fn check_constraint_fields(
     enumerals: &BTreeSet<&str>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Bind constraints name HDL-side signals, not e fields; skip them.
+    if constraint.is_bind {
+        return;
+    }
     let mut roots = Vec::new();
     collect_root_identifiers(&constraint.expr, &mut roots);
     for (name, span) in roots {

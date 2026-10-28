@@ -94,8 +94,32 @@ pub enum PortDirection {
 pub struct EventDecl {
     pub name: String,
     pub name_span: Span,
-    pub trigger: Option<Expr>,
+    pub trigger: Option<EventTrigger>,
     pub span: Span,
+}
+
+/// The `is …` trigger of an [`EventDecl`]: an optional `only`/`unexp`
+/// modifier, the `cycle` keyword and one or more sampled items joined by
+/// `or`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventTrigger {
+    /// `only` / `unexp` modifier as written, if present.
+    pub modifier: Option<String>,
+    /// `cycle` keyword before the first item, if present.
+    pub cycle: bool,
+    pub items: Vec<EventTriggerItem>,
+}
+
+/// One sampled item of an [`EventTrigger`]: `@p_smp.clk` on its own or a
+/// `change(cond) @sim`-style edge sample. Routine names (`rise`, `fall`,
+/// `change`, `true`) are validated by the parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventTriggerItem {
+    /// Dotted sampled path after `@`; the last segment may carry the HDL
+    /// `$` suffix (`@off_p$`).
+    pub path: Vec<String>,
+    /// `rise(cond)`-style condition guarding this item, if any.
+    pub condition: Option<Expr>,
 }
 
 /// A `simple_port` member: `name: inout simple_port of bit is instance;`.
@@ -127,6 +151,9 @@ pub struct Field {
 pub struct KeepConstraint {
     pub expr: Expr,
     pub is_soft: bool,
+    /// `keep bind (port, hdl_kind);` — hierarchical HDL binding recorded
+    /// as a `bind(a, b)` call. Skipped by identifier checking and by `gen`.
+    pub is_bind: bool,
     pub span: Span,
 }
 
@@ -381,6 +408,8 @@ pub enum BinaryOp {
     Mul,
     Div,
     Mod,
+    /// `=>` constraint implication (`a => b` is `!a || b`).
+    Imply,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

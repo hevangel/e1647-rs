@@ -646,7 +646,13 @@ impl<'a> Interp<'a> {
         let constraints: Vec<Expr> = types
             .iter()
             .find(|t| t.name == obj_type_name)
-            .map(|t| t.constraints.iter().map(|c| c.expr.clone()).collect())
+            .map(|t| {
+                t.constraints
+                    .iter()
+                    .filter(|c| !c.is_bind)
+                    .map(|c| c.expr.clone())
+                    .collect()
+            })
             .unwrap_or_default();
         // Solver-backed path (feature `solver-pumpkin`).
         #[cfg(feature = "solver-pumpkin")]
@@ -781,6 +787,7 @@ impl<'a> Interp<'a> {
         let constraints: Vec<Expr> = ty
             .constraints
             .iter()
+            .filter(|constraint| !constraint.is_bind)
             .map(|constraint| constraint.expr.clone())
             .collect();
         // Solver-backed path (feature `solver-pumpkin`): the integer
@@ -1438,6 +1445,19 @@ impl<'a> Interp<'a> {
                     };
                     Ok(Value::Bool(r))
                 }
+                // `a => b` is `!a || b`, short-circuiting on a false lhs.
+                BinaryOp::Imply => {
+                    let Value::Bool(l) = self.eval(lhs, frame, me)? else {
+                        return Err(self.error("E0402", "operand of => is not a boolean", *span));
+                    };
+                    if !l {
+                        return Ok(Value::Bool(true));
+                    }
+                    let Value::Bool(r) = self.eval(rhs, frame, me)? else {
+                        return Err(self.error("E0402", "operand of => is not a boolean", *span));
+                    };
+                    Ok(Value::Bool(r))
+                }
                 _ => {
                     let l = self.eval(lhs, frame, me)?;
                     let r = self.eval(rhs, frame, me)?;
@@ -1697,7 +1717,7 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Value::Int(value))
             }
-            LogicalAnd | LogicalOr => unreachable!("handled with short-circuiting"),
+            LogicalAnd | LogicalOr | Imply => unreachable!("handled with short-circuiting"),
         }
     }
 
