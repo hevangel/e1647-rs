@@ -348,7 +348,9 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
             collect_root_identifiers(else_expr, roots);
         }
         Expr::CastAs { expr, .. } => collect_root_identifiers(expr, roots),
-        Expr::BitSlice { base, high, low, .. } => {
+        Expr::BitSlice {
+            base, high, low, ..
+        } => {
             collect_root_identifiers(base, roots);
             collect_root_identifiers(high, roots);
             collect_root_identifiers(low, roots);

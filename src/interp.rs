@@ -1480,7 +1480,12 @@ impl<'a> Interp<'a> {
                 // enumerals and booleans flow through unchanged.
                 self.eval(expr, frame, me)
             }
-            Expr::BitSlice { base, high, low, span } => {
+            Expr::BitSlice {
+                base,
+                high,
+                low,
+                span,
+            } => {
                 let Value::Int(value) = self.eval(base, frame, me)? else {
                     return Err(self.error("E0402", "bit slice expects an integer", *span));
                 };
@@ -1494,14 +1499,14 @@ impl<'a> Interp<'a> {
                     return Err(self.error("E0402", "bit slice range invalid", *span));
                 }
                 let width = (h - l + 1) as u32;
-                let mask: i128 = if width >= 127 { -1 } else { (1i128 << width) - 1 };
+                let mask: i128 = if width >= 127 {
+                    -1
+                } else {
+                    (1i128 << width) - 1
+                };
                 Ok(Value::Int((value >> l) & mask))
             }
-            Expr::InSet {
-                element,
-                set,
-                span,
-            } => {
+            Expr::InSet { element, set, span } => {
                 let value = self.eval(element, frame, me)?;
                 let contained = match set {
                     crate::ast::InSetExpr::Items(items) => {

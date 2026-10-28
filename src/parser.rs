@@ -483,9 +483,7 @@ impl Parser {
     fn parse_member(&mut self) -> Option<Vec<Member>> {
         match self.peek_kind() {
             Some(TokenKind::Keyword(k)) if k == "import" => self.parse_import(),
-            Some(TokenKind::Keyword(k)) if k == "define" => {
-                self.parse_define().map(|m| vec![m])
-            }
+            Some(TokenKind::Keyword(k)) if k == "define" => self.parse_define().map(|m| vec![m]),
             Some(TokenKind::Identifier(_)) => {
                 if matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == "(") {
                     self.parse_method().map(|m| vec![m])
@@ -518,7 +516,8 @@ impl Parser {
         self.bump(); // 'import'
         let mut names = Vec::new();
         loop {
-            let (name, _) = self.expect_identifier("E0102", "expected a module name after 'import'")?;
+            let (name, _) =
+                self.expect_identifier("E0102", "expected a module name after 'import'")?;
             names.push(name);
             if !self.eat_punct(",") {
                 break;
@@ -536,7 +535,8 @@ impl Parser {
     fn parse_define(&mut self) -> Option<Member> {
         let start = self.current_span().0;
         self.bump(); // 'define'
-        let (name, name_span) = self.expect_identifier("E0102", "expected a name after 'define'")?;
+        let (name, name_span) =
+            self.expect_identifier("E0102", "expected a name after 'define'")?;
         let value = if self.at_punct(";") {
             None
         } else {
@@ -614,7 +614,11 @@ impl Parser {
     fn parse_fields(&mut self) -> Option<Vec<Member>> {
         // `%name` physical / `!name` do-not-generate prefixes.
         let physical = self.eat_punct("%");
-        let no_gen = if !physical { self.eat_punct("!") } else { false };
+        let no_gen = if !physical {
+            self.eat_punct("!")
+        } else {
+            false
+        };
         let (first, first_span) = self.expect_identifier("E0102", "expected field name")?;
         let mut names = vec![(first, first_span)];
         while self.eat_punct(",") {
@@ -1421,11 +1425,7 @@ impl Parser {
                         if member == "as_a" && self.at_punct("(") {
                             self.bump();
                             let ty = self.parse_type()?;
-                            self.expect_punct(
-                                ")",
-                                "E0110",
-                                "expected ')' to close the cast",
-                            )?;
+                            self.expect_punct(")", "E0110", "expected ')' to close the cast")?;
                             expr = Expr::CastAs {
                                 expr: Box::new(expr),
                                 ty,
@@ -1466,11 +1466,7 @@ impl Parser {
                         if self.eat_punct(":") {
                             // Bit slice: base[high:low].
                             let low = self.parse_expr()?;
-                            self.expect_punct(
-                                "]",
-                                "E0107",
-                                "expected ']' to close the bit slice",
-                            )?;
+                            self.expect_punct("]", "E0107", "expected ']' to close the bit slice")?;
                             expr = Expr::BitSlice {
                                 base: Box::new(expr),
                                 high: Box::new(first),

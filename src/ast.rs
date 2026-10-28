@@ -46,7 +46,10 @@ pub enum Member {
     /// An `event` member.
     Event(EventDecl),
     /// `import a, b;` — recorded; no cross-file resolution yet.
-    Import { names: Vec<String>, span: Span },
+    Import {
+        names: Vec<String>,
+        span: Span,
+    },
     /// `define name value;` — a compile-time constant; the name resolves
     /// to the value's literal in the interpreter.
     Define {
