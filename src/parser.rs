@@ -535,7 +535,7 @@ impl Parser {
     fn parse_define(&mut self) -> Option<Member> {
         let start = self.current_span().0;
         self.bump(); // 'define'
-        let (name, name_span) =
+        let (name, _name_span) =
             self.expect_identifier("E0102", "expected a name after 'define'")?;
         let value = if self.at_punct(";") {
             None
