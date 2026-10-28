@@ -547,11 +547,7 @@ impl Parser {
         Some(Member::Define {
             name,
             value,
-            span: (start, name_span.1),
-        })
-        .map(|member| {
-            let _ = end;
-            member
+            span: (start, end),
         })
     }
 
