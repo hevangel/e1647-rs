@@ -25,6 +25,8 @@ Rules:
 | `vscode-specman-grammar` | [tsvi/specman-vscode-grammar](https://github.com/tsvi/specman-vscode-grammar) | MIT | TextMate grammar covering e syntax — cross-check for keyword sets and syntax categories |
 | `vscode-specman-support` | [ErickSancho/vscode-specman-support](https://github.com/ErickSancho/vscode-specman-support) | MIT | Editor grammar and snippet shapes for e |
 | `specman-e-support` | [k-sparrow/specman-e-support](https://github.com/k-sparrow/specman-e-support) | no license file (reference only, do not copy) | Second editor grammar; keyword list cross-check |
+| `design-verification` | [uobdv/Design-Verification](https://github.com/uobdv/Design-Verification) (pinned `0a48307`) | no license file (reference only, do not copy) | `SN-CPU-Tutorial/cpu/e/gold` — the golden Specman CPU verification environment (signal map, driver, refmodel, checker, tests) used as a runnable-goal corpus and construct-inventory source |
+| `spmn-e-utils` | [efratcdn/spmn-e-utils](https://github.com/efratcdn/spmn-e-utils) (pinned `1fa3555`) | no license file (reference only, do not copy) | Index of small e utility examples (the utilities live in sibling `efratcdn/*` repos); used to source additional real-world e files for front-end testing — see "Testbench corpora" below |
 
 ## OVM-e methodology library — status: no lawful public pin
 
@@ -41,3 +43,21 @@ e code:
   in `.env`; see [docs/REFERENCES.md](REFERENCES.md)).
 
 If a suitable upstream appears, propose it in an issue before pinning.
+
+## Testbench corpora (in `local/`, gitignored)
+
+Real-world e testbenches used to measure the front-end are kept **out of
+the repository** under the gitignored `local/` folder — third-party code
+is never committed. Provenance for each corpus:
+
+| Local folder | Source | Contents | Baseline |
+| --- | --- | --- | --- |
+| `local/eda-examples/` | EDA Playground curated "Specman e + SV/Verilog" playgrounds: [/x/Pfq](https://www.edaplayground.com/x/Pfq) (XOR TCM example), [/x/D6W](https://www.edaplayground.com/x/D6W) (Hello e World), [/x/5Wj](https://www.edaplayground.com/x/5Wj) (SER UVC), [/x/ZFqZ](https://www.edaplayground.com/x/ZFqZ) (UART verification) | 4 testbenches + designs | docs/VERIFICATION.md entry (2026-10-27, "curated Specman-e examples: baseline") |
+| `local/asic-world/` | [asic-world Specman examples](https://www.asic-world.com/examples/specman/index.html) (memory/fifo/uart multi-file projects; arbiter is stub-only upstream) | 24 extracted code blocks | docs/VERIFICATION.md entry 7 |
+| `local/sn-cpu-tutorial/` | Concatenated `SN-CPU-Tutorial/cpu/e/gold` files (from the `design-verification` pin above) — `golden-combined.e`, the runnable-goal corpus | 796-line combined golden testbench | docs/VERIFICATION.md entries 8–10 |
+| `local/spmn-utils/` | Shallow clones of the utility repos indexed by the `spmn-e-utils` pin: `dependency_util`, `e_type_min_max`, `keep_multi_lists`, `igen-dist`, `cover_on_any_event`, `spmn-dut_error`, `reflection_example` | 17 e files (libraries + usage examples) | measured 2026-10-27: 4 files at 1 diagnostic, others 5–25 (`define as` macros, ports/UVC structure are the gaps) |
+
+Rules for these corpora mirror the pin rules: read-only measurement
+input, never committed, never copied into `src/` or `tests/`. Our own
+independently authored examples live in `examples/` and are the only
+files that ship with the repository.
