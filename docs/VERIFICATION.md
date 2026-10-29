@@ -835,3 +835,74 @@ reproducible with `e1647 parse` per file; the concatenation measure
 is `find <uvc> -name '*.e' -exec cat {} + | e1647 parse /dev/stdin`
 equivalent (probe used a temporary file). The SN-CPU Playground
 reference run (goal) remains parked on the manual reCAPTCHA login.
+
+## 2026-10-29 (13) — EDA Playground reference runs vs our implementation; divergence-driven fixes
+
+- Method: every comparison case was run on EDA Playground
+  (Specman Elite + Cadence Xcelium 25.03, seed 1) through the
+  Playwright automation (`local/playwright/run-corpus.mjs`,
+  `finish-corpus.mjs`; logs in gitignored `local/compare/*.specman.log`),
+  and the same source was run with `e1647 run --seed 1`
+  (`local/compare/ours-*.log`). Divergences were fixed until the
+  front-end matched or the remaining gap was a recorded milestone.
+- Specman reference results captured (complete runs): `/x/Pfq` xor_try
+  (20 packed operations, `check that` 0 DUT errors), `/x/D6W` SER
+  ("Hello e :-) World!" + 8 driven transfers, 0 errors), `/x/5Wj` SER
+  UVC (TX/RX packet collection flow), `/x/ZFqZ` UART agent (full UART
+  traffic with scoreboard), `type-min-max-usage` (macros evaluate, "No
+  actual running requested", 0 errors — a declarations-only case).
+- The SN-CPU golden playground `/x/iCmt` reference: with the previous
+  design pane, all 11 signal-map ports failed HDL binding; with a
+  faithful signal shell (`top` + `cpu` submodule providing every bound
+  signal) the ports bind, but Specman idles — "No @sim temporal
+  expressions found". Root cause: the pin ships no Verilog DUT (the
+  tutorial CPU ships with Specman installs), and the golden's events
+  are all `@sys.any`-based, so nothing triggers Specman from the
+  simulator. Recorded adaptation: `clkgen() @sim` in the signal map
+  (one token) gives Specman its required trigger; the design shell is
+  in `finish-corpus.mjs`. The re-run is parked on a fresh manual
+  login.
+- Divergences found and fixed (commit dbc014b, 958 insertions):
+  the `as_a()` cast postfix was unreachable dead code since it landed
+  (the parser rejected the keyword member name first) — now every
+  primary (parens, predefined names) runs the shared postfix chain;
+  predefined e names that lex as keywords (`NULL`, `it`, `index`,
+  `print`, `radix`, `hex`, `dec`, `bin`, `items`, `simulation`,
+  `rise`, `fall`, `change`) parse as identifiers in expression and
+  statement position, and statements may assign through them
+  (`it.result_from_dut = p_out$;`); `name is instance` implicit-typed
+  fields; trailing `;` optional before `}` (Specman accepts both
+  spellings — fixture expectation corrected); `extend global`;
+  when-modifier-qualified extends and when-qualified types; `wait
+  until`; grouped event triggers `(fall(a) and true(b))@clk`; `check
+  that … else …`; `for i from a to b do`; field dimensions `regs[4]`;
+  enumeral width suffix `] (bits: 4)`; file-level `define`/`import`;
+  `+=`/`-=`. Interpreter: the root `sys` instance is addressable by
+  name; data fields are implicitly generated before `run()` as Specman
+  does (honoring `keep` constraints, skipping `!` and unit-typed
+  fields, with `keep list.size() == N` driving list lengths);
+  HDL-binding constraints (`hdl_path()`/`delayed()`) never gate gen;
+  `pack(NULL, item)` packs physical fields MSB-first; `append`;
+  `message(severity, …)`; `dut_error`/`error` counted and reported as
+  Specman's closing DUT-error count; `stop_run()` builtin.
+- Our side per case after the fixes: pfq-xor parses to zero
+  diagnostics and executes gen/pack/check to the first HDL port write
+  (E0408 no simulator loaded — the case needs the xezim bridge plus
+  the xor_try design, which is captured in
+  `local/compare/designs/`); golden-combined 83 → 65 → 13 parse
+  diagnostics (remaining: `cover` groups, `expect`, `scbd_port`);
+  d6w/5wj/zfqz need cross-file `import` resolution and the
+  sequence/UVC construct family (their Specman references are
+  captured for when those land).
+- Operational notes: concurrent Playwright logins invalidate each
+  other's EDA Playground session — one browser at a time; the site
+  throttles rapid playground creation ("saved: /home" without a
+  redirect). Remaining Playground runs (golden @sim re-run,
+  cover-edges, igen-dist, save-restart-test1, etl-simple-examples) are
+  parked on a fresh manual reCAPTCHA login
+  (`local/playwright/login-manual.mjs`).
+
+Verification: fmt/clippy clean; `cargo test` green (92 tests). CI
+green on fdb2775 and dbc014b (check + check-solver). Specman
+reference logs and design panes are gitignored under
+`local/compare/`; re-runs are `node local/playwright/finish-corpus.mjs`.
