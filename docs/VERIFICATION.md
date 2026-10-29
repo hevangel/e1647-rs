@@ -906,3 +906,44 @@ Verification: fmt/clippy clean; `cargo test` green (92 tests). CI
 green on fdb2775 and dbc014b (check + check-solver). Specman
 reference logs and design panes are gitignored under
 `local/compare/`; re-runs are `node local/playwright/finish-corpus.mjs`.
+
+## 2026-10-29 (14) — offline arc while the Playground login is parked: multi-file imports, sequence declarations, d6w runs to the reference line
+
+- With the manual login parked, the comparison continued offline on the
+  fully captured cases. The d6w playground turned out to be TWO e files
+  (the imported `my_traffic.e` lives in a hidden editor tab — the pane
+  capture now reads every `.CodeMirror`, not just visible ones;
+  `local/compare/designs/` holds all panes of d6w/5wj/zfqz).
+- Multi-file `import` resolution (commit 95de620): `import a.b;`
+  resolves to `a/b.e` or `a.b.e` beside the source, depth-first; the
+  well-formedness pass now runs once over the MERGED declaration set
+  (`parse_unchecked` + one `check_declarations`), so cross-file
+  references resolve; unresolvable imports report E0205. This closes
+  the "single-file adaptation" workaround for imported corpora.
+- Sequence declarations: `sequence NAME using item = T,
+  created_driver = D, created_kind = K;` synthesizes the declaration
+  trio (`type K: [MAIN];`, `unit D` with `item_done`/`get_next_item`,
+  `struct NAME`) plus option defines that elab recovers into
+  `Elaborated.sequences`; `do <item> [keeping { … }];` statements;
+  `any_sequence_item` accepted as a builtin like base; `LOW`/`MEDIUM`/
+  `HIGH`/`TEST_DONE` predefined names; objection raise/drop as no-op
+  builtins; member-called builtins (`driver.raise_objection(...)`)
+  route through the builtin table. Implicit gen and MAIN sequence
+  start now happen even when no explicit `run()` exists (Specman
+  test-start semantics); `do` generates the item in place — the
+  get_next_item/item_done blocking handshake remains the TCM-scheduler
+  milestone.
+- Result: the two-file /x/D6W case parses clean across files and runs
+  to the reference output line `Hello e :-) World!` (the Specman
+  reference also shows 8 DUT-side `Received …` echoes, which come from
+  the Verilog design via $display — comparable only through the xezim
+  bridge with the captured `dut`/`top` panes).
+- Remaining for a full d6w/5wj/zfqz comparison: the TCM scheduler
+  (real event-driven start/wait so the driver loop and sequence
+  handshake interleave), then the bridge wiring for the captured
+  designs.
+
+Verification: fmt/clippy clean; `cargo test` green; CI green on
+95de620. Reproduce: `e1647 run local/corpora/d6w/testbench.e --seed 1`
+(two files: `my_traffic.e` + `testbench.e` under `local/corpora/d6w/`,
+gitignored; the run needs no simulator).
