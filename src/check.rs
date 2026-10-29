@@ -124,7 +124,7 @@ fn check_like_target(
         return;
     };
     let like_span = declaration.like_span.unwrap_or(declaration.name_span);
-    if !declared.contains(like.as_str()) {
+    if !declared.contains(like.as_str()) && !crate::builtins::is_builtin_base(like) {
         diagnostics.push(Diagnostic::new(
             "E0203",
             format!("unknown type '{like}' in like clause"),
@@ -262,6 +262,17 @@ fn check_statements<'a>(
             }
             Stmt::Check { else_body, .. } => {
                 check_statements(else_body, seen, declared, method_name, diagnostics);
+            }
+            Stmt::SeqDo { item, .. } => {
+                // The item field must exist in the enclosing scope.
+                if !seen.contains(item.as_str()) {
+                    diagnostics.push(Diagnostic::new(
+                        "E0204",
+                        format!("unknown sequence item '{item}' in 'do'"),
+                        statement.span().0,
+                        statement.span().1,
+                    ));
+                }
             }
             Stmt::Assign { .. }
             | Stmt::ExprStmt { .. }

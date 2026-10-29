@@ -40,10 +40,22 @@ pub const BUILTIN_ROUTINES: &[&str] = &[
     // `pack(NULL, item)` concatenates the item's physical fields
     // MSB-first into one integer.
     "pack",
+    // eRM objection protocol: raise/drop coordinate end-of-test; the
+    // inline execution subset treats them as no-ops.
+    "raise_objection",
+    "drop_objection",
 ];
 
 pub fn is_builtin_unit(name: &str) -> bool {
     BUILTIN_UNITS.contains(&name)
+}
+
+/// Predeclared base types a `struct … like …` may descend from
+/// (`any_sequence_item` is the base of sequence items).
+pub const BUILTIN_BASES: &[&str] = &["any_sequence_item", "any_sequence", "any_struct"];
+
+pub fn is_builtin_base(name: &str) -> bool {
+    BUILTIN_BASES.contains(&name)
 }
 
 pub fn is_builtin_routine(name: &str) -> bool {

@@ -54,6 +54,16 @@ pub struct PortInfo {
     pub hdl_path: Option<String>,
 }
 
+/// One `sequence NAME using item = T, created_driver = D, created_kind
+/// = K;` declaration, recovered from the synthesized define markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceInfo {
+    pub name: String,
+    pub item: String,
+    pub driver: String,
+    pub kind: String,
+}
+
 /// Outcome of elaborating one file's declarations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Elaborated {
@@ -62,6 +72,9 @@ pub struct Elaborated {
     pub types: Vec<ElaboratedType>,
     /// `define` constants by name (literal values only).
     pub defines: BTreeMap<String, crate::ast::Expr>,
+    /// Sequence declarations recovered from the parser's synthesized
+    /// markers.
+    pub sequences: Vec<SequenceInfo>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -180,9 +193,45 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             }
         }
     }
+    // Recover sequence declarations from the parser's synthesized
+    // `<name>.item` / `<name>.created_driver` / `<name>.created_kind`
+    // string defines on the sequence struct.
+    let mut sequences = Vec::new();
+    for declaration in declarations {
+        let prefix = format!("{}.", declaration.name);
+        let mut item = None;
+        let mut driver = None;
+        let mut kind = None;
+        for member in &declaration.members {
+            let Member::Define { name, value, .. } = member else {
+                continue;
+            };
+            let Some(field) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(crate::ast::Expr::StringLiteral { value, .. }) = value else {
+                continue;
+            };
+            match field {
+                "item" => item = Some(value.clone()),
+                "created_driver" => driver = Some(value.clone()),
+                "created_kind" => kind = Some(value.clone()),
+                _ => {}
+            }
+        }
+        if let (Some(item), Some(driver)) = (item, driver) {
+            sequences.push(SequenceInfo {
+                name: declaration.name.clone(),
+                item,
+                driver,
+                kind: kind.unwrap_or_else(|| format!("{}_kind_t", declaration.name)),
+            });
+        }
+    }
     Elaborated {
         types,
         defines,
+        sequences,
         diagnostics: elaborator.diagnostics,
     }
 }

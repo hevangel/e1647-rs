@@ -75,6 +75,11 @@ const PREDEFINED_NAMES: &[&str] = &[
     "rise",
     "fall",
     "change",
+    "TEST_DONE",
+    // Message-verbosity levels (`message(LOW, …)`).
+    "LOW",
+    "MEDIUM",
+    "HIGH",
 ];
 
 fn is_predefined_name(word: &str) -> bool {
@@ -145,6 +150,39 @@ pub fn parse(source: &str) -> ParseResult {
     let declarations = parser.parse_program();
     diagnostics.extend(parser.diagnostics);
     diagnostics.extend(crate::check::check_declarations(&declarations));
+    ParseResult {
+        declarations,
+        diagnostics,
+    }
+}
+
+/// Parse without the well-formedness pass — for multi-file drivers that
+/// merge declarations first and check the merged set once.
+pub fn parse_unchecked(source: &str) -> ParseResult {
+    let mut diagnostics = Vec::new();
+    let tokens = match lexer::tokenize(source) {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            let end = Position {
+                byte: err.position.byte + 1,
+                line: err.position.line,
+                column: err.position.column + 1,
+            };
+            diagnostics.push(Diagnostic::new("E0001", err.message, err.position, end));
+            return ParseResult {
+                declarations: Vec::new(),
+                diagnostics,
+            };
+        }
+    };
+    let eof = tokens.last().map(|t| t.end).unwrap_or(Position {
+        byte: source.len(),
+        line: 1,
+        column: 1,
+    });
+    let mut parser = Parser::new(tokens, eof);
+    let declarations = parser.parse_program();
+    diagnostics.extend(parser.diagnostics);
     ParseResult {
         declarations,
         diagnostics,
@@ -376,6 +414,17 @@ impl Parser {
                     }
                     continue;
                 }
+                // `sequence NAME using item = T, created_driver = D,
+                // created_kind = K;` — synthesizes the kind type (with
+                // MAIN), the sequencer unit (item_done event +
+                // get_next_item) and the sequence struct; execution-side
+                // sequence scheduling is a later milestone.
+                Some(TokenKind::Keyword(k)) if k.as_str() == "sequence" => {
+                    if let Some(synthesized) = self.parse_sequence_declaration() {
+                        declarations.extend(synthesized);
+                    }
+                    continue;
+                }
                 _ => {
                     self.error_here(
                         "E0101",
@@ -395,6 +444,120 @@ impl Parser {
             }
         }
         declarations
+    }
+
+    /// `sequence NAME using item = T, created_driver = D, created_kind
+    /// = K;` — the specman sequence-declaration macro in source form.
+    /// Synthesizes the declaration trio the rest of the language then
+    /// sees: `type K: [MAIN];`, `unit D { event item_done;
+    /// get_next_item(): T is empty; }` and `struct NAME;`. The sequence
+    /// execution engine (do/handshake scheduling) is a later milestone.
+    fn parse_sequence_declaration(&mut self) -> Option<Vec<Declaration>> {
+        let start = self.current_span().0;
+        self.bump(); // 'sequence'
+        let (name, name_span) = self.expect_identifier("E0102", "expected the sequence name")?;
+        self.expect_keyword_word("using")?;
+        let mut item: Option<String> = None;
+        let mut driver: Option<String> = None;
+        let mut kind: Option<String> = None;
+        loop {
+            let option = self.take_word()?;
+            self.expect_punct("=", "E0108", "expected '=' after the sequence option")?;
+            let (value, _) = self.expect_type_name("expected the sequence option value")?;
+            match option.as_str() {
+                "item" => item = Some(value),
+                "created_driver" => driver = Some(value),
+                "created_kind" => kind = Some(value),
+                _ => {
+                    self.error_here("E0102", &format!("unknown sequence option '{option}'"));
+                    return None;
+                }
+            }
+            if !self.eat_punct(",") {
+                break;
+            }
+        }
+        self.expect_punct(";", "E0105", "expected ';' after the sequence declaration")?;
+        let end = self.last_end();
+        let Some(item) = item else {
+            self.error_here("E0102", "the 'item' sequence option is required");
+            return None;
+        };
+        let driver = driver.unwrap_or_else(|| format!("{name}_sequencer"));
+        let kind = kind.unwrap_or_else(|| format!("{name}_kind_t"));
+        let mut members = Vec::new();
+        for option in ["created_kind", "created_driver", "item"] {
+            let value = match option {
+                "created_kind" => &kind,
+                "created_driver" => &driver,
+                _ => &item,
+            };
+            members.push(Member::Define {
+                name: format!("{name}.{option}"),
+                value: Some(Expr::StringLiteral {
+                    value: value.clone(),
+                    span: (start, end),
+                }),
+                span: (start, end),
+            });
+        }
+        members.push(Member::Enumeral(crate::ast::Enumeral {
+            name: "MAIN".to_owned(),
+            name_span: (start, start),
+            value: None,
+        }));
+        Some(vec![
+            Declaration {
+                kind: DeclarationKind::Type,
+                name: kind,
+                name_span: (start, start),
+                like: None,
+                like_span: None,
+                modifiers: Vec::new(),
+                members: vec![members.pop().expect("MAIN enumeral")],
+                span: (start, end),
+            },
+            Declaration {
+                kind: DeclarationKind::Unit,
+                name: driver,
+                name_span: (start, start),
+                like: None,
+                like_span: None,
+                modifiers: Vec::new(),
+                members: vec![
+                    Member::Event(crate::ast::EventDecl {
+                        name: "item_done".to_owned(),
+                        name_span: (start, start),
+                        trigger: None,
+                        span: (start, end),
+                    }),
+                    Member::Method(crate::ast::MethodDecl {
+                        name: "get_next_item".to_owned(),
+                        name_span: (start, start),
+                        params: Vec::new(),
+                        return_type: Some(TypeExpr::Named {
+                            name: item,
+                            span: (start, start),
+                        }),
+                        tcm_event: None,
+                        modifier: None,
+                        body: Vec::new(),
+                        span: (start, end),
+                    }),
+                ],
+                span: (start, end),
+            },
+            Declaration {
+                kind: DeclarationKind::Struct,
+                name,
+                name_span,
+                like: None,
+                like_span: None,
+                modifiers: Vec::new(),
+                members,
+                span: (start, end),
+            },
+        ])
     }
 
     /// `type name: [ENUMERAL [= expr] , ..];`
@@ -1574,6 +1737,26 @@ impl Parser {
                 Some(Stmt::Check {
                     condition,
                     else_body,
+                    span: (start, end),
+                })
+            }
+            Some(TokenKind::Keyword(k)) if k == "do" => {
+                // `do <item-field>;` — a sequence body item execution.
+                self.bump();
+                let (item, _) =
+                    self.expect_identifier("E0102", "expected the item field after 'do'")?;
+                // The `do trans keeping { … }` form: the boolean block
+                // constrains the generated item; recorded, not enforced
+                // (constraint-scoped gen is a later milestone).
+                if self.eat_keyword("keeping") {
+                    self.expect_punct("{", "E0106", "expected '{' to open the keeping block")?;
+                    self.parse_expr()?;
+                    self.expect_punct("}", "E0107", "expected '}' to close the keeping block")?;
+                }
+                self.expect_punct(";", "E0105", "expected ';' after the do statement")?;
+                let end = self.last_end();
+                Some(Stmt::SeqDo {
+                    item,
                     span: (start, end),
                 })
             }

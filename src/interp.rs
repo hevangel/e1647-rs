@@ -223,20 +223,49 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
         .iter()
         .filter(|method| method.name == "run")
         .collect();
-    if run_blocks.is_empty() {
-        return RunResult {
-            output: interp.output,
-            diagnostics: Vec::new(),
-        };
-    }
     let sys_index = interp.instantiate("sys");
     // Specman generates the root unit's data fields before run() starts
     // (respecting `keep` constraints and skipping `!` fields); mirror
-    // that so corpus testbenches see generated lists/scalars.
+    // that so corpus testbenches see generated lists/scalars. Both this
+    // and the sequence start happen even when no explicit run() exists.
     if let Err(diagnostic) = interp.gen_object(sys_index) {
         interp
             .output
             .push_str(&format!("implicit gen: {}\n", diagnostic.render()));
+    }
+    // Start each declared sequence's MAIN body inline: Specman's
+    // sequencer launches MAIN during test start; the inline subset runs
+    // it synchronously with `driver` bound to the driver instance.
+    let sequences: Vec<crate::elab::SequenceInfo> = elaborated.sequences.clone();
+    for sequence in &sequences {
+        let Some(driver_index) = interp
+            .instances
+            .iter()
+            .position(|instance| instance.type_name == sequence.driver)
+        else {
+            continue;
+        };
+        let sequence_index = interp.instantiate(&sequence.name);
+        interp.instances[sequence_index].set("driver", Value::Object(driver_index));
+        let types: &[crate::elab::ElaboratedType] = interp.types;
+        let Some(body) = types
+            .iter()
+            .find(|t| t.name == sequence.name)
+            .and_then(|t| t.methods.iter().find(|m| m.name == "body").cloned())
+        else {
+            continue;
+        };
+        let mut frame = Frame::default();
+        frame
+            .locals
+            .insert("driver".to_owned(), Value::Object(driver_index));
+        if let Err(diagnostic) = interp.exec_block(&body.body, &mut frame, Some(sequence_index)) {
+            interp.output.push_str(&format!(
+                "sequence {}: {}\n",
+                sequence.name,
+                diagnostic.render()
+            ));
+        }
     }
     let mut diagnostics = Vec::new();
     for block in run_blocks {
@@ -491,6 +520,20 @@ impl<'a> Interp<'a> {
             Stmt::StopRun { .. } => {
                 self.stop_requested = true;
                 Ok(Flow::Stop)
+            }
+            Stmt::SeqDo { item, span } => {
+                // Inline item execution: gen the item field in place.
+                // The sequencer handshake (get_next_item/item_done
+                // blocking) needs the TCM scheduler — a later milestone.
+                self.exec_gen(
+                    &Expr::Ident {
+                        name: item.clone(),
+                        span: *span,
+                    },
+                    frame,
+                    me,
+                    *span,
+                )
             }
             Stmt::Check {
                 condition,
@@ -1196,6 +1239,11 @@ impl<'a> Interp<'a> {
             self.stop_requested = true;
             return Ok(Value::Void);
         }
+        if name == "raise_objection" || name == "drop_objection" {
+            // Objections coordinate end-of-test across TCMs; the inline
+            // subset has nothing to wait on, so they are no-ops.
+            return Ok(Value::Void);
+        }
         if name == "pack" {
             // pack(NULL, item) packs the item's physical fields,
             // MSB-first in declaration order, into one integer. Only the
@@ -1507,6 +1555,20 @@ impl<'a> Interp<'a> {
                 if name == "NULL" {
                     return Ok(Value::Void);
                 }
+                // Objection identifiers: values are irrelevant to the
+                // inline subset.
+                if name == "TEST_DONE" {
+                    return Ok(Value::Int(0));
+                }
+                // Message-verbosity levels.
+                if matches!(name.as_str(), "LOW" | "MEDIUM" | "HIGH") {
+                    let level = match name.as_str() {
+                        "LOW" => 0,
+                        "MEDIUM" => 1,
+                        _ => 2,
+                    };
+                    return Ok(Value::Int(level));
+                }
                 if let Some(value) = frame.locals.get(name) {
                     return Ok(value.clone());
                 }
@@ -1595,6 +1657,12 @@ impl<'a> Interp<'a> {
                         self.call_method(index, name, values, *span)
                     }
                     Expr::MemberAccess { object, name, .. } => {
+                        // Objection/other builtins called through an
+                        // instance (`driver.raise_objection(...)`) route
+                        // to the builtin table first.
+                        if crate::builtins::is_builtin_routine(name) {
+                            return self.call_builtin(name, values, *span);
+                        }
                         let object_value = self.eval(object, frame, me)?;
                         match object_value {
                             Value::Object(index) => self.call_method(index, name, values, *span),

@@ -1,8 +1,71 @@
+use e1647::ast::Member;
 use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-const USAGE: &str = "Usage: e1647 <command> <source.e> [--seed N]\nCommands:\n  tokens  tokenize the source (does not parse)\n  parse   parse the source and print the AST or diagnostics\n  elab    parse and fold like/extend into elaborated types\n  run     parse, elaborate and execute sys.run() (--seed N for reproducible gen)";
+const USAGE: &str = "Usage: e1647 <command> <source.e> [--seed N]\nCommands:\n  tokens  tokenize the source (does not parse)\n  parse   parse the source and print the AST or diagnostics\n  elab    parse and fold like/extend into elaborated types\n  run     parse, elaborate and execute sys.run() (--seed N for reproducible gen)\n\n`import x.y;` members resolve to `x/y.e` (or `x.y.e`) next to the source\nfile; imported declarations are spliced before the importing file's own.";
+
+/// Parse `source` and splice in the files it imports (`import a.b;` →
+/// `a/b.e` or `a.b.e` beside the source), depth-first, one level wide.
+/// Imported declarations precede the importing file's own, mirroring
+/// Specman's load order. Unresolvable imports stay in the AST (the
+/// existing E0101/E0203 diagnostics name them) — no silent drops.
+fn parse_with_imports(path: &str, source: &str) -> e1647::parser::ParseResult {
+    let result = e1647::parser::parse_unchecked(source);
+    let mut declarations = Vec::new();
+    // Imported files' diagnostics come first (their declarations precede
+    // ours); spans carry no file name yet, so they render under the
+    // importing file's path — a known limitation of the flat ParseResult.
+    let mut diagnostics = Vec::new();
+    let dir = std::path::Path::new(path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    for declaration in &result.declarations {
+        for member in &declaration.members {
+            let Member::Import { names, .. } = member else {
+                continue;
+            };
+            for name in names {
+                let candidates = [
+                    dir.join(format!("{name}.e")),
+                    dir.join(name.replace('.', "/")).with_extension("e"),
+                    dir.join(name.replace('.', "-")).with_extension("e"),
+                ];
+                let mut loaded = false;
+                for candidate in &candidates {
+                    let Ok(imported) = fs::read_to_string(candidate) else {
+                        continue;
+                    };
+                    let imported =
+                        parse_with_imports(candidate.to_string_lossy().as_ref(), &imported);
+                    diagnostics.extend(imported.diagnostics);
+                    declarations.extend(imported.declarations);
+                    loaded = true;
+                    break;
+                }
+                if !loaded {
+                    let (start, end) = declaration.span;
+                    diagnostics.push(e1647::diagnostic::Diagnostic::new(
+                        "E0205",
+                        format!("no file found for imported module '{name}'"),
+                        start,
+                        end,
+                    ));
+                }
+            }
+        }
+    }
+    declarations.extend(result.declarations);
+    diagnostics.extend(result.diagnostics);
+    // The well-formedness pass runs once over the MERGED declaration set
+    // so cross-file references (imports) resolve.
+    diagnostics.extend(e1647::check::check_declarations(&declarations));
+    e1647::parser::ParseResult {
+        declarations,
+        diagnostics,
+    }
+}
 
 fn run(command: &str, path: &str, seed: u64) -> ExitCode {
     let source = match fs::read_to_string(path) {
@@ -29,7 +92,7 @@ fn run(command: &str, path: &str, seed: u64) -> ExitCode {
             }
         },
         "parse" => {
-            let result = e1647::parser::parse(&source);
+            let result = parse_with_imports(path, &source);
             for diagnostic in &result.diagnostics {
                 eprintln!("{path}:{}", diagnostic.render());
             }
@@ -43,7 +106,7 @@ fn run(command: &str, path: &str, seed: u64) -> ExitCode {
             }
         }
         "elab" => {
-            let result = e1647::parser::parse(&source);
+            let result = parse_with_imports(path, &source);
             for diagnostic in &result.diagnostics {
                 eprintln!("{path}:{}", diagnostic.render());
             }
@@ -61,7 +124,7 @@ fn run(command: &str, path: &str, seed: u64) -> ExitCode {
             }
         }
         "run" => {
-            let result = e1647::parser::parse(&source);
+            let result = parse_with_imports(path, &source);
             for diagnostic in &result.diagnostics {
                 eprintln!("{path}:{}", diagnostic.render());
             }

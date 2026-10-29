@@ -262,6 +262,14 @@ pub enum Stmt {
     StopRun {
         span: Span,
     },
+    /// `do <item-field>;` — execute one sequence item inside a sequence
+    /// body (`do trans keeping { … };` records the constraint block).
+    /// Scheduling the item through the sequencer handshake is a later
+    /// milestone; execution currently generates the item in place.
+    SeqDo {
+        item: String,
+        span: Span,
+    },
     /// `check that <cond> else { .. }` — on a false condition the else
     /// body runs (usually a `dut_error` call) and the DUT-error counter
     /// increments; the run itself continues.
@@ -328,6 +336,7 @@ impl Stmt {
             | Stmt::Print { span, .. }
             | Stmt::Gen { span, .. }
             | Stmt::StopRun { span }
+            | Stmt::SeqDo { span, .. }
             | Stmt::Check { span, .. }
             | Stmt::ForEach { span, .. }
             | Stmt::ForTo { span, .. }
