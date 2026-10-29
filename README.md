@@ -2,6 +2,14 @@
 
 **An experimental, open-source Rust implementation of tooling for the IEEE 1647 _e_ hardware verification language.**
 
+<p align="center">
+  <img src="slopman-logo.png" alt="Slopman: the e wordmark dripping green slop, representing the current state of this repository" width="240">
+  &nbsp;&#8594;&nbsp;
+  <img src="rustman-logo.png" alt="Rustman: the same e wordmark, clean, representing this repository once enough tokens have been burned" width="240">
+  <br>
+  <em>Slopman (present) &#8594; Rustman (pending sufficient token expenditure).</em>
+</p>
+
 > **Status: pre-alpha.** Implements a source tokenizer and a parser for a
 > declared subset of the language: struct/unit/extend/type declarations,
 > fields, scalar/list/named and enumeral types, `keep`/`keep soft`
@@ -17,6 +25,24 @@
 > non-linear or disjunctive constraint solving, HDL bridging or testbench
 > execution. No IEEE conformance is claimed. See
 > [docs/ROADMAP.md](docs/ROADMAP.md) for the staged plan.
+
+## From Slopman to Rustman
+
+In keeping with this repository's policy of honest staged claims, the
+mascot above is a status report. Everything here is authored by AI coding
+agents under human review, and until the qualification corpus is complete
+the honest word for that output is *slop*. Slopman wears his without
+embarrassment: he is what this repository currently is — plausible, usefully
+wrong in documented ways, and improving with every token.
+
+He is not a permanent appointment. Every reviewed pull request, every
+diagnostic fixture that earns its expected output, and every reference run
+recorded in [docs/VERIFICATION.md](docs/VERIFICATION.md) burns more tokens
+and drains a little more green from the *e*. No date is promised — only the
+mechanism: work the staged plan in [docs/ROADMAP.md](docs/ROADMAP.md), keep
+every claim matched by its tests, and one day, when enough tokens have been
+burned, Slopman will quietly become Rustman. Same letter; less slime. Until
+then, no conformance is claimed, and no cleanliness either.
 
 ## Goals
 
@@ -64,6 +90,7 @@ semantics and its honest limits).
 | `examples/` | Small e-language sources used by tests and the CLI |
 | `docs/` | Architecture, roadmap, references and the verification log |
 | `external/` | Pinned read-only reference repositories (see [external/README.md](external/README.md)) |
+| `slopman-logo.png`, `rustman-logo.png` | The project mascot, present and prospective (see [From Slopman to Rustman](#from-slopman-to-rustman)) |
 
 ## Working on this repository
 
