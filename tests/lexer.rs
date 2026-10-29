@@ -368,3 +368,45 @@ fn reports_unterminated_string() {
     let error = tokenize("name: string = \"abc").unwrap_err();
     assert_eq!(error.message, "unterminated string literal");
 }
+
+#[test]
+fn prose_outside_code_blocks_is_skipped() {
+    // Specman loads only `<' .. '>` spans; a file whose delimiters are
+    // opened but unterminated runs to end of source (and must terminate).
+    let tokens =
+        tokenize("spec header prose\n<'\nextend packet { keep tail == 3; };\n'>\ntrailing prose\n")
+            .expect("terminates and tokenizes");
+    assert!(
+        tokens
+            .iter()
+            .all(|t| !matches!(&t.kind, TokenKind::Identifier(w) if w == "prose")),
+        "outside prose must be skipped: {tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(w) if w == "packet")),
+        "code inside the block must be tokenized"
+    );
+}
+
+#[test]
+fn unterminated_code_block_runs_to_end_of_source() {
+    let tokens = tokenize("prose\n<'\nkeep a == 1;").expect("must terminate");
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Keyword(k) if k == "keep")),
+        "code after the opener must be tokenized"
+    );
+}
+
+#[test]
+fn source_without_code_blocks_is_all_code() {
+    let tokens = tokenize("keep a == 1;").expect("tokenizes");
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Keyword(k) if k == "keep"))
+    );
+}

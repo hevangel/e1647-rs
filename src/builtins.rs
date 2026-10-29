@@ -24,6 +24,22 @@ pub const BUILTIN_ROUTINES: &[&str] = &[
     "hdl_get",
     "hdl_run",
     "hdl_finish",
+    // `dut_error`/`error` report a check failure and count it; the run
+    // continues, as in Specman.
+    "dut_error",
+    "error",
+    // `message(severity, ...)` prints when verbosity allows; the plain
+    // subset always prints the message text.
+    "message",
+    // `append(a, b, ...)` concatenates strings (list append is a later
+    // milestone).
+    "append",
+    // `stop_run()` ends the test: it unwinds all TCMs and stops the run
+    // loop.
+    "stop_run",
+    // `pack(NULL, item)` concatenates the item's physical fields
+    // MSB-first into one integer.
+    "pack",
 ];
 
 pub fn is_builtin_unit(name: &str) -> bool {

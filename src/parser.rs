@@ -57,6 +57,30 @@ use crate::lexer::{self, Position, Token, TokenKind};
 /// all left-associative in this subset). The word spellings (`and`, `or`,
 /// `xor`) share the level of their symbol twins, as in the reference
 /// grammar.
+/// Predefined e names that lex as keywords but appear as bare values or
+/// call targets in real code (`set_config(print, radix, hex)`,
+/// `pack(NULL, it)`, `it.x`, `wait until rise(sig)`). In expression and
+/// statement position they are treated as plain identifiers.
+const PREDEFINED_NAMES: &[&str] = &[
+    "print",
+    "radix",
+    "hex",
+    "dec",
+    "bin",
+    "items",
+    "simulation",
+    "NULL",
+    "index",
+    "it",
+    "rise",
+    "fall",
+    "change",
+];
+
+fn is_predefined_name(word: &str) -> bool {
+    PREDEFINED_NAMES.contains(&word)
+}
+
 const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
     &[("=>", BinaryOp::Imply)],
     &[("||", BinaryOp::LogicalOr), ("or", BinaryOp::LogicalOr)],
@@ -295,14 +319,62 @@ impl Parser {
         }
     }
 
+    /// A type name: an identifier, or the `global` keyword (`extend
+    /// global` extends the root environment, as in Specman).
+    fn expect_type_name(&mut self, message: &str) -> Option<(String, (Position, Position))> {
+        if self.at_identifier() {
+            return Some(self.take_identifier());
+        }
+        if self.peek_word_is("global") {
+            let (start, end) = self.current_span();
+            self.bump();
+            return Some(("global".to_owned(), (start, end)));
+        }
+        self.error_here("E0102", message);
+        None
+    }
+
     fn parse_program(&mut self) -> Vec<Declaration> {
-        let mut declarations = Vec::new();
+        let mut declarations: Vec<Declaration> = Vec::new();
         while self.peek().is_some() {
             let keyword = match self.peek_kind() {
                 Some(TokenKind::Keyword(k))
                     if matches!(k.as_str(), "struct" | "unit" | "extend" | "type") =>
                 {
                     k.clone()
+                }
+                // File-level `define` constants and `import` lists live in
+                // the global scope; they are represented as members of an
+                // `extend global` pseudo-declaration.
+                Some(TokenKind::Keyword(k)) if matches!(k.as_str(), "define" | "import") => {
+                    let (gstart, _) = self.current_span();
+                    let members = if k.as_str() == "define" {
+                        self.parse_define().map(|m| vec![m])
+                    } else {
+                        self.parse_import()
+                    };
+                    let Some(members) = members else {
+                        continue;
+                    };
+                    let gend = self.last_end();
+                    match declarations.last_mut() {
+                        Some(last)
+                            if last.kind == DeclarationKind::Extend && last.name == "global" =>
+                        {
+                            last.members.extend(members);
+                        }
+                        _ => declarations.push(Declaration {
+                            kind: DeclarationKind::Extend,
+                            name: "global".to_owned(),
+                            name_span: (gstart, gstart),
+                            like: None,
+                            like_span: None,
+                            modifiers: Vec::new(),
+                            members,
+                            span: (gstart, gend),
+                        }),
+                    }
+                    continue;
                 }
                 _ => {
                     self.error_here(
@@ -342,6 +414,7 @@ impl Parser {
                 name_span,
                 like: None,
                 like_span: None,
+                modifiers: Vec::new(),
                 members: Vec::new(),
                 span: (start, self.eof),
             });
@@ -381,9 +454,19 @@ impl Parser {
                 name_span,
                 like: None,
                 like_span: None,
+                modifiers: Vec::new(),
                 members,
                 span: (start, self.last_end()),
             });
+        }
+        // Optional storage width: `type e: [A, B] (bits: 4);` — accepted
+        // for syntax compatibility; scalar sizing of enumerals is not
+        // modeled yet.
+        if self.eat_punct("(") {
+            self.eat_keyword("bits");
+            self.expect_punct(":", "E0103", "expected ':' after 'bits'")?;
+            self.parse_expr()?;
+            self.expect_punct(")", "E0110", "expected ')' after the width")?;
         }
         if self
             .expect_punct(";", "E0105", "expected ';' after the type declaration")
@@ -396,6 +479,7 @@ impl Parser {
                 name_span,
                 like: None,
                 like_span: None,
+                modifiers: Vec::new(),
                 members,
                 span: (start, self.last_end()),
             });
@@ -407,6 +491,7 @@ impl Parser {
             name_span,
             like: None,
             like_span: None,
+            modifiers: Vec::new(),
             members,
             span: (start, end),
         })
@@ -421,12 +506,52 @@ impl Parser {
             _ => unreachable!("caller validated the keyword"),
         };
         self.bump();
-        let (name, name_span) = self.expect_identifier("E0102", "expected declaration name")?;
+        // When-modifier prefixes qualify the extended subtype (`extend
+        // imm cpu_instr_s`, `extend ACTIVE TX uart_agent_u`). The
+        // declared name is always the LAST word before `{` or `like`,
+        // so every preceding word is a modifier (`value'id` pairs are
+        // flattened to their two words). Modifiers are recorded but
+        // when-scoping of extensions is not modeled yet.
+        let mut modifiers = Vec::new();
+        let (name, name_span) = if kind == DeclarationKind::Extend && self.at_identifier() {
+            let mut words: Vec<Vec<(String, (Position, Position))>> = Vec::new();
+            while self.at_identifier() {
+                let Some(Token {
+                    kind: word_kind,
+                    start: ws,
+                    end: we,
+                }) = self.peek().cloned()
+                else {
+                    break;
+                };
+                let word = match word_kind {
+                    TokenKind::Identifier(text) => text,
+                    TokenKind::Keyword(text) if text == "global" => text,
+                    _ => break,
+                };
+                self.bump();
+                let mut parts = vec![(word, (ws, we))];
+                if self.eat_punct("'") {
+                    let (id, id_span) =
+                        self.expect_identifier("E0102", "expected an id after the modifier quote")?;
+                    parts.push((id, id_span));
+                }
+                words.push(parts);
+            }
+            // The final word run is the type name.
+            let last = words.pop().expect("checked at_identifier above");
+            for parts in words {
+                modifiers.extend(parts.into_iter().map(|(word, _)| word));
+            }
+            let (name, name_span) = last.into_iter().next().expect("non-empty run");
+            (name, name_span)
+        } else {
+            self.expect_type_name("expected declaration name")?
+        };
         let mut like = None;
         let mut like_span = None;
         if self.eat_keyword("like") {
-            let (base, span) =
-                self.expect_identifier("E0102", "expected type name after 'like'")?;
+            let (base, span) = self.expect_type_name("expected type name after 'like'")?;
             like = Some(base);
             like_span = Some(span);
         }
@@ -441,6 +566,7 @@ impl Parser {
                 name_span,
                 like,
                 like_span,
+                modifiers,
                 members: Vec::new(),
                 span: (start, self.eof),
             });
@@ -456,6 +582,7 @@ impl Parser {
             name_span,
             like,
             like_span,
+            modifiers,
             members,
             span: (start, end),
         })
@@ -630,6 +757,44 @@ impl Parser {
                 self.expect_identifier("E0102", "expected field name after ','")?;
             names.push((name, name_span));
         }
+        // Optional fixed-size dimension: `regs[4] : list of byte;`. The
+        // list-length constraint is not modeled yet, so the dimension is
+        // accepted and dropped.
+        if self.at_punct("[") {
+            self.bump();
+            self.parse_expr()?;
+            self.expect_punct("]", "E0107", "expected ']' after the field dimension")?;
+        }
+        // `name is instance;` — an implicitly typed field whose type is
+        // the same-named struct (`verify is instance;`).
+        if self.at_keyword("is") && !self.at_punct(":") {
+            self.bump(); // 'is'
+            if !self.eat_keyword("instance") && !self.eat_keyword("inline") {
+                self.error_here("E0104", "expected 'instance' or 'inline' after 'is'");
+                return None;
+            }
+            if !self.eat_punct(";") && !self.at_punct("}") {
+                self.expect_punct(";", "E0105", "expected ';' after field declaration")?;
+            }
+            let _end = self.last_end();
+            return Some(
+                names
+                    .into_iter()
+                    .map(|(name, name_span)| {
+                        Member::Field(Field {
+                            name: name.clone(),
+                            name_span,
+                            ty: TypeExpr::Named {
+                                name,
+                                span: name_span,
+                            },
+                            physical: false,
+                            no_gen: false,
+                        })
+                    })
+                    .collect(),
+            );
+        }
         self.expect_punct(":", "E0103", "expected ':' after field name")?;
         let ty = self.parse_type()?;
         // `is instance` / `is inline` suffixes are syntactic in this
@@ -638,7 +803,11 @@ impl Parser {
             self.error_here("E0104", "expected 'instance' or 'inline' after 'is'");
             return None;
         }
-        self.expect_punct(";", "E0105", "expected ';' after field declaration")?;
+        // The final member of a body may omit the `;` (Specman accepts
+        // both spellings).
+        if !self.eat_punct(";") && !self.at_punct("}") {
+            self.expect_punct(";", "E0105", "expected ';' after field declaration")?;
+        }
         Some(
             names
                 .into_iter()
@@ -759,13 +928,19 @@ impl Parser {
             return false;
         }
         let Some(Token {
-            kind: TokenKind::Identifier(direction),
+            kind: direction_kind,
             ..
         }) = self.tokens.get(self.pos + 2)
         else {
             return false;
         };
-        matches!(direction.as_str(), "in" | "out" | "inout")
+        // `in` is a keyword (`for each in …`), `out`/`inout` lex as
+        // identifiers — the direction is matched by word text either way.
+        let direction = match direction_kind {
+            TokenKind::Keyword(word) | TokenKind::Identifier(word) => word.as_str(),
+            _ => return false,
+        };
+        matches!(direction, "in" | "out" | "inout")
             && matches!(
                 self.tokens.get(self.pos + 3).map(|t| &t.kind),
                 Some(TokenKind::Identifier(id)) if id == "simple_port"
@@ -778,7 +953,7 @@ impl Parser {
         let (name, name_span) = self.take_identifier();
         self.expect_punct(":", "E0103", "expected ':' after the port name")?;
         let direction = match self.peek_kind() {
-            Some(TokenKind::Identifier(id)) => match id.as_str() {
+            Some(TokenKind::Keyword(id)) | Some(TokenKind::Identifier(id)) => match id.as_str() {
                 "in" => {
                     self.bump();
                     PortDirection::In
@@ -874,24 +1049,41 @@ impl Parser {
         if cycle {
             self.bump();
         }
-        let mut items = Vec::new();
-        loop {
-            let condition = if self.peek_is_edge_routine() {
-                let routine = self.take_word()?;
-                if !matches!(routine.as_str(), "rise" | "fall" | "change" | "true") {
-                    self.error_here("E0102", &format!("unknown edge routine '{routine}'"));
-                    return None;
+        // Grouped guard form: `is (fall(a) and true(b)) @clk` — the
+        // sampled path comes after the group and applies to every inner
+        // sample.
+        if self.eat_punct("(") {
+            let mut items = Vec::new();
+            let mut group_op = None;
+            loop {
+                items.push(self.parse_edge_sample()?);
+                if self.eat_keyword("and") {
+                    group_op = Some("and".to_owned());
+                } else if self.eat_keyword("or") {
+                    group_op = Some("or".to_owned());
+                } else {
+                    break;
                 }
-                self.expect_punct("(", "E0108", "expected '(' after the edge routine")?;
-                let condition = self.parse_expr()?;
-                self.expect_punct(")", "E0108", "expected ')' after the edge condition")?;
-                Some(condition)
-            } else {
-                None
-            };
+            }
+            self.expect_punct(")", "E0110", "expected ')' to close the trigger group")?;
             self.expect_punct("@", "E0108", "expected '@' in the event trigger")?;
             let path = self.parse_dotted_path()?;
-            items.push(crate::ast::EventTriggerItem { path, condition });
+            for item in &mut items {
+                if item.path.is_empty() {
+                    item.path = path.clone();
+                }
+            }
+            return Some(crate::ast::EventTrigger {
+                modifier,
+                cycle,
+                items,
+                group_op,
+            });
+        }
+        let mut items = Vec::new();
+        loop {
+            let item = self.parse_edge_sample_with_path()?;
+            items.push(item);
             if !self.eat_keyword("or") {
                 break;
             }
@@ -900,6 +1092,43 @@ impl Parser {
             modifier,
             cycle,
             items,
+            group_op: None,
+        })
+    }
+
+    /// One `@path` or `routine(cond) @path` sample (grouped-guard form;
+    /// the `@path` is filled in by the caller).
+    fn parse_edge_sample(&mut self) -> Option<crate::ast::EventTriggerItem> {
+        let (routine, condition) = if self.peek_is_edge_routine() {
+            let routine = self.take_word()?;
+            if !matches!(routine.as_str(), "rise" | "fall" | "change" | "true") {
+                self.error_here("E0102", &format!("unknown edge routine '{routine}'"));
+                return None;
+            }
+            self.expect_punct("(", "E0108", "expected '(' after the edge routine")?;
+            let condition = self.parse_expr()?;
+            self.expect_punct(")", "E0108", "expected ')' after the edge condition")?;
+            (Some(routine), Some(condition))
+        } else {
+            (None, None)
+        };
+        Some(crate::ast::EventTriggerItem {
+            routine,
+            path: Vec::new(),
+            condition,
+        })
+    }
+
+    /// One `@path` or `routine(cond) @path` sample of an ungrouped
+    /// trigger.
+    fn parse_edge_sample_with_path(&mut self) -> Option<crate::ast::EventTriggerItem> {
+        let item = self.parse_edge_sample()?;
+        self.expect_punct("@", "E0108", "expected '@' in the event trigger")?;
+        let path = self.parse_dotted_path()?;
+        Some(crate::ast::EventTriggerItem {
+            routine: item.routine,
+            path,
+            condition: item.condition,
         })
     }
 
@@ -944,6 +1173,86 @@ impl Parser {
             path,
             span: (start, self.last_end()),
         }
+    }
+
+    /// The postfix loop shared by every primary that can carry one:
+    /// `.member` access, `.as_a(type)` casts, calls and indexing. Member
+    /// names accept keyword spellings (`as_a` is a keyword; predefined
+    /// member names such as `kind` may collide with other keywords).
+    fn parse_postfix_chain(&mut self, mut expr: Expr, start: Position) -> Option<Expr> {
+        loop {
+            if self.at_punct(".") {
+                self.bump();
+                let (member, member_span) = if self.at_identifier() {
+                    self.take_identifier()
+                } else if let Some(word) = self.take_word() {
+                    let span = self.last_end();
+                    (word, (span, span))
+                } else {
+                    self.error_here("E0102", "expected member name after '.'");
+                    return None;
+                };
+                // `expr.as_a(type)` cast.
+                if member == "as_a" && self.at_punct("(") {
+                    self.bump();
+                    let ty = self.parse_type()?;
+                    self.expect_punct(")", "E0110", "expected ')' to close the cast")?;
+                    expr = Expr::CastAs {
+                        expr: Box::new(expr),
+                        ty,
+                        span: (start, self.last_end()),
+                    };
+                    continue;
+                }
+                expr = Expr::MemberAccess {
+                    object: Box::new(expr),
+                    name: member,
+                    name_span: member_span,
+                    span: (start, member_span.1),
+                };
+            } else if self.at_punct("(") {
+                self.bump();
+                let mut args = Vec::new();
+                if !self.at_punct(")") {
+                    loop {
+                        args.push(self.parse_expr()?);
+                        if !self.eat_punct(",") {
+                            break;
+                        }
+                    }
+                }
+                self.expect_punct(")", "E0110", "expected ')' to close the call arguments")?;
+                expr = Expr::Call {
+                    callee: Box::new(expr),
+                    args,
+                    span: (start, self.last_end()),
+                };
+            } else if self.at_punct("[") {
+                self.bump();
+                let first = self.parse_expr()?;
+                if self.eat_punct(":") {
+                    // Bit slice: base[high:low].
+                    let low = self.parse_expr()?;
+                    self.expect_punct("]", "E0107", "expected ']' to close the bit slice")?;
+                    expr = Expr::BitSlice {
+                        base: Box::new(expr),
+                        high: Box::new(first),
+                        low: Box::new(low),
+                        span: (start, self.last_end()),
+                    };
+                } else {
+                    self.expect_punct("]", "E0107", "expected ']' to close the index expression")?;
+                    expr = Expr::Index {
+                        base: Box::new(expr),
+                        index: Box::new(first),
+                        span: (start, self.last_end()),
+                    };
+                }
+            } else {
+                break;
+            }
+        }
+        Some(expr)
     }
 
     /// The keyword or identifier text at the cursor, if any.
@@ -1067,6 +1376,15 @@ impl Parser {
         }
         if self.at_identifier() {
             let (name, span) = self.take_identifier();
+            // A when-qualified type (`reg cpu_instr_s`, the modifier
+            // naming the subtype variant) — the subtype qualifier is
+            // dropped; subtype dispatch is not modeled yet.
+            let (name, span) = if self.at_identifier() {
+                let (base, base_span) = self.take_identifier();
+                (base, base_span)
+            } else {
+                (name, span)
+            };
             return Some(TypeExpr::Named { name, span });
         }
         let Some(TokenKind::Keyword(keyword)) = self.peek_kind() else {
@@ -1231,6 +1549,62 @@ impl Parser {
                     span: (start, end),
                 })
             }
+            Some(TokenKind::Keyword(k)) if k == "check" => {
+                // `check that <cond> else <stmt-or-block>;` — the `that`
+                // keyword is optional in the reference grammar.
+                self.bump();
+                self.eat_keyword("that");
+                let condition = self.parse_expr()?;
+                let else_body = if self.eat_keyword("else") {
+                    if self.eat_punct("{") {
+                        let body = self.parse_statements();
+                        self.expect_punct("}", "E0107", "expected '}' to close the check body")?;
+                        self.eat_punct(";");
+                        body
+                    } else {
+                        // A single-statement else carries its own `;`.
+                        let statement = self.parse_statement()?;
+                        vec![statement]
+                    }
+                } else {
+                    self.eat_punct(";");
+                    Vec::new()
+                };
+                let end = self.last_end();
+                Some(Stmt::Check {
+                    condition,
+                    else_body,
+                    span: (start, end),
+                })
+            }
+            Some(TokenKind::Keyword(k)) if is_predefined_name(k) => {
+                // A statement whose target is a predefined name (`it.x =
+                // p_out$;`) — parse as the expression/assignment form.
+                let expr = self.parse_expr()?;
+                if self.eat_punct("=") {
+                    let value = self.parse_expr()?;
+                    self.expect_punct(";", "E0105", "expected ';' after assignment")?;
+                    let end = self.last_end();
+                    Some(Stmt::Assign {
+                        target: expr,
+                        value,
+                        span: (start, end),
+                    })
+                } else if !self.eat_punct(";") && !self.at_punct("}") {
+                    self.expect_punct(";", "E0105", "expected ';' after statement")?;
+                    let end = self.last_end();
+                    Some(Stmt::ExprStmt {
+                        expr,
+                        span: (start, end),
+                    })
+                } else {
+                    let end = self.last_end();
+                    Some(Stmt::ExprStmt {
+                        expr,
+                        span: (start, end),
+                    })
+                }
+            }
             Some(TokenKind::Keyword(_)) => {
                 self.error_here("E0113", "this statement kind is not supported yet");
                 self.recover_to_member_boundary();
@@ -1247,8 +1621,36 @@ impl Parser {
                         value,
                         span: (start, end),
                     })
+                } else if self.at_punct("+=") || self.at_punct("-=") {
+                    // `x += n` desugars to `x = x + n` (and `-=` likewise);
+                    // no other compound operators occur in the corpora.
+                    let TokenKind::Punctuation(op) = self.bump().kind else {
+                        unreachable!("peeked a compound assignment operator");
+                    };
+                    let operand = self.parse_expr()?;
+                    let value = Expr::Binary {
+                        op: if op == "+=" {
+                            crate::ast::BinaryOp::Add
+                        } else {
+                            crate::ast::BinaryOp::Sub
+                        },
+                        lhs: Box::new(expr.clone()),
+                        rhs: Box::new(operand),
+                        span: (start, self.last_end()),
+                    };
+                    self.expect_punct(";", "E0105", "expected ';' after assignment")?;
+                    let end = self.last_end();
+                    Some(Stmt::Assign {
+                        target: expr,
+                        value,
+                        span: (start, end),
+                    })
                 } else {
-                    self.expect_punct(";", "E0105", "expected ';' after statement")?;
+                    // The final statement of a `{ .. }` body may omit the
+                    // `;` (Specman accepts both spellings).
+                    if !self.eat_punct(";") && !self.at_punct("}") {
+                        self.expect_punct(";", "E0105", "expected ';' after statement")?;
+                    }
                     let end = self.last_end();
                     Some(Stmt::ExprStmt {
                         expr,
@@ -1394,6 +1796,15 @@ impl Parser {
                 text: "1".to_owned(),
                 span: (start, self.last_end()),
             }
+        } else if self.eat_keyword("until") {
+            // `wait until <expr>` samples a temporal condition; edge
+            // sampling is a later milestone, so the condition is checked
+            // for syntax and the wait advances one cycle for now.
+            self.parse_expr()?;
+            Expr::IntLiteral {
+                text: "1".to_owned(),
+                span: (start, self.last_end()),
+            }
         } else {
             self.expect_punct("[", "E0106", "expected 'cycle' or '[n]' after 'wait'")?;
             let count = self.parse_expr()?;
@@ -1418,15 +1829,25 @@ impl Parser {
         let start = self.current_span().0;
         self.bump(); // 'for'
         if self.eat_keyword("each") {
+            // Optional named binding: `for each (m) in list do`.
+            let var = if self.eat_punct("(") {
+                let (name, _) = self
+                    .expect_identifier("E0102", "expected the iterator name after 'for each ('")?;
+                self.expect_punct(")", "E0110", "expected ')' after the iterator name")?;
+                Some(name)
+            } else {
+                None
+            };
             self.expect_keyword_word("in")?;
             let list = self.parse_expr()?;
-            self.expect_keyword_word("do")?;
+            self.eat_keyword("do");
             self.expect_punct("{", "E0106", "expected '{' to open the for-each body")?;
             let body = self.parse_statements();
             self.expect_punct("}", "E0107", "expected '}' to close the for-each body")?;
             self.expect_punct(";", "E0105", "expected ';' after the for-each statement")?;
             let end = self.last_end();
             return Some(Stmt::ForEach {
+                var,
                 list,
                 body,
                 span: (start, end),
@@ -1437,6 +1858,8 @@ impl Parser {
         let from = self.parse_expr()?;
         self.expect_keyword_word("to")?;
         let to = self.parse_expr()?;
+        // `do` before `{` is the spelled form; both spellings occur.
+        self.eat_keyword("do");
         self.expect_punct("{", "E0106", "expected '{' to open the for body")?;
         let body = self.parse_statements();
         self.expect_punct("}", "E0107", "expected '}' to close the for body")?;
@@ -1484,11 +1907,14 @@ impl Parser {
             };
             let start = first.span().0;
             let end = self.last_end();
-            return Some(Expr::InSet {
+            let membership = Expr::InSet {
                 element: Box::new(first),
                 set,
                 span: (start, end),
-            });
+            };
+            // A postfix membership can still feed a loosest-level
+            // operator (`keep x in [A, B] => y == 1;`).
+            return self.finish_binary_level(0, BINARY_LEVELS[0], membership);
         }
         if self.eat_punct("?") {
             let then_expr = self.parse_expr()?;
@@ -1496,12 +1922,13 @@ impl Parser {
             let else_expr = self.parse_expr()?;
             let start = first.span().0;
             let end = else_expr.span().1;
-            return Some(Expr::Ternary {
+            let ternary = Expr::Ternary {
                 cond: Box::new(first),
                 then_expr: Box::new(then_expr),
                 else_expr: Box::new(else_expr),
                 span: (start, end),
-            });
+            };
+            return self.finish_binary_level(0, BINARY_LEVELS[0], ternary);
         }
         Some(first)
     }
@@ -1510,7 +1937,18 @@ impl Parser {
         let Some(operators) = BINARY_LEVELS.get(level) else {
             return self.parse_unary();
         };
-        let mut lhs = self.parse_binary_level(level + 1)?;
+        let lhs = self.parse_binary_level(level + 1)?;
+        self.finish_binary_level(level, operators, lhs)
+    }
+
+    /// The left-associative loop for one precedence level, seeded with an
+    /// already-parsed left-hand side.
+    fn finish_binary_level(
+        &mut self,
+        level: usize,
+        operators: &[(&str, BinaryOp)],
+        mut lhs: Expr,
+    ) -> Option<Expr> {
         loop {
             let op = match self.peek_kind() {
                 Some(TokenKind::Punctuation(symbol)) => operators
@@ -1587,6 +2025,23 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Option<Expr> {
         let (start, end) = self.current_span();
+        // Predefined e names that appear as bare values in real code
+        // (see PREDEFINED_NAMES); treated as plain identifiers in
+        // expression position.
+        if let Some(TokenKind::Keyword(word)) = self.peek_kind()
+            && is_predefined_name(word)
+        {
+            let name = word.clone();
+            self.bump();
+            let ident = Expr::Ident {
+                name,
+                span: (start, end),
+            };
+            // These names take the same postfix chain as identifiers
+            // (`it.a`, `append(s, index, …)` — call args parse through
+            // here too).
+            return self.parse_postfix_chain(ident, start);
+        }
         match self.peek_kind() {
             Some(TokenKind::Number(_)) => {
                 let token = self.bump();
@@ -1633,85 +2088,12 @@ impl Parser {
             }
             Some(TokenKind::Identifier(_)) => {
                 let (name, _) = self.take_identifier();
-                let mut expr = Expr::Ident {
+                let expr = Expr::Ident {
                     name,
                     span: (start, end),
                 };
                 // Postfix chain: member access, calls, indexing.
-                loop {
-                    if self.at_punct(".") {
-                        self.bump();
-                        let (member, member_span) =
-                            self.expect_identifier("E0102", "expected member name after '.'")?;
-                        // `expr.as_a(type)` cast.
-                        if member == "as_a" && self.at_punct("(") {
-                            self.bump();
-                            let ty = self.parse_type()?;
-                            self.expect_punct(")", "E0110", "expected ')' to close the cast")?;
-                            expr = Expr::CastAs {
-                                expr: Box::new(expr),
-                                ty,
-                                span: (start, self.last_end()),
-                            };
-                            continue;
-                        }
-                        expr = Expr::MemberAccess {
-                            object: Box::new(expr),
-                            name: member,
-                            name_span: member_span,
-                            span: (start, member_span.1),
-                        };
-                    } else if self.at_punct("(") {
-                        self.bump();
-                        let mut args = Vec::new();
-                        if !self.at_punct(")") {
-                            loop {
-                                args.push(self.parse_expr()?);
-                                if !self.eat_punct(",") {
-                                    break;
-                                }
-                            }
-                        }
-                        self.expect_punct(
-                            ")",
-                            "E0110",
-                            "expected ')' to close the call arguments",
-                        )?;
-                        expr = Expr::Call {
-                            callee: Box::new(expr),
-                            args,
-                            span: (start, self.last_end()),
-                        };
-                    } else if self.at_punct("[") {
-                        self.bump();
-                        let first = self.parse_expr()?;
-                        if self.eat_punct(":") {
-                            // Bit slice: base[high:low].
-                            let low = self.parse_expr()?;
-                            self.expect_punct("]", "E0107", "expected ']' to close the bit slice")?;
-                            expr = Expr::BitSlice {
-                                base: Box::new(expr),
-                                high: Box::new(first),
-                                low: Box::new(low),
-                                span: (start, self.last_end()),
-                            };
-                        } else {
-                            self.expect_punct(
-                                "]",
-                                "E0107",
-                                "expected ']' to close the index expression",
-                            )?;
-                            expr = Expr::Index {
-                                base: Box::new(expr),
-                                index: Box::new(first),
-                                span: (start, self.last_end()),
-                            };
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                Some(expr)
+                self.parse_postfix_chain(expr, start)
             }
             Some(TokenKind::Punctuation(p)) if p == "'" => {
                 // Quoted hierarchical HDL path: 'path.to.signal'.
@@ -1750,10 +2132,13 @@ impl Parser {
                 let inner = self.parse_expr()?;
                 self.expect_punct(")", "E0110", "expected ')' to close the expression")?;
                 let end = self.last_end();
-                Some(Expr::Paren {
+                let paren = Expr::Paren {
                     expr: Box::new(inner),
                     span: (start, end),
-                })
+                };
+                // `(a == 1).as_a(bool)` — parenthesized primaries take
+                // the same postfix chain as identifiers.
+                self.parse_postfix_chain(paren, start)
             }
             _ => {
                 self.error_here("E0108", "expected an expression");

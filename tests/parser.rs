@@ -460,12 +460,23 @@ fn when_bare_and_chained_modifiers_parse() {
 
 #[test]
 fn when_blocks_are_searched_for_fields_and_constraints() {
-    // A duplicate field inside a when block is diagnosed against the
-    // declaration's other fields (including sibling when blocks).
-    let result =
+    // A `when` branch may shadow a base field (each subtype variant
+    // carries its own field set), so only a duplicate in the SAME scope
+    // is diagnosed.
+    let shadowing =
         parse("struct s {\n    a: uint;\n    when fast'kind s {\n        a: uint;\n    };\n};\n");
-    let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
-    assert_eq!(rendered, vec!["4:9: error[E0202]: duplicate field 'a'"]);
+    assert!(
+        shadowing.diagnostics.is_empty(),
+        "when-shadowing must be accepted: {:?}",
+        shadowing
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    let duplicate = parse("struct s {\n    a: uint;\n    a: uint;\n};\n");
+    let rendered: Vec<String> = duplicate.diagnostics.iter().map(|d| d.render()).collect();
+    assert_eq!(rendered, vec!["3:5: error[E0202]: duplicate field 'a'"]);
 }
 
 #[test]

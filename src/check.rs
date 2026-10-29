@@ -48,8 +48,9 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
         }
     }
     // Enumerals live in the file-global namespace once their `type` is
-    // declared, so any `keep` constraint may reference them.
-    let enumerals: BTreeSet<&str> = declarations
+    // declared, so any `keep` constraint may reference them. Inline
+    // enumerals (`kind : [imm, reg]`) contribute the same way.
+    let mut enumerals: BTreeSet<&str> = declarations
         .iter()
         .filter(|declaration| declaration.kind == DeclarationKind::Type)
         .flat_map(|declaration| declaration.members.iter())
@@ -58,6 +59,15 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             _ => None,
         })
         .collect();
+    for declaration in declarations {
+        for_each_field(&declaration.members, &mut |field| {
+            if let crate::ast::TypeExpr::InlineEnum { names, .. } = &field.ty {
+                for name in names {
+                    enumerals.insert(name.as_str());
+                }
+            }
+        });
+    }
     for declaration in declarations {
         check_extend_target(declaration, &declared, &mut diagnostics);
         check_like_target(declaration, &declared, &mut diagnostics);
@@ -83,6 +93,11 @@ fn check_extend_target(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if declaration.kind != DeclarationKind::Extend {
+        return;
+    }
+    // The parser's pseudo-declaration holding file-level `define`/`import`
+    // members is scope, not an extend of a real type.
+    if declaration.name == "global" && declaration.like.is_none() {
         return;
     }
     if !declared.contains(declaration.name.as_str())
@@ -124,8 +139,14 @@ fn check_fields(
     declared: &BTreeSet<&str>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Field names may repeat across `when` branches (each subtype variant
+    // carries its own field set, possibly shadowing the base field), so
+    // only the top-level scope participates in the duplicate check.
     let mut seen: BTreeSet<&str> = BTreeSet::new();
-    for_each_field(&declaration.members, &mut |field| {
+    for member in &declaration.members {
+        let Member::Field(field) = member else {
+            continue;
+        };
         if !seen.insert(field.name.as_str()) {
             diagnostics.push(Diagnostic::new(
                 "E0202",
@@ -134,6 +155,8 @@ fn check_fields(
                 field.name_span.1,
             ));
         }
+    }
+    for_each_field(&declaration.members, &mut |field| {
         check_named_type(&field.ty, declared, diagnostics);
         if let TypeExpr::Scalar {
             base: crate::ast::ScalarBase::Uint | crate::ast::ScalarBase::Int,
@@ -236,6 +259,9 @@ fn check_statements<'a>(
                 if let Some(else_body) = else_body {
                     check_statements(else_body, seen, declared, method_name, diagnostics);
                 }
+            }
+            Stmt::Check { else_body, .. } => {
+                check_statements(else_body, seen, declared, method_name, diagnostics);
             }
             Stmt::Assign { .. }
             | Stmt::ExprStmt { .. }

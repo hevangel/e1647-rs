@@ -28,6 +28,11 @@ pub struct Declaration {
     /// `struct derived like base { .. }` inheritance clause.
     pub like: Option<String>,
     pub like_span: Option<Span>,
+    /// When-modifier prefixes of the declared/extended type
+    /// (`extend imm cpu_instr_s`, `extend ACTIVE TX uart_agent_u`) —
+    /// `value'id` pairs flattened to their modifier text. When-scoping of
+    /// extensions is not modeled yet; the modifiers are recorded only.
+    pub modifiers: Vec<String>,
     pub members: Vec<Member>,
     pub span: Span,
 }
@@ -108,6 +113,10 @@ pub struct EventTrigger {
     /// `cycle` keyword before the first item, if present.
     pub cycle: bool,
     pub items: Vec<EventTriggerItem>,
+    /// A Boolean combination guarding the whole trigger (`is
+    /// (fall(a) and true(b)) @clk`) — the joined sample conditions are
+    /// stored in the items, the combination operator here.
+    pub group_op: Option<String>,
 }
 
 /// One sampled item of an [`EventTrigger`]: `@p_smp.clk` on its own or a
@@ -115,6 +124,9 @@ pub struct EventTrigger {
 /// `change`, `true`) are validated by the parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventTriggerItem {
+    /// `rise` / `fall` / `change` / `true` for edge samples, absent for
+    /// plain event attachments.
+    pub routine: Option<String>,
     /// Dotted sampled path after `@`; the last segment may carry the HDL
     /// `$` suffix (`@off_p$`).
     pub path: Vec<String>,
@@ -250,8 +262,18 @@ pub enum Stmt {
     StopRun {
         span: Span,
     },
-    /// `for each in list do { .. };` — binds `it` to each element.
+    /// `check that <cond> else { .. }` — on a false condition the else
+    /// body runs (usually a `dut_error` call) and the DUT-error counter
+    /// increments; the run itself continues.
+    Check {
+        condition: Expr,
+        else_body: Vec<Stmt>,
+        span: Span,
+    },
+    /// `for each in list do { .. };` binds `it` to each element;
+    /// `for each (m) in list do { .. };` binds `m` instead.
     ForEach {
+        var: Option<String>,
         list: Expr,
         body: Vec<Stmt>,
         span: Span,
@@ -306,6 +328,7 @@ impl Stmt {
             | Stmt::Print { span, .. }
             | Stmt::Gen { span, .. }
             | Stmt::StopRun { span }
+            | Stmt::Check { span, .. }
             | Stmt::ForEach { span, .. }
             | Stmt::ForTo { span, .. }
             | Stmt::Wait { span, .. }

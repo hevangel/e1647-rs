@@ -6,10 +6,11 @@
 //! `external/` (see docs/REFERENCES.md). A bare `'` followed by an
 //! identifier is the subtype modifier quote (`read'kind`), tokenized as a
 //! standalone punctuation token like the reference grammar's `SNG_QUOTE`.
-//! The e code-block delimiters `<'` (open) and `'>` (close) are recognized
-//! and skipped as trivia; their contents are ordinary code in this subset.
-//! Character literals are deliberately not supported yet and produce
-//! explicit errors.
+//! The e code-block delimiters `<'` (open) and `'>` (close): when a source
+//! contains any `<'`, only the spans inside `<' .. '>` pairs are code, as
+//! in Specman — prose outside the blocks is skipped; a source without any
+//! `<'` is code in full. Character literals are deliberately not supported
+//! yet and produce explicit errors.
 
 use std::fmt;
 
@@ -226,7 +227,7 @@ pub fn is_keyword(word: &str) -> bool {
 /// Multi-character operators, longest match first. `===`/`!==` are the
 /// e identity comparisons; `=>` is implication; `..` is a range.
 const OPERATORS: &[&str] = &[
-    "===", "!==", "==", "!=", "<=", ">=", "=>", "&&", "||", "<<", ">>", "..",
+    "===", "!==", "==", "!=", "<=", ">=", "=>", "&&", "||", "<<", ">>", "..", "+=", "-=",
 ];
 
 struct Cursor<'a> {
@@ -234,6 +235,11 @@ struct Cursor<'a> {
     byte: usize,
     line: usize,
     column: usize,
+    /// Whether the cursor is inside a `<' .. '>` code block. Only
+    /// meaningful when the source carries any `<'` at all (see
+    /// [`tokenize`]): with delimiters present, prose outside the blocks
+    /// is skipped; without them the whole source is code.
+    in_code: bool,
 }
 
 impl<'a> Cursor<'a> {
@@ -243,6 +249,7 @@ impl<'a> Cursor<'a> {
             byte: 0,
             line: 1,
             column: 1,
+            in_code: !source.contains("<'"),
         }
     }
 
@@ -320,11 +327,25 @@ impl<'a> Cursor<'a> {
                         });
                     }
                 }
-                // e code-block delimiters: `<'` opens and `'>` closes;
-                // recognized and skipped, their contents are ordinary code
-                // in this subset.
-                (Some('<'), Some('\'')) | (Some('\''), Some('>')) => {
+                // e code-block delimiters: `<'` opens and `'>` closes.
+                // When the source uses code blocks, only their contents
+                // are code — prose between blocks (specman-style mixed
+                // e/HDL files) is skipped, and an unterminated `<'` runs
+                // to end of source.
+                (Some('<'), Some('\'')) if !self.in_code => {
+                    self.in_code = true;
                     self.bump();
+                    self.bump();
+                }
+                (Some('\''), Some('>')) if self.in_code => {
+                    self.in_code = false;
+                    self.bump();
+                    self.bump();
+                }
+                // Prose outside code blocks is skipped; end of source
+                // (an unterminated `<'`) ends the scan rather than
+                // spinning.
+                _ if !self.in_code && self.peek().is_some() => {
                     self.bump();
                 }
                 _ => return Ok(()),

@@ -162,6 +162,9 @@ struct Interp<'a> {
     emitted: std::collections::BTreeSet<String>,
     /// Set by `stop_run()`; unwinds the whole run.
     stop_requested: bool,
+    /// Failed `check that` conditions (`dut_error`), reported like
+    /// Specman's DUT-error count.
+    dut_errors: usize,
     /// `define` constants resolved to values.
     defines: std::collections::BTreeMap<String, Value>,
 }
@@ -200,6 +203,7 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
         wait_budget: WAIT_BUDGET,
         emitted: std::collections::BTreeSet::new(),
         stop_requested: false,
+        dut_errors: 0,
         defines,
     };
     let types: &[crate::elab::ElaboratedType] = interp.types;
@@ -226,6 +230,14 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
         };
     }
     let sys_index = interp.instantiate("sys");
+    // Specman generates the root unit's data fields before run() starts
+    // (respecting `keep` constraints and skipping `!` fields); mirror
+    // that so corpus testbenches see generated lists/scalars.
+    if let Err(diagnostic) = interp.gen_object(sys_index) {
+        interp
+            .output
+            .push_str(&format!("implicit gen: {}\n", diagnostic.render()));
+    }
     let mut diagnostics = Vec::new();
     for block in run_blocks {
         let mut frame = Frame::default();
@@ -233,6 +245,13 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
             diagnostics.push(diagnostic);
             break;
         }
+    }
+    // Specman closes every run with a DUT-error count; mirror it.
+    if interp.dut_errors > 0 {
+        interp.output.push_str(&format!(
+            "Checking is complete - {} DUT error(s).\n",
+            interp.dut_errors
+        ));
     }
     RunResult {
         output: interp.output,
@@ -473,12 +492,38 @@ impl<'a> Interp<'a> {
                 self.stop_requested = true;
                 Ok(Flow::Stop)
             }
-            Stmt::ForEach { list, body, span } => {
+            Stmt::Check {
+                condition,
+                else_body,
+                span,
+            } => {
+                let Value::Bool(holds) = self.eval(condition, frame, me)? else {
+                    return Err(self.error(
+                        "E0402",
+                        "the condition of 'check that' is not a boolean",
+                        *span,
+                    ));
+                };
+                if !holds {
+                    // Specman counts DUT errors and keeps running; the
+                    // else body (typically `dut_error(...)`) reports.
+                    self.dut_errors += 1;
+                    self.exec_block(else_body, frame, me)?;
+                }
+                Ok(Flow::Normal)
+            }
+            Stmt::ForEach {
+                var,
+                list,
+                body,
+                span,
+            } => {
                 let list_value = self.eval(list, frame, me)?;
                 match list_value {
                     Value::List(items) => {
+                        let binding = var.clone().unwrap_or_else(|| "it".to_owned());
                         for item in items {
-                            frame.locals.insert("it".to_owned(), item);
+                            frame.locals.insert(binding.clone(), item);
                             match self.exec_block(body, frame, me)? {
                                 Flow::Normal => {}
                                 Flow::Break => break,
@@ -768,6 +813,69 @@ impl<'a> Interp<'a> {
 
     /// Randomize one struct instance in place: every field is sampled and
     /// the type's top-level `keep` constraints must all hold.
+    /// Whether the type expression names a unit (instance) type — those
+    /// fields are instantiated, never generated.
+    fn is_unit_typed(&self, ty: &TypeExpr) -> bool {
+        let TypeExpr::Named { name, .. } = ty else {
+            return false;
+        };
+        self.types
+            .iter()
+            .any(|t| &t.name == name && t.kind == DeclarationKind::Unit)
+    }
+
+    /// The fixed length demanded by a `keep <field>.size() == N`
+    /// constraint, if any (only the equality form drives lengths here;
+    /// ranges are a later milestone).
+    fn required_list_size<'c>(&self, field: &str, constraints: &'c [Expr]) -> Option<usize> {
+        for constraint in constraints {
+            let Expr::Binary {
+                op: crate::ast::BinaryOp::Eq,
+                lhs,
+                rhs,
+                ..
+            } = constraint
+            else {
+                continue;
+            };
+            let size_call = |expr: &'c Expr| -> Option<(&'c String, &'c Expr)> {
+                let Expr::Call { callee, args, .. } = expr else {
+                    return None;
+                };
+                if !args.is_empty() {
+                    return None;
+                }
+                let Expr::MemberAccess { object, name, .. } = callee.as_ref() else {
+                    return None;
+                };
+                if name != "size" {
+                    return None;
+                }
+                let Expr::Ident { name, .. } = object.as_ref() else {
+                    return None;
+                };
+                Some((name, expr))
+            };
+            let (accessor, size_expr) = if let Some((name, _)) = size_call(lhs) {
+                (name, rhs.as_ref())
+            } else if let Some((name, _)) = size_call(rhs) {
+                (name, lhs.as_ref())
+            } else {
+                continue;
+            };
+            if accessor != field {
+                continue;
+            }
+            if let Expr::IntLiteral { text, .. } = size_expr
+                && let Some(length) = parse_int_literal(text)
+                && let Ok(length) = usize::try_from(length)
+            {
+                return Some(length);
+            }
+        }
+        None
+    }
+
     fn gen_object(&mut self, index: usize) -> Result<(), Diagnostic> {
         let type_name = self.instances[index].type_name.clone();
         let types: &[crate::elab::ElaboratedType] = self.types;
@@ -779,9 +887,12 @@ impl<'a> Interp<'a> {
             ));
         };
         let type_span = ty.span;
+        // `!` fields keep their value; instance (unit-typed) fields are
+        // not generated — they are instantiated structurally.
         let field_types: Vec<(String, TypeExpr)> = ty
             .fields
             .iter()
+            .filter(|field| !field.no_gen && !self.is_unit_typed(&field.ty))
             .map(|field| (field.name.clone(), field.ty.clone()))
             .collect();
         let constraints: Vec<Expr> = ty
@@ -813,9 +924,36 @@ impl<'a> Interp<'a> {
             for (name, field_ty) in &field_types {
                 let value = self.sample_type(field_ty)?;
                 self.instances[index].set(name, value);
+                // A `keep list.size() == N` constraint drives the list
+                // length: fill the sampled (empty) list with generated
+                // elements so the constraint can pass.
+                if let Some(length) = self.required_list_size(name, &constraints)
+                    && let Value::List(items) = self.instances[index]
+                        .get(name)
+                        .cloned()
+                        .unwrap_or(Value::Void)
+                {
+                    let mut filled = items;
+                    filled.resize(length, Value::Void);
+                    for slot in filled.iter_mut() {
+                        let element_ty = list_element_type(field_ty);
+                        let element = self.sample_type(&element_ty)?;
+                        *slot = element;
+                        if let Value::Object(element_index) = *slot {
+                            self.gen_object(element_index)?;
+                        }
+                    }
+                    self.instances[index].set(name, Value::List(filled));
+                }
             }
             let mut pass = true;
             for constraint in &constraints {
+                // HDL-binding constraints (`keep x.hdl_path() == "…"`,
+                // `keep x.delayed() == FALSE`) record simulator-side
+                // facts, not data constraints; they never gate gen.
+                if expr_calls_any(constraint, &["hdl_path", "delayed", "soft", "select"]) {
+                    continue;
+                }
                 match self.eval(constraint, &mut Frame::default(), Some(index))? {
                     Value::Bool(true) => {}
                     Value::Bool(false) => {
@@ -1031,10 +1169,79 @@ impl<'a> Interp<'a> {
         if name == "outf" {
             return self.call_outf(values, span);
         }
+        if name == "dut_error" || name == "error" {
+            self.dut_errors += 1;
+            let text: String = values.iter().map(|v| self.format_value(v)).collect();
+            self.output.push_str(&format!("{name}: {text}\n"));
+            return Ok(Value::Void);
+        }
+        if name == "message" {
+            // message(severity, ...): the severity argument is skipped in
+            // this subset (verbosity filtering is not modeled).
+            let text: String = values
+                .iter()
+                .skip(1)
+                .map(|v| self.format_value(v))
+                .collect();
+            self.output.push_str(&text);
+            self.output.push('\n');
+            return Ok(Value::Void);
+        }
+        if name == "append" {
+            // String concatenation form; list append is a later milestone.
+            let text: String = values.iter().map(|v| self.format_value(v)).collect();
+            return Ok(Value::Str(text));
+        }
+        if name == "stop_run" {
+            self.stop_requested = true;
+            return Ok(Value::Void);
+        }
+        if name == "pack" {
+            // pack(NULL, item) packs the item's physical fields,
+            // MSB-first in declaration order, into one integer. Only the
+            // null-packing argument form occurs in the corpora; the
+            // packing-options argument is ignored.
+            let Some(Value::Object(index)) =
+                values.iter().rev().find(|v| matches!(v, Value::Object(_)))
+            else {
+                return Err(self.error("E0402", "'pack' expects an object to pack", span));
+            };
+            return self.pack_object(*index, span);
+        }
         if name.starts_with("hdl_") {
             return self.call_hdl(name, values, span);
         }
         Err(self.error("E0405", format!("routine '{name}' is not supported"), span))
+    }
+
+    /// `pack(NULL, obj)` — concatenate the object's physical fields
+    /// MSB-first into one integer (per-field widths from their scalar
+    /// declarations; non-physical and `!` fields are excluded).
+    fn pack_object(&mut self, index: usize, span: crate::ast::Span) -> Result<Value, Diagnostic> {
+        let type_name = self.instances[index].type_name.clone();
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let Some(ty) = types.iter().find(|t| t.name == type_name) else {
+            return Err(self.error("E0401", format!("unknown type '{type_name}'"), span));
+        };
+        let mut packed: i128 = 0;
+        for field in &ty.fields {
+            if !field.physical || field.no_gen {
+                continue;
+            }
+            let Some(value) = self.instances[index].get(&field.name) else {
+                continue;
+            };
+            let Value::Int(bits) = value else {
+                return Err(self.error(
+                    "E0402",
+                    format!("field '{}' cannot be packed (not an integer)", field.name),
+                    span,
+                ));
+            };
+            let width = field_width_bits(&field.ty).unwrap_or(1) as u32;
+            packed = (packed << width) | (bits & ((1i128 << width) - 1));
+        }
+        Ok(Value::Int(packed))
     }
 
     /// `outf("format %x", args)` — printf-style output; specs `%x`/`%X`
@@ -1296,6 +1503,10 @@ impl<'a> Interp<'a> {
                 if let Some(value) = self.defines.get(name) {
                     return Ok(value.clone());
                 }
+                // The null reference.
+                if name == "NULL" {
+                    return Ok(Value::Void);
+                }
                 if let Some(value) = frame.locals.get(name) {
                     return Ok(value.clone());
                 }
@@ -1303,6 +1514,17 @@ impl<'a> Interp<'a> {
                     && let Some(value) = self.instances[index].get(name)
                 {
                     return Ok(value.clone());
+                }
+                // The root unit instance is addressable by name from any
+                // method (`for each in sys.ops`).
+                if name == "sys" {
+                    let sys_index = self
+                        .instances
+                        .iter()
+                        .position(|instance| instance.type_name == "sys");
+                    if let Some(index) = sys_index {
+                        return Ok(Value::Object(index));
+                    }
                 }
                 let types: &[crate::elab::ElaboratedType] = self.types;
                 for t in types.iter().filter(|t| t.kind == DeclarationKind::Type) {
@@ -1741,6 +1963,16 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(value.clone());
                 }
+                // The root unit instance is addressable by name from any
+                // method (`for each in sys.ops`).
+                if name == "sys"
+                    && let Some(index) = self
+                        .instances
+                        .iter()
+                        .position(|instance| instance.type_name == "sys")
+                {
+                    return Ok(Value::Object(index));
+                }
                 Err(self.error(
                     "E0401",
                     format!("unknown identifier '{name}'"),
@@ -1950,10 +2182,84 @@ fn as_i64(value: &Value) -> Option<i64> {
     }
 }
 
+/// Whether the expression calls any of the named routines anywhere in its
+/// tree (including as a member call like `x.hdl_path()`).
+fn expr_calls_any(expr: &Expr, names: &[&str]) -> bool {
+    match expr {
+        Expr::Call { callee, args, .. } => {
+            let callee_name = match callee.as_ref() {
+                Expr::Ident { name, .. } => Some(name.as_str()),
+                Expr::MemberAccess { name, .. } => Some(name.as_str()),
+                _ => None,
+            };
+            callee_name.is_some_and(|name| names.contains(&name))
+                || args.iter().any(|arg| expr_calls_any(arg, names))
+        }
+        Expr::MemberAccess { object, .. } => expr_calls_any(object, names),
+        Expr::Unary { expr: inner, .. }
+        | Expr::Paren { expr: inner, .. }
+        | Expr::CastAs { expr: inner, .. } => expr_calls_any(inner, names),
+        Expr::Binary { lhs, rhs, .. } => expr_calls_any(lhs, names) || expr_calls_any(rhs, names),
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            expr_calls_any(cond, names)
+                || expr_calls_any(then_expr, names)
+                || expr_calls_any(else_expr, names)
+        }
+        Expr::BitSlice {
+            base, high, low, ..
+        } => {
+            expr_calls_any(base, names) || expr_calls_any(high, names) || expr_calls_any(low, names)
+        }
+        Expr::Index { base, index, .. } => {
+            expr_calls_any(base, names) || expr_calls_any(index, names)
+        }
+        Expr::InSet { element, set, .. } => {
+            let set_has = match set {
+                crate::ast::InSetExpr::Items(items) => {
+                    items.iter().any(|item| expr_calls_any(item, names))
+                }
+                crate::ast::InSetExpr::Range(low, high) => {
+                    expr_calls_any(low, names) || expr_calls_any(high, names)
+                }
+            };
+            expr_calls_any(element, names) || set_has
+        }
+        _ => false,
+    }
+}
+
 fn as_f64(value: &Value) -> Option<f64> {
     match value {
         Value::Int(i) => Some(*i as f64),
         Value::Real(r) => Some(*r),
+        _ => None,
+    }
+}
+
+/// The element type of a list type expression (identity for non-lists).
+fn list_element_type(ty: &TypeExpr) -> TypeExpr {
+    match ty {
+        TypeExpr::List { element, .. } => (**element).clone(),
+        other => other.clone(),
+    }
+}
+
+/// The bit width of a scalar type declaration (`uint(bits: 3)` → 3);
+/// unsized scalars count as one bit for packing.
+fn field_width_bits(ty: &TypeExpr) -> Option<i128> {
+    let TypeExpr::Scalar {
+        width: Some(width), ..
+    } = ty
+    else {
+        return None;
+    };
+    match width.as_ref() {
+        Expr::IntLiteral { text, .. } => parse_int_literal(text),
         _ => None,
     }
 }
