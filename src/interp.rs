@@ -1526,6 +1526,13 @@ impl<'a> Interp<'a> {
                     )
                 }),
             Expr::BitLiteral { text, .. } => {
+                if based_value_is_mvl(text) {
+                    return Err(self.error(
+                        "E0402",
+                        format!("MVL literal '{text}' is not evaluated yet"),
+                        expr.span(),
+                    ));
+                }
                 parse_int_literal(text).map(Value::Int).ok_or_else(|| {
                     self.error(
                         "E0402",
@@ -2332,10 +2339,36 @@ fn field_width_bits(ty: &TypeExpr) -> Option<i128> {
     }
 }
 
-/// Parse an integer literal: decimal, `0x`/`0b`/`0o` prefixed, or a sized/
-/// unsized based literal (`8'hFF`, `'hFF`). Underscores are ignored; the
-/// size prefix is ignored (widths are not truncated yet).
+/// Whether the value digits of a sized or unsized based literal include an
+/// MVL letter (clause 4.1.4.3). The base character itself (`'h`, `'x`) is
+/// not part of the value. In an ambiguous context those letters make the
+/// literal MVL rather than a number; hex `x` is therefore not read as 15.
+pub(crate) fn based_value_is_mvl(text: &str) -> bool {
+    let Some(quote) = text.find('\'') else {
+        return false;
+    };
+    text[quote + 1..].chars().skip(1).any(|c| {
+        matches!(
+            c,
+            'x' | 'X' | 'z' | 'Z' | 'u' | 'U' | 'l' | 'L' | 'h' | 'H' | 'w' | 'W' | 'n' | 'N'
+        )
+    })
+}
+
+/// Parse an integer literal: decimal (optional `K`/`M` multiplier),
+/// `0c"..."` character, `0x`/`0b`/`0o` prefixed, or a sized/unsized based
+/// literal (`8'hFF`, `'hFF`). Underscores are ignored. The size prefix is
+/// ignored (widths are not truncated yet). MVL literals return [`None`].
 pub(crate) fn parse_int_literal(text: &str) -> Option<i128> {
+    if text.len() >= 2
+        && text.as_bytes()[0] == b'0'
+        && text.as_bytes()[1].eq_ignore_ascii_case(&b'c')
+    {
+        return parse_character_literal(text);
+    }
+    if based_value_is_mvl(text) {
+        return None;
+    }
     let lower = text.to_ascii_lowercase();
     let cleaned: String = lower.chars().filter(|c| *c != '_').collect();
     for (prefix, radix) in [("0x", 16u32), ("0b", 2), ("0o", 8)] {
@@ -2356,7 +2389,53 @@ pub(crate) fn parse_int_literal(text: &str) -> Option<i128> {
         };
         return i128::from_str_radix(digits, radix).ok();
     }
-    cleaned.parse::<i128>().ok()
+    let (body, factor) = decimal_multiplier(&cleaned);
+    let value = body.parse::<i128>().ok()?;
+    value.checked_mul(factor)
+}
+
+/// `K`/`k` is ×1024 and `M`/`m` is ×1024×1024, on a decimal integer only.
+fn decimal_multiplier(text: &str) -> (&str, i128) {
+    let Some(last) = text.chars().last() else {
+        return (text, 1);
+    };
+    let factor = match last {
+        'k' => 1024,
+        'm' => 1024 * 1024,
+        _ => return (text, 1),
+    };
+    let body = &text[..text.len() - last.len_utf8()];
+    if body.is_empty() || !body.bytes().all(|byte| byte.is_ascii_digit()) {
+        return (text, 1);
+    }
+    (body, factor)
+}
+
+/// `0c"..."` / `0C"..."` evaluates to the character's code point.
+fn parse_character_literal(text: &str) -> Option<i128> {
+    let rest = if let Some(rest) = text.strip_prefix("0c") {
+        rest
+    } else {
+        text.strip_prefix("0C")?
+    };
+    let inner = rest.strip_prefix('"')?.strip_suffix('"')?;
+    let mut chars = inner.chars();
+    let value = match chars.next()? {
+        '\\' => match chars.next()? {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '\\' => '\\',
+            '"' => '"',
+            '0' => '\0',
+            _ => return None,
+        },
+        other => other,
+    };
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(u32::from(value) as i128)
 }
 
 /// Interpret the escape sequences the lexer preserved as raw text.

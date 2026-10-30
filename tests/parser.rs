@@ -233,7 +233,7 @@ fn expression_precedence() {
     let Member::Constraint(constraint) = &declarations[0].members[4] else {
         panic!("expected a keep constraint");
     };
-    // `||` binds loosest in the C-style precedence, so it is at the top:
+    // `||` is looser than `&&`, which is looser than `==` (clause 4.5):
     // flag || ((a + b * 2 == 10) && !(x > 3))
     let Expr::Binary {
         op: BinaryOp::LogicalOr,
@@ -255,6 +255,103 @@ fn expression_precedence() {
     else {
         panic!("expected && under the ||");
     };
+}
+
+#[test]
+fn clause_4_5_places_xor_identity_and_in() {
+    let declarations = expect_clean(
+        "struct s {\n    a: uint;\n    b: uint;\n    c: uint;\n    flag: bool;\n    y: bool;\n    \
+         keep a === b == c;\n    keep a == b === c;\n    keep flag && a in [1, 2];\n    \
+         keep a in [1, 2] => y;\n    keep a | b ^ c;\n    keep a ^ b | c;\n};\n",
+    );
+    let keep = |index: usize| match &declarations[0].members[5 + index] {
+        Member::Constraint(constraint) => &constraint.expr,
+        _ => panic!("expected a keep constraint"),
+    };
+    // `==` is tighter than `===`: a === (b == c)
+    let Expr::Binary {
+        op: BinaryOp::IdentityEq,
+        rhs,
+        ..
+    } = keep(0)
+    else {
+        panic!("expected === at the top of a === b == c");
+    };
+    assert!(matches!(
+        rhs.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            ..
+        }
+    ));
+    // (a == b) === c
+    let Expr::Binary {
+        op: BinaryOp::IdentityEq,
+        lhs,
+        ..
+    } = keep(1)
+    else {
+        panic!("expected === at the top of a == b === c");
+    };
+    assert!(matches!(
+        lhs.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            ..
+        }
+    ));
+    // `in` is tighter than `&&`: flag && (a in [1, 2])
+    let Expr::Binary {
+        op: BinaryOp::LogicalAnd,
+        rhs,
+        ..
+    } = keep(2)
+    else {
+        panic!("expected && at the top");
+    };
+    assert!(matches!(rhs.as_ref(), Expr::InSet { .. }));
+    // `in` is tighter than `=>`: (a in [1, 2]) => y
+    let Expr::Binary {
+        op: BinaryOp::Imply,
+        lhs,
+        ..
+    } = keep(3)
+    else {
+        panic!("expected => at the top");
+    };
+    assert!(matches!(lhs.as_ref(), Expr::InSet { .. }));
+    // `|` is tighter than `^`: (a | b) ^ c
+    let Expr::Binary {
+        op: BinaryOp::BitXor,
+        lhs,
+        ..
+    } = keep(4)
+    else {
+        panic!("expected ^ at the top of a | b ^ c");
+    };
+    assert!(matches!(
+        lhs.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::BitOr,
+            ..
+        }
+    ));
+    // a ^ (b | c)
+    let Expr::Binary {
+        op: BinaryOp::BitXor,
+        rhs,
+        ..
+    } = keep(5)
+    else {
+        panic!("expected ^ at the top of a ^ b | c");
+    };
+    assert!(matches!(
+        rhs.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::BitOr,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -338,7 +435,7 @@ fn diagnostics_are_reported_with_positions() {
 
 #[test]
 fn lex_errors_become_diagnostics() {
-    let result = parse("struct s { keep x < 8'xZZ; };");
+    let result = parse("struct s { keep x < 8'b2; };");
     assert_eq!(result.declarations.len(), 0);
     assert_eq!(result.diagnostics.len(), 1);
     assert_eq!(result.diagnostics[0].code, "E0001");

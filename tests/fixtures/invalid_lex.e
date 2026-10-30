@@ -1,4 +1,4 @@
 struct packet {
     a: uint(bits: 8);
-    keep a < 8'xZZ;
+    keep a < 8'b2;
 };

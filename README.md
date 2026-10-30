@@ -13,18 +13,21 @@
 > **Status: pre-alpha.** Implements a source tokenizer and a parser for a
 > declared subset of the language: struct/unit/extend/type declarations,
 > fields, scalar/list/named and enumeral types, `keep`/`keep soft`
-> constraints and expressions, `when` subtype members, and methods with
-> parameter lists and statement bodies, with diagnostic fixtures; member
-> composition that folds `like` chains and `extend` blocks into per-type
-> member lists; and an interpreter that executes the non-temporal subset
-> (`e1647 run`): method calls, statements, `print`/`out`, and `gen` — a
-> seeded rejection sampler by default, or a seeded solve of conjunctive
+> constraints, `when` subtype members, ports, events and sequences, and
+> methods with parameter lists and statement bodies (including `for`,
+> `case`, `check that`, `wait`, `emit` and `start`), with diagnostic
+> fixtures. `import` loads a sibling file. Member composition folds `like`
+> chains and `extend` blocks into per-type member lists. The interpreter
+> (`e1647 run`) executes that subset, including `print`/`out` and `gen` —
+> a seeded rejection sampler by default, or a seeded solve of conjunctive
 > linear constraints via the Pumpkin CP solver when the `solver-pumpkin`
-> cargo feature is enabled. It does **not** yet do full type checking,
-> `when`-subtype resolution, temporal evaluation, events, coverage,
-> non-linear or disjunctive constraint solving, HDL bridging or testbench
-> execution. No IEEE conformance is claimed. See
-> [docs/ROADMAP.md](docs/ROADMAP.md) for the staged plan.
+> cargo feature is enabled. A single xezim VPI bridge (`src/hdl.rs`,
+> `hdl_load` and quoted signal paths) drives one mixed SystemVerilog
+> example. It does **not** yet do full type checking, `when`-subtype
+> resolution, event-driven temporal evaluation, coverage, non-linear or
+> disjunctive constraint solving, or general testbench execution. No IEEE
+> conformance is claimed. See [docs/ROADMAP.md](docs/ROADMAP.md) for the
+> staged plan.
 
 ## From Slopman to Rustman
 
@@ -75,9 +78,11 @@ docker compose run --rm toolchain  # interactive shell in the container
 ```
 
 `run` executes the built-in `sys` unit's `run()` methods. Every run takes
-an explicit `--seed` and is fully deterministic; `gen` is a rejection
-sampler, not a constraint solver (see `src/interp.rs` for the exact
-semantics and its honest limits).
+an explicit `--seed` and is fully deterministic per backend. By default
+`gen` is a rejection sampler; with `solver-pumpkin` it solves conjunctive
+linear `keep` constraints and falls back to rejection sampling for
+anything else (see `src/interp.rs` for the exact semantics and its honest
+limits).
 
 ## Repository layout
 

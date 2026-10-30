@@ -53,10 +53,6 @@ use crate::ast::{
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Position, Token, TokenKind};
 
-/// Binary operators from loosest to tightest binding (C-style precedence;
-/// all left-associative in this subset). The word spellings (`and`, `or`,
-/// `xor`) share the level of their symbol twins, as in the reference
-/// grammar.
 /// Predefined e names that lex as keywords but appear as bare values or
 /// call targets in real code (`set_config(print, radix, hex)`,
 /// `pack(NULL, it)`, `it.x`, `wait until rise(sig)`). In expression and
@@ -86,19 +82,22 @@ fn is_predefined_name(word: &str) -> bool {
     PREDEFINED_NAMES.contains(&word)
 }
 
+/// Binary operators from loosest to tightest binding (clause 4.5, Table 12).
+/// Arithmetic, shifts, relational operators, and `&&` / `||` follow C.
+/// `^` is looser than `|`, `===` / `!==` are looser than `==` / `!=`, and
+/// `in` (not in this table; see [`IN_LEVEL`]) sits between `===` and `&`.
+/// All of these are left-associative. The word spellings (`and`, `or`,
+/// `xor`) share the level of their symbol twins. `is [not] a` and the
+/// string-match operators are not parsed yet.
 const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
     &[("=>", BinaryOp::Imply)],
     &[("||", BinaryOp::LogicalOr), ("or", BinaryOp::LogicalOr)],
     &[("&&", BinaryOp::LogicalAnd), ("and", BinaryOp::LogicalAnd)],
-    &[("|", BinaryOp::BitOr)],
     &[("^", BinaryOp::BitXor), ("xor", BinaryOp::BitXor)],
+    &[("|", BinaryOp::BitOr)],
     &[("&", BinaryOp::BitAnd)],
-    &[
-        ("==", BinaryOp::Eq),
-        ("!=", BinaryOp::NotEq),
-        ("===", BinaryOp::IdentityEq),
-        ("!==", BinaryOp::IdentityNe),
-    ],
+    &[("===", BinaryOp::IdentityEq), ("!==", BinaryOp::IdentityNe)],
+    &[("==", BinaryOp::Eq), ("!=", BinaryOp::NotEq)],
     &[
         ("<", BinaryOp::Lt),
         ("<=", BinaryOp::Le),
@@ -113,6 +112,11 @@ const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
         ("%", BinaryOp::Mod),
     ],
 ];
+
+/// `in` is not a [`BINARY_LEVELS`] row. It binds looser than `===` / `!==`
+/// and tighter than `&` (clause 4.5). Levels below this index map straight
+/// onto [`BINARY_LEVELS`]; levels above it map one slot later.
+const IN_LEVEL: usize = 6;
 
 /// Outcome of parsing one source file: whatever declarations parsed, plus
 /// every diagnostic found (syntax and well-formedness).
@@ -2072,33 +2076,6 @@ impl Parser {
 
     fn parse_expr(&mut self) -> Option<Expr> {
         let first = self.parse_binary_level(0)?;
-        // `expr in [a, b]` / `expr in [low .. high]` membership.
-        if self.eat_keyword("in") {
-            self.expect_punct("[", "E0106", "expected '[' after 'in'")?;
-            let first_item = self.parse_expr()?;
-            let set = if self.eat_punct("..") {
-                let high = self.parse_expr()?;
-                self.expect_punct("]", "E0107", "expected ']' to close the range")?;
-                crate::ast::InSetExpr::Range(Box::new(first_item), Box::new(high))
-            } else {
-                let mut items = vec![first_item];
-                while self.eat_punct(",") {
-                    items.push(self.parse_expr()?);
-                }
-                self.expect_punct("]", "E0107", "expected ']' to close the set")?;
-                crate::ast::InSetExpr::Items(items)
-            };
-            let start = first.span().0;
-            let end = self.last_end();
-            let membership = Expr::InSet {
-                element: Box::new(first),
-                set,
-                span: (start, end),
-            };
-            // A postfix membership can still feed a loosest-level
-            // operator (`keep x in [A, B] => y == 1;`).
-            return self.finish_binary_level(0, BINARY_LEVELS[0], membership);
-        }
         if self.eat_punct("?") {
             let then_expr = self.parse_expr()?;
             self.expect_punct(":", "E0103", "expected ':' in the ternary expression")?;
@@ -2117,11 +2094,46 @@ impl Parser {
     }
 
     fn parse_binary_level(&mut self, level: usize) -> Option<Expr> {
-        let Some(operators) = BINARY_LEVELS.get(level) else {
+        if level == IN_LEVEL {
+            return self.parse_in_level();
+        }
+        let op_index = if level < IN_LEVEL { level } else { level - 1 };
+        let Some(operators) = BINARY_LEVELS.get(op_index) else {
             return self.parse_unary();
         };
         let lhs = self.parse_binary_level(level + 1)?;
         self.finish_binary_level(level, operators, lhs)
+    }
+
+    /// `expr in [a, b]` / `expr in [low .. high]`, left-associative, at
+    /// [`IN_LEVEL`].
+    fn parse_in_level(&mut self) -> Option<Expr> {
+        let mut lhs = self.parse_binary_level(IN_LEVEL + 1)?;
+        while self.at_keyword("in") {
+            self.bump();
+            self.expect_punct("[", "E0106", "expected '[' after 'in'")?;
+            let first_item = self.parse_expr()?;
+            let set = if self.eat_punct("..") {
+                let high = self.parse_expr()?;
+                self.expect_punct("]", "E0107", "expected ']' to close the range")?;
+                crate::ast::InSetExpr::Range(Box::new(first_item), Box::new(high))
+            } else {
+                let mut items = vec![first_item];
+                while self.eat_punct(",") {
+                    items.push(self.parse_expr()?);
+                }
+                self.expect_punct("]", "E0107", "expected ']' to close the set")?;
+                crate::ast::InSetExpr::Items(items)
+            };
+            let start = lhs.span().0;
+            let end = self.last_end();
+            lhs = Expr::InSet {
+                element: Box::new(lhs),
+                set,
+                span: (start, end),
+            };
+        }
+        Some(lhs)
     }
 
     /// The left-associative loop for one precedence level, seeded with an

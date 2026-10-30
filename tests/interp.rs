@@ -86,6 +86,31 @@ fn based_and_prefixed_literals_evaluate() {
 }
 
 #[test]
+fn multipliers_and_character_literals_evaluate() {
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        out(32K, \" \", 2m, \" \", 1_0K, \" \", 0c\"a\", \" \", 0c\"\\n\", \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "32768 2097152 10240 97 10\n");
+}
+
+#[test]
+fn mvl_literals_are_reported_not_evaluated() {
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        print 8'b10x1;\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>(),
+        vec!["MVL literal '8'b10x1' is not evaluated yet".to_string()]
+    );
+}
+
+#[test]
 fn lists_support_push_size_and_indexing() {
     let output = clean_output(
         "extend sys {\n    run() is also {\n        var xs: list of uint;\n        xs.push(3);\n        xs.push(4);\n        print xs.size(), xs[0] + xs[1];\n        xs[1] = 10;\n        print xs[1];\n    };\n};\n",
