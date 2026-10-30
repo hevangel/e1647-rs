@@ -17,25 +17,31 @@
       and MVL digits in non-decimal based literals are tokenized.
       Not yet the complete lexical grammar: MVL literals are not
       evaluated, `/* */` block comments are an extension beyond
-      clause 4.1.3, and remaining operator spellings are open
+      clause 4.1.3, and the 32-bit default width is not applied
 - [x] Build AST and parser for a declared subset: `struct`/`unit`/`extend`/
-      `type` with `like` (including `extend global` and when-modifier
-      prefixes recorded on the declaration), fields (name groups, `%`
-      physical and `!` do-not-generate), scalar/list/named types, enumeral
-      types, `keep`/`keep soft` and `keep bind`, `when` subtype members
-      (`value'id` modifiers), `simple_port`, `event` (trigger stored as
-      written), `import`, literal `define`, and `sequence ... using`
-      (synthesized into a type, a driver unit and a kind enum). Methods
-      have parameter lists, optional `@event` TCM suffixes, and statement
-      bodies: local `var`, assignment (including quoted HDL paths), calls,
-      indexing, `return`, braced `if`/`else` (optional `then`), `while`
-      with `break`/`continue`, `for each` and `for i from .. to`, `case`,
+      `type` with `like` (when-modifier prefixes recorded on the
+      declaration; user `extend global` is rejected per clause 4.3.1.1),
+      fields (name groups, `%` physical and `!` do-not-generate),
+      scalar/list/named types, enumeral types, `keep`/`keep soft` and
+      `keep bind`, `when` subtype members (`value'id` modifiers),
+      `simple_port`, `event` (trigger stored as written), `import`,
+      literal `define`, and `sequence ... using` (synthesized into a
+      type, a driver unit and a kind enum). Methods have parameter lists,
+      optional `@event` TCM suffixes, and statement bodies: local `var`,
+      assignment (including quoted HDL paths), calls, indexing, `return`,
+      braced `if`/`else` (optional `then`), `while` with
+      `break`/`continue`, `for each` and `for i from .. to`, `case`,
       `check that`, `wait`, `emit`, `start`, sequence `do`, `print`,
-      `gen`, `stop_run`. Spanned diagnostics and declaration/member/
-      statement-level recovery. The CLI resolves `import a.b` to `a/b.e`
-      or `a.b.e` beside the source and checks the merged declarations
-      (not yet: `when` elaboration, `repeat`, single-statement
-      `if ... do`, `on` blocks, `define as` templates, coverage)
+      `gen`, `stop_run`. Expression precedence matches clause 4.5
+      Table 12, including `is [not] a` (runtime check is exact-name or
+      `like`-chain) and the `~` / `!~` string-match operators (runtime
+      evaluation is the case-insensitive full-string literal subset;
+      meta-characters and `/.../` AWK patterns report `E0410`). Spanned
+      diagnostics and declaration/member/statement-level recovery. The
+      CLI resolves `import a.b` to `a/b.e` or `a.b.e` beside the source
+      and checks the merged declarations (not yet: `when` elaboration,
+      `repeat`, single-statement `if ... do`, `on` blocks, `define as`
+      templates, coverage, `$1`-`$27` match captures)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness
       checks only (duplicate declaration/field names, duplicate
       parameters/local variables/enumerals, unknown named/`like`/`extend`

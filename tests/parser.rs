@@ -778,3 +778,190 @@ fn prefixed_field_declarations_parse() {
     };
     assert!(physical.physical && !physical.no_gen);
 }
+
+#[test]
+fn clause_4_5_places_string_match_between_identity_and_in() {
+    let declarations = expect_clean(
+        "struct s {\n    a: string;\n    b: string;\n    c: string;\n    \
+         keep a ~ b;\n    keep a !~ b;\n    keep a === b ~ c;\n    \
+         keep a == b ~ c;\n    keep a ~ b == c;\n};\n",
+    );
+    let keep = |index: usize| match &declarations[0].members[3 + index] {
+        Member::Constraint(constraint) => &constraint.expr,
+        _ => panic!("expected a keep constraint"),
+    };
+    let Expr::Binary {
+        op: BinaryOp::Match,
+        ..
+    } = keep(0)
+    else {
+        panic!("expected a ~ b to parse as a match");
+    };
+    let Expr::Binary {
+        op: BinaryOp::NotMatch,
+        ..
+    } = keep(1)
+    else {
+        panic!("expected a !~ b to parse as a negative match");
+    };
+    // `===` is tighter than `~` (clause 4.5): (a === b) ~ c
+    let Expr::Binary {
+        op: BinaryOp::Match,
+        lhs,
+        ..
+    } = keep(2)
+    else {
+        panic!("expected the match on top of a === b ~ c");
+    };
+    assert!(matches!(
+        lhs.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::IdentityEq,
+            ..
+        }
+    ));
+    // `==` is tighter than `~`: (a == b) ~ c
+    let Expr::Binary {
+        op: BinaryOp::Match,
+        lhs,
+        ..
+    } = keep(3)
+    else {
+        panic!("expected the match on top of a == b ~ c");
+    };
+    assert!(matches!(
+        lhs.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            ..
+        }
+    ));
+    // ...and on the right: a ~ (b == c)
+    let Expr::Binary {
+        op: BinaryOp::Match,
+        rhs,
+        ..
+    } = keep(4)
+    else {
+        panic!("expected the match on top of a ~ b == c");
+    };
+    assert!(matches!(
+        rhs.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn clause_4_5_places_is_a_between_equality_and_comparisons() {
+    let declarations = expect_clean(
+        "struct s {\n    x: uint;\n    y: uint;\n    flag: bool;\n    \
+         keep x is a uint;\n    keep x is not a uint;\n    keep x is a list of uint;\n    \
+         keep flag == x is a uint;\n    keep x < y is a bool;\n};\n",
+    );
+    let keep = |index: usize| match &declarations[0].members[3 + index] {
+        Member::Constraint(constraint) => &constraint.expr,
+        _ => panic!("expected a keep constraint"),
+    };
+    let Expr::IsA {
+        expr: _,
+        ty,
+        negated: false,
+        ..
+    } = keep(0)
+    else {
+        panic!("expected an is-a expression");
+    };
+    assert!(matches!(
+        ty,
+        TypeExpr::Scalar {
+            base: ScalarBase::Uint,
+            ..
+        }
+    ));
+    let Expr::IsA {
+        expr,
+        negated: true,
+        ..
+    } = keep(1)
+    else {
+        panic!("expected a negated is-a expression");
+    };
+    assert!(matches!(expr.as_ref(), Expr::Ident { name, .. } if name == "x"));
+    let Expr::IsA { ty, .. } = keep(2) else {
+        panic!("expected an is-a expression");
+    };
+    assert!(matches!(ty, TypeExpr::List { .. }));
+    // `is a` is tighter than `==` (clause 4.5): flag == (x is a uint)
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        rhs,
+        ..
+    } = keep(3)
+    else {
+        panic!("expected == on top of flag == x is a uint");
+    };
+    assert!(matches!(rhs.as_ref(), Expr::IsA { .. }));
+    // ...and looser than the comparisons: (x < y) is a bool
+    let Expr::IsA { expr, .. } = keep(4) else {
+        panic!("expected an is-a expression on top of x < y is a bool");
+    };
+    assert!(matches!(
+        expr.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::Lt,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn bare_is_is_not_consumed_as_a_type_check() {
+    // `is` followed by something other than `a`/`not a` is left alone;
+    // the keep constraint then fails on its missing `;`, not on a
+    // consumed `is`.
+    let result = parse("struct s {\n    a: uint;\n    keep a is;\n};\n");
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.render().contains("E0105")),
+        "expected the keep terminator diagnostic: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn extend_global_is_rejected() {
+    // Clause 4.3.1.1: extensions of `global` are reserved for the runtime.
+    let result = parse("extend global {\n    helper: uint;\n};\n");
+    assert!(result.declarations.is_empty());
+    let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
+    assert_eq!(
+        rendered,
+        vec![
+            "1:8: error[E0116]: cannot extend 'global': extensions of the root type are reserved for the runtime"
+                .to_owned()
+        ]
+    );
+}
+
+#[test]
+fn file_level_define_and_import_still_form_the_global_pseudo_declaration() {
+    // The parser's own `extend global` pseudo-declaration (the holder of
+    // file-level `define`/`import` members) is not user syntax and must
+    // keep parsing.
+    let declarations =
+        expect_clean("define WIDTH 8;\nimport pkg;\nstruct s {\n    w: uint(bits: WIDTH);\n};\n");
+    let pseudo = declarations
+        .iter()
+        .find(|d| d.kind == DeclarationKind::Extend && d.name == "global")
+        .expect("expected the global pseudo-declaration");
+    assert_eq!(pseudo.members.len(), 2);
+}

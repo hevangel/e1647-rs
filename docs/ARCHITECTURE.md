@@ -41,9 +41,14 @@ multi-simulator HDL API, and wasm32.
   type expressions, constraint expressions, methods (including a TCM
   `@event` suffix) and statements, all carrying byte/line/column spans.
 - `src/parser.rs` — recursive-descent parser for the declared subset.
-  Expression precedence follows clause 4.5: C order for the arithmetic
-  and boolean operators, with `^` looser than `|`, `===` looser than
-  `==`, and `in` between `===` and `&`. Error recovery is at declaration,
+  Expression precedence follows clause 4.5 (Table 12): C order for the
+  arithmetic and boolean operators, with `^` looser than `|`, `===`
+  looser than `==`, the `~` / `!~` string-match operators between `===`
+  and `in`, and `is [not] a <type>` between `==` and the comparisons. A
+  bare `is` that does not start a type check is left for the caller. A
+  user-written `extend global` is rejected (`E0116`, clause 4.3.1.1);
+  the parser's file-level `define`/`import` pseudo-declaration is
+  unaffected. Error recovery is at declaration,
   member and statement boundaries. The statement subset includes braced `if`/`while`,
   `for each` and `for i from .. to`, `case`, `check that`, `wait`, `emit`,
   `start`, sequence `do` and `stop_run`. Diagnostics are collected (codes
@@ -66,9 +71,14 @@ multi-simulator HDL API, and wasm32.
   `dut_error`, `stop_run`, the objection no-ops, and the `hdl_*` bridge
   calls.
 - `src/interp.rs` — interpreter for the statement subset (codes
-  `E0401`–`E0409`). Entry: the built-in `sys` unit's `run()` methods, with
+  `E0401`–`E0410`). Entry: the built-in `sys` unit's `run()` methods, with
   implicit field generation before `run()`. Integers are unbounded `i128`
-  (widths are not truncated). `gen` uses the constraint-solver backend
+  (widths are not truncated). `is [not] a` checks scalars by value shape
+  and named types by declared name, walking `like` bases — subtype-aware
+  dispatch is a later milestone. String matching evaluates only the
+  case-insensitive full-string literal subset; `/.../` AWK patterns and
+  native meta-characters report `E0410`. `gen` uses the
+  constraint-solver backend
   when that compiles in, and rejection sampling otherwise. `start` runs
   the called method inline; `wait` advances a virtual cycle counter and
   does not drive the simulator; `emit` records a firing and does not

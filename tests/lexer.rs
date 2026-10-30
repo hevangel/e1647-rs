@@ -245,6 +245,27 @@ fn operators_longest_match() {
 }
 
 #[test]
+fn negative_string_match_is_one_token() {
+    // `!~` is the negative string-match operator (clause 4.11); the
+    // spaced form stays a logical not followed by a bitwise not.
+    assert_eq!(
+        kinds("a!~b"),
+        vec![
+            TokenKind::Identifier("a".into()),
+            TokenKind::Punctuation("!~".into()),
+            TokenKind::Identifier("b".into())
+        ]
+    );
+    assert_eq!(
+        kinds("! ~"),
+        vec![
+            TokenKind::Punctuation("!".into()),
+            TokenKind::Punctuation("~".into())
+        ]
+    );
+}
+
+#[test]
 fn based_and_prefixed_numerals() {
     assert_eq!(
         kinds("8'b1010 'hFF 'b1010 'd15 'o17 'x1f 'F0F 0xAB 0b1010 0o17 0xAB CD"),

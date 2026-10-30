@@ -230,9 +230,10 @@ pub fn is_keyword(word: &str) -> bool {
 }
 
 /// Multi-character operators, longest match first. `===`/`!==` are the
-/// e identity comparisons; `=>` is implication; `..` is a range.
+/// e identity comparisons; `!~` is the negative string match; `=>` is
+/// implication; `..` is a range.
 const OPERATORS: &[&str] = &[
-    "===", "!==", "==", "!=", "<=", ">=", "=>", "&&", "||", "<<", ">>", "..", "+=", "-=",
+    "===", "!==", "==", "!=", "!~", "<=", ">=", "=>", "&&", "||", "<<", ">>", "..", "+=", "-=",
 ];
 
 struct Cursor<'a> {

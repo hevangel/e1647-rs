@@ -433,6 +433,11 @@ pub enum BinaryOp {
     Le,
     Gt,
     Ge,
+    /// `lhs ~ pattern` — native string matching (clause 4.11), case
+    /// insensitive over the full string.
+    Match,
+    /// `lhs !~ pattern` — the negation of [`BinaryOp::Match`].
+    NotMatch,
     ShiftLeft,
     ShiftRight,
     Add,
@@ -544,6 +549,15 @@ pub enum Expr {
         set: InSetExpr,
         span: Span,
     },
+    /// `expr is a ty` / `expr is not a ty` — the type check operator
+    /// (clause 4.5). Runtime type dispatch is exact-name only; there is no
+    /// inheritance-aware type system yet.
+    IsA {
+        expr: Box<Expr>,
+        ty: TypeExpr,
+        negated: bool,
+        span: Span,
+    },
 }
 
 /// The right-hand side of an `in` membership expression.
@@ -574,6 +588,7 @@ impl Expr {
             | Expr::CastAs { span, .. }
             | Expr::BitSlice { span, .. }
             | Expr::InSet { span, .. }
+            | Expr::IsA { span, .. }
             | Expr::HdlPath { span, .. } => *span,
         }
     }

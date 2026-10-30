@@ -1867,6 +1867,16 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Value::Bool(contained))
             }
+            Expr::IsA {
+                expr,
+                ty,
+                negated,
+                span,
+            } => {
+                let value = self.eval(expr, frame, me)?;
+                let is_a = self.value_is_a(&value, ty, *span)?;
+                Ok(Value::Bool(is_a != *negated))
+            }
             Expr::HdlPath { path, span } => {
                 if self.hdl.is_none() {
                     return Err(self.error(
@@ -1882,6 +1892,64 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+    }
+
+    /// The runtime half of `expr is [not] a <type>` (clause 4.5). Scalar
+    /// kinds match by value shape (integers are one runtime value, so
+    /// `is a int` and `is a uint` both accept it); named types match by
+    /// declared name, walking `like` bases — subtype-aware dispatch is a
+    /// later milestone.
+    fn value_is_a(
+        &self,
+        value: &Value,
+        ty: &TypeExpr,
+        span: crate::ast::Span,
+    ) -> Result<bool, Diagnostic> {
+        match ty {
+            TypeExpr::Scalar { base, .. } => Ok(matches!(
+                (base, value),
+                (
+                    ScalarBase::Int
+                        | ScalarBase::Uint
+                        | ScalarBase::Bit
+                        | ScalarBase::Byte
+                        | ScalarBase::Nibble
+                        | ScalarBase::Time,
+                    Value::Int(_)
+                ) | (ScalarBase::Bool, Value::Bool(_))
+                    | (ScalarBase::Real, Value::Real(_))
+                    | (ScalarBase::String, Value::Str(_))
+            )),
+            TypeExpr::List { .. } => Ok(matches!(value, Value::List(_))),
+            TypeExpr::Named { name, .. } => Ok(match value {
+                Value::Object(index) => self.type_is_a(&self.instances[*index].type_name, name),
+                Value::Enum { type_name, .. } => self.type_is_a(type_name, name),
+                _ => false,
+            }),
+            TypeExpr::InlineEnum { .. } => Err(self.error(
+                "E0402",
+                "'is a' with an inline enumeral type is not supported",
+                span,
+            )),
+        }
+    }
+
+    /// Whether `name` is `target` or a `like` descendant of it.
+    fn type_is_a(&self, name: &str, target: &str) -> bool {
+        let mut current = name;
+        for _ in 0..=self.types.len() {
+            if current == target {
+                return true;
+            }
+            let Some(declared) = self.types.iter().find(|t| t.name == current) else {
+                return false;
+            };
+            match &declared.base {
+                Some(base) => current = base.as_str(),
+                None => return false,
+            }
+        }
+        false
     }
 
     fn apply_binary(
@@ -2013,6 +2081,37 @@ impl<'a> Interp<'a> {
                     _ => unreachable!(),
                 };
                 Ok(Value::Int(value))
+            }
+            Match | NotMatch => {
+                let (Value::Str(text), Value::Str(pattern)) = (&lhs, &rhs) else {
+                    return Err(err("string match"));
+                };
+                // `/.../` selects AWK-style regular expression matching
+                // (clause 4.11.2) — not implemented.
+                if pattern.len() >= 2 && pattern.starts_with('/') && pattern.ends_with('/') {
+                    return Err(self.error(
+                        "E0410",
+                        "AWK-style regular expression string matching is not supported",
+                        span,
+                    ));
+                }
+                // Native matching (clause 4.11.1) is case insensitive and
+                // always matches the full string. Only a literal pattern —
+                // letters, digits, underscore and space — is evaluated;
+                // the meta-characters of the native pattern language are
+                // not implemented.
+                if !pattern
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ' ')
+                {
+                    return Err(self.error(
+                        "E0410",
+                        "native string matching with meta-characters is not supported",
+                        span,
+                    ));
+                }
+                let matched = text.to_lowercase() == pattern.to_lowercase();
+                Ok(Value::Bool(if op == Match { matched } else { !matched }))
             }
             LogicalAnd | LogicalOr | Imply => unreachable!("handled with short-circuiting"),
         }

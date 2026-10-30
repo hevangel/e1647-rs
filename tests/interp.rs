@@ -281,3 +281,82 @@ fn bind_constraints_are_skipped_by_gen() {
     );
     assert!(output.contains('\n'), "output: {output}");
 }
+
+#[test]
+fn is_a_checks_scalar_named_and_like_types() {
+    let output = clean_output(
+        "struct base_s {\n    f: uint;\n};\n\
+         struct child_s like base_s {\n    g: uint;\n};\n\
+         extend sys {\n    run() is also {\n        var c: child_s;\n        \
+         print c is a child_s;\n        print c is a base_s;\n        print c is not a base_s;\n        \
+         var i: int = 3;\n        print i is a int;\n        print i is a real;\n        \
+         print i is a string;\n        print \"text\" is a string;\n        \
+         var l: list of uint;\n        print l is a list of uint;\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        output,
+        "TRUE\nTRUE\nFALSE\nTRUE\nFALSE\nFALSE\nTRUE\nTRUE\n"
+    );
+}
+
+#[test]
+fn is_a_checks_enumeral_types_by_name() {
+    let output = clean_output(
+        "type color_t: [red, green];\n\
+         extend sys {\n    run() is also {\n        var c: color_t = red;\n        \
+         print c is a color_t;\n        print c is not a color_t;\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUE\nFALSE\n");
+}
+
+#[test]
+fn string_match_evaluates_case_insensitive_full_string_literals() {
+    // Native string matching (clause 4.11.1) is case insensitive and
+    // always matches the full string; the literal subset compares
+    // equal-ignoring-case.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        \
+         print \"hello\" ~ \"hello\";\n        print \"hello\" ~ \"HELLO\";\n        \
+         print \"hello\" !~ \"world\";\n        print \"hello\" !~ \"hell\";\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUE\nTRUE\nTRUE\nTRUE\n");
+}
+
+#[test]
+fn string_match_reports_unsupported_pattern_shapes() {
+    // `/.../` selects AWK-style regular expressions (clause 4.11.2) and
+    // native meta-characters are unimplemented; both report E0410.
+    let result = run(
+        &elaborate(
+            &parse(
+                "extend sys {\n    run() is also {\n        print \"x\" ~ \"/ab+/\";\n    };\n};\n",
+            )
+            .declarations,
+        ),
+        1,
+    );
+    assert_eq!(result.diagnostics.len(), 1);
+    assert!(
+        result.diagnostics[0].render().contains("E0410"),
+        "expected E0410: {:?}",
+        result.diagnostics[0].render()
+    );
+    let result = run(
+        &elaborate(
+            &parse(
+                "extend sys {\n    run() is also {\n        print \"x\" ~ \"a*b\";\n    };\n};\n",
+            )
+            .declarations,
+        ),
+        1,
+    );
+    assert_eq!(result.diagnostics.len(), 1);
+    assert!(
+        result.diagnostics[0].render().contains("E0410"),
+        "expected E0410: {:?}",
+        result.diagnostics[0].render()
+    );
+}

@@ -82,13 +82,14 @@ fn is_predefined_name(word: &str) -> bool {
     PREDEFINED_NAMES.contains(&word)
 }
 
-/// Binary operators from loosest to tightest binding (clause 4.5, Table 12).
-/// Arithmetic, shifts, relational operators, and `&&` / `||` follow C.
-/// `^` is looser than `|`, `===` / `!==` are looser than `==` / `!=`, and
-/// `in` (not in this table; see [`IN_LEVEL`]) sits between `===` and `&`.
-/// All of these are left-associative. The word spellings (`and`, `or`,
-/// `xor`) share the level of their symbol twins. `is [not] a` and the
-/// string-match operators are not parsed yet.
+/// Binary operator rows from loosest to tightest binding (clause 4.5,
+/// Table 12). Arithmetic, shifts, relational operators, and `&&` / `||`
+/// follow C. `^` is looser than `|`, `===` / `!==` are looser than
+/// `==` / `!=`. The word spellings (`and`, `or`, `xor`) share the level of
+/// their symbol twins. All of these are left-associative. Three operators
+/// of Table 12 are not rows here: `in` and `~` / `!~` sit between these
+/// rows (see [`IN_LEVEL`], [`MATCH_LEVEL`]), and `is [not] a` has a type
+/// operand instead of an expression (see [`ISA_LEVEL`]).
 const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
     &[("=>", BinaryOp::Imply)],
     &[("||", BinaryOp::LogicalOr), ("or", BinaryOp::LogicalOr)],
@@ -113,10 +114,32 @@ const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
     ],
 ];
 
-/// `in` is not a [`BINARY_LEVELS`] row. It binds looser than `===` / `!==`
-/// and tighter than `&` (clause 4.5). Levels below this index map straight
-/// onto [`BINARY_LEVELS`]; levels above it map one slot later.
+/// `in` membership is not a [`BINARY_LEVELS`] row. It binds looser than
+/// the string-match operators and tighter than `&` (clause 4.5).
 const IN_LEVEL: usize = 6;
+
+/// `~` / `!~` string match is not a [`BINARY_LEVELS`] row. It binds looser
+/// than `===` / `!==` and tighter than `in` (clause 4.5, Table 12).
+const MATCH_LEVEL: usize = 7;
+
+/// `is [not] a <type>` is not a [`BINARY_LEVELS`] row: its right operand
+/// is a type, not an expression. It binds tighter than `==` / `!=` and
+/// looser than the comparisons (clause 4.5, Table 12).
+const ISA_LEVEL: usize = 10;
+
+/// The [`BINARY_LEVELS`] row for a parse level, if the level is a plain
+/// binary-operator row. Two special levels (`in` at [`IN_LEVEL`] and
+/// string match at [`MATCH_LEVEL`]) sit between rows 5 and 6, and `is
+/// [not] a` ([`ISA_LEVEL`]) between rows 7 and 8, so levels above a
+/// special level shift by the number of specials passed.
+fn binary_row_for(level: usize) -> Option<&'static [(&'static str, BinaryOp)]> {
+    match level {
+        0..=5 => BINARY_LEVELS.get(level).copied(),
+        8..=9 => BINARY_LEVELS.get(level - 2).copied(),
+        11..=14 => BINARY_LEVELS.get(level - 3).copied(),
+        _ => None,
+    }
+}
 
 /// Outcome of parsing one source file: whatever declarations parsed, plus
 /// every diagnostic found (syntax and well-formedness).
@@ -715,6 +738,21 @@ impl Parser {
         } else {
             self.expect_type_name("expected declaration name")?
         };
+        // Clause 4.3.1.1: extensions of the root `global` type are reserved
+        // for the runtime; user code shall not write `extend global`. The
+        // parser's own `extend global` pseudo-declaration (the holder of
+        // file-level `define`/`import` members) is built in
+        // `parse_program` and never passes through here.
+        if kind == DeclarationKind::Extend && name == "global" {
+            self.diagnostics.push(Diagnostic::new(
+                "E0116",
+                "cannot extend 'global': extensions of the root type are reserved for the runtime",
+                name_span.0,
+                name_span.1,
+            ));
+            self.recover_to_declaration_boundary();
+            return None;
+        }
         let mut like = None;
         let mut like_span = None;
         if self.eat_keyword("like") {
@@ -2094,11 +2132,13 @@ impl Parser {
     }
 
     fn parse_binary_level(&mut self, level: usize) -> Option<Expr> {
-        if level == IN_LEVEL {
-            return self.parse_in_level();
+        match level {
+            IN_LEVEL => return self.parse_in_level(),
+            MATCH_LEVEL => return self.parse_match_level(),
+            ISA_LEVEL => return self.parse_isa_level(),
+            _ => {}
         }
-        let op_index = if level < IN_LEVEL { level } else { level - 1 };
-        let Some(operators) = BINARY_LEVELS.get(op_index) else {
+        let Some(operators) = binary_row_for(level) else {
             return self.parse_unary();
         };
         let lhs = self.parse_binary_level(level + 1)?;
@@ -2136,6 +2176,70 @@ impl Parser {
         Some(lhs)
     }
 
+    /// `lhs ~ pattern` / `lhs !~ pattern` string match (clause 4.11),
+    /// left-associative, at [`MATCH_LEVEL`].
+    fn parse_match_level(&mut self) -> Option<Expr> {
+        let mut lhs = self.parse_binary_level(MATCH_LEVEL + 1)?;
+        loop {
+            let op = match self.peek_kind() {
+                Some(TokenKind::Punctuation(p)) if p == "~" => BinaryOp::Match,
+                Some(TokenKind::Punctuation(p)) if p == "!~" => BinaryOp::NotMatch,
+                _ => break,
+            };
+            self.bump();
+            let rhs = self.parse_binary_level(MATCH_LEVEL + 1)?;
+            let start = lhs.span().0;
+            let end = rhs.span().1;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span: (start, end),
+            };
+        }
+        Some(lhs)
+    }
+
+    /// `expr is [not] a <type>` type check (clause 4.5), left-associative,
+    /// at [`ISA_LEVEL`]. A bare `is` that does not start this shape is left
+    /// for the caller — `is` also appears in member and trigger syntax.
+    fn parse_isa_level(&mut self) -> Option<Expr> {
+        let mut lhs = self.parse_binary_level(ISA_LEVEL + 1)?;
+        while self.peek_is_type_check() {
+            self.bump(); // 'is'
+            let negated = self.eat_keyword("not");
+            self.bump(); // 'a'
+            let ty = self.parse_type()?;
+            let start = lhs.span().0;
+            let end = self.last_end();
+            lhs = Expr::IsA {
+                expr: Box::new(lhs),
+                ty,
+                negated,
+                span: (start, end),
+            };
+        }
+        Some(lhs)
+    }
+
+    /// `is`, optionally `is not`, directly followed by `a` — the shape of
+    /// the type check operator. Multi-token lookahead so a different use of
+    /// `is` is never consumed here.
+    fn peek_is_type_check(&self) -> bool {
+        if !self.at_keyword("is") {
+            return false;
+        }
+        match self.peek_second_kind() {
+            Some(TokenKind::Identifier(word)) => word == "a",
+            Some(TokenKind::Keyword(word)) if word == "not" => {
+                matches!(
+                    self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                    Some(TokenKind::Identifier(word)) if word == "a"
+                )
+            }
+            _ => false,
+        }
+    }
     /// The left-associative loop for one precedence level, seeded with an
     /// already-parsed left-hand side.
     fn finish_binary_level(
