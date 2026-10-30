@@ -338,10 +338,38 @@ fn diagnostics_are_reported_with_positions() {
 
 #[test]
 fn lex_errors_become_diagnostics() {
-    let result = parse("struct s { keep x < ''; };");
+    let result = parse("struct s { keep x < 8'xZZ; };");
     assert_eq!(result.declarations.len(), 0);
     assert_eq!(result.diagnostics.len(), 1);
     assert_eq!(result.diagnostics[0].code, "E0001");
+}
+
+#[test]
+fn quoted_hdl_paths_parse() {
+    let declarations = expect_clean(
+        "struct s {\n    run() is {\n        'memory_tb.address' = 8'hFF;\n        var v: uint = 'memory_tb.data_out';\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    assert_eq!(run.body.len(), 2);
+    assert!(
+        matches!(
+            &run.body[0],
+            Stmt::Assign {
+                target: Expr::HdlPath { path, .. },
+                ..
+            } if path == "memory_tb.address"
+        ),
+        "expected an HdlPath assignment target"
+    );
+    assert!(matches!(
+        &run.body[1],
+        Stmt::VarDecl {
+            init: Some(Expr::HdlPath { path, .. }),
+            ..
+        } if path == "memory_tb.data_out"
+    ));
 }
 
 #[test]
@@ -362,16 +390,17 @@ fn recovery_reports_each_bad_declaration() {
 
 #[test]
 fn unsupported_members_report_explicitly() {
-    let result = parse("struct s {\n    event done;\n    a: uint;\n};\n");
+    let result = parse("struct s {\n    b: uint;\n    cover my_cover is { item a; };\n};\n");
     assert_eq!(
         result
             .diagnostics
             .iter()
             .map(|d| d.code)
             .collect::<Vec<_>>(),
-        vec!["E0113"]
+        vec!["E0113", "E0101"]
     );
-    // The parser recovers and keeps the well-formed field.
+    // The parser recovers; the well-formed field survives in the partial
+    // AST and the diagnostics are authoritative.
     assert_eq!(result.declarations[0].members.len(), 1);
 }
 
@@ -431,12 +460,23 @@ fn when_bare_and_chained_modifiers_parse() {
 
 #[test]
 fn when_blocks_are_searched_for_fields_and_constraints() {
-    // A duplicate field inside a when block is diagnosed against the
-    // declaration's other fields (including sibling when blocks).
-    let result =
+    // A `when` branch may shadow a base field (each subtype variant
+    // carries its own field set), so only a duplicate in the SAME scope
+    // is diagnosed.
+    let shadowing =
         parse("struct s {\n    a: uint;\n    when fast'kind s {\n        a: uint;\n    };\n};\n");
-    let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
-    assert_eq!(rendered, vec!["4:9: error[E0202]: duplicate field 'a'"]);
+    assert!(
+        shadowing.diagnostics.is_empty(),
+        "when-shadowing must be accepted: {:?}",
+        shadowing
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    let duplicate = parse("struct s {\n    a: uint;\n    a: uint;\n};\n");
+    let rendered: Vec<String> = duplicate.diagnostics.iter().map(|d| d.render()).collect();
+    assert_eq!(rendered, vec!["3:5: error[E0202]: duplicate field 'a'"]);
 }
 
 #[test]
@@ -465,4 +505,179 @@ fn while_break_and_continue_parse() {
         panic!("expected an if statement");
     };
     assert!(matches!(then_body[0], Stmt::Break { .. }));
+}
+
+#[test]
+fn case_statements_parse() {
+    let declarations = expect_clean(
+        "struct s {\n    opcode: uint;\n    run() is {\n        case opcode {\n            3: { out(3); };\n            [1, 2]: { out(12); };\n            default: { out(0); };\n        };\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[1] else {
+        panic!("expected a method");
+    };
+    let Some(Stmt::Case {
+        scrutinee,
+        arms,
+        default,
+        ..
+    }) = run.body.first()
+    else {
+        panic!("expected a case statement");
+    };
+    let Expr::Ident { name, .. } = scrutinee else {
+        panic!("expected an identifier scrutinee");
+    };
+    assert_eq!(name, "opcode");
+    assert_eq!(arms.len(), 2);
+    assert_eq!(arms[0].0.len(), 1);
+    assert_eq!(arms[1].0.len(), 2, "the grouped alternative");
+    assert!(default.is_some());
+}
+
+#[test]
+fn ternary_expressions_parse() {
+    let declarations = expect_clean(
+        "struct s {\n    run() is {\n        var v: uint = a > 3 ? 10 : 20;\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    let Some(Stmt::VarDecl {
+        init: Some(init), ..
+    }) = run.body.first()
+    else {
+        panic!("expected a var with initializer");
+    };
+    let Expr::Ternary {
+        cond,
+        then_expr,
+        else_expr,
+        ..
+    } = init
+    else {
+        panic!("expected a ternary");
+    };
+    assert!(matches!(cond.as_ref(), Expr::Binary { .. }));
+    assert!(matches!(then_expr.as_ref(), Expr::IntLiteral { .. }));
+    assert!(matches!(else_expr.as_ref(), Expr::IntLiteral { .. }));
+}
+
+#[test]
+fn if_then_variant_parses() {
+    let declarations = expect_clean(
+        "struct s {\n    run() is {\n        if 1 < 2 then {\n            out(1);\n        };\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    assert!(matches!(&run.body[0], Stmt::If { .. }));
+}
+
+#[test]
+fn method_keyword_spelling_parses() {
+    let declarations = expect_clean(
+        "struct s {\n    method run() is {\n        out(1);\n    };\n    method calc(x: uint): uint is empty;\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method member");
+    };
+    assert_eq!(run.name, "run");
+    let Member::Method(calc) = &declarations[0].members[1] else {
+        panic!("expected a method member");
+    };
+    assert_eq!(calc.name, "calc");
+    assert!(calc.body.is_empty(), "is empty must give an empty body");
+}
+
+#[test]
+fn event_trigger_forms_parse() {
+    let declarations = expect_clean(
+        "unit u {\n    event clk is @sys.any;\n    event sampled is only cycle @p_sync.clk_e;\n    \
+         event edge is change(dut.sig$) @sim;\n    event both is fall(clk$ == 1) @sim or rise(clk$) @sim;\n    \
+         event port_edge is @off_p$;\n};\n",
+    );
+    let unit = &declarations[0];
+    let Member::Event(event) = &unit.members[1] else {
+        panic!("expected an event member");
+    };
+    let Some(trigger) = &event.trigger else {
+        panic!("expected a trigger");
+    };
+    assert_eq!(trigger.modifier.as_deref(), Some("only"));
+    assert!(trigger.cycle);
+    assert_eq!(trigger.items[0].path, vec!["p_sync", "clk_e"]);
+
+    let Member::Event(edge) = &unit.members[2] else {
+        panic!("expected an event member");
+    };
+    let edge_trigger = edge.trigger.as_ref().unwrap();
+    assert_eq!(edge_trigger.items[0].path, vec!["sim"]);
+    assert!(edge_trigger.items[0].condition.is_some());
+
+    let Member::Event(both) = &unit.members[3] else {
+        panic!("expected an event member");
+    };
+    let both_trigger = both.trigger.as_ref().unwrap();
+    assert_eq!(both_trigger.items.len(), 2, "or-composed items");
+}
+
+#[test]
+fn keep_bind_constraints_parse() {
+    let declarations = expect_clean(
+        "unit u {\n    keep bind (sig_clk, external);\n    keep bind bfm0 to ~/dut/u0;\n};\n",
+    );
+    let Member::Constraint(first) = &declarations[0].members[0] else {
+        panic!("expected a keep constraint");
+    };
+    assert!(first.is_bind);
+    let Expr::Call { args, .. } = &first.expr else {
+        panic!("expected a bind call");
+    };
+    assert_eq!(args.len(), 2);
+    let Member::Constraint(second) = &declarations[0].members[1] else {
+        panic!("expected a keep constraint");
+    };
+    assert!(second.is_bind);
+}
+
+#[test]
+fn implication_not_and_soft_rhs_parse() {
+    let declarations = expect_clean(
+        "struct s {\n    a: bool;\n    b: bool;\n    keep a == TRUE => soft b == TRUE;\n    \
+         keep not a and not b;\n};\n",
+    );
+    let Member::Constraint(first) = &declarations[0].members[2] else {
+        panic!("expected a keep constraint");
+    };
+    let Expr::Binary {
+        op: BinaryOp::Imply,
+        ..
+    } = first.expr
+    else {
+        panic!("expected an implication");
+    };
+    let Member::Constraint(second) = &declarations[0].members[3] else {
+        panic!("expected a keep constraint");
+    };
+    assert!(matches!(
+        second.expr,
+        Expr::Binary {
+            op: BinaryOp::LogicalAnd,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn prefixed_field_declarations_parse() {
+    let declarations =
+        expect_clean("struct s {\n    !do_not_gen: bool;\n    %packed: uint(bits: 8);\n};\n");
+    let Member::Field(no_gen) = &declarations[0].members[0] else {
+        panic!("expected a field");
+    };
+    assert!(no_gen.no_gen && !no_gen.physical);
+    let Member::Field(physical) = &declarations[0].members[1] else {
+        panic!("expected a field");
+    };
+    assert!(physical.physical && !physical.no_gen);
 }

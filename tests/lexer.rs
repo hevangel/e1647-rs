@@ -285,14 +285,25 @@ fn reals_and_ranges() {
 
 #[test]
 fn rejects_bad_based_literals() {
-    let error = tokenize("''").unwrap_err();
-    assert_eq!(error.message, "character literals are not supported yet");
     let error = tokenize("8'xZZ").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
     let error = tokenize("'d").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
     let error = tokenize("8'").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
+}
+
+#[test]
+fn bare_quotes_tokenize_standalone() {
+    // Non-literal quotes are standalone punctuation; the parser decides
+    // what they delimit (quoted paths, subtype modifiers).
+    assert_eq!(
+        kinds("''"),
+        vec![
+            TokenKind::Punctuation("'".into()),
+            TokenKind::Punctuation("'".into()),
+        ]
+    );
 }
 
 #[test]
@@ -333,6 +344,20 @@ fn comments_and_source_locations() {
 }
 
 #[test]
+fn dash_dash_comments_are_skipped() {
+    // e's native line comment: `--` to end of line.
+    let tokens = tokenize("-- a comment\nfoo -- trailing\nbar").unwrap();
+    assert_eq!(
+        kinds("-- a comment\nfoo -- trailing\nbar"),
+        vec![
+            TokenKind::Identifier("foo".into()),
+            TokenKind::Identifier("bar".into()),
+        ]
+    );
+    assert_eq!(tokens[0].start.line, 2);
+}
+
+#[test]
 fn reports_unterminated_comment() {
     let error = tokenize("foo /* not closed").unwrap_err();
     assert_eq!(error.message, "unterminated block comment");
@@ -342,4 +367,46 @@ fn reports_unterminated_comment() {
 fn reports_unterminated_string() {
     let error = tokenize("name: string = \"abc").unwrap_err();
     assert_eq!(error.message, "unterminated string literal");
+}
+
+#[test]
+fn prose_outside_code_blocks_is_skipped() {
+    // Specman loads only `<' .. '>` spans; a file whose delimiters are
+    // opened but unterminated runs to end of source (and must terminate).
+    let tokens =
+        tokenize("spec header prose\n<'\nextend packet { keep tail == 3; };\n'>\ntrailing prose\n")
+            .expect("terminates and tokenizes");
+    assert!(
+        tokens
+            .iter()
+            .all(|t| !matches!(&t.kind, TokenKind::Identifier(w) if w == "prose")),
+        "outside prose must be skipped: {tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(w) if w == "packet")),
+        "code inside the block must be tokenized"
+    );
+}
+
+#[test]
+fn unterminated_code_block_runs_to_end_of_source() {
+    let tokens = tokenize("prose\n<'\nkeep a == 1;").expect("must terminate");
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Keyword(k) if k == "keep")),
+        "code after the opener must be tokenized"
+    );
+}
+
+#[test]
+fn source_without_code_blocks_is_all_code() {
+    let tokens = tokenize("keep a == 1;").expect("tokenizes");
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Keyword(k) if k == "keep"))
+    );
 }

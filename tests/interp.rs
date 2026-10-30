@@ -177,3 +177,82 @@ fn enumeral_fields_and_comparisons_execute() {
     );
     assert!(output == "busy\n" || output == "idle\n", "output: {output}");
 }
+
+#[test]
+fn hdl_path_access_without_a_session_is_e0408() {
+    // Quoted HDL paths parse (asic-world driver style) but require a
+    // simulator session started with hdl_load.
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        'tb.sig' = 1;\n        print 'tb.sig';\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>(),
+        vec!["E0408"]
+    );
+}
+
+#[test]
+fn case_ternary_and_outf_execute() {
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var x: uint = 2;\n        case x {\n            1: { out(\"one\\n\"); };\n            [2, 7]: { out(\"two-or-seven\\n\"); };\n            default: { out(\"other\\n\"); };\n        };\n        var verdict: string = x > 1 ? \"big\" : \"small\";\n        out(verdict, \"\\n\");\n        outf(\"hex=%x dec=%d str=%s 100%%\\n\", 255, 42, \"tag\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "two-or-seven\nbig\nhex=ff dec=42 str=tag 100%\n");
+}
+
+#[test]
+fn start_runs_tcm_inline_and_waits_advance() {
+    let output = clean_output(
+        "unit counter_u {\n    ticks: uint;\n    tick() @sys.any is {\n        var i: uint = 0;\n        while i < 3 {\n            i = i + 1;\n            ticks = ticks + 1;\n            wait cycle;\n        };\n    };\n};\nextend sys {\n    c: counter_u is instance;\n    run() is also {\n        start c.tick();\n        print c.ticks;\n        emit sys.done;\n    };\n};\n",
+        1,
+    );
+    // The inline-started TCM mutated the instance across its waits.
+    assert!(output.contains("3\n"), "output: {output}");
+}
+
+#[test]
+fn runaway_tcm_hits_the_wait_budget() {
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        while TRUE {\n            wait cycle;\n        };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>(),
+        vec!["E0409"]
+    );
+}
+
+#[test]
+fn implication_and_not_evaluate_in_constraints() {
+    // `a => b` with a held TRUE forces b to gen TRUE; `not b` excludes
+    // FALSE from the second field.
+    let output = clean_output(
+        "struct s {\n    a: bool;\n    b: bool;\n    keep a == TRUE => b == TRUE;\n    \
+         keep not (b == FALSE);\n};\n\
+         extend sys {\n    run() is {\n        var x: s;\n        gen x;\n        print x.a, x.b;\n    };\n};\n",
+        7,
+    );
+    assert!(output.contains("TRUE"), "output: {output}");
+}
+
+#[test]
+fn bind_constraints_are_skipped_by_gen() {
+    // A bind constraint names HDL-side signals; gen must not treat it as
+    // a rejection predicate over e fields.
+    let output = clean_output(
+        "struct s {\n    v: uint(bits: 8);\n    keep bind (sig_clk, external);\n    \
+         keep v < 10;\n};\n\
+         extend sys {\n    run() is {\n        var x: s;\n        gen x;\n        print x.v;\n    };\n};\n",
+        3,
+    );
+    assert!(output.contains('\n'), "output: {output}");
+}

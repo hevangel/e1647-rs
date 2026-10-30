@@ -48,8 +48,9 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
         }
     }
     // Enumerals live in the file-global namespace once their `type` is
-    // declared, so any `keep` constraint may reference them.
-    let enumerals: BTreeSet<&str> = declarations
+    // declared, so any `keep` constraint may reference them. Inline
+    // enumerals (`kind : [imm, reg]`) contribute the same way.
+    let mut enumerals: BTreeSet<&str> = declarations
         .iter()
         .filter(|declaration| declaration.kind == DeclarationKind::Type)
         .flat_map(|declaration| declaration.members.iter())
@@ -58,6 +59,15 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             _ => None,
         })
         .collect();
+    for declaration in declarations {
+        for_each_field(&declaration.members, &mut |field| {
+            if let crate::ast::TypeExpr::InlineEnum { names, .. } = &field.ty {
+                for name in names {
+                    enumerals.insert(name.as_str());
+                }
+            }
+        });
+    }
     for declaration in declarations {
         check_extend_target(declaration, &declared, &mut diagnostics);
         check_like_target(declaration, &declared, &mut diagnostics);
@@ -85,6 +95,11 @@ fn check_extend_target(
     if declaration.kind != DeclarationKind::Extend {
         return;
     }
+    // The parser's pseudo-declaration holding file-level `define`/`import`
+    // members is scope, not an extend of a real type.
+    if declaration.name == "global" && declaration.like.is_none() {
+        return;
+    }
     if !declared.contains(declaration.name.as_str())
         && !crate::builtins::is_builtin_unit(declaration.name.as_str())
     {
@@ -109,7 +124,7 @@ fn check_like_target(
         return;
     };
     let like_span = declaration.like_span.unwrap_or(declaration.name_span);
-    if !declared.contains(like.as_str()) {
+    if !declared.contains(like.as_str()) && !crate::builtins::is_builtin_base(like) {
         diagnostics.push(Diagnostic::new(
             "E0203",
             format!("unknown type '{like}' in like clause"),
@@ -124,8 +139,14 @@ fn check_fields(
     declared: &BTreeSet<&str>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Field names may repeat across `when` branches (each subtype variant
+    // carries its own field set, possibly shadowing the base field), so
+    // only the top-level scope participates in the duplicate check.
     let mut seen: BTreeSet<&str> = BTreeSet::new();
-    for_each_field(&declaration.members, &mut |field| {
+    for member in &declaration.members {
+        let Member::Field(field) = member else {
+            continue;
+        };
         if !seen.insert(field.name.as_str()) {
             diagnostics.push(Diagnostic::new(
                 "E0202",
@@ -134,6 +155,8 @@ fn check_fields(
                 field.name_span.1,
             ));
         }
+    }
+    for_each_field(&declaration.members, &mut |field| {
         check_named_type(&field.ty, declared, diagnostics);
         if let TypeExpr::Scalar {
             base: crate::ast::ScalarBase::Uint | crate::ast::ScalarBase::Int,
@@ -237,12 +260,33 @@ fn check_statements<'a>(
                     check_statements(else_body, seen, declared, method_name, diagnostics);
                 }
             }
+            Stmt::Check { else_body, .. } => {
+                check_statements(else_body, seen, declared, method_name, diagnostics);
+            }
+            Stmt::SeqDo { item, .. } => {
+                // The item field must exist in the enclosing scope.
+                if !seen.contains(item.as_str()) {
+                    diagnostics.push(Diagnostic::new(
+                        "E0204",
+                        format!("unknown sequence item '{item}' in 'do'"),
+                        statement.span().0,
+                        statement.span().1,
+                    ));
+                }
+            }
             Stmt::Assign { .. }
             | Stmt::ExprStmt { .. }
             | Stmt::Return { .. }
             | Stmt::While { .. }
             | Stmt::Break { .. }
             | Stmt::Continue { .. }
+            | Stmt::Case { .. }
+            | Stmt::Wait { .. }
+            | Stmt::Emit { .. }
+            | Stmt::Start { .. }
+            | Stmt::StopRun { .. }
+            | Stmt::ForEach { .. }
+            | Stmt::ForTo { .. }
             | Stmt::Print { .. }
             | Stmt::Gen { .. } => {}
         }
@@ -262,7 +306,7 @@ fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut 
             }
         }
         TypeExpr::List { element, .. } => check_named_type(element, declared, diagnostics),
-        TypeExpr::Scalar { .. } => {}
+        TypeExpr::Scalar { .. } | TypeExpr::InlineEnum { .. } => {}
     }
 }
 
@@ -292,6 +336,10 @@ fn check_constraint_fields(
     enumerals: &BTreeSet<&str>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Bind constraints name HDL-side signals, not e fields; skip them.
+    if constraint.is_bind {
+        return;
+    }
     let mut roots = Vec::new();
     collect_root_identifiers(&constraint.expr, &mut roots);
     for (name, span) in roots {
@@ -329,6 +377,45 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
         Expr::Unary { expr, .. } | Expr::Paren { expr, .. } => {
             collect_root_identifiers(expr, roots)
         }
+        // Quoted HDL paths are simulator signals, not struct fields.
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            collect_root_identifiers(cond, roots);
+            collect_root_identifiers(then_expr, roots);
+            collect_root_identifiers(else_expr, roots);
+        }
+        Expr::CastAs { expr, .. } => collect_root_identifiers(expr, roots),
+        Expr::BitSlice {
+            base, high, low, ..
+        } => {
+            collect_root_identifiers(base, roots);
+            collect_root_identifiers(high, roots);
+            collect_root_identifiers(low, roots);
+        }
+        Expr::InSet {
+            element,
+            set: crate::ast::InSetExpr::Items(items),
+            ..
+        } => {
+            collect_root_identifiers(element, roots);
+            for item in items {
+                collect_root_identifiers(item, roots);
+            }
+        }
+        Expr::InSet {
+            element,
+            set: crate::ast::InSetExpr::Range(low, high),
+            ..
+        } => {
+            collect_root_identifiers(element, roots);
+            collect_root_identifiers(low, roots);
+            collect_root_identifiers(high, roots);
+        }
+        Expr::HdlPath { .. } => {}
         Expr::IntLiteral { .. }
         | Expr::RealLiteral { .. }
         | Expr::BitLiteral { .. }

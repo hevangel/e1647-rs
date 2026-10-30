@@ -28,6 +28,11 @@ pub struct Declaration {
     /// `struct derived like base { .. }` inheritance clause.
     pub like: Option<String>,
     pub like_span: Option<Span>,
+    /// When-modifier prefixes of the declared/extended type
+    /// (`extend imm cpu_instr_s`, `extend ACTIVE TX uart_agent_u`) —
+    /// `value'id` pairs flattened to their modifier text. When-scoping of
+    /// extensions is not modeled yet; the modifiers are recorded only.
+    pub modifiers: Vec<String>,
     pub members: Vec<Member>,
     pub span: Span,
 }
@@ -41,6 +46,22 @@ pub enum Member {
     Enumeral(Enumeral),
     /// A `when <modifier> .. { members };` subtype member.
     When(WhenDecl),
+    /// A `simple_port` member.
+    Port(PortDecl),
+    /// An `event` member.
+    Event(EventDecl),
+    /// `import a, b;` — recorded; no cross-file resolution yet.
+    Import {
+        names: Vec<String>,
+        span: Span,
+    },
+    /// `define name value;` — a compile-time constant; the name resolves
+    /// to the value's literal in the interpreter.
+    Define {
+        name: String,
+        value: Option<Expr>,
+        span: Span,
+    },
 }
 
 /// A `when` subtype member: one or more `value'id` (or bare `id`) modifiers
@@ -62,11 +83,78 @@ pub struct SubtypeModifier {
     pub id: Option<(String, Span)>,
 }
 
+/// Port direction of a [`PortDecl`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortDirection {
+    In,
+    Out,
+    Inout,
+}
+
+/// An `event` member: `event name;` (explicitly emitted) or
+/// `event name is <trigger>;` (e.g. `is fall(clk$) @sim`,
+/// `is cycle @p_smp.clock_f`, `is @sys.any`). The trigger is stored as
+/// written; edge scheduling is a later milestone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub trigger: Option<EventTrigger>,
+    pub span: Span,
+}
+
+/// The `is …` trigger of an [`EventDecl`]: an optional `only`/`unexp`
+/// modifier, the `cycle` keyword and one or more sampled items joined by
+/// `or`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventTrigger {
+    /// `only` / `unexp` modifier as written, if present.
+    pub modifier: Option<String>,
+    /// `cycle` keyword before the first item, if present.
+    pub cycle: bool,
+    pub items: Vec<EventTriggerItem>,
+    /// A Boolean combination guarding the whole trigger (`is
+    /// (fall(a) and true(b)) @clk`) — the joined sample conditions are
+    /// stored in the items, the combination operator here.
+    pub group_op: Option<String>,
+}
+
+/// One sampled item of an [`EventTrigger`]: `@p_smp.clk` on its own or a
+/// `change(cond) @sim`-style edge sample. Routine names (`rise`, `fall`,
+/// `change`, `true`) are validated by the parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventTriggerItem {
+    /// `rise` / `fall` / `change` / `true` for edge samples, absent for
+    /// plain event attachments.
+    pub routine: Option<String>,
+    /// Dotted sampled path after `@`; the last segment may carry the HDL
+    /// `$` suffix (`@off_p$`).
+    pub path: Vec<String>,
+    /// `rise(cond)`-style condition guarding this item, if any.
+    pub condition: Option<Expr>,
+}
+
+/// A `simple_port` member: `name: inout simple_port of bit is instance;`.
+/// The HDL location comes from a `keep name.hdl_path() == "path"`
+/// constraint and is resolved during elaboration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub direction: PortDirection,
+    pub element: TypeExpr,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     pub name: String,
     pub name_span: Span,
     pub ty: TypeExpr,
+    /// `%name` physical field (packing-relevant).
+    pub physical: bool,
+    /// `!name` do-not-generate field (skipped by `gen`).
+    pub no_gen: bool,
 }
 
 /// A `keep <expr>;` or `keep soft <expr>;` constraint. The expression is
@@ -75,6 +163,9 @@ pub struct Field {
 pub struct KeepConstraint {
     pub expr: Expr,
     pub is_soft: bool,
+    /// `keep bind (port, hdl_kind);` — hierarchical HDL binding recorded
+    /// as a `bind(a, b)` call. Skipped by identifier checking and by `gen`.
+    pub is_bind: bool,
     pub span: Span,
 }
 
@@ -85,6 +176,9 @@ pub struct MethodDecl {
     pub name_span: Span,
     pub params: Vec<Param>,
     pub return_type: Option<TypeExpr>,
+    /// `@event` suffix of a time-consuming method (TCM); the event
+    /// expression as written (e.g. `@sys.any`, `@driver.clock`).
+    pub tcm_event: Option<Expr>,
     /// `is also` / `is first` / `is only` extension modifier.
     pub modifier: Option<MethodModifier>,
     pub body: Vec<Stmt>,
@@ -164,6 +258,68 @@ pub enum Stmt {
         expr: Expr,
         span: Span,
     },
+    /// `stop_run();` — ends the simulation run.
+    StopRun {
+        span: Span,
+    },
+    /// `do <item-field>;` — execute one sequence item inside a sequence
+    /// body (`do trans keeping { … };` records the constraint block).
+    /// Scheduling the item through the sequencer handshake is a later
+    /// milestone; execution currently generates the item in place.
+    SeqDo {
+        item: String,
+        span: Span,
+    },
+    /// `check that <cond> else { .. }` — on a false condition the else
+    /// body runs (usually a `dut_error` call) and the DUT-error counter
+    /// increments; the run itself continues.
+    Check {
+        condition: Expr,
+        else_body: Vec<Stmt>,
+        span: Span,
+    },
+    /// `for each in list do { .. };` binds `it` to each element;
+    /// `for each (m) in list do { .. };` binds `m` instead.
+    ForEach {
+        var: Option<String>,
+        list: Expr,
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    /// `for i from a to b { .. };` — inclusive bounds.
+    ForTo {
+        var: String,
+        from: Expr,
+        to: Expr,
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    /// `wait cycle;` / `wait [n];` / `wait [n] * cycle;` — advances
+    /// simulation time by the evaluated cycle count.
+    Wait {
+        cycles: Expr,
+        span: Span,
+    },
+    /// `emit <target>;` — fires an event.
+    Emit {
+        target: Expr,
+        span: Span,
+    },
+    /// `start <call>;` — starts a TCM. Executed inline (synchronously)
+    /// with a shared cycle budget in this milestone; event-triggered
+    /// suspension is a later milestone.
+    Start {
+        call: Expr,
+        span: Span,
+    },
+    /// `case expr { val: {..}; [a, b]: {..}; default: {..}; };`
+    Case {
+        scrutinee: Expr,
+        /// Each arm carries its alternative expressions (one or more).
+        arms: Vec<(Vec<Expr>, Vec<Stmt>)>,
+        default: Option<Vec<Stmt>>,
+        span: Span,
+    },
 }
 
 impl Stmt {
@@ -178,7 +334,16 @@ impl Stmt {
             | Stmt::Break { span }
             | Stmt::Continue { span }
             | Stmt::Print { span, .. }
-            | Stmt::Gen { span, .. } => *span,
+            | Stmt::Gen { span, .. }
+            | Stmt::StopRun { span }
+            | Stmt::SeqDo { span, .. }
+            | Stmt::Check { span, .. }
+            | Stmt::ForEach { span, .. }
+            | Stmt::ForTo { span, .. }
+            | Stmt::Wait { span, .. }
+            | Stmt::Emit { span, .. }
+            | Stmt::Start { span, .. }
+            | Stmt::Case { span, .. } => *span,
         }
     }
 }
@@ -239,6 +404,8 @@ pub enum TypeExpr {
     List { element: Box<TypeExpr>, span: Span },
     /// A user-defined type name.
     Named { name: String, span: Span },
+    /// An inline enumeral list type: `[imm, reg]`.
+    InlineEnum { names: Vec<String>, span: Span },
 }
 
 impl TypeExpr {
@@ -246,6 +413,7 @@ impl TypeExpr {
         match self {
             TypeExpr::Scalar { span, .. } | TypeExpr::List { span, .. } => *span,
             TypeExpr::Named { span, .. } => *span,
+            TypeExpr::InlineEnum { span, .. } => *span,
         }
     }
 }
@@ -272,6 +440,8 @@ pub enum BinaryOp {
     Mul,
     Div,
     Mod,
+    /// `=>` constraint implication (`a => b` is `!a || b`).
+    Imply,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +512,47 @@ pub enum Expr {
         expr: Box<Expr>,
         span: Span,
     },
+    /// `cond ? then_expr : else_expr`
+    Ternary {
+        cond: Box<Expr>,
+        then_expr: Box<Expr>,
+        else_expr: Box<Expr>,
+        span: Span,
+    },
+    /// A quoted hierarchical HDL path (`'memory_tb.address'`) — read or
+    /// assigned through the simulator bridge ([`crate::hdl`]).
+    HdlPath {
+        path: String,
+        span: Span,
+    },
+    /// `expr.as_a(type)` cast.
+    CastAs {
+        expr: Box<Expr>,
+        ty: TypeExpr,
+        span: Span,
+    },
+    /// Bit slice `base[high:low]` (integer extraction).
+    BitSlice {
+        base: Box<Expr>,
+        high: Box<Expr>,
+        low: Box<Expr>,
+        span: Span,
+    },
+    /// `element in [a, b]` / `element in [low .. high]` membership.
+    InSet {
+        element: Box<Expr>,
+        set: InSetExpr,
+        span: Span,
+    },
+}
+
+/// The right-hand side of an `in` membership expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InSetExpr {
+    /// `[a, b, c]` — any match.
+    Items(Vec<Expr>),
+    /// `[low .. high]` — inclusive numeric range.
+    Range(Box<Expr>, Box<Expr>),
 }
 
 impl Expr {
@@ -358,7 +569,12 @@ impl Expr {
             | Expr::Index { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Unary { span, .. }
-            | Expr::Paren { span, .. } => *span,
+            | Expr::Paren { span, .. }
+            | Expr::Ternary { span, .. }
+            | Expr::CastAs { span, .. }
+            | Expr::BitSlice { span, .. }
+            | Expr::InSet { span, .. }
+            | Expr::HdlPath { span, .. } => *span,
         }
     }
 }
