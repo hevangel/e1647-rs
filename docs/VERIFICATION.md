@@ -947,3 +947,55 @@ Verification: fmt/clippy clean; `cargo test` green; CI green on
 95de620. Reproduce: `e1647 run local/corpora/d6w/testbench.e --seed 1`
 (two files: `my_traffic.e` + `testbench.e` under `local/corpora/d6w/`,
 gitignored; the run needs no simulator).
+
+## 2026-10-30 (15) — remaining corpus cases green on the Playground; adaptation anatomy and our-side deltas
+
+- After the login refresh, every remaining corpus case ran on EDA
+  Playground (Specman Elite + Xcelium 25.03). Playwright discipline:
+  ONE automation Chrome at a time — the ~128 accumulated
+  temp-profile processes wedged every new session until they were
+  killed (`local/playwright/kill-eda-chrome.ps1` matches
+  `--user-data-dir=` temp paths only, leaving personal browsing
+  alone).
+- Reference results (`local/compare/*.specman.log`):
+  `cover-edges` and `igen-dist` run CLEAN — Specman end-of-test, 0
+  DUT errors, cover data written, clean `$finish` exit;
+  `save-restart-test1` runs clean (0 DUT errors); `type-min-max-usage`
+  runs clean (declarations-only; macros evaluate at load);
+  `etl-simple-examples` fails to compile on Specman template macros
+  (`No template called 'deque_iterator'` — `define as` templates, the
+  same rung-3 family our parser is missing; our per-file concat also
+  required stripping each component's `package etl;` line — package
+  must appear exactly once);
+  `sn-cpu-golden` compiles, all 11 ports bind, and Specman runs to
+  the Playground runtime ceiling — the recorded no-DUT ceiling (the
+  tutorial's Verilog CPU ships only with Specman installs).
+- Adaptation anatomy (why the first four attempts failed, recorded
+  for the next person): (1) `@sim` is only legal as
+  `change/rise/fall(<hdl path>)@sim` — a bare `@sim` fails to
+  compile; (2) the sampler must be an ACTIVE event whose port path
+  resolves (`keep hdl_path() == "top"` + port `keep … == "tick"`, and
+  the event declared in `extend sys` referencing
+  `sim_smp.tick_p$`, exactly the golden's shape); (3) the added code
+  needs its own `<' … '>` block — the corpus files open their blocks
+  later, so unwrapped additions are prose to Specman; (4) the pure-e
+  design shell needs `always` activity plus a bounded `$finish`, else
+  declarations-only cases idle into the Playground runtime kill
+  (exit 137).
+- Our side after these runs (`local/compare/ours-*.log`, `e1647 run
+  --seed 1`): save-restart 12 → 2 diagnostics (the `sequence …
+  using` synthesis from 95de620; remaining: `on <event> { … }`
+  blocks), igen-dist 5 (weighted `select` constraints),
+  type-min-max 2 (`define as` macro templates), cover-edges 13
+  (cover groups, `file`/reflection builtins), etl 22 (template
+  structs/macros), golden 13 (cover/`expect`/`scbd_port`). These
+  first-blocker lines are the ranked input for the next parse arcs.
+- Operational: `peek-tb.mjs <url>` dumps a playground's saved panes
+  (the paste-before-rerender failure mode is real — always verify
+  what the site holds, never trust the intended paste).
+
+Verification: reference logs are runs of the cited playgrounds
+(Specman Elite 25.03, Xcelium 25.03, seed 1); our-side numbers are
+`e1647 run` exit logs. fmt/clippy clean; `cargo test` green at the
+commits of record (through 801564e); no source changes in this
+entry — corpora adaptations live in gitignored `local/`.
