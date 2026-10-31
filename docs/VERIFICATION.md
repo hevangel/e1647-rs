@@ -1342,3 +1342,45 @@ verbatim option captures, group option entries, `is also`, stray
 `unsupported_member` fixture (whose example was `cover` itself) now
 pins `assert` members (clause 16), the remaining unsupported-member
 family.
+
+## 2026-10-31 (22) — offline arc: clause 11.4 expect/assume members recorded; golden-combined parse-clean
+
+Scope claimed for this change (nothing broader):
+
+- `expect`/`assume` struct members (clause 11.4) parse and are recorded
+  **uninterpreted**: the temporal expression is captured as raw tokens
+  up to the `else` keyword or a top-level `;` at brace depth zero
+  (TE-internal braces and their semicolons stay inside the capture);
+  the `else` failure body parses as ordinary actions in both the
+  one-statement form (which consumes its own terminator) and the braced
+  form. An empty temporal expression reports `E0119`. The clause 12
+  temporal-expression grammar, ports, and the evaluation engine are
+  later milestones — nothing is evaluated at run time, and the members
+  are not collected during elaboration.
+- `E0119` added for the missing temporal expression.
+
+Corpus movement (absolute paths, `--seed 1`): **golden-combined 2 → 0
+parse diagnostics — every corpus file in `local/` now parses clean or
+carries only external-dependency diagnostics** (etl 4 `base_struct`,
+cover-edges 4 rf-library types, golden-imports 3 missing tutorial
+modules, igen-dist 5 weighted-select constraints, d6w/type-min-max/
+save-restart 0). The recorded Specman run of the golden needed the full
+Specman install; our parse of the standalone extract is complete.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(127 passed: 11 elab, 1 fixtures, 34 interp, 24 lexer, 48 parser, 9 solve)
+```
+
+New tests: `tests/fixtures/expect_member.{e,expected}` (OK — the
+golden's expect shape plus an assume with a braced else);
+`tests/parser.rs` expect/assume recording (kind, raw-TE content with
+the `else` keyword excluded, one-statement and braced else bodies) and
+the no-else form plus the `E0119` empty-expression diagnostic.

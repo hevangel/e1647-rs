@@ -419,7 +419,9 @@ impl<'a> Elaborator<'a> {
                 Member::Cover(cover) => composed.covers.push(cover),
                 Member::Port(port) => composed.ports.push((port, block)),
                 Member::Import { .. } | Member::Define { .. } | Member::Macro(_) => {}
-                Member::Event(_) | Member::Enumeral(_) => {}
+                // Expect/assume members are recorded in the AST; the
+                // temporal engine (clause 12) is a later milestone.
+                Member::Expect(_) | Member::Event(_) | Member::Enumeral(_) => {}
             }
         }
     }

@@ -64,7 +64,10 @@
       recorded verbatim; the coverage data model is a later milestone.
       Predefined non-scalar types `file` and `event` are accepted in
       type positions; `for each <type> (v) in list` records the element
-      type filter.
+      type filter. `expect`/`assume` members (clause 11.4) record the
+      temporal expression as raw tokens with the `else` failure body
+      parsed as ordinary actions — the clause 12 temporal-expression
+      grammar and evaluation are later milestones.
       Preprocessor directives (clause 21): `#ifdef` / `#ifndef` /
       `#define` / `#undef` in statement, struct-member and action
       positions with flag semantics — `#define` records the flag but
@@ -76,8 +79,8 @@
       (clause 8.3), template `extend` (clause 8.2), macro
       match-expression interpretation and expansion
       (clause 15.4–15.5), the coverage data model and reports
-      (clause 14 options, buckets, grades), `expect`/`assume` members
-      (clause 11.4, needs the clause 12 temporal-expression grammar),
+      (clause 14 options, buckets, grades), the clause 12
+      temporal-expression grammar and evaluation,
       `$1`-`$27` match captures, `#define` replacement rules, `#else`)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness
       checks only (duplicate declaration/field names, duplicate

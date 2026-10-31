@@ -299,6 +299,16 @@ fn print_members(members: &[e1647::ast::Member], indent: &str) {
                     on.span.0.line
                 );
             }
+            Member::Expect(expect) => println!(
+                "{indent}{} ({} te tokens, {} else statements, line {})",
+                match expect.kind {
+                    e1647::ast::ExpectKind::Expect => "expect",
+                    e1647::ast::ExpectKind::Assume => "assume",
+                },
+                expect.te.len(),
+                expect.else_body.len(),
+                expect.span.0.line
+            ),
             Member::Import { names, .. } => {
                 println!("{indent}import {}", names.join(", "));
             }
