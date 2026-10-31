@@ -1,0 +1,3 @@
+extend global {
+    helper: uint;
+};

@@ -6,11 +6,15 @@
 //! `external/` (see docs/REFERENCES.md). A bare `'` followed by an
 //! identifier is the subtype modifier quote (`read'kind`), tokenized as a
 //! standalone punctuation token like the reference grammar's `SNG_QUOTE`.
-//! The e code-block delimiters `<'` (open) and `'>` (close): when a source
-//! contains any `<'`, only the spans inside `<' .. '>` pairs are code, as
-//! in Specman — prose outside the blocks is skipped; a source without any
-//! `<'` is code in full. Character literals are deliberately not supported
-//! yet and produce explicit errors.
+//! Code-segment markers `<'` and `'>` (clause 4.1.2) count only when they
+//! occupy the first column and the rest of that line is whitespace. A file
+//! that contains such a begin marker is a comment until the first one, and
+//! again between segments. A file with no begin marker is tokenized as code
+//! throughout, so snippet tests need not wrap a segment. Decimal integers
+//! may end in a `K`/`k` (×1024) or `M`/`m` (×1024×1024) multiplier
+//! (clause 4.1.4.1). `0c"..."` is a one-character literal (clause 4.1.4.6).
+//! Based literals may include the MVL digits `x z u l h w n`
+//! (clause 4.1.4.3); evaluating those literals is a later stage.
 
 use std::fmt;
 
@@ -19,9 +23,10 @@ pub enum TokenKind {
     /// An exact-match e keyword such as `struct`, `keep` or `bits`.
     Keyword(String),
     Identifier(String),
-    /// Any numeral: decimal, real, sized based literal (`8'b1010`),
-    /// unsized based literal (`'hFF`) or `0x`/`0b` literal. Raw text is
-    /// preserved; interpretation belongs to the parser.
+    /// Any numeral: decimal (optional `K`/`M` multiplier), real, sized or
+    /// unsized based literal (`8'b1010`, `'hFF`, MVL digits included),
+    /// `0x`/`0b`/`0o` literal, or a `0c"..."` character literal. Raw text is
+    /// preserved; interpretation belongs to later stages.
     Number(String),
     StringLiteral(String),
     Punctuation(String),
@@ -225,9 +230,10 @@ pub fn is_keyword(word: &str) -> bool {
 }
 
 /// Multi-character operators, longest match first. `===`/`!==` are the
-/// e identity comparisons; `=>` is implication; `..` is a range.
+/// e identity comparisons; `!~` is the negative string match; `=>` is
+/// implication; `..` is a range.
 const OPERATORS: &[&str] = &[
-    "===", "!==", "==", "!=", "<=", ">=", "=>", "&&", "||", "<<", ">>", "..", "+=", "-=",
+    "===", "!==", "==", "!=", "!~", "<=", ">=", "=>", "&&", "||", "<<", ">>", "..", "+=", "-=",
 ];
 
 struct Cursor<'a> {
@@ -235,21 +241,24 @@ struct Cursor<'a> {
     byte: usize,
     line: usize,
     column: usize,
-    /// Whether the cursor is inside a `<' .. '>` code block. Only
-    /// meaningful when the source carries any `<'` at all (see
-    /// [`tokenize`]): with delimiters present, prose outside the blocks
-    /// is skipped; without them the whole source is code.
+    /// Whether this file has a column-0 `<'` marker line (clause 4.1.2).
+    /// Without one, the whole source is code.
+    segments: bool,
+    /// Whether the cursor is inside a code segment. Prose outside segments
+    /// is skipped when [`Self::segments`] is set.
     in_code: bool,
 }
 
 impl<'a> Cursor<'a> {
     fn new(source: &'a str) -> Self {
+        let segments = has_begin_code_marker(source);
         Self {
             source,
             byte: 0,
             line: 1,
             column: 1,
-            in_code: !source.contains("<'"),
+            segments,
+            in_code: !segments,
         }
     }
 
@@ -285,6 +294,19 @@ impl<'a> Cursor<'a> {
 
     fn skip_trivia(&mut self) -> Result<(), LexError> {
         loop {
+            if let Some(open) = self.line_is_code_marker() {
+                if open && self.in_code {
+                    return Err(LexError {
+                        position: self.position(),
+                        message: "code segment opened inside a code segment",
+                    });
+                }
+                if open || self.in_code {
+                    self.consume_rest_of_line();
+                    self.in_code = open;
+                    continue;
+                }
+            }
             match (self.peek(), self.peek_second()) {
                 (Some(ch), _) if ch.is_whitespace() => {
                     self.bump();
@@ -327,28 +349,43 @@ impl<'a> Cursor<'a> {
                         });
                     }
                 }
-                // e code-block delimiters: `<'` opens and `'>` closes.
-                // When the source uses code blocks, only their contents
-                // are code — prose between blocks (specman-style mixed
-                // e/HDL files) is skipped, and an unterminated `<'` runs
-                // to end of source.
-                (Some('<'), Some('\'')) if !self.in_code => {
-                    self.in_code = true;
-                    self.bump();
-                    self.bump();
-                }
-                (Some('\''), Some('>')) if self.in_code => {
-                    self.in_code = false;
-                    self.bump();
-                    self.bump();
-                }
-                // Prose outside code blocks is skipped; end of source
-                // (an unterminated `<'`) ends the scan rather than
-                // spinning.
+                // Prose outside code segments is skipped. An unterminated
+                // `<'` runs to end of source and the scan still terminates.
                 _ if !self.in_code && self.peek().is_some() => {
                     self.bump();
                 }
                 _ => return Ok(()),
+            }
+        }
+    }
+
+    /// A begin-code (`<'`) or end-code (`'>`) marker: first column, and
+    /// only whitespace after it on that line (clause 4.1.2). `Some(true)`
+    /// is a begin marker.
+    fn line_is_code_marker(&self) -> Option<bool> {
+        if !self.segments || self.column != 1 {
+            return None;
+        }
+        let rest = &self.source[self.byte..];
+        let open = rest.starts_with("<'");
+        if !open && !rest.starts_with("'>") {
+            return None;
+        }
+        let mut tail = rest[2..].chars();
+        for ch in tail.by_ref() {
+            match ch {
+                ' ' | '\t' => {}
+                '\r' | '\n' => return Some(open),
+                _ => return None,
+            }
+        }
+        Some(open)
+    }
+
+    fn consume_rest_of_line(&mut self) {
+        while let Some(ch) = self.bump() {
+            if ch == '\n' {
+                break;
             }
         }
     }
@@ -373,24 +410,24 @@ impl<'a> Cursor<'a> {
     }
 
     /// Digits legal for a based literal, validated per base. Hexadecimal
-    /// spellings: `x`/`X` per the reference grammar, `h`/`H` per common
-    /// Specman usage (confirmed by the Specman 2025.03 reference run,
-    /// docs/VERIFICATION.md 2026-10-27), `f`/`F` per the reference grammar.
-    fn read_based_digits(&mut self, base: char, start: Position) -> Result<(), LexError> {
-        let accepted = match base {
-            'b' | 'B' => |c: char| matches!(c, '0' | '1' | '_'),
-            'o' | 'O' => |c: char| c.is_ascii_digit() && c <= '7' || c == '_',
-            'd' | 'D' => |c: char| c.is_ascii_digit() || c == '_',
-            'x' | 'X' | 'h' | 'H' | 'f' | 'F' => |c: char| c.is_ascii_hexdigit() || c == '_',
-            _ => unreachable!("caller validates the base letter"),
-        };
-        if !self.peek().is_some_and(accepted) {
+    /// spellings: `x`/`X` per the reference grammar, `h`/`H` per clause
+    /// 4.1.4.2 and common Specman usage, `f`/`F` per the reference grammar.
+    /// Non-decimal bases also accept MVL digits `x z u l h w n`
+    /// (clause 4.1.4.3). Decimal bases do not. `0x`/`0b`/`0o` prefixes are
+    /// unsized numbers (clause 4.1.4.1) and do not take MVL digits.
+    fn read_based_digits(
+        &mut self,
+        base: char,
+        start: Position,
+        mvl: bool,
+    ) -> Result<(), LexError> {
+        if !self.peek().is_some_and(|c| based_digit_ok(base, c, mvl)) {
             return Err(LexError {
                 position: start,
                 message: "invalid based literal",
             });
         }
-        while self.peek().is_some_and(accepted) {
+        while self.peek().is_some_and(|c| based_digit_ok(base, c, mvl)) {
             self.bump();
         }
         Ok(())
@@ -406,11 +443,86 @@ impl<'a> Cursor<'a> {
         )
     }
 
+    fn finish_number(&self, start: Position) -> TokenKind {
+        TokenKind::Number(self.source[start.byte..self.byte].to_owned())
+    }
+
+    /// `0c"..."` / `0C"..."`: one ASCII character, or one string-style
+    /// escape, between the quotes (clause 4.1.4.6).
+    fn read_character_literal(&mut self, start: Position) -> Result<TokenKind, LexError> {
+        self.bump();
+        self.bump();
+        self.bump();
+        let Some(ch) = self.bump() else {
+            return Err(LexError {
+                position: start,
+                message: "unterminated character literal",
+            });
+        };
+        if ch == '\n' || ch == '\r' {
+            return Err(LexError {
+                position: start,
+                message: "unterminated character literal",
+            });
+        }
+        if ch == '"' {
+            return Err(LexError {
+                position: start,
+                message: "invalid character literal",
+            });
+        }
+        if ch == '\\' {
+            let Some(escaped) = self.bump() else {
+                return Err(LexError {
+                    position: start,
+                    message: "unterminated character literal",
+                });
+            };
+            if !matches!(escaped, 'n' | 't' | 'r' | '\\' | '"' | '0') {
+                return Err(LexError {
+                    position: start,
+                    message: "invalid character literal",
+                });
+            }
+        }
+        if self.peek() != Some('"') {
+            return Err(LexError {
+                position: start,
+                message: "invalid character literal",
+            });
+        }
+        self.bump();
+        Ok(self.finish_number(start))
+    }
+
+    /// A single `K`/`k` or `M`/`m` glued to a decimal integer, and not the
+    /// start of a longer name (`32KEEP` stays a number and an identifier).
+    fn take_decimal_multiplier(&mut self) {
+        if !matches!(self.peek(), Some('K' | 'k' | 'M' | 'm')) {
+            return;
+        }
+        if self
+            .peek_second()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        {
+            return;
+        }
+        self.bump();
+    }
+
     /// Numerals: decimal, real with optional exponent, sized/unsized based
-    /// literal (`8'b1010`, `'hFF`), and `0x`/`0b`/`0o` prefixed literals.
+    /// literal (`8'b1010`, `'hFF`, MVL digits), `0x`/`0b`/`0o` prefixes,
+    /// `K`/`M` multipliers, and `0c"..."` character literals.
     fn read_number(&mut self) -> Result<TokenKind, LexError> {
         let start = self.position();
-        // 0x / 0b / 0o prefixed literals.
+        if self.peek() == Some('0')
+            && matches!(self.peek_second(), Some('c') | Some('C'))
+            && self.source[self.byte..].chars().nth(2) == Some('"')
+        {
+            return self.read_character_literal(start);
+        }
+        // 0x / 0b / 0o prefixed literals. These are unsized numbers, so
+        // they do not take MVL digits or K/M multipliers.
         if self.peek() == Some('0')
             && matches!(
                 self.peek_second(),
@@ -419,13 +531,11 @@ impl<'a> Cursor<'a> {
         {
             self.bump();
             let base = self.bump().expect("peeked prefix letter");
-            self.read_based_digits(base, start)?;
-            return Ok(TokenKind::Number(
-                self.source[start.byte..self.byte].to_owned(),
-            ));
+            self.read_based_digits(base, start, false)?;
+            return Ok(self.finish_number(start));
         }
         self.read_decimal_digits();
-        // Sized based literal: digits ' base digits.
+        // Sized based literal: digits ' base digits. No K/M multiplier.
         if self.peek() == Some('\'') {
             self.bump();
             let Some(base) = self.peek() else {
@@ -441,10 +551,8 @@ impl<'a> Cursor<'a> {
                 });
             }
             self.bump();
-            self.read_based_digits(base, start)?;
-            return Ok(TokenKind::Number(
-                self.source[start.byte..self.byte].to_owned(),
-            ));
+            self.read_based_digits(base, start, true)?;
+            return Ok(self.finish_number(start));
         }
         // Real fraction: only when `.` is followed by a digit, so `1..5`
         // lexes as a number, a range and a number.
@@ -468,9 +576,15 @@ impl<'a> Cursor<'a> {
                 self.read_decimal_digits();
             }
         }
-        Ok(TokenKind::Number(
-            self.source[start.byte..self.byte].to_owned(),
-        ))
+        // K/M apply only to a decimal integer, not to a real or an exponent.
+        let spelling = &self.source[start.byte..self.byte];
+        if !spelling
+            .bytes()
+            .any(|byte| byte == b'.' || byte == b'e' || byte == b'E')
+        {
+            self.take_decimal_multiplier();
+        }
+        Ok(self.finish_number(start))
     }
 
     fn read_operator(&mut self) -> TokenKind {
@@ -528,19 +642,18 @@ impl<'a> Cursor<'a> {
             }
             TokenKind::StringLiteral(value)
         } else if first == '\'' {
-            // Either a based literal (`'hFF`), the subtype modifier quote
-            // (`read'kind`), the opening or closing quote of a quoted
-            // hierarchical path (`'memory_tb.address'`), or — until a
-            // later milestone — an unsupported character literal. All
-            // non-literal quotes become standalone punctuation tokens
-            // (like the reference grammar's `SNG_QUOTE`); the parser
-            // decides what they delimit.
+            // Either a based literal (`'hFF`, including MVL digits), the
+            // subtype modifier quote (`read'kind`), or the opening or
+            // closing quote of a quoted hierarchical path
+            // (`'memory_tb.address'`). Non-literal quotes become standalone
+            // punctuation tokens (like the reference grammar's `SNG_QUOTE`);
+            // the parser decides what they delimit.
             match self.peek_second() {
                 Some(base) if Self::based_base_letter(base) => {
                     self.bump();
                     self.bump();
-                    self.read_based_digits(base, start)?;
-                    TokenKind::Number(self.source[start.byte..self.byte].to_owned())
+                    self.read_based_digits(base, start, true)?;
+                    self.finish_number(start)
                 }
                 _ => {
                     self.bump();
@@ -558,9 +671,51 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Whether `c` is legal in a based literal of `base`. `mvl` allows the
+/// clause 4.1.4.3 digits on binary, octal, and hexadecimal values.
+fn based_digit_ok(base: char, c: char, mvl: bool) -> bool {
+    let mvl_letter = mvl
+        && matches!(
+            c,
+            'x' | 'X' | 'z' | 'Z' | 'u' | 'U' | 'l' | 'L' | 'h' | 'H' | 'w' | 'W' | 'n' | 'N'
+        );
+    match base {
+        'b' | 'B' => matches!(c, '0' | '1' | '_') || mvl_letter,
+        'o' | 'O' => (c.is_ascii_digit() && c <= '7') || c == '_' || mvl_letter,
+        'd' | 'D' => c.is_ascii_digit() || c == '_',
+        'x' | 'X' | 'h' | 'H' | 'f' | 'F' => c.is_ascii_hexdigit() || c == '_' || mvl_letter,
+        _ => false,
+    }
+}
+
+/// Clause 4.1.2: a begin-code marker is `<'` at the first column with only
+/// whitespace after it on that line.
+fn has_begin_code_marker(source: &str) -> bool {
+    let mut at_line_start = true;
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if at_line_start && bytes[index..].starts_with(b"<'") {
+            let mut cursor = index + 2;
+            while cursor < bytes.len() && (bytes[cursor] == b' ' || bytes[cursor] == b'\t') {
+                cursor += 1;
+            }
+            if cursor == bytes.len() || bytes[cursor] == b'\n' || bytes[cursor] == b'\r' {
+                return true;
+            }
+        }
+        match bytes[index] {
+            b'\n' => at_line_start = true,
+            b'\r' => {}
+            _ => at_line_start = false,
+        }
+        index += 1;
+    }
+    false
+}
+
 /// Tokenize source. The lexer reports the first lexical error; later stages
-/// collect multiple diagnostics. Future versions will add character
-/// literals, `<' .. '>` code literals and remaining operator spellings.
+/// collect multiple diagnostics.
 pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
     let mut cursor = Cursor::new(source);
     let mut result = Vec::new();

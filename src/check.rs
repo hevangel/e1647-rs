@@ -415,6 +415,7 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
             collect_root_identifiers(low, roots);
             collect_root_identifiers(high, roots);
         }
+        Expr::IsA { expr, .. } => collect_root_identifiers(expr, roots),
         Expr::HdlPath { .. } => {}
         Expr::IntLiteral { .. }
         | Expr::RealLiteral { .. }

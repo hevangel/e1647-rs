@@ -1526,6 +1526,13 @@ impl<'a> Interp<'a> {
                     )
                 }),
             Expr::BitLiteral { text, .. } => {
+                if based_value_is_mvl(text) {
+                    return Err(self.error(
+                        "E0402",
+                        format!("MVL literal '{text}' is not evaluated yet"),
+                        expr.span(),
+                    ));
+                }
                 parse_int_literal(text).map(Value::Int).ok_or_else(|| {
                     self.error(
                         "E0402",
@@ -1860,6 +1867,16 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Value::Bool(contained))
             }
+            Expr::IsA {
+                expr,
+                ty,
+                negated,
+                span,
+            } => {
+                let value = self.eval(expr, frame, me)?;
+                let is_a = self.value_is_a(&value, ty, *span)?;
+                Ok(Value::Bool(is_a != *negated))
+            }
             Expr::HdlPath { path, span } => {
                 if self.hdl.is_none() {
                     return Err(self.error(
@@ -1875,6 +1892,64 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+    }
+
+    /// The runtime half of `expr is [not] a <type>` (clause 4.5). Scalar
+    /// kinds match by value shape (integers are one runtime value, so
+    /// `is a int` and `is a uint` both accept it); named types match by
+    /// declared name, walking `like` bases — subtype-aware dispatch is a
+    /// later milestone.
+    fn value_is_a(
+        &self,
+        value: &Value,
+        ty: &TypeExpr,
+        span: crate::ast::Span,
+    ) -> Result<bool, Diagnostic> {
+        match ty {
+            TypeExpr::Scalar { base, .. } => Ok(matches!(
+                (base, value),
+                (
+                    ScalarBase::Int
+                        | ScalarBase::Uint
+                        | ScalarBase::Bit
+                        | ScalarBase::Byte
+                        | ScalarBase::Nibble
+                        | ScalarBase::Time,
+                    Value::Int(_)
+                ) | (ScalarBase::Bool, Value::Bool(_))
+                    | (ScalarBase::Real, Value::Real(_))
+                    | (ScalarBase::String, Value::Str(_))
+            )),
+            TypeExpr::List { .. } => Ok(matches!(value, Value::List(_))),
+            TypeExpr::Named { name, .. } => Ok(match value {
+                Value::Object(index) => self.type_is_a(&self.instances[*index].type_name, name),
+                Value::Enum { type_name, .. } => self.type_is_a(type_name, name),
+                _ => false,
+            }),
+            TypeExpr::InlineEnum { .. } => Err(self.error(
+                "E0402",
+                "'is a' with an inline enumeral type is not supported",
+                span,
+            )),
+        }
+    }
+
+    /// Whether `name` is `target` or a `like` descendant of it.
+    fn type_is_a(&self, name: &str, target: &str) -> bool {
+        let mut current = name;
+        for _ in 0..=self.types.len() {
+            if current == target {
+                return true;
+            }
+            let Some(declared) = self.types.iter().find(|t| t.name == current) else {
+                return false;
+            };
+            match &declared.base {
+                Some(base) => current = base.as_str(),
+                None => return false,
+            }
+        }
+        false
     }
 
     fn apply_binary(
@@ -2006,6 +2081,37 @@ impl<'a> Interp<'a> {
                     _ => unreachable!(),
                 };
                 Ok(Value::Int(value))
+            }
+            Match | NotMatch => {
+                let (Value::Str(text), Value::Str(pattern)) = (&lhs, &rhs) else {
+                    return Err(err("string match"));
+                };
+                // `/.../` selects AWK-style regular expression matching
+                // (clause 4.11.2) — not implemented.
+                if pattern.len() >= 2 && pattern.starts_with('/') && pattern.ends_with('/') {
+                    return Err(self.error(
+                        "E0410",
+                        "AWK-style regular expression string matching is not supported",
+                        span,
+                    ));
+                }
+                // Native matching (clause 4.11.1) is case insensitive and
+                // always matches the full string. Only a literal pattern —
+                // letters, digits, underscore and space — is evaluated;
+                // the meta-characters of the native pattern language are
+                // not implemented.
+                if !pattern
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ' ')
+                {
+                    return Err(self.error(
+                        "E0410",
+                        "native string matching with meta-characters is not supported",
+                        span,
+                    ));
+                }
+                let matched = text.to_lowercase() == pattern.to_lowercase();
+                Ok(Value::Bool(if op == Match { matched } else { !matched }))
             }
             LogicalAnd | LogicalOr | Imply => unreachable!("handled with short-circuiting"),
         }
@@ -2332,10 +2438,36 @@ fn field_width_bits(ty: &TypeExpr) -> Option<i128> {
     }
 }
 
-/// Parse an integer literal: decimal, `0x`/`0b`/`0o` prefixed, or a sized/
-/// unsized based literal (`8'hFF`, `'hFF`). Underscores are ignored; the
-/// size prefix is ignored (widths are not truncated yet).
+/// Whether the value digits of a sized or unsized based literal include an
+/// MVL letter (clause 4.1.4.3). The base character itself (`'h`, `'x`) is
+/// not part of the value. In an ambiguous context those letters make the
+/// literal MVL rather than a number; hex `x` is therefore not read as 15.
+pub(crate) fn based_value_is_mvl(text: &str) -> bool {
+    let Some(quote) = text.find('\'') else {
+        return false;
+    };
+    text[quote + 1..].chars().skip(1).any(|c| {
+        matches!(
+            c,
+            'x' | 'X' | 'z' | 'Z' | 'u' | 'U' | 'l' | 'L' | 'h' | 'H' | 'w' | 'W' | 'n' | 'N'
+        )
+    })
+}
+
+/// Parse an integer literal: decimal (optional `K`/`M` multiplier),
+/// `0c"..."` character, `0x`/`0b`/`0o` prefixed, or a sized/unsized based
+/// literal (`8'hFF`, `'hFF`). Underscores are ignored. The size prefix is
+/// ignored (widths are not truncated yet). MVL literals return [`None`].
 pub(crate) fn parse_int_literal(text: &str) -> Option<i128> {
+    if text.len() >= 2
+        && text.as_bytes()[0] == b'0'
+        && text.as_bytes()[1].eq_ignore_ascii_case(&b'c')
+    {
+        return parse_character_literal(text);
+    }
+    if based_value_is_mvl(text) {
+        return None;
+    }
     let lower = text.to_ascii_lowercase();
     let cleaned: String = lower.chars().filter(|c| *c != '_').collect();
     for (prefix, radix) in [("0x", 16u32), ("0b", 2), ("0o", 8)] {
@@ -2356,7 +2488,53 @@ pub(crate) fn parse_int_literal(text: &str) -> Option<i128> {
         };
         return i128::from_str_radix(digits, radix).ok();
     }
-    cleaned.parse::<i128>().ok()
+    let (body, factor) = decimal_multiplier(&cleaned);
+    let value = body.parse::<i128>().ok()?;
+    value.checked_mul(factor)
+}
+
+/// `K`/`k` is ×1024 and `M`/`m` is ×1024×1024, on a decimal integer only.
+fn decimal_multiplier(text: &str) -> (&str, i128) {
+    let Some(last) = text.chars().last() else {
+        return (text, 1);
+    };
+    let factor = match last {
+        'k' => 1024,
+        'm' => 1024 * 1024,
+        _ => return (text, 1),
+    };
+    let body = &text[..text.len() - last.len_utf8()];
+    if body.is_empty() || !body.bytes().all(|byte| byte.is_ascii_digit()) {
+        return (text, 1);
+    }
+    (body, factor)
+}
+
+/// `0c"..."` / `0C"..."` evaluates to the character's code point.
+fn parse_character_literal(text: &str) -> Option<i128> {
+    let rest = if let Some(rest) = text.strip_prefix("0c") {
+        rest
+    } else {
+        text.strip_prefix("0C")?
+    };
+    let inner = rest.strip_prefix('"')?.strip_suffix('"')?;
+    let mut chars = inner.chars();
+    let value = match chars.next()? {
+        '\\' => match chars.next()? {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '\\' => '\\',
+            '"' => '"',
+            '0' => '\0',
+            _ => return None,
+        },
+        other => other,
+    };
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(u32::from(value) as i128)
 }
 
 /// Interpret the escape sequences the lexer preserved as raw text.

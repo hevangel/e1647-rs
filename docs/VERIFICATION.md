@@ -999,3 +999,45 @@ Verification: reference logs are runs of the cited playgrounds
 `e1647 run` exit logs. fmt/clippy clean; `cargo test` green at the
 commits of record (through 801564e); no source changes in this
 entry — corpora adaptations live in gitignored `local/`.
+
+## 2026-10-30 (16) — offline arc: clause 4.5 operator completion and clause 4.3.1.1 extend-global rejection
+
+Scope claimed for this change (nothing broader):
+
+- Expression precedence completes the clause 4.5 Table 12 operators the
+  parser already tokenized: `is [not] a <type>` between `==`/`!=` and the
+  comparisons, and the `~` / `!~` string-match operators between `===`/
+  `!==` and `in`. A bare `is` not followed by `a`/`not a` is not consumed
+  by the type-check level.
+- Runtime semantics, honestly staged: `is [not] a` checks scalar kinds by
+  value shape and named types by declared name walking `like` bases (no
+  subtype-aware dispatch); string matching evaluates the case-insensitive
+  full-string literal subset only — `/.../` AWK patterns and native
+  meta-characters report `E0410` (the meta-character table of clause 4.11
+  is an image in the local redline copy, so no meta-character semantics
+  were guessed).
+- User-written `extend global` is rejected with `E0116` (clause 4.3.1.1);
+  the parser's file-level `define`/`import` `extend global`
+  pseudo-declaration keeps parsing (fixture + unit test both ways).
+
+No reference-simulator runs in this arc: the behavior qualified is pure
+syntax/precedence, which the local tests pin, and the string-match
+semantics subset is documented as unevaluated rather than claimed.
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`, Windows):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(100 passed: 10 elab, 1 fixtures, 24 interp, 24 lexer, 35 parser, 6 solve)
+```
+
+New tests: `tests/lexer.rs::negative_string_match_is_one_token`;
+`tests/parser.rs` clause 4.5 precedence placements (string match between
+identity and `in`, `is a` between equality and comparisons), bare-`is`
+non-consumption, `extend global` rejection, pseudo-declaration survival;
+`tests/interp.rs` `is a` scalar/named/like/enumeral checks, literal string
+match, `E0410` for AWK and meta-character patterns;
+`tests/fixtures/extend_global.{e,expected}`.

@@ -245,6 +245,27 @@ fn operators_longest_match() {
 }
 
 #[test]
+fn negative_string_match_is_one_token() {
+    // `!~` is the negative string-match operator (clause 4.11); the
+    // spaced form stays a logical not followed by a bitwise not.
+    assert_eq!(
+        kinds("a!~b"),
+        vec![
+            TokenKind::Identifier("a".into()),
+            TokenKind::Punctuation("!~".into()),
+            TokenKind::Identifier("b".into())
+        ]
+    );
+    assert_eq!(
+        kinds("! ~"),
+        vec![
+            TokenKind::Punctuation("!".into()),
+            TokenKind::Punctuation("~".into())
+        ]
+    );
+}
+
+#[test]
 fn based_and_prefixed_numerals() {
     assert_eq!(
         kinds("8'b1010 'hFF 'b1010 'd15 'o17 'x1f 'F0F 0xAB 0b1010 0o17 0xAB CD"),
@@ -285,8 +306,11 @@ fn reals_and_ranges() {
 
 #[test]
 fn rejects_bad_based_literals() {
-    let error = tokenize("8'xZZ").unwrap_err();
+    let error = tokenize("8'b2").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
+    // `Z` is an MVL digit on a hex value (clause 4.1.4.3), so this is one
+    // literal rather than a bad hex digit.
+    assert_eq!(kinds("8'xZZ"), vec![TokenKind::Number("8'xZZ".into())]);
     let error = tokenize("'d").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
     let error = tokenize("8'").unwrap_err();
@@ -321,17 +345,37 @@ fn subtype_modifier_quote_tokenizes_standalone() {
 }
 
 #[test]
-fn code_literal_delimiters_are_skipped() {
-    // <' .. '> wrap e code blocks; their contents are ordinary code.
-    let tokens = tokenize("<' extend foo '>").unwrap();
+fn code_segment_markers_must_own_their_line() {
+    // Clause 4.1.2: the marker is the whole line, at the first column.
     assert_eq!(
-        kinds("<' extend foo '>"),
+        kinds("<\'\nextend foo\n\'>\n"),
         vec![
             TokenKind::Keyword("extend".into()),
             TokenKind::Identifier("foo".into())
         ]
     );
-    assert_eq!(tokens.len(), 2);
+    // The same characters mid-line are operators, not a segment. With no
+    // real begin marker, the file is code throughout.
+    assert_eq!(
+        kinds("<\' extend foo \'>\n"),
+        vec![
+            TokenKind::Punctuation("<".into()),
+            TokenKind::Punctuation("'".into()),
+            TokenKind::Keyword("extend".into()),
+            TokenKind::Identifier("foo".into()),
+            TokenKind::Punctuation("'".into()),
+            TokenKind::Punctuation(">".into()),
+        ]
+    );
+    // An indented `<'` does not open a segment either.
+    assert_eq!(
+        kinds("  <\'\nkeep\n"),
+        vec![
+            TokenKind::Punctuation("<".into()),
+            TokenKind::Punctuation("'".into()),
+            TokenKind::Keyword("keep".into()),
+        ]
+    );
 }
 
 #[test]
@@ -399,6 +443,85 @@ fn unterminated_code_block_runs_to_end_of_source() {
             .any(|t| matches!(&t.kind, TokenKind::Keyword(k) if k == "keep")),
         "code after the opener must be tokenized"
     );
+}
+
+#[test]
+fn comparison_is_not_a_code_marker() {
+    assert_eq!(
+        kinds("a<'hFF"),
+        vec![
+            TokenKind::Identifier("a".into()),
+            TokenKind::Punctuation("<".into()),
+            TokenKind::Number("'hFF".into()),
+        ]
+    );
+}
+
+#[test]
+fn decimal_multipliers_and_character_literals() {
+    assert_eq!(
+        kinds("32K 32k 2m 4M 1_0K 32KEEP 1.5K 8'hFFK"),
+        vec![
+            TokenKind::Number("32K".into()),
+            TokenKind::Number("32k".into()),
+            TokenKind::Number("2m".into()),
+            TokenKind::Number("4M".into()),
+            TokenKind::Number("1_0K".into()),
+            TokenKind::Number("32".into()),
+            TokenKind::Identifier("KEEP".into()),
+            TokenKind::Number("1.5".into()),
+            TokenKind::Identifier("K".into()),
+            TokenKind::Number("8'hFF".into()),
+            TokenKind::Identifier("K".into()),
+        ]
+    );
+    assert_eq!(
+        kinds("0c\"a\" 0C\"\\n\""),
+        vec![
+            TokenKind::Number("0c\"a\"".into()),
+            TokenKind::Number("0C\"\\n\"".into()),
+        ]
+    );
+}
+
+#[test]
+fn mvl_digits_belong_to_non_decimal_based_literals() {
+    assert_eq!(
+        kinds("8'b10x1 8'h1x 'bz01 64'bz_1111 0b10x"),
+        vec![
+            TokenKind::Number("8'b10x1".into()),
+            TokenKind::Number("8'h1x".into()),
+            TokenKind::Number("'bz01".into()),
+            TokenKind::Number("64'bz_1111".into()),
+            TokenKind::Number("0b10".into()),
+            TokenKind::Identifier("x".into()),
+        ]
+    );
+    let error = tokenize("8'dx").unwrap_err();
+    assert_eq!(error.message, "invalid based literal");
+}
+
+#[test]
+fn rejects_bad_character_literals() {
+    assert_eq!(
+        tokenize("0c\"ab\"").unwrap_err().message,
+        "invalid character literal"
+    );
+    assert_eq!(
+        tokenize("0c\"\"").unwrap_err().message,
+        "invalid character literal"
+    );
+    assert_eq!(
+        tokenize("0c\"a").unwrap_err().message,
+        "invalid character literal"
+    );
+}
+
+#[test]
+fn rejects_a_nested_code_segment() {
+    let error = tokenize("<\'\n<\'\nkeep\n").unwrap_err();
+    assert_eq!(error.message, "code segment opened inside a code segment");
+    assert_eq!(error.position.line, 2);
 }
 
 #[test]
