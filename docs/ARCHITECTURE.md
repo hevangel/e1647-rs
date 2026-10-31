@@ -65,7 +65,13 @@ multi-simulator HDL API, and wasm32.
   string and raw body tokens (`E0118` when the pattern string is
   missing); the match-expression grammar and expansion are later
   milestones. Clause 5 scalar type declarations (`type name: <type>;`)
-  record the underlying representation. Diagnostics
+  record the underlying representation. Clause 8 template declarations
+  (`template [package] struct|unit name of <params> [like base] { .. }`)
+  record their `<tag'category>` parameters and defaults; formals
+  (`<type>`), template references (`deque of int`) and keyed lists
+  (`list (key:it) of t`) are TypeExpr variants, and `new [<type>]
+  [with { .. }]` parses to an explicit not-supported runtime diagnostic.
+  `package`/`private` member prefixes are recorded on fields. Diagnostics
   are collected (codes
   `E01xx` syntax, `E02xx` well-formedness; see the module documentation)
   and the AST stays partial under errors.
@@ -129,6 +135,7 @@ integers), an event scheduler
 and time-consuming-method suspension, coverage, integer width truncation,
 evaluation of MVL literals, `repeat`, single-statement `if ... do`,
 `expect`/`assume`, `on event-port`, `#else` and `#define` replacement
-rules, template types (clause 8), macro match-expression
+rules, template instantiation and `template extend` (clause 8.2–8.3),
+macro match-expression
 interpretation and expansion (clause 15.4–15.5), a multi-simulator HDL
 API, and WASM.

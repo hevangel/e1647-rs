@@ -227,7 +227,9 @@ fn check_methods(
                     param.name_span.1,
                 ));
             }
-            check_named_type(&param.ty, declared, diagnostics);
+            if let Some(ty) = &param.ty {
+                check_named_type(ty, declared, diagnostics);
+            }
         }
         if let Some(return_type) = &method.return_type {
             check_named_type(return_type, declared, diagnostics);
@@ -261,7 +263,9 @@ fn check_statements<'a>(
                         name_span.1,
                     ));
                 }
-                check_named_type(ty, declared, diagnostics);
+                if let Some(ty) = ty {
+                    check_named_type(ty, declared, diagnostics);
+                }
             }
             Stmt::If {
                 then_body,
@@ -297,6 +301,7 @@ fn check_statements<'a>(
             | Stmt::Wait { .. }
             | Stmt::Emit { .. }
             | Stmt::Start { .. }
+            | Stmt::Compute { .. }
             | Stmt::StopRun { .. }
             | Stmt::ForEach { .. }
             | Stmt::ForTo { .. }
@@ -319,6 +324,24 @@ fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut 
             }
         }
         TypeExpr::List { element, .. } => check_named_type(element, declared, diagnostics),
+        // A template instantiation checks its template name and each
+        // argument; a formal parameter is bound by the enclosing
+        // template declaration (checked at instantiation, a later
+        // milestone).
+        TypeExpr::TemplateRef { name, args, span } => {
+            if !declared.contains(name.as_str()) {
+                diagnostics.push(Diagnostic::new(
+                    "E0203",
+                    format!("unknown template '{name}'"),
+                    span.0,
+                    span.1,
+                ));
+            }
+            for arg in args {
+                check_named_type(arg, declared, diagnostics);
+            }
+        }
+        TypeExpr::Formal { .. } => {}
         TypeExpr::Scalar { .. } | TypeExpr::InlineEnum { .. } => {}
     }
 }
@@ -429,12 +452,32 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
             collect_root_identifiers(high, roots);
         }
         Expr::IsA { expr, .. } => collect_root_identifiers(expr, roots),
+        // `new` creates an instance; its type names no field and its
+        // init assignments run against the fresh instance.
+        Expr::New { inits, .. } => {
+            for statement in inits {
+                collect_with_init_roots(statement, roots);
+            }
+        }
         Expr::HdlPath { .. } => {}
         Expr::IntLiteral { .. }
         | Expr::RealLiteral { .. }
         | Expr::BitLiteral { .. }
         | Expr::BoolLiteral { .. }
         | Expr::StringLiteral { .. } => {}
+    }
+}
+
+/// Visit every field of the declaration, descending into `when` subtype
+/// members.
+/// Root identifiers of the expressions inside a `new ... with {}`
+/// block: the assigned values, not the fresh instance's fields being
+/// assigned to.
+fn collect_with_init_roots(statement: &Stmt, roots: &mut Vec<(String, crate::ast::Span)>) {
+    match statement {
+        Stmt::Assign { value, .. } => collect_root_identifiers(value, roots),
+        Stmt::ExprStmt { expr, .. } => collect_root_identifiers(expr, roots),
+        _ => {}
     }
 }
 

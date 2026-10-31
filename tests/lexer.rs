@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 /// The single-token keyword spellings of the reference grammar
 /// (`external/specman-e-parser/specman.flex`, MIT licensed), transcribed for
 /// this cross-check. Deviations in `KEYWORDS`, as documented there: the
-/// IEEE 1647 predefined types `real` and `string` are added; the multi-word
+/// IEEE 1647 predefined types `real` and `string` are added; the 2016
+/// keyword `template` (Table 8) is added — the reference grammar predates
+/// it; the multi-word
 /// reference keywords (`is a`, `is not a`, `state machine`, `C export`,
 /// `C routine`) are not single-token keywords.
 const REFERENCE_KEYWORDS: &[&str] = &[
@@ -152,6 +154,7 @@ const REFERENCE_KEYWORDS: &[&str] = &[
     "NULL",
     "real",
     "string",
+    "template",
 ];
 
 fn kinds(source: &str) -> Vec<TokenKind> {

@@ -1218,3 +1218,66 @@ computed and category-less shapes plus a scalar type declaration);
 computed flag, raw-token bodies surviving nested braces, placement in
 the global pseudo-declaration) and scalar type declarations (underlying
 recorded; unknown names in it rejected).
+
+## 2026-10-31 (20) — offline arc: clause 8 template declarations (stage 1) and the etl body surface
+
+Scope claimed for this change (nothing broader):
+
+- Clause 8.1 template declarations parse: `template [package]
+  struct|unit name of <params> [like base] { .. };` with `<[tag']category>`
+  parameters (defaults recorded for trailing parameters), `package`
+  prefixes recorded, and parameterized bases (`like container of
+  <type>`) stored as the base name plus the full type expression.
+  `template extend` (clause 8.2) and instantiation (clause 8.3) are not
+  implemented; the lexer gains the 2016 keyword `template` (a documented
+  deviation — the pinned reference grammar predates it).
+- Type positions record template formals (`<type>` — the raw text
+  between the brackets; formal names may be keyword spellings such as
+  `type`), template references (`deque of int`, parenthesized
+  multi-argument forms) and keyed lists (`list (key:it) of t`, key
+  expression recorded). Unknown template names are `E0203`, like unknown
+  types.
+- The etl corpus's body surface, surfaced once headers parsed:
+  `var x := e` type-inferring declarations (`:=` operator); `new
+  [<type>] [with { assignments }]` parsed, evaluating to an explicit
+  `E0402` not-supported diagnostic; `compute <call>;` statements
+  (executed inline like `start` — clause 13's run-to-completion
+  semantics needs the TCM scheduler); `for i from a down to b`;
+  `else if` chains; `for each (v) using index (idx) in reverse list`
+  (index binding = element position; the `using` name recorded);
+  `is undefined` body-less methods; untyped parameters (`add(packet)`);
+  `is a <type> (binding)` bindings (a true match binds the value for
+  the branch body); last-statements-of-a-block may omit `;`; method
+  and field names may be Table 8 keyword spellings (`set(...)`,
+  `item: <type>`, `prev: ...`); `package`/`private` member prefixes
+  recorded on fields (clause 22, not enforced).
+
+Corpus movement (`local/`, absolute paths, `--seed 1`):
+etl-simple-examples 22 parse diagnostics → **4**, all four the same
+honest `E0203` — `base_struct` is declared in the etl library's other
+file, absent from this single-file corpus extract, exactly like the
+reference's own missing-dependency class of failure (the recorded
+Specman run of this file also failed to compile, on template macros).
+Everything else unchanged: type-min-max 0, save-restart 0 (run still
+clean), igen-dist 5, cover-edges 1, d6w 0.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`, Windows;
+no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(123 passed: 11 elab, 2 fixtures, 35 interp, 24 lexer, 45 parser, 6 solve)
+```
+
+New tests: `tests/fixtures/template_declaration.{e,expected}` (OK —
+nested template references, package/private prefixes, defaults,
+`new ... with`, `var :=`, keyed lists, `is undefined`, scalar type
+declarations); `tests/parser.rs` template parameter/base recording,
+formal-and-keyed-list type shapes, is-a bindings;
+`tests/interp.rs` `down to` counting, reverse for-each with index
+binding, is-a binding visibility, untyped parameters with `compute`
+inline calls, and the explicit `E0402` for `new`.

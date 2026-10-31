@@ -77,6 +77,12 @@ const PREDEFINED_NAMES: &[&str] = &[
     "fall",
     "change",
     "TEST_DONE",
+    // Method/field/var names of Table 8 keywords in real code (`me.x`,
+    // `add(item: <type>)`, `key_exists(key)`, `result = new …` in the
+    // etl corpus).
+    "me",
+    "item",
+    "key",
     // Message-verbosity levels (`message(LOW, …)`).
     "LOW",
     "MEDIUM",
@@ -242,6 +248,9 @@ struct Parser {
     /// consulted by `#ifdef` / `#ifndef` (clause 21). Directive state
     /// follows source order.
     defined: BTreeSet<String>,
+    /// `package` / `private` visibility prefix of the member being
+    /// parsed (clause 22), recorded on the field, not enforced.
+    member_visibility: Option<String>,
 }
 
 /// The included body of one preprocessor directive: members in member
@@ -261,6 +270,7 @@ impl Parser {
             eof,
             diagnostics: Vec::new(),
             defined: BTreeSet::new(),
+            member_visibility: None,
         }
     }
 
@@ -403,6 +413,29 @@ impl Parser {
         }
     }
 
+    /// A word in identifier position that may also be a keyword spelling
+    /// — template formals are conventionally named `<type>`, and `type`
+    /// is a keyword (clause 8.1).
+    fn expect_word(
+        &mut self,
+        code: &'static str,
+        message: &str,
+    ) -> Option<(String, (Position, Position))> {
+        let (start, end) = self.current_span();
+        match self.peek_kind() {
+            Some(TokenKind::Identifier(_)) => Some(self.take_identifier()),
+            Some(TokenKind::Keyword(word)) => {
+                let word = word.clone();
+                self.bump();
+                Some((word, (start, end)))
+            }
+            _ => {
+                self.error_here(code, message);
+                None
+            }
+        }
+    }
+
     /// A type name: an identifier, or the `global` keyword (`extend
     /// global` extends the root environment, as in Specman).
     fn expect_type_name(&mut self, message: &str) -> Option<(String, (Position, Position))> {
@@ -420,6 +453,9 @@ impl Parser {
 
     fn parse_program(&mut self) -> Vec<Declaration> {
         let mut declarations: Vec<Declaration> = Vec::new();
+        // `package` prefix of the next declaration (clause 22 visibility,
+        // recorded not enforced).
+        let mut packaged = false;
         while self.peek().is_some() {
             let keyword = match self.peek_kind() {
                 Some(TokenKind::Keyword(k))
@@ -448,8 +484,11 @@ impl Parser {
                             name: "global".to_owned(),
                             name_span: (gstart, gstart),
                             underlying: None,
+                            template_params: Vec::new(),
+                            packaged: false,
                             like: None,
                             like_span: None,
+                            like_type: None,
                             modifiers: Vec::new(),
                             members,
                             span: (gstart, gend),
@@ -479,8 +518,11 @@ impl Parser {
                             name: "global".to_owned(),
                             name_span: (gstart, gstart),
                             underlying: None,
+                            template_params: Vec::new(),
+                            packaged: false,
                             like: None,
                             like_span: None,
+                            like_type: None,
                             modifiers: Vec::new(),
                             members,
                             span: (gstart, gend),
@@ -497,6 +539,34 @@ impl Parser {
                     if let Some(synthesized) = self.parse_sequence_declaration() {
                         declarations.extend(synthesized);
                     }
+                    continue;
+                }
+                // `template (struct|unit) ...` (clause 8).
+                Some(TokenKind::Keyword(k)) if k.as_str() == "template" => {
+                    if let Some(mut declaration) = self.parse_template_declaration() {
+                        declaration.packaged = packaged;
+                        packaged = false;
+                        declarations.push(declaration);
+                    } else {
+                        packaged = false;
+                    }
+                    continue;
+                }
+                // `package` visibility prefix of the following
+                // declaration (`package template struct ...`), recorded.
+                Some(TokenKind::Keyword(k))
+                    if k == "package"
+                        && matches!(
+                            self.peek_second_kind(),
+                            Some(TokenKind::Keyword(k))
+                                if matches!(
+                                    k.as_str(),
+                                    "template" | "struct" | "unit" | "extend" | "type"
+                                )
+                        ) =>
+                {
+                    self.bump();
+                    packaged = true;
                     continue;
                 }
                 // File-level preprocessor directives: only `#define` /
@@ -531,9 +601,19 @@ impl Parser {
                 }
             };
             let declaration = if keyword == "type" {
-                self.parse_type_declaration()
+                let mut declaration = self.parse_type_declaration();
+                if let Some(d) = declaration.as_mut() {
+                    d.packaged = packaged;
+                }
+                packaged = false;
+                declaration
             } else {
-                self.parse_declaration(&keyword)
+                let mut declaration = self.parse_declaration(&keyword);
+                if let Some(d) = declaration.as_mut() {
+                    d.packaged = packaged;
+                }
+                packaged = false;
+                declaration
             };
             if let Some(declaration) = declaration {
                 declarations.push(declaration);
@@ -608,8 +688,11 @@ impl Parser {
                 name: kind,
                 name_span: (start, start),
                 underlying: None,
+                template_params: Vec::new(),
+                packaged: false,
                 like: None,
                 like_span: None,
+                like_type: None,
                 modifiers: Vec::new(),
                 members: vec![members.pop().expect("MAIN enumeral")],
                 span: (start, end),
@@ -619,8 +702,11 @@ impl Parser {
                 name: driver,
                 name_span: (start, start),
                 underlying: None,
+                template_params: Vec::new(),
+                packaged: false,
                 like: None,
                 like_span: None,
+                like_type: None,
                 modifiers: Vec::new(),
                 members: vec![
                     Member::Event(crate::ast::EventDecl {
@@ -650,13 +736,132 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                template_params: Vec::new(),
+                packaged: false,
                 like: None,
                 like_span: None,
+                like_type: None,
                 modifiers: Vec::new(),
                 members,
                 span: (start, end),
             },
         ])
+    }
+
+    /// `template (struct|unit) name of <params> [like base] { members };`
+    /// (clause 8.1). The parameters are recorded; instantiation
+    /// (monomorphization) is a later milestone. A parameterized base
+    /// type (`like container of <type>`) lands in `like` (the base
+    /// name) and `like_type` (the full expression). Template `extend`
+    /// (clause 8.2) is not parsed yet.
+    fn parse_template_declaration(&mut self) -> Option<Declaration> {
+        let start = self.current_span().0;
+        self.bump(); // 'template'
+        let kind = match self.peek_kind() {
+            Some(TokenKind::Keyword(k)) if k == "struct" => DeclarationKind::Struct,
+            Some(TokenKind::Keyword(k)) if k == "unit" => DeclarationKind::Unit,
+            _ => {
+                self.error_here(
+                    "E0101",
+                    "expected 'struct' or 'unit' after 'template' (template extend is not supported yet)",
+                );
+                self.recover_to_declaration_boundary();
+                return None;
+            }
+        };
+        self.bump();
+        let (name, name_span) = self.expect_identifier("E0102", "expected the template name")?;
+        self.expect_keyword_word("of")?;
+        let mut template_params = Vec::new();
+        if self.eat_punct("(") {
+            loop {
+                template_params.push(self.parse_template_param()?);
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            self.expect_punct(
+                ")",
+                "E0110",
+                "expected ')' to close the template parameters",
+            )?;
+        } else {
+            template_params.push(self.parse_template_param()?);
+        }
+        let mut like = None;
+        let mut like_span = None;
+        let mut like_type = None;
+        if self.eat_keyword("like") {
+            let base = self.parse_type()?;
+            like_span = Some(base.span());
+            like = match &base {
+                TypeExpr::Named { name, .. } | TypeExpr::TemplateRef { name, .. } => {
+                    Some(name.clone())
+                }
+                _ => None,
+            };
+            like_type = Some(base);
+        }
+        if self
+            .expect_punct("{", "E0106", "expected '{' to open the declaration body")
+            .is_none()
+        {
+            self.recover_to_declaration_boundary();
+            return Some(Declaration {
+                kind,
+                name,
+                name_span,
+                underlying: None,
+                template_params,
+                packaged: false,
+                like,
+                like_span,
+                like_type,
+                modifiers: Vec::new(),
+                members: Vec::new(),
+                span: (start, self.eof),
+            });
+        }
+        let members = self.parse_member_list();
+        self.eat_punct(";");
+        let end = self.last_end();
+        Some(Declaration {
+            kind,
+            name,
+            name_span,
+            underlying: None,
+            template_params,
+            packaged: false,
+            like,
+            like_span,
+            like_type,
+            modifiers: Vec::new(),
+            members,
+            span: (start, end),
+        })
+    }
+
+    /// One `<[tag']category [= default]>` template parameter.
+    fn parse_template_param(&mut self) -> Option<crate::ast::TemplateParam> {
+        self.expect_punct("<", "E0106", "expected '<' to open the template parameter")?;
+        let (name, name_span) = self.expect_word("E0102", "expected the parameter name")?;
+        let mut name = name;
+        if self.eat_punct("'") {
+            let (category, _) = self.expect_word("E0102", "expected the parameter category")?;
+            name.push('\'');
+            name.push_str(&category);
+        }
+        self.expect_punct(">", "E0107", "expected '>' to close the template parameter")?;
+        let default = if self.eat_punct("=") {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        Some(crate::ast::TemplateParam {
+            name,
+            name_span,
+            default,
+        })
     }
 
     /// `type name: [ENUMERAL [= expr] , ..];` or the clause 5 scalar
@@ -678,8 +883,11 @@ impl Parser {
                 name,
                 name_span,
                 underlying: Some(underlying),
+                template_params: Vec::new(),
+                packaged: false,
                 like: None,
                 like_span: None,
+                like_type: None,
                 modifiers: Vec::new(),
                 members: Vec::new(),
                 span: (start, end),
@@ -695,8 +903,11 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                template_params: Vec::new(),
+                packaged: false,
                 like: None,
                 like_span: None,
+                like_type: None,
                 modifiers: Vec::new(),
                 members: Vec::new(),
                 span: (start, self.eof),
@@ -736,8 +947,11 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                template_params: Vec::new(),
+                packaged: false,
                 like: None,
                 like_span: None,
+                like_type: None,
                 modifiers: Vec::new(),
                 members,
                 span: (start, self.last_end()),
@@ -762,8 +976,11 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                template_params: Vec::new(),
+                packaged: false,
                 like: None,
                 like_span: None,
+                like_type: None,
                 modifiers: Vec::new(),
                 members,
                 span: (start, self.last_end()),
@@ -775,8 +992,11 @@ impl Parser {
             name,
             name_span,
             underlying: None,
+            template_params: Vec::new(),
+            packaged: false,
             like: None,
             like_span: None,
+            like_type: None,
             modifiers: Vec::new(),
             members,
             span: (start, end),
@@ -851,10 +1071,20 @@ impl Parser {
         }
         let mut like = None;
         let mut like_span = None;
+        let mut like_type = None;
         if self.eat_keyword("like") {
-            let (base, span) = self.expect_type_name("expected type name after 'like'")?;
-            like = Some(base);
-            like_span = Some(span);
+            // The base may be a template instance (`like linked_list of
+            // packet`, clause 8.3); the full type is recorded alongside
+            // the base name.
+            let base = self.parse_type()?;
+            like_span = Some(base.span());
+            like = match &base {
+                TypeExpr::Named { name, .. } | TypeExpr::TemplateRef { name, .. } => {
+                    Some(name.clone())
+                }
+                _ => None,
+            };
+            like_type = Some(base);
         }
         if self
             .expect_punct("{", "E0106", "expected '{' to open the declaration body")
@@ -866,6 +1096,9 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                template_params: Vec::new(),
+                packaged: false,
+                like_type,
                 like,
                 like_span,
                 modifiers,
@@ -883,6 +1116,9 @@ impl Parser {
             name,
             name_span,
             underlying: None,
+            template_params: Vec::new(),
+            packaged: false,
+            like_type,
             like,
             like_span,
             modifiers,
@@ -914,6 +1150,23 @@ impl Parser {
     /// One member often produces several AST members (`a, b: uint;` is two
     /// fields), hence the vector.
     fn parse_member(&mut self) -> Option<Vec<Member>> {
+        // `package` / `private` visibility prefix of a member
+        // (`package items: …`, `private mset: …`, clause 22) — recorded
+        // on the field, not enforced. The prefix is consumed by the
+        // field parser one level down.
+        if (self.peek_word_is("package") || self.peek_word_is("private"))
+            && !matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == "(")
+        {
+            let word = match self.peek_kind() {
+                Some(TokenKind::Keyword(word)) | Some(TokenKind::Identifier(word)) => word.clone(),
+                _ => unreachable!("peek_word_is matched"),
+            };
+            self.bump();
+            self.member_visibility = Some(word);
+            let members = self.parse_member();
+            self.member_visibility = None;
+            return members;
+        }
         match self.peek_kind() {
             Some(TokenKind::Keyword(k)) if k == "import" => self.parse_import(),
             Some(TokenKind::Keyword(k)) if k == "define" => self.parse_define().map(|m| vec![m]),
@@ -938,6 +1191,21 @@ impl Parser {
             // The explicit `method name() …` spelling; the bare
             // `name() …` init style is handled by the identifier arm.
             Some(TokenKind::Keyword(k)) if k == "method" => self.parse_method().map(|m| vec![m]),
+            // A keyword-spelled method name (`set(index: uint, …)` —
+            // `set` is a Table 8 keyword). The `(` disambiguates from
+            // the statement/member keywords handled above.
+            Some(TokenKind::Keyword(_)) if matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == "(") => {
+                self.parse_method().map(|m| vec![m])
+            }
+            // A keyword-spelled field name (`item: <type>;`, `prev:
+            // llist_node of <type>;` — Table 8 keywords). The `:` or
+            // dimension bracket disambiguates.
+            Some(TokenKind::Keyword(_))
+                if matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == ":")
+                    || self.peek_second_is_word("is") =>
+            {
+                self.parse_fields()
+            }
             // `%name` physical / `!name` do-not-generate field prefixes.
             Some(TokenKind::Punctuation(p)) if p == "%" || p == "!" => self.parse_fields(),
             _ => {
@@ -1042,6 +1310,18 @@ impl Parser {
     /// Whether the token after the current one is the given punctuation.
     fn peek_second_is_punct(&self, symbol: &str) -> bool {
         matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == symbol)
+    }
+
+    /// Whether the token after the current one is the given word, as a
+    /// keyword or an identifier.
+    fn peek_second_is_word(&self, word: &str) -> bool {
+        matches!(
+            self.peek_second_kind(),
+            Some(TokenKind::Identifier(w)) if w == word
+        ) || matches!(
+            self.peek_second_kind(),
+            Some(TokenKind::Keyword(w)) if w == word
+        )
     }
 
     /// Collect the raw tokens up to and including the `}` matching the
@@ -1302,11 +1582,10 @@ impl Parser {
         } else {
             false
         };
-        let (first, first_span) = self.expect_identifier("E0102", "expected field name")?;
+        let (first, first_span) = self.expect_word("E0102", "expected field name")?;
         let mut names = vec![(first, first_span)];
         while self.eat_punct(",") {
-            let (name, name_span) =
-                self.expect_identifier("E0102", "expected field name after ','")?;
+            let (name, name_span) = self.expect_word("E0102", "expected field name after ','")?;
             names.push((name, name_span));
         }
         // Optional fixed-size dimension: `regs[4] : list of byte;`. The
@@ -1342,6 +1621,7 @@ impl Parser {
                             },
                             physical: false,
                             no_gen: false,
+                            visibility: self.member_visibility.clone(),
                         })
                     })
                     .collect(),
@@ -1370,6 +1650,7 @@ impl Parser {
                         ty: ty.clone(),
                         physical,
                         no_gen,
+                        visibility: self.member_visibility.clone(),
                     })
                 })
                 .collect(),
@@ -1381,7 +1662,7 @@ impl Parser {
         let start = self.current_span().0;
         // Optional explicit `method` keyword (`method name() is { .. }`).
         self.eat_keyword("method");
-        let (name, name_span) = self.take_identifier();
+        let (name, name_span) = self.expect_word("E0102", "expected the method name")?;
         self.expect_punct(
             "(",
             "E0109",
@@ -1391,9 +1672,14 @@ impl Parser {
         if !self.at_punct(")") {
             loop {
                 let (param_name, param_span) =
-                    self.expect_identifier("E0102", "expected parameter name")?;
-                self.expect_punct(":", "E0103", "expected ':' after parameter name")?;
-                let ty = self.parse_type()?;
+                    self.expect_word("E0102", "expected parameter name")?;
+                // `name: type` or the untyped `name` (clause 17), which
+                // accepts anything.
+                let ty = if self.eat_punct(":") {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
                 params.push(Param {
                     name: param_name,
                     name_span: param_span,
@@ -1438,7 +1724,9 @@ impl Parser {
             None
         };
         // `is empty;` — a body-less method (no-op by declaration).
-        if self.eat_keyword("empty") {
+        // `is undefined;` — declared unimplemented; the same body-less
+        // shape (calling it is a later-milestone runtime distinction).
+        if self.eat_keyword("empty") || self.eat_keyword("undefined") {
             self.expect_punct(";", "E0105", "expected ';' after the method declaration")?;
             let end = self.last_end();
             return Some(Member::Method(MethodDecl {
@@ -1455,7 +1743,11 @@ impl Parser {
         self.expect_punct("{", "E0106", "expected '{' to open the method body")?;
         let body = self.parse_statements();
         self.expect_punct("}", "E0107", "expected '}' to close the method body")?;
-        self.expect_punct(";", "E0105", "expected ';' after the method declaration")?;
+        // The `;` may be omitted when the method is the last member of a
+        // body (Specman accepts both spellings).
+        if !self.eat_punct(";") && !self.at_punct("}") {
+            self.expect_punct(";", "E0105", "expected ';' after the method declaration")?;
+        }
         let end = self.last_end();
         Some(Member::Method(MethodDecl {
             name,
@@ -1926,6 +2218,25 @@ impl Parser {
                 span: (start, end),
             });
         }
+        if self.at_punct("<") {
+            // A template's formal parameter in a type position
+            // (`<type>`, `<key'type>` — clause 8.1): recorded as the raw
+            // text between the brackets.
+            self.bump();
+            let (name, _) = self.expect_word("E0102", "expected the formal parameter name")?;
+            let mut name = name;
+            if self.eat_punct("'") {
+                let (category, _) = self.expect_word("E0102", "expected the parameter category")?;
+                name.push('\'');
+                name.push_str(&category);
+            }
+            self.expect_punct(">", "E0107", "expected '>' to close the formal parameter")?;
+            let end = self.last_end();
+            return Some(TypeExpr::Formal {
+                name,
+                span: (start, end),
+            });
+        }
         if self.at_identifier() {
             let (name, span) = self.take_identifier();
             // A when-qualified type (`reg cpu_instr_s`, the modifier
@@ -1937,6 +2248,32 @@ impl Parser {
             } else {
                 (name, span)
             };
+            // `deque of int` — a template instantiation in a type
+            // position (clause 8.3). `list of` never reaches here: the
+            // keyword branch handles it first.
+            if self.at_keyword("of") {
+                self.bump();
+                let args = if self.eat_punct("(") {
+                    let mut args = vec![self.parse_type()?];
+                    while self.eat_punct(",") {
+                        args.push(self.parse_type()?);
+                    }
+                    self.expect_punct(
+                        ")",
+                        "E0110",
+                        "expected ')' to close the template arguments",
+                    )?;
+                    args
+                } else {
+                    vec![self.parse_type()?]
+                };
+                let end = self.last_end();
+                return Some(TypeExpr::TemplateRef {
+                    name,
+                    args,
+                    span: (start, end),
+                });
+            }
             return Some(TypeExpr::Named { name, span });
         }
         let Some(TokenKind::Keyword(keyword)) = self.peek_kind() else {
@@ -1946,6 +2283,18 @@ impl Parser {
         let keyword = keyword.clone();
         if keyword == "list" {
             self.bump();
+            // Keyed list: `list (key:it) of <type>` — the key expression
+            // is recorded (clause 5.1.8's keyed lists).
+            let key = if self.at_punct("(") && self.peek_second_is_word("key") {
+                self.bump();
+                self.expect_keyword_word("key")?;
+                self.expect_punct(":", "E0103", "expected ':' after 'key'")?;
+                let key = self.parse_expr()?;
+                self.expect_punct(")", "E0110", "expected ')' after the key specification")?;
+                Some(Box::new(key))
+            } else {
+                None
+            };
             if !self.eat_keyword("of") {
                 self.error_here("E0112", "expected 'of' after 'list'");
                 return None;
@@ -1954,6 +2303,7 @@ impl Parser {
             let end = element.span().1;
             return Some(TypeExpr::List {
                 element,
+                key,
                 span: (start, end),
             });
         }
@@ -2011,14 +2361,21 @@ impl Parser {
         match self.peek_kind() {
             Some(TokenKind::Keyword(k)) if k == "var" => {
                 self.bump();
-                let (name, name_span) =
-                    self.expect_identifier("E0102", "expected variable name")?;
-                self.expect_punct(":", "E0103", "expected ':' after the variable name")?;
-                let ty = self.parse_type()?;
-                let init = if self.eat_punct("=") {
-                    Some(self.parse_expr()?)
+                let (name, name_span) = self.expect_word("E0102", "expected variable name")?;
+                // `var x: t = e;` or the type-inferring `var x := e;`
+                // (clause 18) — the inferred type is resolved at run
+                // time from the initializer.
+                let (ty, init) = if self.eat_punct(":=") {
+                    (None, Some(self.parse_expr()?))
                 } else {
-                    None
+                    self.expect_punct(":", "E0103", "expected ':' after the variable name")?;
+                    let ty = Some(self.parse_type()?);
+                    let init = if self.eat_punct("=") {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    (ty, init)
                 };
                 self.expect_punct(";", "E0105", "expected ';' after variable declaration")?;
                 let end = self.last_end();
@@ -2051,7 +2408,7 @@ impl Parser {
                 } else {
                     Some(self.parse_expr()?)
                 };
-                self.expect_punct(";", "E0105", "expected ';' after 'return'")?;
+                self.expect_stmt_semi("expected ';' after 'return'")?;
                 let end = self.last_end();
                 Some(Stmt::Return {
                     value,
@@ -2079,7 +2436,7 @@ impl Parser {
             Some(TokenKind::Keyword(k)) if k == "gen" => {
                 self.bump();
                 let expr = self.parse_expr()?;
-                self.expect_punct(";", "E0105", "expected ';' after 'gen'")?;
+                self.expect_stmt_semi("expected ';' after 'gen'")?;
                 let end = self.last_end();
                 Some(Stmt::Gen {
                     expr,
@@ -2092,7 +2449,7 @@ impl Parser {
             Some(TokenKind::Keyword(k)) if k == "emit" => {
                 self.bump();
                 let target = self.parse_expr()?;
-                self.expect_punct(";", "E0105", "expected ';' after 'emit'")?;
+                self.expect_stmt_semi("expected ';' after 'emit'")?;
                 let end = self.last_end();
                 Some(Stmt::Emit {
                     target,
@@ -2102,9 +2459,21 @@ impl Parser {
             Some(TokenKind::Keyword(k)) if k == "start" => {
                 self.bump();
                 let call = self.parse_expr()?;
-                self.expect_punct(";", "E0105", "expected ';' after 'start'")?;
+                self.expect_stmt_semi("expected ';' after 'start'")?;
                 let end = self.last_end();
                 Some(Stmt::Start {
+                    call,
+                    span: (start, end),
+                })
+            }
+            // `compute <call>;` (clause 13) — parsed like `start`;
+            // without TCM suspension the two execute the same way.
+            Some(TokenKind::Keyword(k)) if k == "compute" => {
+                self.bump();
+                let call = self.parse_expr()?;
+                self.expect_stmt_semi("expected ';' after 'compute'")?;
+                let end = self.last_end();
+                Some(Stmt::Compute {
                     call,
                     span: (start, end),
                 })
@@ -2163,7 +2532,10 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 if self.eat_punct("=") {
                     let value = self.parse_expr()?;
-                    self.expect_punct(";", "E0105", "expected ';' after assignment")?;
+                    // The last statement of a block may omit the `;`.
+                    if !self.eat_punct(";") && !self.at_punct("}") {
+                        self.expect_punct(";", "E0105", "expected ';' after assignment")?;
+                    }
                     let end = self.last_end();
                     Some(Stmt::Assign {
                         target: expr,
@@ -2194,7 +2566,10 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 if self.eat_punct("=") {
                     let value = self.parse_expr()?;
-                    self.expect_punct(";", "E0105", "expected ';' after assignment")?;
+                    // The last statement of a block may omit the `;`.
+                    if !self.eat_punct(";") && !self.at_punct("}") {
+                        self.expect_punct(";", "E0105", "expected ';' after assignment")?;
+                    }
                     let end = self.last_end();
                     Some(Stmt::Assign {
                         target: expr,
@@ -2244,6 +2619,14 @@ impl Parser {
     /// `if cond { statements } else { statements };` — the braced form only;
     /// `if ... do ..` and loops are a later milestone.
     fn parse_if_statement(&mut self) -> Option<Stmt> {
+        let inner = self.parse_if_inner()?;
+        self.expect_stmt_semi("expected ';' after the 'if' statement")?;
+        Some(inner)
+    }
+
+    /// The `if`/`else if` shape without its statement terminator —
+    /// `else if` chains share the outer statement's `;`.
+    fn parse_if_inner(&mut self) -> Option<Stmt> {
         let start = self.current_span().0;
         self.bump(); // 'if'
         let cond = self.parse_expr()?;
@@ -2259,20 +2642,25 @@ impl Parser {
         let then_body = self.parse_statements();
         self.expect_punct("}", "E0107", "expected '}' to close the 'if' body")?;
         let else_body = if self.eat_keyword("else") {
-            if self
-                .expect_punct("{", "E0106", "expected '{' to open the 'else' body")
-                .is_none()
-            {
-                self.recover_to_member_boundary();
-                return None;
+            if self.at_keyword("if") {
+                // `else if` chains nest as a one-statement else body.
+                let inner = self.parse_if_inner()?;
+                Some(vec![inner])
+            } else {
+                if self
+                    .expect_punct("{", "E0106", "expected '{' to open the 'else' body")
+                    .is_none()
+                {
+                    self.recover_to_member_boundary();
+                    return None;
+                }
+                let body = self.parse_statements();
+                self.expect_punct("}", "E0107", "expected '}' to close the 'else' body")?;
+                Some(body)
             }
-            let body = self.parse_statements();
-            self.expect_punct("}", "E0107", "expected '}' to close the 'else' body")?;
-            Some(body)
         } else {
             None
         };
-        self.expect_punct(";", "E0105", "expected ';' after the 'if' statement")?;
         let end = self.last_end();
         Some(Stmt::If {
             cond,
@@ -2297,7 +2685,7 @@ impl Parser {
         }
         let body = self.parse_statements();
         self.expect_punct("}", "E0107", "expected '}' to close the 'while' body")?;
-        self.expect_punct(";", "E0105", "expected ';' after the 'while' statement")?;
+        self.expect_stmt_semi("expected ';' after the 'while' statement")?;
         let end = self.last_end();
         Some(Stmt::While {
             cond,
@@ -2395,7 +2783,7 @@ impl Parser {
             }
             count
         };
-        self.expect_punct(";", "E0105", "expected ';' after 'wait'")?;
+        self.expect_stmt_semi("expected ';' after 'wait'")?;
         let end = self.last_end();
         Some(Stmt::Wait {
             cycles,
@@ -2411,23 +2799,59 @@ impl Parser {
         if self.eat_keyword("each") {
             // Optional named binding: `for each (m) in list do`.
             let var = if self.eat_punct("(") {
-                let (name, _) = self
-                    .expect_identifier("E0102", "expected the iterator name after 'for each ('")?;
+                let (name, _) =
+                    self.expect_word("E0102", "expected the iterator name after 'for each ('")?;
                 self.expect_punct(")", "E0110", "expected ')' after the iterator name")?;
                 Some(name)
             } else {
                 None
             };
+            // `using <index-name> (idx)` — the index binding form; the
+            // name is a (dotted) field path, recorded. A full expression
+            // parse would swallow `(idx)` as a call.
+            let mut using = None;
+            let mut index_var = None;
+            if self.eat_keyword("using") {
+                let (first, first_span) =
+                    self.expect_word("E0102", "expected the index field after 'using'")?;
+                let mut path = Expr::Ident {
+                    name: first,
+                    span: first_span,
+                };
+                while self.at_punct(".") {
+                    self.bump();
+                    let (segment, segment_span) =
+                        self.expect_word("E0102", "expected a path segment after '.'")?;
+                    let end = self.last_end();
+                    path = Expr::MemberAccess {
+                        object: Box::new(path),
+                        name: segment,
+                        name_span: segment_span,
+                        span: (first_span.0, end),
+                    };
+                }
+                using = Some(path);
+                self.expect_punct("(", "E0106", "expected '(' before the index name")?;
+                let (name, _) =
+                    self.expect_word("E0102", "expected the index name after 'using'")?;
+                self.expect_punct(")", "E0110", "expected ')' after the index name")?;
+                index_var = Some(name);
+            }
             self.expect_keyword_word("in")?;
+            // `for each in reverse my_list` — iteration in reverse order.
+            let reversed = self.eat_keyword("reverse");
             let list = self.parse_expr()?;
             self.eat_keyword("do");
             self.expect_punct("{", "E0106", "expected '{' to open the for-each body")?;
             let body = self.parse_statements();
             self.expect_punct("}", "E0107", "expected '}' to close the for-each body")?;
-            self.expect_punct(";", "E0105", "expected ';' after the for-each statement")?;
+            self.expect_stmt_semi("expected ';' after the for-each statement")?;
             let end = self.last_end();
             return Some(Stmt::ForEach {
                 var,
+                index_var,
+                using,
+                reversed,
                 list,
                 body,
                 span: (start, end),
@@ -2436,6 +2860,8 @@ impl Parser {
         let (var, _) = self.expect_identifier("E0102", "expected the loop variable after 'for'")?;
         self.expect_keyword_word("from")?;
         let from = self.parse_expr()?;
+        // `down to` counts down (clause 20); plain `to` counts up.
+        let down = self.eat_keyword("down");
         self.expect_keyword_word("to")?;
         let to = self.parse_expr()?;
         // `do` before `{` is the spelled form; both spellings occur.
@@ -2443,12 +2869,13 @@ impl Parser {
         self.expect_punct("{", "E0106", "expected '{' to open the for body")?;
         let body = self.parse_statements();
         self.expect_punct("}", "E0107", "expected '}' to close the for body")?;
-        self.expect_punct(";", "E0105", "expected ';' after the for statement")?;
+        self.expect_stmt_semi("expected ';' after the for statement")?;
         let end = self.last_end();
         Some(Stmt::ForTo {
             var,
             from,
             to,
+            down,
             body,
             span: (start, end),
         })
@@ -2463,6 +2890,16 @@ impl Parser {
             self.error_here("E0102", &format!("expected '{word}'"));
             None
         }
+    }
+
+    /// The statement terminator: `;` required, except as the last
+    /// statement of a block, where the closing `}` may follow directly
+    /// (Specman accepts both spellings).
+    fn expect_stmt_semi(&mut self, message: &'static str) -> Option<()> {
+        if self.eat_punct(";") || self.at_punct("}") {
+            return Some(());
+        }
+        self.expect_punct(";", "E0105", message)
     }
 
     // ---- expressions, loosest to tightest binding ----
@@ -2555,9 +2992,11 @@ impl Parser {
         Some(lhs)
     }
 
-    /// `expr is [not] a <type>` type check (clause 4.5), left-associative,
-    /// at [`ISA_LEVEL`]. A bare `is` that does not start this shape is left
-    /// for the caller — `is` also appears in member and trigger syntax.
+    /// `expr is [not] a <type> [(name)]` type check (clause 4.5),
+    /// left-associative, at [`ISA_LEVEL`]. The optional `(name)` binds a
+    /// true match to a local. A bare `is` that does not start this shape
+    /// is left for the caller — `is` also appears in member and trigger
+    /// syntax.
     fn parse_isa_level(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_binary_level(ISA_LEVEL + 1)?;
         while self.peek_is_type_check() {
@@ -2565,11 +3004,19 @@ impl Parser {
             let negated = self.eat_keyword("not");
             self.bump(); // 'a'
             let ty = self.parse_type()?;
+            let binding = if self.eat_punct("(") {
+                let (name, _) = self.expect_word("E0102", "expected the binding name")?;
+                self.expect_punct(")", "E0110", "expected ')' after the binding name")?;
+                Some(name)
+            } else {
+                None
+            };
             let start = lhs.span().0;
             let end = self.last_end();
             lhs = Expr::IsA {
                 expr: Box::new(lhs),
                 ty,
+                binding,
                 negated,
                 span: (start, end),
             };
@@ -2679,6 +3126,37 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Option<Expr> {
         let (start, end) = self.current_span();
+        // `new [<type>] [with { assignments }]` — instance creation
+        // (clause 6.2). The type is optional (`var p: packet = new;`).
+        // Evaluation is staged: instances come from declared fields and
+        // typed locals today.
+        if self.at_keyword("new") {
+            self.bump();
+            let ty = if self.at_identifier()
+                || self.at_punct("<")
+                || matches!(self.peek_kind(), Some(TokenKind::Keyword(k)) if {
+                    ScalarBase::from_keyword(k).is_some() || k == "list"
+                }) {
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            let inits = if self.eat_keyword("with") {
+                self.expect_punct("{", "E0106", "expected '{' to open the 'with' block")?;
+                let inits = self.parse_statements();
+                self.expect_punct("}", "E0107", "expected '}' to close the 'with' block")?;
+                inits
+            } else {
+                Vec::new()
+            };
+            let end = self.last_end();
+            let new_expr = Expr::New {
+                ty,
+                inits,
+                span: (start, end),
+            };
+            return self.parse_postfix_chain(new_expr, start);
+        }
         // Predefined e names that appear as bare values in real code
         // (see PREDEFINED_NAMES); treated as plain identifiers in
         // expression position.

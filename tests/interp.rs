@@ -445,3 +445,61 @@ fn gen_domain_narrowing_leaves_unconstrained_fields_alone() {
     );
     assert_eq!(output, "OK\n");
 }
+
+#[test]
+fn down_to_counts_and_reverse_for_each_binds_the_index() {
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var l: list of int;\n        \
+         l.push(10); l.push(20); l.push(30);\n        \
+         for i from 3 down to 1 {\n            out(i, \"\\n\");\n        };\n        \
+         for each (v) using index (idx) in reverse l {\n            \
+         out(idx, \"=\", v, \"\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "3\n2\n1\n0=30\n1=20\n2=10\n");
+}
+
+#[test]
+fn is_a_binding_exposes_the_matched_value() {
+    let output = clean_output(
+        "struct packet_s {\n    x: int;\n};\n\
+         extend sys {\n    run() is also {\n        var p: packet_s;\n        \
+         if p is a packet_s (cp) {\n            out(\"x=\", cp.x, \"\\n\");\n        } else {\n            \
+         out(\"no match\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "x=0\n");
+}
+
+#[test]
+fn compute_calls_inline_and_untyped_params_accept_anything() {
+    let output = clean_output(
+        "struct s {\n    bump(v) is {\n        return v + 1;\n    };\n    \
+         note() is {\n            out(\"computed\\n\");\n        };\n    \
+         twice(): uint is {\n        compute note();\n        return 2;\n    };\n};\n\
+         extend sys {\n    run() is also {\n        var m: s;\n        \
+         out(m.bump(4), \"\\n\");\n        print m.twice();\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "5\ncomputed\n2\n");
+}
+
+#[test]
+fn new_reports_a_clean_runtime_diagnostic() {
+    let result = run(
+        &elaborate(
+            &parse(
+                "struct s {\n    v: int;\n};\n\
+             extend sys {\n    run() is also {\n        var p: s = new;\n    };\n};\n",
+            )
+            .declarations,
+        ),
+        1,
+    );
+    assert_eq!(result.diagnostics.len(), 1);
+    assert!(
+        result.diagnostics[0].render().contains("E0402"),
+        "expected E0402 for 'new': {:?}",
+        result.diagnostics[0].render()
+    );
+}

@@ -70,7 +70,9 @@ impl std::error::Error for LexError {}
 /// `external/specman-e-parser/specman.flex` by
 /// `tests/lexer.rs::keywords_match_reference_grammar_set`. Deviations:
 /// the IEEE 1647 predefined type spellings `real` and `string` are keywords
-/// here (the reference grammar leaves them as identifiers), multi-word
+/// here (the reference grammar leaves them as identifiers), the clause 8
+/// keyword `template` (Table 8 of the 2016 standard) is a keyword here —
+/// the reference grammar predates it — multi-word
 /// reference keywords (`is a`, `state machine`, `C export`, `C routine`)
 /// are not single-token keywords, and their operator spellings are handled
 /// by later stages.
@@ -194,6 +196,7 @@ pub const KEYWORDS: &[&str] = &[
     "string",
     "struct",
     "sync",
+    "template",
     "that",
     "text",
     "then",
@@ -231,9 +234,11 @@ pub fn is_keyword(word: &str) -> bool {
 
 /// Multi-character operators, longest match first. `===`/`!==` are the
 /// e identity comparisons; `!~` is the negative string match; `=>` is
-/// implication; `..` is a range.
+/// implication; `..` is a range; `:=` is the type-inferring `var`
+/// initialization (clause 18).
 const OPERATORS: &[&str] = &[
     "===", "!==", "==", "!=", "!~", "<=", ">=", "=>", "&&", "||", "<<", ">>", "..", "+=", "-=",
+    ":=",
 ];
 
 struct Cursor<'a> {
