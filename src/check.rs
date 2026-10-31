@@ -299,6 +299,7 @@ fn check_statements<'a>(
             | Stmt::Continue { .. }
             | Stmt::Case { .. }
             | Stmt::Wait { .. }
+            | Stmt::WaitTemporal { .. }
             | Stmt::Emit { .. }
             | Stmt::Start { .. }
             | Stmt::Compute { .. }

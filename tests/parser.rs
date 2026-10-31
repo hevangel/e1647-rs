@@ -1548,3 +1548,64 @@ fn select_distributions_parse_weights_and_verbatim_choices() {
         ]
     );
 }
+
+#[test]
+fn wait_statements_split_numeric_from_temporal_forms() {
+    // 13.1.3: `cycle`, `[n]` and `[n]*cycle` stay the numeric wait;
+    // event atoms, `until` + TE, repeats over events, sequences and
+    // proposition waits are temporal.
+    let declarations = expect_clean(
+        "struct s {\n    ev: event;\n    clk: event;\n    x: uint;\n    run() is {\n        \
+         wait cycle;\n        wait [3];\n        wait [3]*cycle;\n        wait until x > 3;\n        \
+         wait @ev;\n        wait until @ev;\n        wait [2]*@ev;\n        \
+         wait {@ev; @clk} @clk;\n        wait true(x == 3) @clk;\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[3] else {
+        panic!("expected the run method");
+    };
+    assert_eq!(run.body.len(), 9);
+    // The numeric forms keep their cycle-count normalization.
+    for stmt in run.body.iter().take(4) {
+        assert!(
+            matches!(stmt, Stmt::Wait { .. }),
+            "expected a numeric wait: {stmt:?}"
+        );
+    }
+    // `wait @ev` and `wait until @ev` are the same event-atom TE.
+    for stmt in run.body.iter().skip(4).take(2) {
+        let Stmt::WaitTemporal { te, .. } = stmt else {
+            panic!("expected a temporal wait: {stmt:?}");
+        };
+        assert!(
+            matches!(te, e1647::ast::TemporalExpr::EventRef { .. }),
+            "expected an event atom: {te:?}"
+        );
+    }
+    // `wait [2]*@ev` is the fixed repeat (12.2.9).
+    let Stmt::WaitTemporal { te, .. } = &run.body[6] else {
+        panic!("expected the repeat wait");
+    };
+    let e1647::ast::TemporalExpr::Repeat {
+        kind: e1647::ast::RepeatKind::Fixed,
+        ..
+    } = te
+    else {
+        panic!("expected a fixed repeat: {te:?}");
+    };
+    // A sampled sequence and a proposition keep their sampling.
+    for stmt in run.body.iter().skip(7) {
+        let Stmt::WaitTemporal { te, .. } = stmt else {
+            panic!("expected a temporal wait: {stmt:?}");
+        };
+        let e1647::ast::TemporalExpr::Sampled { te: inner, .. } = te else {
+            panic!("expected the sampling suffix: {te:?}");
+        };
+        assert!(
+            matches!(
+                &**inner,
+                e1647::ast::TemporalExpr::Sequence { .. } | e1647::ast::TemporalExpr::True { .. }
+            ),
+            "expected a sequence or proposition: {inner:?}"
+        );
+    }
+}

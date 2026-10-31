@@ -1569,3 +1569,80 @@ draws); yield/not/fail distinction with the golden's
 tight satisfaction; fixed/true-match repeats over propositions and
 `eventually` + first-match `{[..]*@a; @b}`; edge-sample error;
 unresolvable-bound error.
+
+## 2026-10-31 (26) — offline arc: clause 12 temporal engine wired to the run loop (wait, emit log, expect monitoring)
+
+Branch `agent/temporal-runloop` (off main after #15 merged). The
+temporal-engine core now has a driver: the interpreter keeps a run
+log — one `State` per virtual cycle recording which events occurred —
+and `emit`, temporal `wait`s and `expect`/`assume` rules read and
+write it.
+
+- `emit` (11.2) additionally records the occurrence in the current
+  cycle's state. `emit e; wait @e;` succeeds in the same cycle
+  (12.3.1's sub-path over the recorded state).
+- Temporal `wait` statements parse (13.1.3): `wait @event`,
+  `wait {..} @clk`, `wait true(exp) @clk`, `wait [n]*@event`,
+  `wait until <te>` — the standard's NOTE makes `until` readability
+  only, so it is the same temporal wait; `cycle`/`[n]`/`[n]*cycle`
+  stay the numeric wait, and a plain-expression `until` keeps the v1
+  advance-one behavior. Execution advances one cycle at a time and
+  re-checks `succeeds` (12.3.1) over the log from the wait's start;
+  a wait unsatisfied after 1,000 cycles (or the shared budget)
+  reports `E0409`; unevaluable TEs (`change/rise/fall`, unresolvable
+  bounds) report `E0402` honestly.
+- `expect`/`assume` members (11.4) elaborate per type
+  (`ElaboratedType.expects`, base-first then extends) and are
+  monitored at quit: `rule_failed` (12.3.2 — the rule fails where
+  `fail te` succeeds) reads per shape — yields fail when an lhs
+  success left no rhs success after it (12.2.13's "in sequence"),
+  `eventually` and other success-required shapes fail when they never
+  succeeded anywhere (12.3.1 at any point via `succeeded_somewhere`),
+  `not`/`fail` shapes are invariants. A failed rule runs its `else`
+  body on the sys instance (whose `dut_error` reports as usual); with
+  no else body the failure itself prints and counts as the check
+  error.
+- Honest approximations, documented in the code and ARCHITECTURE: one
+  global timeline (all events share per-cycle states; the sampling
+  event's occurrences are every cycle boundary, so 12.3.3's legal
+  starts are any index), propositions and repeat bounds evaluate once
+  per check with current field values (no per-cycle value history —
+  the log records event occurrences only), nothing executes
+  concurrently during a wait (TCM suspension is the next temporal
+  milestone), and a temporal wait can therefore only observe
+  emissions recorded before it started or the padded later cycles.
+
+Corpus state (absolute paths): golden-combined 0, igen-dist 0,
+type-min-max/save-restart/d6w 0, etl 4 (E0203 base_struct),
+cover-edges 4 (rf-library types), golden-imports 3 (missing tutorial
+modules) — unchanged. `e1647 run` of golden-combined still exits 0
+with only the pre-existing implicit-gen E0407; its `@sys.any`-based
+expect rules stay vacuous (sys.any never fires in this model) so
+monitoring is silent there.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(149 passed: 11 elab, 1 fixtures, 45 interp, 24 lexer, 51 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 9 interpreter tests (emit feeds the log and a same-cycle
+wait sees it; an `on` block's numeric wait lands the emission in the
+next cycle's state and `wait until @ev` sees it; the unsatisfied
+temporal wait hits the budget guard without completing; a failed
+`@start => eventually @done` expect runs its `dut_error` else body
+and counts one DUT error; satisfied and vacuous rules stay silent; a
+failed rule with no else body prints the failure as a check error;
+`expect eventually @done` fails at quit when done never occurred;
+`wait {@a; cycle}` spins into the padded next cycle and succeeds;
+`wait true(x == 3)` evaluates the proposition with current field
+values); a parser test splitting the nine wait spellings into
+numeric vs temporal shapes; and a clean-parse fixture
+(`temporal_wait.e`) locking the expect/assume + temporal-wait syntax.

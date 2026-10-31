@@ -167,6 +167,11 @@ struct Interp<'a> {
     wait_budget: u64,
     /// Events fired by `emit`, keyed by their path as written.
     emitted: std::collections::BTreeSet<String>,
+    /// The run's temporal log (clause 12): one state per virtual cycle,
+    /// recording which events occurred in it. `emit` writes here and
+    /// temporal `wait`s and `expect` rules read it. One global
+    /// timeline: all events share the per-cycle states.
+    temporal_log: Vec<crate::temporal::State>,
     /// Set by `stop_run()`; unwinds the whole run.
     stop_requested: bool,
     /// Failed `check that` conditions (`dut_error`), reported like
@@ -178,6 +183,11 @@ struct Interp<'a> {
 
 /// How many `wait` statements one run may execute (the runaway-TCM guard).
 const WAIT_BUDGET: u64 = 100_000;
+
+/// How many cycles one temporal `wait` may stay unsatisfied before it
+/// reports `E0409` — the temporal twin of the runaway guard, bounded
+/// low because the success scan walks the whole log each cycle.
+const TEMPORAL_WAIT_CYCLES: u64 = 1_000;
 
 /// Instantiate the built-in `sys` unit and execute its `run()` methods.
 pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
@@ -209,6 +219,7 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
         cycle: 0,
         wait_budget: WAIT_BUDGET,
         emitted: std::collections::BTreeSet::new(),
+        temporal_log: Vec::new(),
         stop_requested: false,
         dut_errors: 0,
         defines,
@@ -282,6 +293,46 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
             break;
         }
     }
+    // 11.4: at quit, report the expect/assume rules that failed over
+    // the run log (12.3.2 — the rule fails where all possibilities to
+    // satisfy it are exhausted). The `else` body (usually a
+    // `dut_error` call) runs on the sys instance; without one, the
+    // failure itself is the check error. Rules whose TE cannot be
+    // evaluated over the log report the gap honestly.
+    for expect_rule in elaborated.types.iter().flat_map(|t| t.expects.iter()) {
+        if interp.stop_requested {
+            break;
+        }
+        let kind = format!("{:?}", expect_rule.kind).to_lowercase();
+        let (booleans, numerics) =
+            interp.evaluate_temporal_exprs(&expect_rule.te, &mut Frame::default(), Some(sys_index));
+        let callbacks = temporal_callbacks(&booleans, &numerics);
+        match crate::temporal::rule_failed(&expect_rule.te, &interp.temporal_log, &callbacks) {
+            Ok(true) => {
+                if expect_rule.else_body.is_empty() {
+                    // No `dut_error` clause: the failure itself is the
+                    // check error (11.4 — the tool prints the rule).
+                    interp.dut_errors += 1;
+                    interp.output.push_str(&format!(
+                        "{kind} rule failed: temporal property not satisfied, no else body\n"
+                    ));
+                } else {
+                    let mut frame = Frame::default();
+                    if let Err(diagnostic) =
+                        interp.exec_block(&expect_rule.else_body, &mut frame, Some(sys_index))
+                    {
+                        interp
+                            .output
+                            .push_str(&format!("{kind} rule else body: {}\n", diagnostic.render()));
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(err) => interp.output.push_str(&format!(
+                "{kind} rule cannot be evaluated over the run: {err:?}\n"
+            )),
+        }
+    }
     // Specman closes every run with a DUT-error count; mirror it.
     if interp.dut_errors > 0 {
         interp.output.push_str(&format!(
@@ -305,6 +356,36 @@ fn origin() -> Position {
 
 fn origin_span() -> crate::ast::Span {
     (origin(), origin())
+}
+
+/// Pre-evaluated temporal propositions and bounds, keyed by expression
+/// identity (see [`Interp::evaluate_temporal_exprs`]).
+type TemporalValues<'te> = (
+    Vec<(&'te crate::ast::Expr, Option<bool>)>,
+    Vec<(&'te crate::ast::Expr, Option<i128>)>,
+);
+
+/// The engine callback set over pre-evaluated propositions and bounds:
+/// expressions are matched by identity (the engine passes back the
+/// references [`Interp::evaluate_temporal_exprs`] collected).
+fn temporal_callbacks<'a>(
+    booleans: &'a [(&'a crate::ast::Expr, Option<bool>)],
+    numerics: &'a [(&'a crate::ast::Expr, Option<i128>)],
+) -> crate::temporal::EvalCallbacks<'a> {
+    crate::temporal::EvalCallbacks {
+        boolean: Box::new(move |expr| {
+            booleans
+                .iter()
+                .find(|(key, _)| std::ptr::eq(*key, expr))
+                .and_then(|(_, value)| *value)
+        }),
+        numeric: Box::new(move |expr| {
+            numerics
+                .iter()
+                .find(|(key, _)| std::ptr::eq(*key, expr))
+                .and_then(|(_, value)| *value)
+        }),
+    }
 }
 
 impl<'a> Interp<'a> {
@@ -669,11 +750,61 @@ impl<'a> Interp<'a> {
                 }
                 self.wait_budget -= 1;
                 self.cycle = self.cycle.saturating_add(n as u64);
+                self.pad_log();
                 Ok(Flow::Normal)
+            }
+            // A temporal wait (13.1.3): suspend until the TE succeeds
+            // over the run log (12.3.1), advancing one cycle at a time
+            // under the wait budget. Propositions and repeat bounds
+            // evaluate once, with current field values — the log keeps
+            // event occurrences, not value history. A temporal wait
+            // that stays unsatisfied for TEMPORAL_WAIT_CYCLES cycles
+            // is reported like the runaway-TCM guard (the success scan
+            // is quadratic in the log, so the cap is far below the
+            // numeric wait budget).
+            Stmt::WaitTemporal { te, span } => {
+                let start = self.cycle as usize;
+                self.pad_log();
+                let (booleans, numerics) = self.evaluate_temporal_exprs(te, frame, me);
+                let mut waited = 0u64;
+                loop {
+                    let callbacks = temporal_callbacks(&booleans, &numerics);
+                    let slice = &self.temporal_log[start..];
+                    match crate::temporal::succeeds(te, slice, &callbacks) {
+                        Ok(true) => return Ok(Flow::Normal),
+                        Ok(false) => {}
+                        Err(err) => {
+                            return Err(self.error(
+                                "E0402",
+                                format!("temporal wait cannot be evaluated: {err:?}"),
+                                *span,
+                            ));
+                        }
+                    }
+                    if self.wait_budget == 0 || waited >= TEMPORAL_WAIT_CYCLES {
+                        return Err(self.error(
+                            "E0409",
+                            format!(
+                                "cycle budget exceeded at cycle {} (temporal wait unsatisfied after {waited} cycles)",
+                                self.cycle
+                            ),
+                            *span,
+                        ));
+                    }
+                    self.wait_budget -= 1;
+                    waited += 1;
+                    self.cycle = self.cycle.saturating_add(1);
+                    self.pad_log();
+                }
             }
             Stmt::Emit { target, span } => {
                 let path = self.event_path(target)?;
                 self.emitted.insert(path.clone());
+                // The occurrence feeds the temporal log: this cycle's
+                // state records the event for `wait`s and `expect`
+                // rules (clause 12).
+                self.pad_log();
+                self.temporal_log[self.cycle as usize].record(&path);
                 // `emit` executes the event's `on` action blocks
                 // immediately, in declaration order (clause 11.2). No
                 // TCMs wait in this milestone, so "before waiting TCMs"
@@ -1555,6 +1686,54 @@ impl<'a> Interp<'a> {
             }
             _ => Err(self.error("E0402", "unsupported event target", target.span())),
         }
+    }
+
+    /// The temporal log has one state per cycle up to the current one;
+    /// cycles where nothing was emitted carry empty states.
+    fn pad_log(&mut self) {
+        while self.temporal_log.len() <= self.cycle as usize {
+            self.temporal_log.push(crate::temporal::State::default());
+        }
+    }
+
+    /// Evaluate a temporal expression's propositions (`true(exp)` —
+    /// `TRUE` or non-zero numeric, 12.1.1.1) and numeric repeat bounds
+    /// once, with current field values. The results key the callback
+    /// set the engine sees (by expression identity — the engine passes
+    /// back the very references collected here); the interpreter keeps
+    /// no per-cycle value history, so this is the honest approximation
+    /// for propositions spanning several states.
+    fn evaluate_temporal_exprs<'te>(
+        &mut self,
+        te: &'te crate::ast::TemporalExpr,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> TemporalValues<'te> {
+        let mut propositions = Vec::new();
+        let mut bounds = Vec::new();
+        crate::temporal::collect_exprs(te, &mut propositions, &mut bounds);
+        let booleans = propositions
+            .into_iter()
+            .map(|expr| {
+                let value = match self.eval(expr, frame, me) {
+                    Ok(Value::Bool(value)) => Some(value),
+                    Ok(Value::Int(value)) => Some(value != 0),
+                    _ => None,
+                };
+                (expr, value)
+            })
+            .collect();
+        let numerics = bounds
+            .into_iter()
+            .map(|expr| {
+                let value = match self.eval(expr, frame, me) {
+                    Ok(Value::Int(value)) => Some(value),
+                    _ => None,
+                };
+                (expr, value)
+            })
+            .collect();
+        (booleans, numerics)
     }
 
     /// The instance whose `on` blocks an emitted event triggers: the

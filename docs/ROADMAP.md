@@ -71,13 +71,16 @@
       yield, `and`/`or`/`not`/`fail`/`eventually`, `[n]*`/`~[l..h]*`/
       `[l..h]*` repeats, and the `te @event` sampling operator;
       `detach`/`delay`/`exec` report `E0120`) with the `else` failure
-      body parsed as ordinary actions. The temporal-engine core
+      body parsed as ordinary actions, and temporal `wait` statements
+      parse the same grammar (13.1.3, including the readability-only
+      `until`). The temporal-engine core
       (`src/temporal.rs`) propagates the sampling event to sampled
       normal form (12.1.4) and evaluates tight satisfaction (12.1.1.2)
       and last-point success (12.1.1.12) over explicit finite paths
-      (12.3) through caller-supplied expression callbacks — without a
-      simulation clock, which is the interpreter's wait/event scheduler
-      integration, a later milestone. `select { weight : choice; .. }`
+      (12.3) through caller-supplied expression callbacks — the
+      interpreter drives it over the run's event log (see M3); a
+      simulation clock with TCM suspension is a later milestone.
+      `select { weight : choice; .. }`
       distribution
       expressions (clause 10) parse — weights structurally, choices
       verbatim — and the rejection sampler treats select constraints as
@@ -94,9 +97,10 @@
       match-expression interpretation and expansion
       (clause 15.4–15.5), the coverage data model and reports
       (clause 14 options, buckets, grades), the clause 12 temporal
-      engine's simulation integration — the pure core exists
-      (`src/temporal.rs`); `wait`/`emit`/expect monitoring over the
-      run loop is not wired — `detach`/`delay`/`exec` TEs, select
+      engine's remaining simulation integration — the run loop drives
+      waits and expect monitoring over the event log; TCM suspension
+      (`@`-triggered methods), `sync`, and `@sim` sampling are not
+      wired — `detach`/`delay`/`exec` TEs, select
       distribution biasing in the sampler, `$1`-`$27` match captures,
       `#define` replacement rules, `#else`)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness
@@ -167,8 +171,17 @@
       and `wait` advances a virtual cycle counter under a fixed budget
       (`E0409`). No `@sim` sampling, no TCM suspension, and `wait` does
       not advance the HDL simulator. The clause 12 temporal-engine core
-      (`src/temporal.rs`) evaluates sampled normal forms over explicit
-      finite paths — it is not yet driven by the run loop
+      (`src/temporal.rs`) is driven by the run loop's event log: `emit`
+      records occurrences in per-cycle states, temporal `wait`s
+      (`@event`, sequences, propositions, event repeats, with 13.1.3's
+      readability-only `until`) suspend until the expression succeeds
+      or the budget guard reports `E0409`, and `expect`/`assume` rules
+      (elaborated per type) are checked at quit per 12.3.2 — a failed
+      rule runs its `else` body (or prints the failure when there is
+      none) as a check error. One global timeline, and propositions
+      evaluate with current field values (no per-cycle value history);
+      TCM suspension and per-instance timelines are the next temporal
+      milestones
 - [ ] Coverage data model and reports
 
 ## M4 — Simulator integration

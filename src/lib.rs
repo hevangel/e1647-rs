@@ -8,9 +8,10 @@
 //! ([`elab`]), and an interpreter that executes the non-temporal statement
 //! subset, including `gen` as a seeded rejection sampler ([`interp`]).
 //! The clause 12 temporal-engine core evaluates sampled normal forms
-//! over explicit finite paths ([`temporal`]); wiring it to the run loop
-//! is a later milestone. See docs/ROADMAP.md for what is deliberately
-//! not implemented yet.
+//! over explicit finite paths ([`temporal`]), and the run loop drives
+//! it: an event log fed by `emit`, suspending temporal `wait`s, and
+//! quit-time `expect`/`assume` monitoring. See docs/ROADMAP.md for
+//! what is deliberately not implemented yet.
 
 pub mod ast;
 pub mod builtins;

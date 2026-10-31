@@ -3164,35 +3164,101 @@ impl Parser {
     }
 
     /// `wait cycle;` / `wait [n];` / `wait [n] * cycle;` — normalized to
-    /// a cycle-count expression. In this v1 kernel time units and cycles
+    /// a cycle-count expression — and the temporal forms `wait <te>;`
+    /// (clause 13.1.3: `@event`, sequences, proposition waits, repeats
+    /// over non-cycle TEs; the optional `until` word is readability
+    /// only, 13.1.3's NOTE). In this v1 kernel time units and cycles
     /// advance the same counter (documented in the interpreter).
     fn parse_wait_statement(&mut self) -> Option<Stmt> {
         let start = self.current_span().0;
         self.bump(); // 'wait'
-        let cycles = if self.eat_keyword("cycle") {
-            Expr::IntLiteral {
-                text: "1".to_owned(),
-                span: (start, self.last_end()),
+        if self.eat_keyword("until") {
+            // `until` is readability-only (13.1.3's NOTE): a temporal
+            // expression after it is the wait's TE; a plain expression
+            // keeps the v1 check-syntax-and-advance-one behavior.
+            if self.at_temporal_wait_start() {
+                return self.finish_temporal_wait(start);
             }
-        } else if self.eat_keyword("until") {
-            // `wait until <expr>` samples a temporal condition; edge
-            // sampling is a later milestone, so the condition is checked
-            // for syntax and the wait advances one cycle for now.
             self.parse_expr()?;
-            Expr::IntLiteral {
+            let cycles = Expr::IntLiteral {
                 text: "1".to_owned(),
                 span: (start, self.last_end()),
+            };
+            return self.finish_numeric_wait(start, cycles);
+        }
+        if self.eat_keyword("cycle") {
+            let cycles = Expr::IntLiteral {
+                text: "1".to_owned(),
+                span: (start, self.last_end()),
+            };
+            return self.finish_numeric_wait(start, cycles);
+        }
+        if self.at_temporal_wait_start() {
+            return self.finish_temporal_wait(start);
+        }
+        if self.at_punct("[") {
+            // `wait [n];` / `wait [n]*cycle;` stay the plain numeric
+            // wait; a `..` range or a multiplier over a non-cycle TE is
+            // a temporal wait (12.2.9–12.2.11).
+            let ranged =
+                matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == ".");
+            if !ranged {
+                self.bump(); // '['
+                let count = self.parse_expr()?;
+                self.expect_punct("]", "E0107", "expected ']' to close the wait count")?;
+                if self.at_punct("*") {
+                    self.bump(); // '*'
+                    if !self.eat_keyword("cycle") {
+                        let inner = self.parse_te_prefix()?;
+                        let end = self.last_end();
+                        let te = crate::ast::TemporalExpr::Repeat {
+                            kind: crate::ast::RepeatKind::Fixed,
+                            low: Some(count),
+                            high: None,
+                            te: Box::new(inner),
+                        };
+                        self.expect_stmt_semi("expected ';' after 'wait'")?;
+                        return Some(Stmt::WaitTemporal {
+                            te,
+                            span: (start, end),
+                        });
+                    }
+                }
+                return self.finish_numeric_wait(start, count);
             }
-        } else {
-            self.expect_punct("[", "E0106", "expected 'cycle' or '[n]' after 'wait'")?;
-            let count = self.parse_expr()?;
-            self.expect_punct("]", "E0107", "expected ']' to close the wait count")?;
-            if self.eat_punct("*") && !self.eat_keyword("cycle") {
-                self.error_here("E0113", "expected 'cycle' after the wait multiplier");
-                return None;
-            }
-            count
-        };
+            return self.finish_temporal_wait(start);
+        }
+        self.expect_punct("[", "E0106", "expected 'cycle' or '[n]' after 'wait'")?;
+        let count = self.parse_expr()?;
+        self.finish_numeric_wait(start, count)
+    }
+
+    /// Whether the next token can begin a temporal expression in wait
+    /// position (13.1.3): an event atom, a brace sequence, a tilde
+    /// repeat, a prefixed operator or a temporal routine.
+    fn at_temporal_wait_start(&self) -> bool {
+        if self.at_punct("@") || self.at_punct("{") || self.at_punct("~") {
+            return true;
+        }
+        matches!(
+            self.peek_word(),
+            Some("true" | "change" | "rise" | "fall" | "not" | "fail" | "eventually")
+        )
+    }
+
+    /// Close a temporal wait: the TE is already parsed.
+    fn finish_temporal_wait(&mut self, start: crate::lexer::Position) -> Option<Stmt> {
+        let te = self.parse_temporal_expr()?;
+        self.expect_stmt_semi("expected ';' after 'wait'")?;
+        let end = self.last_end();
+        Some(Stmt::WaitTemporal {
+            te,
+            span: (start, end),
+        })
+    }
+
+    /// Close a numeric wait with the given count expression.
+    fn finish_numeric_wait(&mut self, start: crate::lexer::Position, cycles: Expr) -> Option<Stmt> {
         self.expect_stmt_semi("expected ';' after 'wait'")?;
         let end = self.last_end();
         Some(Stmt::Wait {
