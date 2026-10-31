@@ -83,6 +83,10 @@ pub enum Member {
     /// recorded, not collected: the coverage data model is a later
     /// milestone.
     Cover(CoverGroupDecl),
+    /// An `expect`/`assume` temporal property (clause 11.4) — recorded
+    /// uninterpreted: the temporal-expression grammar (clause 12) and
+    /// the evaluation engine are later milestones.
+    Expect(ExpectDecl),
     /// `import a, b;` — recorded; no cross-file resolution yet.
     Import {
         names: Vec<String>,
@@ -319,6 +323,29 @@ pub enum CoverItemKind {
     Item,
     Cross,
     Transition,
+}
+
+/// An `expect`/`assume` struct member (clause 11.4): the temporal
+/// expression is recorded as raw tokens (clause 12's grammar is a later
+/// milestone), and the `else` failure body parses as ordinary actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectDecl {
+    /// `expect` or `assume` — simulation tools treat them alike; formal
+    /// tools read them differently.
+    pub kind: ExpectKind,
+    /// The temporal expression as written, without the leading keyword
+    /// and without the `else` clause.
+    pub te: Vec<crate::lexer::Token>,
+    /// The `else` failure body (usually a `dut_error` call); empty when
+    /// absent — the default failure reports the rule name.
+    pub else_body: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectKind {
+    Expect,
+    Assume,
 }
 
 /// One enumerand of a `type` declaration, with its optional explicit value.

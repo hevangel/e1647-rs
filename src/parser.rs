@@ -41,6 +41,8 @@
 //! - `E0117` unsupported or misplaced preprocessor directive (clause 21)
 //! - `E0118` expected the match expression string of a macro definition
 //!   (clause 15)
+//! - `E0119` expected the temporal expression of an `expect`/`assume`
+//!   member (clause 11.4)
 //! - `E0201` duplicate declaration name
 //! - `E0202` duplicate field name
 //! - `E0203` unknown type name
@@ -1190,6 +1192,9 @@ impl Parser {
             Some(TokenKind::Keyword(k)) if k == "cover" => {
                 self.parse_cover_group().map(|c| vec![Member::Cover(c)])
             }
+            Some(TokenKind::Keyword(k)) if k == "expect" || k == "assume" => {
+                self.parse_expect().map(|e| vec![Member::Expect(e)])
+            }
             Some(TokenKind::Punctuation(p)) if p == "#" => self.parse_hash_members(),
             // The explicit `method name() …` spelling; the bare
             // `name() …` init style is handled by the identifier arm.
@@ -1490,6 +1495,71 @@ impl Parser {
             is_also,
             items,
             options,
+            span: (start, end),
+        })
+    }
+
+    /// `expect <temporal-expression> [else <failure body>];` and the
+    /// `assume` twin (clause 11.4). The temporal expression is recorded
+    /// as raw tokens up to the `else` keyword at brace depth zero — the
+    /// clause 12 grammar (TE operators, sequences, ports) is a later
+    /// milestone. The failure body parses as ordinary actions.
+    fn parse_expect(&mut self) -> Option<crate::ast::ExpectDecl> {
+        let start = self.current_span().0;
+        let kind = match self.peek_kind() {
+            Some(TokenKind::Keyword(k)) if k == "expect" => crate::ast::ExpectKind::Expect,
+            _ => crate::ast::ExpectKind::Assume,
+        };
+        self.bump(); // 'expect' / 'assume'
+        let mut te = Vec::new();
+        let mut depth = 0usize;
+        loop {
+            match self.peek() {
+                None => break,
+                Some(token) => match &token.kind {
+                    TokenKind::Keyword(k) if k == "else" && depth == 0 => break,
+                    // A top-level `;` ends the member (sequences carry
+                    // theirs inside braces, at depth >= 1).
+                    TokenKind::Punctuation(p) if p == ";" && depth == 0 => break,
+                    TokenKind::Punctuation(p) if p == "{" => {
+                        depth += 1;
+                        te.push(self.bump());
+                    }
+                    TokenKind::Punctuation(p) if p == "}" => {
+                        depth = depth.saturating_sub(1);
+                        te.push(self.bump());
+                    }
+                    _ => te.push(self.bump()),
+                },
+            }
+        }
+        if te.is_empty() {
+            self.error_here("E0119", "expected the temporal expression");
+            self.recover_to_member_boundary();
+            return None;
+        }
+        let mut else_body = Vec::new();
+        // The one-statement else form consumes its own terminator; the
+        // member-level `;` then only applies to the braced/no-else
+        // forms.
+        let mut semi_consumed_by_else = false;
+        if self.eat_keyword("else") {
+            if self.eat_punct("{") {
+                else_body = self.parse_statements();
+                self.expect_punct("}", "E0107", "expected '}' to close the 'else' body")?;
+            } else if let Some(statement) = self.parse_statement() {
+                else_body.push(statement);
+                semi_consumed_by_else = true;
+            }
+        }
+        if !semi_consumed_by_else {
+            self.expect_stmt_semi("expected ';' after the expect member")?;
+        }
+        let end = self.last_end();
+        Some(crate::ast::ExpectDecl {
+            kind,
+            te,
+            else_body,
             span: (start, end),
         })
     }

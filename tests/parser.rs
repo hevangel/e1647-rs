@@ -1280,3 +1280,69 @@ fn is_a_binds_the_matched_value() {
     };
     assert_eq!(binding.as_deref(), Some("cp"));
 }
+
+#[test]
+fn expect_and_assume_members_record_te_and_else() {
+    // Clause 11.4: the temporal expression is recorded as raw tokens —
+    // the clause 12 grammar is a later milestone — and the `else`
+    // failure body parses as ordinary actions, in both the one-statement
+    // and the braced form.
+    let declarations = expect_clean(
+        "extend sys {\n    event enter_exec_st is @sys.any;\n    \
+         expect @enter_exec_st => {@fetch1_assert} @sys.any else\n        \
+         dut_error(\"PROTOCOL ERROR\");\n    \
+         assume @enter_exec_st => {@fetch1_assert} @sys.any else {\n            \
+         dut_error(\"ASSUMPTION\");\n        };\n};\n",
+    );
+    let Member::Expect(expect) = &declarations[0].members[1] else {
+        panic!("expected an expect member");
+    };
+    assert_eq!(expect.kind, e1647::ast::ExpectKind::Expect);
+    let te_texts: Vec<String> = expect
+        .te
+        .iter()
+        .map(|token| match &token.kind {
+            e1647::lexer::TokenKind::Identifier(word) => word.clone(),
+            e1647::lexer::TokenKind::Keyword(word) => word.clone(),
+            e1647::lexer::TokenKind::Punctuation(p) => p.clone(),
+            _ => "?".to_owned(),
+        })
+        .collect();
+    assert!(te_texts.contains(&"@".to_owned()));
+    assert!(te_texts.contains(&"enter_exec_st".to_owned()));
+    assert!(te_texts.contains(&"=>".to_owned()));
+    assert!(
+        !te_texts.contains(&"else".to_owned()),
+        "the else keyword ends the recorded expression"
+    );
+    assert_eq!(expect.else_body.len(), 1);
+    let Member::Expect(assumption) = &declarations[0].members[2] else {
+        panic!("expected an assume member");
+    };
+    assert_eq!(assumption.kind, e1647::ast::ExpectKind::Assume);
+    assert_eq!(assumption.else_body.len(), 1);
+}
+
+#[test]
+fn expect_without_else_and_missing_te_report() {
+    // The `else` clause is optional; an empty temporal expression is
+    // rejected with its own code.
+    let declarations = expect_clean("extend sys {\n    ev: event;\n    expect @ev;\n};\n");
+    let Member::Expect(expect) = &declarations[0].members[1] else {
+        panic!("expected an expect member");
+    };
+    assert!(expect.else_body.is_empty());
+    let result = parse("extend sys {\n    expect;\n};\n");
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.render().contains("E0119")),
+        "expected E0119 for the missing temporal expression: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}

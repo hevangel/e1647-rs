@@ -74,7 +74,10 @@ multi-simulator HDL API, and wasm32.
   Clause 14 coverage groups (`cover <event> is [also] { .. };`, `is
   empty;`) record their item/cross/transition entries structurally and
   every option clause verbatim — nothing is collected at run time.
-  Predefined non-scalar types `file` and `event` are accepted in type
+  Clause 11.4 `expect`/`assume` members record the temporal expression
+  as raw tokens (the clause 12 grammar is a later milestone) with the
+  `else` failure body parsed as actions. Predefined non-scalar types
+  `file` and `event` are accepted in type
   positions; `for each <type> (v) in list` records the element type
   filter. `package`/`private` member prefixes are recorded on fields.
   Diagnostics
@@ -141,8 +144,9 @@ integers), an event scheduler
 and time-consuming-method suspension, the coverage data model and
 reports (clause 14 groups are recorded, not collected), integer width
 truncation, evaluation of MVL literals, `repeat`, single-statement
-`if ... do`, `expect`/`assume` and the temporal-expression grammar
-(clause 12), `on event-port`, `#else` and `#define` replacement
+`if ... do`, the temporal-expression grammar and evaluation
+(clause 12; `expect`/`assume` members are recorded only), `on
+event-port`, `#else` and `#define` replacement
 rules, template instantiation and `template extend` (clause 8.2–8.3),
 macro match-expression
 interpretation and expansion (clause 15.4–15.5), a multi-simulator HDL
