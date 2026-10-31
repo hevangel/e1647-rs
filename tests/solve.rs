@@ -115,6 +115,69 @@ fn translate_splits_conjunctions() {
 }
 
 #[test]
+fn translate_range_membership_into_two_comparisons() {
+    let exprs = parse_exprs("a in [1..100]");
+    let problem = translate(&exprs, &bounds_from(&[("a", (0, 255))])).expect("translatable");
+    let e1647::solve::BoolNode::All(atoms) = &problem.constraints[0] else {
+        panic!("expected the range to translate as a conjunction");
+    };
+    assert_eq!(atoms.len(), 2);
+    let e1647::solve::BoolNode::Atom(low) = &atoms[0] else {
+        panic!("expected the lower bound atom");
+    };
+    // a >= 1
+    assert_eq!(low.terms, vec![("a".to_string(), 1)]);
+    assert_eq!(low.rhs, 1);
+    assert_eq!(low.cmp, e1647::solve::Cmp::Ge);
+    let e1647::solve::BoolNode::Atom(high) = &atoms[1] else {
+        panic!("expected the upper bound atom");
+    };
+    // a <= 100
+    assert_eq!(high.terms, vec![("a".to_string(), 1)]);
+    assert_eq!(high.rhs, 100);
+    assert_eq!(high.cmp, e1647::solve::Cmp::Le);
+}
+
+#[test]
+fn translate_item_membership_is_unsupported() {
+    // Item-list membership needs a disjunction; the IR has none yet and
+    // the caller falls back to the evaluation-based rejection sampler.
+    let exprs = parse_exprs("a in [1, 5, 9]");
+    let error = translate(&exprs, &bounds_from(&[("a", (0, 255))])).expect_err("unsupported");
+    assert_eq!(
+        error,
+        TranslationError::Unsupported("set membership over an item list")
+    );
+}
+
+#[test]
+fn translate_range_with_expression_bounds() {
+    // The bounds go through the same affine translation as comparisons.
+    let exprs = parse_exprs("a in [2*2..a_max - 1]");
+    let problem = translate(&exprs, &bounds_from(&[("a", (0, 50)), ("a_max", (0, 50))]))
+        .expect("translatable");
+    let e1647::solve::BoolNode::All(atoms) = &problem.constraints[0] else {
+        panic!("expected the range to translate as a conjunction");
+    };
+    let e1647::solve::BoolNode::Atom(low) = &atoms[0] else {
+        panic!("expected the lower bound atom");
+    };
+    // a >= 4
+    assert_eq!(low.rhs, 4);
+    assert_eq!(low.cmp, e1647::solve::Cmp::Ge);
+    let e1647::solve::BoolNode::Atom(high) = &atoms[1] else {
+        panic!("expected the upper bound atom");
+    };
+    // a - a_max <= -1  ⟺  a <= a_max - 1
+    assert_eq!(
+        high.terms,
+        vec![("a".to_string(), 1), ("a_max".to_string(), -1)]
+    );
+    assert_eq!(high.rhs, -1);
+    assert_eq!(high.cmp, e1647::solve::Cmp::Le);
+}
+
+#[test]
 fn translate_rejects_unsupported_shapes() {
     let bounds = bounds_from(&[("a", (0, 10))]);
     // Disjunction.

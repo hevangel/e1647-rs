@@ -47,6 +47,7 @@ use crate::ast::{
 use crate::diagnostic::Diagnostic;
 use crate::elab::Elaborated;
 use crate::lexer::Position;
+use std::collections::BTreeMap;
 
 /// Outcome of one run: the text produced by `out`/`print` and any run-time
 /// diagnostics.
@@ -957,6 +958,9 @@ impl<'a> Interp<'a> {
             .filter(|constraint| !constraint.is_bind)
             .map(|constraint| constraint.expr.clone())
             .collect();
+        // Simple range/equality constraints narrow the per-field sampling
+        // domains; everything else is enforced by the rejection predicate.
+        let domains = self.constraint_domains(&constraints);
         // Solver-backed path (feature `solver-pumpkin`): the integer
         // scalar fields are solved, the remaining fields are sampled.
         #[cfg(feature = "solver-pumpkin")]
@@ -978,7 +982,10 @@ impl<'a> Interp<'a> {
         }
         for _ in 0..1000 {
             for (name, field_ty) in &field_types {
-                let value = self.sample_type(field_ty)?;
+                let value = match domains.get(name) {
+                    Some(domain) => self.sample_int_in(field_ty, *domain),
+                    None => self.sample_type(field_ty)?,
+                };
                 self.instances[index].set(name, value);
                 // A `keep list.size() == N` constraint drives the list
                 // length: fill the sampled (empty) list with generated
@@ -1075,6 +1082,112 @@ impl<'a> Interp<'a> {
             )),
             crate::solve::SolveOutcome::Unsupported => Ok(None),
         }
+    }
+
+    /// Per-field sampling domains implied by the constraint list's simple
+    /// shapes: `f in [lo..hi]` and `f == c` (either orientation), where
+    /// the bounds evaluate to integer constants without an instance
+    /// context. Conjuncts contribute independently; everything else —
+    /// soft shapes included, which the rejection predicate enforces
+    /// as written — leaves the field's domain untouched. An empty
+    /// intersection is left as-is: sampling then uses the declared
+    /// bounds and the predicate fails the attempt (E0407), which is the
+    /// honest outcome for contradictory constraints.
+    fn constraint_domains(&mut self, constraints: &[Expr]) -> BTreeMap<String, (i128, i128)> {
+        let mut domains = BTreeMap::new();
+        for constraint in constraints {
+            self.collect_domain_leaves(constraint, &mut domains);
+        }
+        domains
+    }
+
+    fn collect_domain_leaves(&mut self, expr: &Expr, domains: &mut BTreeMap<String, (i128, i128)>) {
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::LogicalAnd,
+                lhs,
+                rhs,
+                ..
+            } => {
+                self.collect_domain_leaves(lhs, domains);
+                self.collect_domain_leaves(rhs, domains);
+            }
+            Expr::Paren { expr: inner, .. } => self.collect_domain_leaves(inner, domains),
+            Expr::InSet {
+                element,
+                set: crate::ast::InSetExpr::Range(low, high),
+                ..
+            } => {
+                if let Expr::Ident { name, .. } = element.as_ref()
+                    && let (Some(low), Some(high)) =
+                        (self.const_int_eval(low), self.const_int_eval(high))
+                {
+                    intersect_domain(domains, name, (low, high));
+                }
+            }
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs,
+                rhs,
+                ..
+            } => {
+                for (side, other) in [(lhs, rhs), (rhs, lhs)] {
+                    if let Expr::Ident { name, .. } = side.as_ref()
+                        && let Some(value) = self.const_int_eval(other)
+                    {
+                        intersect_domain(domains, name, (value, value));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Evaluate an expression expected to be an instance-independent
+    /// integer constant (`2*K`, `100`); `None` on anything else.
+    fn const_int_eval(&mut self, expr: &Expr) -> Option<i128> {
+        match self.eval(expr, &mut Frame::default(), None) {
+            Ok(Value::Int(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Sample an integer-valued scalar inside the declared bounds
+    /// intersected with `domain`. A contradictory domain falls back to
+    /// the natural sampling (the rejection predicate then fails the
+    /// attempt); booleans, reals, strings and time are not domain-sampled.
+    fn sample_int_in(&mut self, ty: &TypeExpr, domain: (i128, i128)) -> Value {
+        let TypeExpr::Scalar { base, width, .. } = ty else {
+            // Callers only pass integer scalar fields; anything else
+            // samples structurally.
+            return self.sample_type(ty).unwrap_or(Value::Void);
+        };
+        let natural = match base {
+            ScalarBase::Uint => {
+                let bits = width_bits(width, 32);
+                Some((0i128, (1i128 << bits) - 1))
+            }
+            ScalarBase::Int => {
+                let bits = width_bits(width, 32);
+                Some((-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1))
+            }
+            ScalarBase::Bit => Some((0, 1)),
+            ScalarBase::Byte => Some((0, 255)),
+            ScalarBase::Nibble => Some((0, 15)),
+            ScalarBase::Bool | ScalarBase::Real | ScalarBase::String | ScalarBase::Time => None,
+        };
+        let Some((natural_low, natural_high)) = natural else {
+            return self.sample_type(ty).unwrap_or(Value::Void);
+        };
+        let low = natural_low.max(domain.0);
+        let high = natural_high.min(domain.1);
+        if low > high {
+            return self.sample_type(ty).unwrap_or(Value::Void);
+        }
+        if low == high {
+            return Value::Int(low);
+        }
+        Value::Int(low + self.rng.below((high - low + 1) as u128) as i128)
     }
 
     /// Sample one value of the declared type within its bounds. Struct
@@ -2423,6 +2536,21 @@ fn width_bits(width: &Option<Box<Expr>>, default_bits: u32) -> u32 {
             .unwrap_or(default_bits),
         _ => default_bits,
     }
+}
+
+/// Narrow a field's sampling domain to the intersection with one more
+/// constraint shape's bounds. Unbounded so far means the full integer
+/// range.
+fn intersect_domain(
+    domains: &mut BTreeMap<String, (i128, i128)>,
+    name: &str,
+    bounds: (i128, i128),
+) {
+    let entry = domains
+        .entry(name.to_owned())
+        .or_insert((i128::MIN, i128::MAX));
+    entry.0 = entry.0.max(bounds.0);
+    entry.1 = entry.1.min(bounds.1);
 }
 
 /// Integer view of a value for the `hdl_*` routines: integers pass
