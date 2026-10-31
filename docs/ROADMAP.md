@@ -56,7 +56,15 @@
       (`list (key:it) of t`) are recorded in type positions;
       instantiation (monomorphization, clause 8.3) is a later milestone,
       and `new [<type>] [with { .. }]` parses but evaluates to an
-      explicit not-supported diagnostic.
+      explicit not-supported diagnostic. Coverage groups (clause 14.1)
+      parse and are recorded, not collected: `cover <event> is [also]
+      { item/cross/transition entries; option entries }` and `cover
+      <event> is empty;` — item types and sampled expressions are
+      structural, every `using` option clause and group option entry is
+      recorded verbatim; the coverage data model is a later milestone.
+      Predefined non-scalar types `file` and `event` are accepted in
+      type positions; `for each <type> (v) in list` records the element
+      type filter.
       Preprocessor directives (clause 21): `#ifdef` / `#ifndef` /
       `#define` / `#undef` in statement, struct-member and action
       positions with flag semantics — `#define` records the flag but
@@ -67,8 +75,10 @@
       `repeat`, single-statement `if ... do`, template instantiation
       (clause 8.3), template `extend` (clause 8.2), macro
       match-expression interpretation and expansion
-      (clause 15.4–15.5), coverage, `$1`-`$27` match captures,
-      `#define` replacement rules, `#else`)
+      (clause 15.4–15.5), the coverage data model and reports
+      (clause 14 options, buckets, grades), `expect`/`assume` members
+      (clause 11.4, needs the clause 12 temporal-expression grammar),
+      `$1`-`$27` match captures, `#define` replacement rules, `#else`)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness
       checks only (duplicate declaration/field names, duplicate
       parameters/local variables/enumerals, unknown named/`like`/`extend`

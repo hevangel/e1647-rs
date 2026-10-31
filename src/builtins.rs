@@ -58,6 +58,14 @@ pub fn is_builtin_base(name: &str) -> bool {
     BUILTIN_BASES.contains(&name)
 }
 
+/// Predeclared value types usable in type positions without a
+/// declaration in the source file (`var f: file`, `ev: event;`).
+pub const BUILTIN_TYPES: &[&str] = &["file", "event"];
+
+pub fn is_builtin_type(name: &str) -> bool {
+    BUILTIN_TYPES.contains(&name)
+}
+
 pub fn is_builtin_routine(name: &str) -> bool {
     BUILTIN_ROUTINES.contains(&name)
 }

@@ -580,6 +580,7 @@ impl<'a> Interp<'a> {
             }
             Stmt::ForEach {
                 var,
+                type_filter,
                 index_var,
                 using,
                 reversed,
@@ -587,6 +588,8 @@ impl<'a> Interp<'a> {
                 body,
                 span,
             } => {
+                // The element type filter is recorded, not enforced.
+                let _ = type_filter;
                 let _ = using;
                 let list_value = self.eval(list, frame, me)?;
                 match list_value {

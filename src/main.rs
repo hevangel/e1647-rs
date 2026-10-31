@@ -263,6 +263,18 @@ fn print_members(members: &[e1647::ast::Member], indent: &str) {
             Member::Field(field) => {
                 println!("{indent}field {}: {}", field.name, render_type(&field.ty));
             }
+            Member::Cover(cover) => {
+                println!(
+                    "{indent}cover {} ({} items, line {})",
+                    if cover.name.is_empty() {
+                        "<expr>"
+                    } else {
+                        &cover.name
+                    },
+                    cover.items.len(),
+                    cover.span.0.line
+                );
+            }
             Member::Port(port) => {
                 let direction = match port.direction {
                     PortDirection::In => "in",

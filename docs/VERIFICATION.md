@@ -1281,3 +1281,64 @@ formal-and-keyed-list type shapes, is-a bindings;
 `tests/interp.rs` `down to` counting, reverse for-each with index
 binding, is-a binding visibility, untyped parameters with `compute`
 inline calls, and the explicit `E0402` for `new`.
+
+## 2026-10-31 (21) — offline arc: clause 14 coverage groups recorded; cover-edges and golden parse surfaces
+
+Scope claimed for this change (nothing broader):
+
+- Clause 14.1 coverage groups parse and are recorded, **not collected**:
+  `cover <event> is [also] { ... };` and `cover <event> is empty;`.
+  Items parse structurally — `item name [: type] [= expr] [using ...];`
+  with the optional declared type and sampled expression — plus
+  `cross a, b;` and `transition f;` entries; every `using` option
+  clause (brace-aware: inner `range(...);` semicolons stay inside the
+  capture) and every group-level option entry (`per_instance = TRUE;`)
+  is recorded verbatim. The `is also` extension form (clause 14.5) is
+  recorded. Nothing is collected at run time: `emit` of a sampling
+  event behaves exactly as before; the coverage data model (options,
+  buckets, grades, reports) is a later milestone.
+- Predefined non-scalar types `file` and `event` are accepted in type
+  positions (`var f: file`, `ev: event;`) via a `BUILTIN_TYPES` list in
+  `builtins.rs`, checked like declared names; `for each <type> (v) in
+  list` records the element type filter (not enforced); stray empty
+  statements (`;;`) are tolerated in statement lists.
+
+Corpus adaptations (gitignored `local/` only, recorded per the ledger
+discipline): cover-edges.e line 136 `'>File name : ...` split into the
+end-code marker plus a prose line — clause 4.1.2 requires **both**
+markers to have no other text on the line, so the lexer was right and
+the file was non-conforming; golden-combined{,-imports}.e's
+`extend global { setup_test() ... }` — the Specman runtime's own system
+hook concatenated into the tutorial extract — re-pointed at `sys` with
+a comment (clause 4.3.1.1 reserves `extend global` for the runtime; our
+interp never calls the hook).
+
+Corpus movement (absolute paths, `--seed 1`): cover-edges 1 lexical +
+13 semantic parse diagnostics → **4**, all `E0203` for the Specman
+reflection library's own types (`rf_struct`, `rf_type`, `rf_field`) —
+a missing external dependency, same class as etl's `base_struct`;
+golden-combined ~20 → **2** (the one `expect` temporal member, clause
+11.4, which needs the clause 12 grammar — the next arc);
+golden-combined-imports → 3 missing tutorial-module `E0205`s plus the
+same `expect`. Unchanged elsewhere: etl 4, type-min-max 0,
+save-restart 0 (run clean), igen-dist 5, d6w 0.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(125 passed: 11 elab, 1 fixtures, 34 interp, 24 lexer, 46 parser, 9 solve)
+```
+
+New tests: `tests/parser.rs` cover-group recording (item kinds
+including cross/transition, typed and sampled items, brace-aware
+verbatim option captures, group option entries, `is also`, stray
+`;;`), typed for-each filters and `file`/`event` types; the stale
+`unsupported_member` fixture (whose example was `cover` itself) now
+pins `assert` members (clause 16), the remaining unsupported-member
+family.
