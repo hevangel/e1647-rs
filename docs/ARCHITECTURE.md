@@ -51,7 +51,16 @@ multi-simulator HDL API, and wasm32.
   unaffected. Error recovery is at declaration,
   member and statement boundaries. The statement subset includes braced `if`/`while`,
   `for each` and `for i from .. to`, `case`, `check that`, `wait`, `emit`,
-  `start`, sequence `do` and `stop_run`. Diagnostics are collected (codes
+  `start`, sequence `do` and `stop_run`. Struct members include `on`
+  event blocks (clause 11.2: dotted event path, action block; extension
+  is a repeated declaration), and the clause 21 preprocessor directives
+  `#ifdef` / `#ifndef` / `#define` / `#undef` in statement, struct-member
+  and action positions — flag semantics only: `#define` records the name
+  (the replacement text is consumed, not substituted; clause 21.3's
+  replacement rules are a later milestone), excluded `#ifdef`/`#ifndef`
+  branches are skipped without parsing, `#else` is not parsed, and the
+  conditional forms are rejected at module level (`E0117`). Diagnostics
+  are collected (codes
   `E01xx` syntax, `E02xx` well-formedness; see the module documentation)
   and the AST stays partial under errors.
 - `src/check.rs` — minimal well-formedness checks (duplicate
@@ -62,7 +71,8 @@ multi-simulator HDL API, and wasm32.
 - `src/elab.rs` — member composition: `like` chains and `extend` blocks fold
   into one composed member list per `struct`/`unit` (inheritance-cycle,
   cross-declaration duplicate-field and unmodified-method-redefinition
-  diagnostics; codes `E03xx`). Also records `simple_port` HDL paths and
+  diagnostics; codes `E03xx`). Also records `simple_port` HDL paths,
+  `on` members (base types first, extends in declaration order) and
   recovered `sequence` declarations. **Not** full elaboration: `when`
   subtypes are carried, not resolved; no type checking.
 - `src/builtins.rs` — predeclared names the executed subset relies on:
@@ -81,8 +91,10 @@ multi-simulator HDL API, and wasm32.
   constraint-solver backend
   when that compiles in, and rejection sampling otherwise. `start` runs
   the called method inline; `wait` advances a virtual cycle counter and
-  does not drive the simulator; `emit` records a firing and does not
-  schedule anything.
+  does not drive the simulator; `emit` records a firing and executes the
+  event's `on` action blocks inline, in composition order, on the
+  instance the event path resolves to (clause 11.2) — `@sim`-attached
+  events never fire.
 - `src/solve.rs` — constraint IR and the pluggable solver seam: the
   top-level `keep` constraints of one type translate (conservatively) into
   bounded-integer variables plus a conjunction of linear comparisons.

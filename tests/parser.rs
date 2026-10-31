@@ -965,3 +965,78 @@ fn file_level_define_and_import_still_form_the_global_pseudo_declaration() {
         .expect("expected the global pseudo-declaration");
     assert_eq!(pseudo.members.len(), 2);
 }
+
+#[test]
+fn on_member_parses_with_path_and_body() {
+    let declarations = expect_clean(
+        "unit env {\n    event reset_done;\n    on reset_done {\n        out(\"fired\");\n    };\n\
+         on driver.clock {\n        out(\"tick\");\n    };\n};\n",
+    );
+    let Member::On(first) = &declarations[0].members[1] else {
+        panic!("expected an on member");
+    };
+    assert_eq!(first.path, vec!["reset_done"]);
+    assert_eq!(first.body.len(), 1);
+    let Member::On(second) = &declarations[0].members[2] else {
+        panic!("expected an on member");
+    };
+    assert_eq!(second.path, vec!["driver", "clock"]);
+    assert_eq!(second.body.len(), 1);
+}
+
+#[test]
+fn hash_directives_include_and_exclude_at_member_level() {
+    // `#ifdef` of an undefined name is excluded ("ignore it", clause
+    // 21.2): garbage inside the braces must not produce diagnostics.
+    // `#define` registers the flag; the `#ifndef` then excludes and the
+    // following `#ifdef` includes a real member. `#undef` clears it.
+    let declarations = expect_clean(
+        "struct s {\n    \
+         #ifdef SAVE_THE_RUN {\n        this is not e at all !!!\n    };\n    \
+         #define SAVE_THE_RUN\n    \
+         #ifdef SAVE_THE_RUN {\n        saved: bool;\n    };\n    \
+         #ifndef SAVE_THE_RUN {\n        not_saved: bool;\n    };\n    \
+         #undef SAVE_THE_RUN;\n    \
+         x: uint;\n};\n",
+    );
+    // `saved` (included after the define) and `x`; the excluded branches
+    // contribute nothing.
+    assert_eq!(declarations.len(), 1);
+    assert_eq!(declarations[0].name, "s");
+    assert_eq!(declarations[0].members.len(), 2);
+}
+
+#[test]
+fn hash_directives_include_and_exclude_at_action_level() {
+    let declarations = expect_clean(
+        "extend sys {\n    run() is also {\n        #ifdef MISSING {\n            \
+         out(\"no\");\n        };\n        #ifndef MISSING {\n            out(\"yes\");\n        };\n\
+         #define MISSING\n        #ifdef MISSING {\n            out(\"flagged\");\n        };\n\
+         #undef MISSING\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    // Two branches include: `#ifndef MISSING` before the define and
+    // `#ifdef MISSING` after it; the excluded branches contribute none.
+    assert_eq!(run.body.len(), 2);
+}
+
+#[test]
+fn conditional_directive_at_file_level_is_rejected() {
+    // Clause 21.2 lists the conditional forms as statement, struct-member
+    // and action positions; the module level takes `#define`/`#undef`.
+    let result = parse("#ifdef FLAG {\nstruct s {\n    x: uint;\n};\n};\n");
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.render().contains("E0117")),
+        "expected E0117: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}

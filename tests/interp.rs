@@ -360,3 +360,31 @@ fn string_match_reports_unsupported_pattern_shapes() {
         result.diagnostics[0].render()
     );
 }
+
+#[test]
+fn emit_runs_on_blocks_in_declaration_order() {
+    // `emit` executes the event's `on` action blocks immediately, in
+    // composition order (clause 11.2), including through a dotted emit
+    // that resolves the owning instance and repeated `on` declarations.
+    let output = clean_output(
+        "unit env {\n    event reset_done;\n};\n\
+         extend sys {\n    env_i : env is instance;\n};\n\
+         extend env {\n    on reset_done {\n        out(\"one\\n\");\n    };\n    \
+         on reset_done {\n        out(\"two\\n\");\n    };\n};\n\
+         extend sys {\n    run() is also {\n        emit sys.env_i.reset_done;\n        \
+         out(\"after\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "one\ntwo\nafter\n");
+}
+
+#[test]
+fn emit_of_event_without_on_blocks_is_silent() {
+    let output = clean_output(
+        "unit env {\n    event reset_done;\n};\n\
+         extend sys {\n    env_i : env is instance;\n    run() is also {\n        \
+         emit sys.env_i.reset_done;\n        out(\"done\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "done\n");
+}

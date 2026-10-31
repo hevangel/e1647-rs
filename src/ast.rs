@@ -50,6 +50,8 @@ pub enum Member {
     Port(PortDecl),
     /// An `event` member.
     Event(EventDecl),
+    /// An `on <event-path> { actions };` struct member (clause 11.2).
+    On(OnDecl),
     /// `import a, b;` — recorded; no cross-file resolution yet.
     Import {
         names: Vec<String>,
@@ -197,6 +199,19 @@ pub enum MethodModifier {
     Also,
     First,
     Only,
+}
+
+/// An `on <event-path> { actions };` struct member (clause 11.2): the
+/// actions run when the named event fires, in written order. Extending an
+/// `on` member is a repeated declaration (the `is also` effect), so the
+/// composed list is ordered. The clause's restriction — no
+/// time-consuming actions or TCMs in the block — is not enforced here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnDecl {
+    /// The dotted event path (`reset_done`, `driver.clock`).
+    pub path: Vec<String>,
+    pub body: Vec<Stmt>,
+    pub span: Span,
 }
 
 /// One enumerand of a `type` declaration, with its optional explicit value.

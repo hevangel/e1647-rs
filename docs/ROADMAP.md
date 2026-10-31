@@ -24,9 +24,11 @@
       fields (name groups, `%` physical and `!` do-not-generate),
       scalar/list/named types, enumeral types, `keep`/`keep soft` and
       `keep bind`, `when` subtype members (`value'id` modifiers),
-      `simple_port`, `event` (trigger stored as written), `import`,
-      literal `define`, and `sequence ... using` (synthesized into a
-      type, a driver unit and a kind enum). Methods have parameter lists,
+      `simple_port`, `event` (trigger stored as written), `on` members
+      (clause 11.2: dotted event path and action block; extension is a
+      repeated declaration), `import`, literal `define`, and
+      `sequence ... using` (synthesized into a type, a driver unit and a
+      kind enum). Methods have parameter lists,
       optional `@event` TCM suffixes, and statement bodies: local `var`,
       assignment (including quoted HDL paths), calls, indexing, `return`,
       braced `if`/`else` (optional `then`), `while` with
@@ -36,12 +38,17 @@
       Table 12, including `is [not] a` (runtime check is exact-name or
       `like`-chain) and the `~` / `!~` string-match operators (runtime
       evaluation is the case-insensitive full-string literal subset;
-      meta-characters and `/.../` AWK patterns report `E0410`). Spanned
+      meta-characters and `/.../` AWK patterns report `E0410`).
+      Preprocessor directives (clause 21): `#ifdef` / `#ifndef` /
+      `#define` / `#undef` in statement, struct-member and action
+      positions with flag semantics — `#define` records the flag but
+      applies no text substitution, and `#else` is not parsed. Spanned
       diagnostics and declaration/member/statement-level recovery. The
       CLI resolves `import a.b` to `a/b.e` or `a.b.e` beside the source
       and checks the merged declarations (not yet: `when` elaboration,
-      `repeat`, single-statement `if ... do`, `on` blocks, `define as`
-      templates, coverage, `$1`-`$27` match captures)
+      `repeat`, single-statement `if ... do`, `define as`
+      templates, coverage, `$1`-`$27` match captures,
+      `#define` replacement rules, `#else`)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness
       checks only (duplicate declaration/field names, duplicate
       parameters/local variables/enumerals, unknown named/`like`/`extend`
@@ -61,6 +68,8 @@
       unmodified-method-redefinition diagnostics. `simple_port` members
       carry HDL paths taken from `hdl_path()` constraints, and
       `sequence` declarations are recovered into `Elaborated.sequences`.
+      `on` members compose through the same fold, base types first and
+      extends in declaration order.
       `when` subtypes are carried, not resolved; there is no type checking
 - [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer
@@ -96,7 +105,10 @@
       event-driven scheduling
 - [~] Events, temporal expressions and time-consuming methods — started
       as syntax plus an inline approximation: event triggers are stored,
-      `emit` records a firing, `start` calls the method synchronously,
+      `emit` records a firing and executes the event's `on` action
+      blocks inline, in composition order (clause 11.2; each block with a
+      fresh locals frame on the owning instance), `start` calls the
+      method synchronously,
       and `wait` advances a virtual cycle counter under a fixed budget
       (`E0409`). No `@sim` sampling, no TCM suspension, and `wait` does
       not advance the HDL simulator
