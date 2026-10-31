@@ -326,16 +326,16 @@ pub enum CoverItemKind {
 }
 
 /// An `expect`/`assume` struct member (clause 11.4): the temporal
-/// expression is recorded as raw tokens (clause 12's grammar is a later
-/// milestone), and the `else` failure body parses as ordinary actions.
+/// expression parses into the clause 12 grammar ([`TemporalExpr`]); the
+/// `else` failure body parses as ordinary actions. Evaluation needs the
+/// temporal engine — a later milestone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectDecl {
     /// `expect` or `assume` — simulation tools treat them alike; formal
     /// tools read them differently.
     pub kind: ExpectKind,
-    /// The temporal expression as written, without the leading keyword
-    /// and without the `else` clause.
-    pub te: Vec<crate::lexer::Token>,
+    /// The temporal expression.
+    pub te: TemporalExpr,
     /// The `else` failure body (usually a `dut_error` call); empty when
     /// absent — the default failure reports the rule name.
     pub else_body: Vec<Stmt>,
@@ -784,6 +784,73 @@ pub enum InSetExpr {
 pub struct SelectArm {
     pub weight: Expr,
     pub choice: Vec<crate::lexer::Token>,
+}
+
+/// A temporal expression (clause 12): the grammar behind `expect`/
+/// `assume` members. Structure only — sampling propagation (12.1.4) and
+/// evaluation over paths (12.3) are the temporal engine, a later
+/// milestone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemporalExpr {
+    /// `@event` — the unary event operator (12.2.4); dotted path, the
+    /// last segment may carry the HDL `$` suffix.
+    EventRef { path: Vec<String> },
+    /// `cycle` (12.2.2).
+    Cycle,
+    /// `true(exp)` — a proposition (12.2.3).
+    True { expr: Expr },
+    /// `change(exp)` / `rise(exp)` / `fall(exp)` edge samples (12.2.17).
+    EdgeSample { routine: EdgeRoutine, expr: Expr },
+    /// `{ a; b; .. }` sequence (12.2.8).
+    Sequence { items: Vec<TemporalExpr> },
+    /// `lhs => rhs` yield (12.2.13) — the expect-operator shape.
+    Yield {
+        lhs: Box<TemporalExpr>,
+        rhs: Box<TemporalExpr>,
+    },
+    /// `a and b` (12.2.6).
+    And(Box<TemporalExpr>, Box<TemporalExpr>),
+    /// `a or b` (12.2.7).
+    Or(Box<TemporalExpr>, Box<TemporalExpr>),
+    /// `not te` (12.2.16).
+    Not(Box<TemporalExpr>),
+    /// `fail te` (12.2.12).
+    Fail(Box<TemporalExpr>),
+    /// `eventually te` (12.2.14).
+    Eventually(Box<TemporalExpr>),
+    /// `[n]*te`, `~[l..h]*te`, `[l..h]*te` — fixed, true-match and
+    /// first-match repeats (12.2.9–12.2.11).
+    Repeat {
+        kind: RepeatKind,
+        low: Option<Expr>,
+        high: Option<Expr>,
+        te: Box<TemporalExpr>,
+    },
+    /// `te @event` — the binary sampling operator (12.2.5); the sampling
+    /// event applies to all sub-expressions.
+    Sampled {
+        te: Box<TemporalExpr>,
+        event: Box<TemporalExpr>,
+    },
+    /// `( te )` — grouping.
+    Group(Box<TemporalExpr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeRoutine {
+    Change,
+    Rise,
+    Fall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepeatKind {
+    /// `[n]` / `[n..n]` fixed repeat.
+    Fixed,
+    /// `~[l..h]` true-match repeat.
+    TrueMatch,
+    /// `[l..h]` first-match repeat (sequence items only).
+    FirstMatch,
 }
 
 impl Expr {

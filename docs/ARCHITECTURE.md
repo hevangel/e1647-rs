@@ -74,15 +74,19 @@ multi-simulator HDL API, and wasm32.
   Clause 14 coverage groups (`cover <event> is [also] { .. };`, `is
   empty;`) record their item/cross/transition entries structurally and
   every option clause verbatim — nothing is collected at run time.
-  Clause 11.4 `expect`/`assume` members record the temporal expression
-  as raw tokens (the clause 12 grammar is a later milestone) with the
-  `else` failure body parsed as actions. Clause 10 `select { weight :
-  choice; .. }` distributions parse — weights structurally, choices
-  verbatim — and the rejection sampler treats select constraints as
-  no-ops until the distribution arc. Predefined non-scalar types
-  `file` and `event` are accepted in type
-  positions; `for each <type> (v) in list` records the element type
-  filter. `package`/`private` member prefixes are recorded on fields.
+  Clause 11.4 `expect`/`assume` members parse their temporal
+  expressions into the clause 12 grammar (`TemporalExpr`: event atoms,
+  `cycle`, propositions and edge samples, `{;}` sequences, `=>` yield,
+  `and`/`or`/`not`/`fail`/`eventually`, repeats, and the binary
+  sampling `te @event`; `detach`/`delay`/`exec` report `E0120`) with
+  the `else` failure body parsed as actions — sampling propagation and
+  path evaluation are the temporal engine, a later milestone. Clause 10
+  `select { weight : choice; .. }` distributions parse — weights
+  structurally, choices verbatim — and the rejection sampler treats
+  select constraints as no-ops until the distribution arc. Predefined
+  non-scalar types `file` and `event` are accepted in type positions;
+  `for each <type> (v) in list` records the element type filter.
+  `package`/`private` member prefixes are recorded on fields.
   Diagnostics
   are collected (codes
   `E01xx` syntax, `E02xx` well-formedness; see the module documentation)
@@ -147,8 +151,9 @@ integers), an event scheduler
 and time-consuming-method suspension, the coverage data model and
 reports (clause 14 groups are recorded, not collected), integer width
 truncation, evaluation of MVL literals, `repeat`, single-statement
-`if ... do`, the temporal-expression grammar and evaluation
-(clause 12; `expect`/`assume` members are recorded only), select
+`if ... do`, the clause 12 temporal engine — sampling propagation
+(12.1.4) and evaluation over paths (12.3) of the parsed
+`TemporalExpr` trees; `detach`/`delay`/`exec` TEs, select
 distribution biasing in the sampler (clause 10; the expressions parse
 and are no-ops), `on
 event-port`, `#else` and `#define` replacement

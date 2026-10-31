@@ -64,14 +64,19 @@
       recorded verbatim; the coverage data model is a later milestone.
       Predefined non-scalar types `file` and `event` are accepted in
       type positions; `for each <type> (v) in list` records the element
-      type filter. `expect`/`assume` members (clause 11.4) record the
-      temporal expression as raw tokens with the `else` failure body
-      parsed as ordinary actions — the clause 12 temporal-expression
-      grammar and evaluation are later milestones. `select { weight :
-      choice; .. }` distribution expressions (clause 10) parse —
-      weights structurally, choices verbatim — and the rejection
-      sampler treats select constraints as no-ops until the
-      distribution arc.
+      type filter. `expect`/`assume` members (clause 11.4) parse their
+      temporal expressions into the clause 12 grammar
+      (`TemporalExpr`: `@event` atoms, `cycle`, `true(exp)`,
+      `change/rise/fall(exp)` edge samples, `{;}` sequences, `=>`
+      yield, `and`/`or`/`not`/`fail`/`eventually`, `[n]*`/`~[l..h]*`/
+      `[l..h]*` repeats, and the `te @event` sampling operator;
+      `detach`/`delay`/`exec` report `E0120`) with the `else` failure
+      body parsed as ordinary actions — sampling propagation (12.1.4)
+      and evaluation over paths (12.3) are the temporal engine, a later
+      milestone. `select { weight : choice; .. }` distribution
+      expressions (clause 10) parse — weights structurally, choices
+      verbatim — and the rejection sampler treats select constraints as
+      no-ops until the distribution arc.
       Preprocessor directives (clause 21): `#ifdef` / `#ifndef` /
       `#define` / `#undef` in statement, struct-member and action
       positions with flag semantics — `#define` records the flag but
@@ -83,8 +88,9 @@
       (clause 8.3), template `extend` (clause 8.2), macro
       match-expression interpretation and expansion
       (clause 15.4–15.5), the coverage data model and reports
-      (clause 14 options, buckets, grades), the clause 12
-      temporal-expression grammar and evaluation, select distribution
+      (clause 14 options, buckets, grades), the clause 12 temporal
+      engine — sampling propagation and evaluation over paths,
+      `detach`/`delay`/`exec` TEs, select distribution
       biasing in the sampler, `$1`-`$27` match captures, `#define`
       replacement rules, `#else`)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness
