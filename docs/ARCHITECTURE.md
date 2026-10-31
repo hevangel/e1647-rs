@@ -149,20 +149,32 @@ multi-simulator HDL API, and wasm32.
   event's `on` action blocks inline, in composition order, on the
   instance the event path resolves to (clause 11.2) — `@sim`-attached
   events never fire. `emit` also records the occurrence in the run's
-  temporal log (one `State` per virtual cycle, clause 12); temporal
-  `wait` statements (`@event`, sequences, propositions, event repeats,
-  with 13.1.3's readability-only `until`) suspend by advancing one
-  cycle at a time until the expression succeeds over the log from the
-  wait's start (12.3.1) — propositions and repeat bounds evaluate once
-  with current field values (no per-cycle value history), a temporal
-  wait unsatisfied after 1,000 cycles reports `E0409` like the runaway
-  guard, and unevaluable TEs (`change/rise/fall`, unresolvable bounds)
-  report `E0402` honestly. `expect`/`assume` rules (elaborated per
-  type, 11.4) are monitored at quit with `rule_failed` (12.3.2): a
-  failed rule runs its `else` body on the sys instance as a check
-  error, or prints the failure when there is no else body. One global
-  timeline — no per-instance sampling, no concurrent execution during
-  a wait (TCM suspension is the next temporal milestone).
+  temporal log (one `State` per virtual cycle, clause 12). The clause
+  13.1.1 scheduler runs concurrent TCMs: the `run()` bodies are the
+  main coroutine and every `start`ed TCM joins the queue with the
+  implicit sync cycle before it commences; coroutines take round-robin
+  turns that run atomically from one synchronization action to the
+  next, and when nothing is eligible one cycle passes (the 5,000-cycle
+  shared budget guards runaway programs, `E0409`). Suspending
+  captures the locals frame and builds a skip-cursor over `while`
+  chains — resumption re-enters the mid-iteration loop without
+  re-checking its condition and re-executes the wait statement
+  against the grown log (13.1.1(b)); `compute` and inline calls are
+  atomic regions whose waits spin inline, as do waits inside
+  `if`/`case`/`for` bodies (the documented v1 limitation of the
+  cursor). Temporal waits (`@event`, sequences, propositions, event
+  repeats, with 13.1.3's readability-only `until`) re-evaluate at
+  every turn (12.3.1); propositions and repeat bounds evaluate with
+  current field values (no per-cycle value history); a temporal wait
+  unsatisfied after 1,000 cycles reports `E0409`, and unevaluable TEs
+  (`change/rise/fall`, unresolvable bounds) report `E0402` honestly.
+  `sync` (13.1.2) parses in bare and TE forms — the bare form
+  suspends one cycle, the TE form behaves like the temporal wait.
+  `expect`/`assume` rules (elaborated per type, 11.4) are monitored at
+  quit with `rule_failed` (12.3.2): a failed rule runs its `else` body
+  on the sys instance as a check error, or prints the failure when
+  there is no else body. One global timeline — no per-instance
+  sampling.
 - `src/solve.rs` — constraint IR and the pluggable solver seam: the
   top-level `keep` constraints of one type translate (conservatively) into
   bounded-integer variables plus a conjunction of linear comparisons;
@@ -184,11 +196,11 @@ multi-simulator HDL API, and wasm32.
 Deliberately not implemented yet: `when`-subtype resolution, non-linear,
 disjunctive or temporal constraint solving (the solver backend covers
 conjunctive linear constraints and constant ranges over bounded
-integers), concurrent TCM scheduling and
-time-consuming-method suspension (temporal `wait`s and expect
-monitoring run over the event log, but nothing executes
-concurrently during a wait), `sync`, `@sim` sampling and per-instance
-timelines, the coverage data model and
+integers), `@`-triggered TCM invocation, `@sim` sampling and
+per-instance timelines, and suspension re-entry beyond `while` chains
+(waits inside `if`/`case`/`for` bodies, inline calls, `compute` and
+`on` blocks spin inline instead of interleaving), the coverage data
+model and
 reports (clause 14 groups are recorded, not collected), integer width
 truncation, evaluation of MVL literals, `repeat`, single-statement
 `if ... do`, `detach`/`delay`/`exec` TEs, select

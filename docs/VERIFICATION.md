@@ -1646,3 +1646,82 @@ failed rule with no else body prints the failure as a check error;
 values); a parser test splitting the nine wait spellings into
 numeric vs temporal shapes; and a clean-parse fixture
 (`temporal_wait.e`) locking the expect/assume + temporal-wait syntax.
+
+## 2026-10-31 (27) — offline arc: clause 13.1.1 TCM scheduler (concurrent TCMs, real suspension)
+
+Branch `agent/tcm-scheduler` (off main after #16 merged). `start` now
+schedules instead of running inline: the clause 13.1.1 semantics —
+interleaved TCMs suspending at synchronization actions — execute over
+the run loop.
+
+- Scheduler: the `run()` bodies are the main coroutine; every
+  `start`ed TCM joins the queue with the implicit "sync cycle" before
+  it commences (13.1.1's bullet). Round-robin turns run atomically
+  from one synchronization action to the next; when no coroutine is
+  eligible, one cycle passes (log padding included). The shared
+  runaway budget dropped from 100,000 wait statements to 5,000
+  wait/cycle draws — every suspension cycle draws from it, and 5,000
+  still exceeds any corpus/test run by orders of magnitude (`E0409`
+  unchanged).
+- Suspension/resumption: a synchronization action in a coroutine turn
+  captures the locals frame and builds a skip-cursor over enclosing
+  `while` chains. Resumption re-enters the mid-iteration loop WITHOUT
+  re-checking its condition (13.1.1: the iteration was in flight),
+  skips the already-executed statement prefix (no replay — side
+  effects do not repeat), and re-executes the wait statement against
+  the grown log (13.1.1(b): evaluate the TE first — succeed resumes
+  immediately, undecided stays suspended). Temporal suspensions stay
+  idle until the next sampling occurrence (13.1.1(b)3); the per-wait
+  runaway guard (1,000 cycles) applies to suspended waits.
+- The marquee behavior now holds: a TCM suspended at `wait @ev`
+  observes an `emit` made by another TCM's turn and resumes. Tested:
+  waiter/emitter interleave ordering; run()-waits suspend while
+  started TCMs progress; TCM locals persist across suspensions in a
+  `while` loop (the captured frame); the implicit sync cycle (the
+  starter continues before the TCM's first statement); `compute`
+  stays run-to-completion inline (13.1.1's "called TCM returns →
+  callee resumes immediately").
+- `sync` (13.1.2) parses in bare (`sync;`/`sync cycle;`) and TE
+  forms; the bare form suspends one cycle, the TE form behaves like
+  the temporal wait.
+- Honest v1 limitations (documented in ARCHITECTURE): suspension
+  re-entry models `while` chains only — waits inside
+  `if`/`case`/`for` bodies, inline method calls, `compute` and `on`
+  blocks keep the previous inline spin (they do not interleave); one
+  global timeline (no per-instance sampling); propositions evaluate
+  with current field values; `@`-triggered TCM invocation and `@sim`
+  sampling are not wired.
+- Debugging note for the record: the first scheduler version lost the
+  `while` context marker on resume — a re-suspension inside the
+  loop's continuation built a cursor without the loop index, and the
+  next resume skipped past the whole loop (a locals test caught it:
+  the count came out 2 instead of 3). The marker now persists across
+  the loop's continuation.
+
+Corpus state (absolute paths): etl 4, cover-edges 4, golden-imports 3,
+golden-combined/igen-dist/type-min-max/save-restart/d6w 0 — unchanged.
+Run parity checked against a main worktree: save-restart and
+igen-dist produce identical (empty) output with exit 0; golden-combined
+still exits 0 with only the pre-existing implicit-gen E0407.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(155 passed: 11 elab, 1 fixtures, 50 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 6 interpreter tests (start schedules while the starter
+continues; the waiter/emitter marquee with ordering; run-waits suspend
+while started TCMs progress; locals persist across suspensions in a
+while loop; bare sync suspends one cycle and the post-sync wait sees a
+later emission; compute stays inline), the inline-start test rewritten
+onto `compute` (the old test encoded the pre-scheduler approximation),
+a parser test for the four `sync` spellings, and the temporal-wait
+fixture extended with `sync` forms and a suspending `while` TCM.

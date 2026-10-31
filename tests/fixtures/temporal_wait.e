@@ -17,5 +17,15 @@ extend sys {
         wait [2]*@ev;
         wait true(done == 0) @clk;
         wait {@clk; @clk};
+        sync;
+        sync @clk;
+    };
+
+    check_it() @clk is {
+        sync cycle;
+        while done < 3 {
+            wait [1]*cycle;
+            done = done + 1;
+        };
     };
 };

@@ -2855,6 +2855,7 @@ impl Parser {
             }
             Some(TokenKind::Keyword(k)) if k == "case" => self.parse_case_statement(),
             Some(TokenKind::Keyword(k)) if k == "wait" => self.parse_wait_statement(),
+            Some(TokenKind::Keyword(k)) if k == "sync" => self.parse_sync_statement(),
             Some(TokenKind::Keyword(k)) if k == "for" => self.parse_for_statement(),
             Some(TokenKind::Keyword(k)) if k == "emit" => {
                 self.bump();
@@ -3231,6 +3232,29 @@ impl Parser {
         self.expect_punct("[", "E0106", "expected 'cycle' or '[n]' after 'wait'")?;
         let count = self.parse_expr()?;
         self.finish_numeric_wait(start, count)
+    }
+
+    /// `sync;` / `sync cycle;` — the bare synchronization action
+    /// (13.1.2) — and `sync <te>;` with a temporal expression, which
+    /// behaves like the temporal wait.
+    fn parse_sync_statement(&mut self) -> Option<Stmt> {
+        let start = self.current_span().0;
+        self.bump(); // 'sync'
+        let te = if self.at_temporal_wait_start() {
+            Some(self.parse_temporal_expr()?)
+        } else {
+            if self.eat_keyword("cycle") {
+                // `sync cycle` — the same bare form with the default
+                // sampling event written out.
+            }
+            None
+        };
+        self.expect_stmt_semi("expected ';' after 'sync'")?;
+        let end = self.last_end();
+        Some(Stmt::Sync {
+            te,
+            span: (start, end),
+        })
     }
 
     /// Whether the next token can begin a temporal expression in wait

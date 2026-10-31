@@ -470,6 +470,13 @@ pub enum Stmt {
         te: TemporalExpr,
         span: Span,
     },
+    /// `sync;` / `sync <te>;` — a synchronization action (13.1.2): the
+    /// bare form suspends for one occurrence of the default sampling
+    /// event; the TE form behaves like the temporal wait.
+    Sync {
+        te: Option<TemporalExpr>,
+        span: Span,
+    },
     /// `emit <target>;` — fires an event.
     Emit {
         target: Expr,
@@ -519,6 +526,7 @@ impl Stmt {
             | Stmt::ForTo { span, .. }
             | Stmt::Wait { span, .. }
             | Stmt::WaitTemporal { span, .. }
+            | Stmt::Sync { span, .. }
             | Stmt::Emit { span, .. }
             | Stmt::Start { span, .. }
             | Stmt::Compute { span, .. }

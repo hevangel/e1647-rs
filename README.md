@@ -26,9 +26,11 @@
 > example. The clause 12 temporal-engine core (`src/temporal.rs`)
 > propagates sampling events to sampled normal form and evaluates
 > temporal expressions over explicit finite paths; the run loop drives
-> it: `emit` feeds an event log, temporal `wait`s suspend until their
-> expression succeeds, and `expect`/`assume` rules are checked at
-> quit. It does **not** yet do full type
+> it: `emit` feeds an event log, the clause 13.1.1 scheduler runs
+> `start`ed TCMs concurrently (round-robin turns suspending at
+> `wait`/`sync`), temporal waits re-evaluate against the log, and
+> `expect`/`assume` rules are checked at quit. It does **not** yet do
+> full type
 > checking, `when`-subtype
 > resolution, event-driven temporal evaluation, coverage, non-linear or
 > disjunctive constraint solving, or general testbench execution. No IEEE

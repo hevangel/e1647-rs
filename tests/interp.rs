@@ -231,13 +231,91 @@ fn case_ternary_and_outf_execute() {
 }
 
 #[test]
-fn start_runs_tcm_inline_and_waits_advance() {
+fn compute_calls_tcm_inline_and_waits_advance() {
     let output = clean_output(
-        "unit counter_u {\n    ticks: uint;\n    tick() @sys.any is {\n        var i: uint = 0;\n        while i < 3 {\n            i = i + 1;\n            ticks = ticks + 1;\n            wait cycle;\n        };\n    };\n};\nextend sys {\n    c: counter_u is instance;\n    run() is also {\n        start c.tick();\n        print c.ticks;\n        emit sys.done;\n    };\n};\n",
+        "unit counter_u {\n    ticks: uint;\n    tick() @sys.any is {\n        var i: uint = 0;\n        while i < 3 {\n            i = i + 1;\n            ticks = ticks + 1;\n            wait cycle;\n        };\n    };\n};\nextend sys {\n    c: counter_u is instance;\n    run() is also {\n        compute c.tick();\n        print c.ticks;\n        emit sys.done;\n    };\n};\n",
         1,
     );
-    // The inline-started TCM mutated the instance across its waits.
+    // The compute-called TCM runs atomically to its return; its waits
+    // advance the cycles inline.
     assert!(output.contains("3\n"), "output: {output}");
+}
+
+#[test]
+fn start_schedules_the_tcm_and_the_starter_continues() {
+    // 13.1.1: `start` enqueues the TCM with an implicit sync cycle and
+    // the starter continues; the TCM's first statement runs after the
+    // starter's turn.
+    let output = clean_output(
+        "extend sys {\n    tcm() @sys.any is {\n        out(\"TCM\");\n    };\n    run() is also {\n        \
+         start tcm();\n        out(\"MAIN\");\n    };\n};\n",
+        1,
+    );
+    let main_pos = output.find("MAIN").expect("MAIN printed");
+    let tcm_pos = output.find("TCM").expect("TCM printed");
+    assert!(main_pos < tcm_pos, "the starter continues first: {output}");
+}
+
+#[test]
+fn temporal_wait_in_a_tcm_observes_emissions_made_while_suspended() {
+    // The marquee clause 13.1.1 behavior: the waiter suspends at
+    // `wait @ev`; the emitter's TCM advances two cycles and emits; the
+    // waiter resumes and completes.
+    let output = clean_output(
+        "extend sys {\n    ev: event;\n    waiter() @sys.any is {\n        wait @ev;\n        \
+         out(\"A RESUMED\");\n    };\n    emitter() @sys.any is {\n        wait [2]*cycle;\n        \
+         emit ev;\n        out(\"B EMITTED\");\n    };\n    run() is also {\n        \
+         start waiter();\n        start emitter();\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("B EMITTED"), "output: {output}");
+    assert!(output.contains("A RESUMED"), "output: {output}");
+    let b_pos = output.find("B EMITTED").expect("B");
+    let a_pos = output.find("A RESUMED").expect("A");
+    assert!(b_pos < a_pos, "the waiter resumes after the emit: {output}");
+}
+
+#[test]
+fn run_waits_suspend_and_started_tcms_progress() {
+    // The main coroutine suspends at `wait @ev`; the started TCM emits
+    // one cycle later; the main coroutine resumes.
+    let output = clean_output(
+        "extend sys {\n    ev: event;\n    tcm() @sys.any is {\n        wait [1]*cycle;\n        \
+         emit ev;\n    };\n    run() is also {\n        start tcm();\n        wait @ev;\n        \
+         out(\"RUN RESUMED\");\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("RUN RESUMED"), "output: {output}");
+}
+
+#[test]
+fn tcm_locals_persist_across_suspensions_in_a_while_loop() {
+    // The resume cursor re-enters the while body mid-iteration and the
+    // captured frame keeps the locals: the loop counts to 3 across
+    // three suspensions.
+    let output = clean_output(
+        "extend sys {\n    tcm() @sys.any is {\n        var i: uint = 0;\n        while i < 3 {\n            \
+         i = i + 1;\n            wait [1]*cycle;\n        };\n        out(\"COUNTED\");\n        \
+         print i;\n    };\n    run() is also {\n        start tcm();\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("COUNTED"), "output: {output}");
+    assert!(output.contains("i = 3"), "output: {output}");
+}
+
+#[test]
+fn bare_sync_suspends_for_one_cycle() {
+    // 13.1.2: `sync;` suspends for one occurrence of the default
+    // sampling event. The TCM syncs away cycle 0 and its wait starts
+    // at cycle 1; the starter's emission lands in cycle 2 and the
+    // post-sync wait observes it from the log.
+    let output = clean_output(
+        "extend sys {\n    ev: event;\n    seen: uint;\n    tcm() @sys.any is {\n        \
+         sync;\n        wait @ev;\n        out(\"SAW EV\");\n    };\n    run() is also {\n        \
+         start tcm();\n        wait [2]*cycle;\n        emit ev;\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("SAW EV"), "output: {output}");
 }
 
 #[test]
