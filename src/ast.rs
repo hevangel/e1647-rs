@@ -25,6 +25,10 @@ pub struct Declaration {
     pub kind: DeclarationKind,
     pub name: String,
     pub name_span: Span,
+    /// `type name: <type>;` — a scalar/list type declaration (clause 5):
+    /// the underlying representation, recorded only. Distinct-type
+    /// semantics over it are a later milestone.
+    pub underlying: Option<TypeExpr>,
     /// `struct derived like base { .. }` inheritance clause.
     pub like: Option<String>,
     pub like_span: Option<Span>,
@@ -64,6 +68,11 @@ pub enum Member {
         value: Option<Expr>,
         span: Span,
     },
+    /// `define <name['category]> "match expression" as [computed] { body };`
+    /// — a macro definition (clause 15.2/15.3). Recorded uninterpreted:
+    /// the match-expression grammar (clause 15.4) and expansion are later
+    /// milestones.
+    Macro(MacroDecl),
 }
 
 /// A `when` subtype member: one or more `value'id` (or bare `id`) modifiers
@@ -199,6 +208,26 @@ pub enum MethodModifier {
     Also,
     First,
     Only,
+}
+
+/// A `define <name['category]> "match expression" as [computed] { body };`
+/// macro definition (clause 15.2/15.3). The header's category is the
+/// non-terminal type the macro returns (`exp`, `any`, ...); the match
+/// expression and body are recorded as written — the body's raw tokens
+/// are kept because simple macros expand them as a template and computed
+/// macros run them as a parse-time action block, both later milestones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub category: Option<String>,
+    /// The match expression string as written (escapes preserved).
+    pub pattern: String,
+    /// `define ... as computed { ... };`
+    pub computed: bool,
+    /// The braced body's raw tokens, without the enclosing braces.
+    pub body: Vec<crate::lexer::Token>,
+    pub span: Span,
 }
 
 /// An `on <event-path> { actions };` struct member (clause 11.2): the

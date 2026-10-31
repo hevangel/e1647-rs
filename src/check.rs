@@ -71,6 +71,9 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
     for declaration in declarations {
         check_extend_target(declaration, &declared, &mut diagnostics);
         check_like_target(declaration, &declared, &mut diagnostics);
+        if let Some(underlying) = &declaration.underlying {
+            check_named_type(underlying, &declared, &mut diagnostics);
+        }
         check_fields(declaration, &declared, &mut diagnostics);
         check_enumerals(declaration, &mut diagnostics);
         check_methods(declaration, &declared, &mut diagnostics);

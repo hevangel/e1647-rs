@@ -1162,3 +1162,59 @@ under `in [1..100]` on an unsized `int` (the E0407 repro), equality
 constraints in both orientations, overlapping ranges intersecting to
 [5..10], and unconstrained fields sampling structurally beside a
 narrowed one.
+
+## 2026-10-30 (19) — offline arc: clause 15 macro definitions recorded; type-min-max-usage parse-clean
+
+Scope claimed for this change (nothing broader):
+
+- Clause 15.2/15.3 macro definitions parse and are recorded
+  uninterpreted: `define <name['category]> "match expression" as
+  [computed] { body };` — the header (name, optional non-terminal
+  category after `'`), the match-expression string (escapes preserved)
+  and the braced body as raw tokens (nested braces included). `computed`
+  is accepted as a word (it is not in the lexer's keyword table). The
+  bodies are deliberately not parsed — a simple macro's template may
+  contain constructs the parser does not know, since the macro is what
+  teaches the parser about them; the match-expression grammar
+  (clause 15.4–15.5) and the expansion engine are later milestones.
+  Missing pattern string reports `E0118`.
+- Clause 5 scalar type declarations parse and are recorded:
+  `type name: <type>;` (e.g. `type addr_t: int (bits : 8);`) — the
+  underlying representation is carried through the AST, the well-
+  formedness check (unknown names in it are `E0203`) and elaboration
+  (`ElaboratedType.underlying`). Distinct-type semantics over the
+  representation are a later milestone.
+- File-level `define`/`import` handling was split into two arms while
+  adding the macro shape; the `extend global` pseudo-declaration
+  behavior is pinned by the existing test and still holds.
+
+Corpus movement (`local/`, absolute paths, `--seed 1`):
+type-min-max-usage 2 parse diagnostics → **0** (parse-clean; the
+corpus defines six macros across the `as`/`as computed` shapes and a
+scalar type declaration, and invokes none of them — declarations-only,
+matching the recorded Specman reference's clean load). The run exits 0
+with no output, as before. Unchanged: etl-simple-examples 22 (its
+blockers are clause 8 `template struct ... of <type>` declarations —
+`template` is not even a lexer keyword yet — plus template
+instantiations; that is the next large family), save-restart-test1 0,
+igen-dist 5, cover-edges 1 (lexical).
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`, Windows;
+no solver-touching changes, so the Docker `--all-features` pass is left
+to CI):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(116 passed: 11 elab, 1 fixtures, 30 interp, 24 lexer, 41 parser, 9 solve)
+```
+
+New tests: `tests/fixtures/macro_definition.{e,expected}` (OK — simple,
+computed and category-less shapes plus a scalar type declaration);
+`tests/parser.rs` macro-definition recording (name/category/pattern/
+computed flag, raw-token bodies surviving nested braces, placement in
+the global pseudo-declaration) and scalar type declarations (underlying
+recorded; unknown names in it rejected).
