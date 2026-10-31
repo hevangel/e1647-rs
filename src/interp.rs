@@ -369,6 +369,10 @@ impl<'a> Interp<'a> {
                 self.depth -= 1;
                 Value::Object(index)
             }
+            // A formal is bound only inside a template instance; a
+            // template reference instantiates like a named type would,
+            // after monomorphization (a later milestone).
+            TypeExpr::Formal { .. } | TypeExpr::TemplateRef { .. } => Value::Void,
         }
     }
 
@@ -395,11 +399,23 @@ impl<'a> Interp<'a> {
     ) -> Result<Flow, Diagnostic> {
         match statement {
             Stmt::VarDecl { name, ty, init, .. } => {
-                let value = match init {
-                    Some(expr) => self.eval(expr, frame, me)?,
-                    None => self.default_for(ty),
+                let value = match (ty, init) {
+                    (_, Some(expr)) => self.eval(expr, frame, me)?,
+                    // A declared type without an initializer takes the
+                    // type's default; the type-inferring `:=` form
+                    // always carries an initializer.
+                    (Some(ty), None) => self.default_for(ty),
+                    (None, None) => {
+                        return Err(self.error(
+                            "E0402",
+                            "type-inferring 'var' without an initializer",
+                            statement.span(),
+                        ));
+                    }
                 };
-                frame.local_types.insert(name.clone(), ty.clone());
+                if let Some(ty) = ty {
+                    frame.local_types.insert(name.clone(), ty.clone());
+                }
                 frame.locals.insert(name.clone(), value);
                 Ok(Flow::Normal)
             }
@@ -564,16 +580,29 @@ impl<'a> Interp<'a> {
             }
             Stmt::ForEach {
                 var,
+                index_var,
+                using,
+                reversed,
                 list,
                 body,
                 span,
             } => {
+                let _ = using;
                 let list_value = self.eval(list, frame, me)?;
                 match list_value {
                     Value::List(items) => {
                         let binding = var.clone().unwrap_or_else(|| "it".to_owned());
-                        for item in items {
+                        let mut items = items;
+                        if *reversed {
+                            items.reverse();
+                        }
+                        for (position, item) in items.into_iter().enumerate() {
                             frame.locals.insert(binding.clone(), item);
+                            if let Some(index_name) = index_var {
+                                frame
+                                    .locals
+                                    .insert(index_name.clone(), Value::Int(position as i128));
+                            }
                             match self.exec_block(body, frame, me)? {
                                 Flow::Normal => {}
                                 Flow::Break => break,
@@ -594,6 +623,7 @@ impl<'a> Interp<'a> {
                 var,
                 from,
                 to,
+                down,
                 body,
                 span,
             } => {
@@ -604,7 +634,7 @@ impl<'a> Interp<'a> {
                     return Err(self.error("E0402", "for upper bound must be an integer", *span));
                 };
                 let mut i = start_v;
-                while i <= end_v {
+                while if *down { i >= end_v } else { i <= end_v } {
                     frame.locals.insert(var.clone(), Value::Int(i));
                     match self.exec_block(body, frame, me)? {
                         Flow::Normal => {}
@@ -612,7 +642,11 @@ impl<'a> Interp<'a> {
                         Flow::Continue => continue,
                         other => return Ok(other),
                     }
-                    i += 1;
+                    if *down {
+                        i -= 1;
+                    } else {
+                        i += 1;
+                    }
                 }
                 Ok(Flow::Normal)
             }
@@ -676,6 +710,39 @@ impl<'a> Interp<'a> {
                         self.call_method(index, name, values, *span)?;
                     }
                     _ => return Err(self.error("E0402", "start target not supported", *span)),
+                }
+                Ok(Flow::Normal)
+            }
+            // `compute <call>;` — without TCM suspension, the call runs
+            // inline exactly like `start` (clause 13's run-to-completion
+            // semantics needs the scheduler).
+            Stmt::Compute { call, span } => {
+                let Expr::Call { callee, args, .. } = call else {
+                    return Err(self.error("E0402", "compute expects a method call", *span));
+                };
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.eval(arg, frame, me)?);
+                }
+                match callee.as_ref() {
+                    Expr::Ident { name, .. } => {
+                        let Some(index) = me else {
+                            return Err(self.error(
+                                "E0402",
+                                format!("compute of '{name}' without an enclosing instance"),
+                                *span,
+                            ));
+                        };
+                        self.call_method(index, name, values, *span)?;
+                    }
+                    Expr::MemberAccess { object, name, .. } => {
+                        let object_value = self.eval(object, frame, me)?;
+                        let Value::Object(index) = object_value else {
+                            return Err(self.error("E0402", "compute requires an object", *span));
+                        };
+                        self.call_method(index, name, values, *span)?;
+                    }
+                    _ => return Err(self.error("E0402", "compute target not supported", *span)),
                 }
                 Ok(Flow::Normal)
             }
@@ -1254,6 +1321,10 @@ impl<'a> Interp<'a> {
                     name: pick,
                 })
             }
+            // Formals are bound only inside template instances and
+            // template references need monomorphization (a later
+            // milestone); sampling yields nothing for them.
+            TypeExpr::Formal { .. } | TypeExpr::TemplateRef { .. } => Ok(Value::Void),
         }
     }
 
@@ -1304,9 +1375,9 @@ impl<'a> Interp<'a> {
             }
             let mut frame = Frame::default();
             for (param, arg) in block.params.iter().zip(args.iter()) {
-                frame
-                    .local_types
-                    .insert(param.name.clone(), param.ty.clone());
+                if let Some(ty) = &param.ty {
+                    frame.local_types.insert(param.name.clone(), ty.clone());
+                }
                 frame.locals.insert(param.name.clone(), arg.clone());
             }
             match self.exec_block(&block.body, &mut frame, Some(object_index))? {
@@ -2067,13 +2138,29 @@ impl<'a> Interp<'a> {
             Expr::IsA {
                 expr,
                 ty,
+                binding,
                 negated,
                 span,
             } => {
                 let value = self.eval(expr, frame, me)?;
                 let is_a = self.value_is_a(&value, ty, *span)?;
+                // A true `is a T (v)` binds the matched value to `v` for
+                // the surrounding statement's body — the `if` condition
+                // evaluates before its block, so the binding is in place
+                // when the branch runs.
+                if is_a
+                    && !*negated
+                    && let Some(name) = binding
+                {
+                    frame.locals.insert(name.clone(), value);
+                }
                 Ok(Value::Bool(is_a != *negated))
             }
+            Expr::New { span, .. } => Err(self.error(
+                "E0402",
+                "'new' instance creation is not supported yet",
+                *span,
+            )),
             Expr::HdlPath { path, span } => {
                 if self.hdl.is_none() {
                     return Err(self.error(
@@ -2123,6 +2210,13 @@ impl<'a> Interp<'a> {
                 Value::Enum { type_name, .. } => self.type_is_a(type_name, name),
                 _ => false,
             }),
+            // A template reference names a template instance; instances
+            // come from monomorphization (a later milestone).
+            TypeExpr::TemplateRef { name, .. } => Ok(match value {
+                Value::Object(index) => self.type_is_a(&self.instances[*index].type_name, name),
+                _ => false,
+            }),
+            TypeExpr::Formal { .. } => Ok(false),
             TypeExpr::InlineEnum { .. } => Err(self.error(
                 "E0402",
                 "'is a' with an inline enumeral type is not supported",

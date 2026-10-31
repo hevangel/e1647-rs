@@ -1114,3 +1114,87 @@ fn scalar_type_declaration_records_underlying() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn template_declarations_record_params_and_parameterized_bases() {
+    // Clause 8.1: `template struct name of <params> like base { .. }` —
+    // parameters (with tag'category and defaults), `package` prefixes,
+    // and parameterized bases are recorded. Instantiation is a later
+    // milestone.
+    let declarations = expect_clean(
+        "struct base_struct {\n    id: int;\n};\n\
+         template struct iterator of <type> like base_struct {\n    idx: int;\n};\n\
+         package template struct map of (<key'type>, <value'type> = <key'type>) like base_struct {\n    \
+         private m: list of <value'type>;\n    \
+         put(k: <key'type>, v: <value'type>) is { };\n};\n\
+         struct queue_s like iterator of int {\n    n: int;\n};\n",
+    );
+    assert_eq!(declarations.len(), 4);
+    let map = &declarations[2];
+    assert!(map.packaged, "package prefix recorded");
+    assert_eq!(map.template_params.len(), 2);
+    assert_eq!(map.template_params[0].name, "key'type");
+    assert_eq!(map.template_params[1].name, "value'type");
+    assert!(map.template_params[1].default.is_some());
+    assert!(map.template_params[0].default.is_none());
+    assert_eq!(map.like.as_deref(), Some("base_struct"));
+    // The parameterized base of a plain struct is recorded with its
+    // arguments.
+    let queue = &declarations[3];
+    let Some(TypeExpr::TemplateRef { name, args, .. }) = &queue.like_type else {
+        panic!("expected a template-instance base");
+    };
+    assert_eq!(name, "iterator");
+    assert_eq!(args.len(), 1);
+    // The private member prefix is recorded on the field.
+    let Member::Field(m) = &map.members[0] else {
+        panic!("expected a field");
+    };
+    assert_eq!(m.visibility.as_deref(), Some("private"));
+}
+
+#[test]
+fn template_body_types_record_formals_and_refs() {
+    let declarations = expect_clean(
+        "template struct container of <type> {\n    \
+         items: list of <type>;\n    \
+         keyed: list (key:it) of <type>;\n    \
+         pick(i: uint): <type> is { return items[i]; };\n};\n",
+    );
+    let Member::Field(items) = &declarations[0].members[0] else {
+        panic!("expected a field");
+    };
+    let TypeExpr::List { element, key, .. } = &items.ty else {
+        panic!("expected a list type");
+    };
+    assert!(key.is_none());
+    assert!(matches!(element.as_ref(), TypeExpr::Formal { name, .. } if name == "type"));
+    let Member::Field(keyed) = &declarations[0].members[1] else {
+        panic!("expected a field");
+    };
+    let TypeExpr::List { key, .. } = &keyed.ty else {
+        panic!("expected a keyed list type");
+    };
+    assert!(key.is_some(), "the keyed-list key expression is recorded");
+}
+
+#[test]
+fn is_a_binds_the_matched_value() {
+    // `if p is a compound_packet (cp)` — the binding variable is part of
+    // the type check expression (clause 5).
+    let declarations = expect_clean(
+        "struct packet_s {\n    x: int;\n};\n\
+         extend sys {\n    run() is also {\n        var p: packet_s;\n        \
+         if p is a packet_s (cp) {\n            out(cp.x);\n        };\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[1].members[0] else {
+        panic!("expected a method");
+    };
+    let Some(Stmt::If { cond, .. }) = run.body.iter().find(|s| matches!(s, Stmt::If { .. })) else {
+        panic!("expected an if");
+    };
+    let Expr::IsA { binding, .. } = cond else {
+        panic!("expected an is-a condition");
+    };
+    assert_eq!(binding.as_deref(), Some("cp"));
+}

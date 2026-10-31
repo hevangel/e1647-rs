@@ -211,9 +211,17 @@ fn render_type(ty: &e1647::ast::TypeExpr) -> String {
             Some(_) => format!("{}(bits: <expr>)", base.name()),
             None => base.name().to_owned(),
         },
-        TypeExpr::List { element, .. } => format!("list of {}", render_type(element)),
+        TypeExpr::List { element, key, .. } => match key {
+            Some(_) => format!("list (key: <expr>) of {}", render_type(element)),
+            None => format!("list of {}", render_type(element)),
+        },
         TypeExpr::Named { name, .. } => name.clone(),
         TypeExpr::InlineEnum { names, .. } => format!("[{}]", names.join(", ")),
+        TypeExpr::Formal { name, .. } => format!("<{name}>"),
+        TypeExpr::TemplateRef { name, args, .. } => {
+            let args = args.iter().map(render_type).collect::<Vec<_>>().join(", ");
+            format!("{name} of {args}")
+        }
     }
 }
 
@@ -221,7 +229,10 @@ fn print_method(method: &e1647::ast::MethodDecl, indent: &str) {
     let params = method
         .params
         .iter()
-        .map(|param| format!("{}: {}", param.name, render_type(&param.ty)))
+        .map(|param| match &param.ty {
+            Some(ty) => format!("{}: {}", param.name, render_type(ty)),
+            None => param.name.clone(),
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let modifier = match method.modifier {

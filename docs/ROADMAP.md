@@ -37,14 +37,26 @@
       kind enum). Methods have parameter lists,
       optional `@event` TCM suffixes, and statement bodies: local `var`,
       assignment (including quoted HDL paths), calls, indexing, `return`,
-      braced `if`/`else` (optional `then`), `while` with
-      `break`/`continue`, `for each` and `for i from .. to`, `case`,
-      `check that`, `wait`, `emit`, `start`, sequence `do`, `print`,
-      `gen`, `stop_run`. Expression precedence matches clause 4.5
-      Table 12, including `is [not] a` (runtime check is exact-name or
-      `like`-chain) and the `~` / `!~` string-match operators (runtime
+      braced `if`/`else if`/`else` (optional `then`), `while` with
+      `break`/`continue`, `for each` (including `using index (idx)` and
+      `in reverse` bindings) and `for i from .. to [down] to`, `case`,
+      `check that`, `wait`, `emit`, `start`, `compute` (executed inline
+      like `start`), sequence `do`, `print`, `gen`, `stop_run`. Method
+      bodies may be `is empty` or `is undefined` (both body-less);
+      parameters may be untyped. Expression precedence matches clause 4.5
+      Table 12, including `is [not] a <type> [(name)]` (runtime check is
+      exact-name or `like`-chain; a true match binds `(name)`) and the
+      `~` / `!~` string-match operators (runtime
       evaluation is the case-insensitive full-string literal subset;
       meta-characters and `/.../` AWK patterns report `E0410`).
+      Template type declarations (clause 8.1) parse: `template
+      [package] struct|unit name of <params> [like base] { .. }` with
+      `<tag'category>` parameters and defaults — formals
+      (`<type>`), template references (`deque of int`) and keyed lists
+      (`list (key:it) of t`) are recorded in type positions;
+      instantiation (monomorphization, clause 8.3) is a later milestone,
+      and `new [<type>] [with { .. }]` parses but evaluates to an
+      explicit not-supported diagnostic.
       Preprocessor directives (clause 21): `#ifdef` / `#ifndef` /
       `#define` / `#undef` in statement, struct-member and action
       positions with flag semantics — `#define` records the flag but
@@ -52,8 +64,9 @@
       diagnostics and declaration/member/statement-level recovery. The
       CLI resolves `import a.b` to `a/b.e` or `a.b.e` beside the source
       and checks the merged declarations (not yet: `when` elaboration,
-      `repeat`, single-statement `if ... do`, template types (clause 8),
-      macro match-expression interpretation and expansion
+      `repeat`, single-statement `if ... do`, template instantiation
+      (clause 8.3), template `extend` (clause 8.2), macro
+      match-expression interpretation and expansion
       (clause 15.4–15.5), coverage, `$1`-`$27` match captures,
       `#define` replacement rules, `#else`)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness

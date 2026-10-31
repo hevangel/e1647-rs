@@ -20,6 +20,18 @@ pub enum DeclarationKind {
     Type,
 }
 
+/// One formal type parameter of a template declaration (clause 8.1):
+/// `<[tag']type-category>` with an optional default (`=<type>`), the
+/// default only for trailing parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateParam {
+    /// The raw parameter text between the angle brackets (`type`,
+    /// `key'type`).
+    pub name: String,
+    pub name_span: Span,
+    pub default: Option<TypeExpr>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declaration {
     pub kind: DeclarationKind,
@@ -29,9 +41,20 @@ pub struct Declaration {
     /// the underlying representation, recorded only. Distinct-type
     /// semantics over it are a later milestone.
     pub underlying: Option<TypeExpr>,
-    /// `struct derived like base { .. }` inheritance clause.
+    /// `template struct name of <params> { .. }` (clause 8): the formal
+    /// type parameters, recorded. Instantiation (monomorphization) is a
+    /// later milestone.
+    pub template_params: Vec<TemplateParam>,
+    /// `package` visibility prefix recorded (clause 22); not enforced.
+    pub packaged: bool,
+    /// `struct derived like base { .. }` inheritance clause. For
+    /// template declarations the base name; the full parameterized base
+    /// type is in [`Declaration::like_type`].
     pub like: Option<String>,
     pub like_span: Option<Span>,
+    /// `template struct t of <type> like container of <type> { .. }` —
+    /// the parameterized base type, recorded (clause 8.1.3).
+    pub like_type: Option<TypeExpr>,
     /// When-modifier prefixes of the declared/extended type
     /// (`extend imm cpu_instr_s`, `extend ACTIVE TX uart_agent_u`) —
     /// `value'id` pairs flattened to their modifier text. When-scoping of
@@ -166,6 +189,9 @@ pub struct Field {
     pub physical: bool,
     /// `!name` do-not-generate field (skipped by `gen`).
     pub no_gen: bool,
+    /// `package name: ...;` / `private name: ...;` visibility prefix
+    /// (clause 22), recorded only.
+    pub visibility: Option<String>,
 }
 
 /// A `keep <expr>;` or `keep soft <expr>;` constraint. The expression is
@@ -200,7 +226,9 @@ pub struct MethodDecl {
 pub struct Param {
     pub name: String,
     pub name_span: Span,
-    pub ty: TypeExpr,
+    /// `name: type`; a bare `name` parameter (clause 17) has none and
+    /// accepts anything.
+    pub ty: Option<TypeExpr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,7 +288,9 @@ pub enum Stmt {
     VarDecl {
         name: String,
         name_span: Span,
-        ty: TypeExpr,
+        /// `var x: t ...` declares the type; `var x := e ...` infers it
+        /// (clause 18) — `None` with a mandatory initializer.
+        ty: Option<TypeExpr>,
         init: Option<Expr>,
         span: Span,
     },
@@ -323,18 +353,26 @@ pub enum Stmt {
         span: Span,
     },
     /// `for each in list do { .. };` binds `it` to each element;
-    /// `for each (m) in list do { .. };` binds `m` instead.
+    /// `for each (m) in list do { .. };` binds `m` instead;
+    /// `for each (m) using index (idx) in list` also binds `idx` to the
+    /// element position, with the `using` expression recorded; `in
+    /// reverse list` iterates in reverse order.
     ForEach {
         var: Option<String>,
+        index_var: Option<String>,
+        using: Option<Expr>,
+        reversed: bool,
         list: Expr,
         body: Vec<Stmt>,
         span: Span,
     },
-    /// `for i from a to b { .. };` — inclusive bounds.
+    /// `for i from a to b { .. };` — inclusive bounds; `down to` counts
+    /// down (`down: true`).
     ForTo {
         var: String,
         from: Expr,
         to: Expr,
+        down: bool,
         body: Vec<Stmt>,
         span: Span,
     },
@@ -353,6 +391,13 @@ pub enum Stmt {
     /// with a shared cycle budget in this milestone; event-triggered
     /// suspension is a later milestone.
     Start {
+        call: Expr,
+        span: Span,
+    },
+    /// `compute <call>;` — calls a TCM and runs it to completion before
+    /// continuing (clause 13). Without TCM suspension, execution is the
+    /// same inline call as `start`.
+    Compute {
         call: Expr,
         span: Span,
     },
@@ -387,6 +432,7 @@ impl Stmt {
             | Stmt::Wait { span, .. }
             | Stmt::Emit { span, .. }
             | Stmt::Start { span, .. }
+            | Stmt::Compute { span, .. }
             | Stmt::Case { span, .. } => *span,
         }
     }
@@ -444,20 +490,39 @@ pub enum TypeExpr {
         width: Option<Box<Expr>>,
         span: Span,
     },
-    /// `list of <element>`.
-    List { element: Box<TypeExpr>, span: Span },
+    /// `list of <element>`, with the optional keyed-list key expression
+    /// (`list (key:it) of <type>`), recorded.
+    List {
+        element: Box<TypeExpr>,
+        key: Option<Box<Expr>>,
+        span: Span,
+    },
     /// A user-defined type name.
     Named { name: String, span: Span },
     /// An inline enumeral list type: `[imm, reg]`.
     InlineEnum { names: Vec<String>, span: Span },
+    /// A template's formal parameter used in a type position
+    /// (`<type>`, `<key'type>`) — the raw text between the angle
+    /// brackets. Bound during template instantiation, a later milestone.
+    Formal { name: String, span: Span },
+    /// A template instantiation in a type position (`deque of int`,
+    /// `map of (key_t, value_t)`).
+    TemplateRef {
+        name: String,
+        args: Vec<TypeExpr>,
+        span: Span,
+    },
 }
 
 impl TypeExpr {
     pub fn span(&self) -> Span {
         match self {
-            TypeExpr::Scalar { span, .. } | TypeExpr::List { span, .. } => *span,
-            TypeExpr::Named { span, .. } => *span,
-            TypeExpr::InlineEnum { span, .. } => *span,
+            TypeExpr::Scalar { span, .. }
+            | TypeExpr::List { span, .. }
+            | TypeExpr::Named { span, .. }
+            | TypeExpr::InlineEnum { span, .. }
+            | TypeExpr::Formal { span, .. }
+            | TypeExpr::TemplateRef { span, .. } => *span,
         }
     }
 }
@@ -574,6 +639,14 @@ pub enum Expr {
         path: String,
         span: Span,
     },
+    /// `new [<type>] [with { <assignments> }]` — instance creation
+    /// (clause 6.2). The `with` block records field assignments for the
+    /// fresh instance.
+    New {
+        ty: Option<TypeExpr>,
+        inits: Vec<Stmt>,
+        span: Span,
+    },
     /// `expr.as_a(type)` cast.
     CastAs {
         expr: Box<Expr>,
@@ -594,11 +667,13 @@ pub enum Expr {
         span: Span,
     },
     /// `expr is a ty` / `expr is not a ty` — the type check operator
-    /// (clause 4.5). Runtime type dispatch is exact-name only; there is no
-    /// inheritance-aware type system yet.
+    /// (clause 4.5), with the optional `(name)` binding of a true match
+    /// to a local. Runtime type dispatch is exact-name only; there is
+    /// no inheritance-aware type system yet.
     IsA {
         expr: Box<Expr>,
         ty: TypeExpr,
+        binding: Option<String>,
         negated: bool,
         span: Span,
     },
@@ -633,6 +708,7 @@ impl Expr {
             | Expr::BitSlice { span, .. }
             | Expr::InSet { span, .. }
             | Expr::IsA { span, .. }
+            | Expr::New { span, .. }
             | Expr::HdlPath { span, .. } => *span,
         }
     }
