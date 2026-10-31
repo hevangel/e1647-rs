@@ -79,8 +79,7 @@ multi-simulator HDL API, and wasm32.
   `cycle`, propositions and edge samples, `{;}` sequences, `=>` yield,
   `and`/`or`/`not`/`fail`/`eventually`, repeats, and the binary
   sampling `te @event`; `detach`/`delay`/`exec` report `E0120`) with
-  the `else` failure body parsed as actions — sampling propagation and
-  path evaluation are the temporal engine, a later milestone. Clause 10
+  the `else` failure body parsed as actions. Clause 10
   `select { weight : choice; .. }` distributions parse — weights
   structurally, choices verbatim — and the rejection sampler treats
   select constraints as no-ops until the distribution arc. Predefined
@@ -91,6 +90,24 @@ multi-simulator HDL API, and wasm32.
   are collected (codes
   `E01xx` syntax, `E02xx` well-formedness; see the module documentation)
   and the AST stays partial under errors.
+- `src/temporal.rs` — the clause 12 temporal-engine core, a pure
+  library the interpreter will drive: `sampled_normal_form` propagates
+  a temporal expression's sampling event so every atom carries it
+  (12.1.4; sub-sampled subtrees keep their own event, 12.2.5) and
+  `holds_tightly`/`succeeds` evaluate tight satisfaction (12.1.1.2) and
+  last-point success (12.1.1.12) over explicit finite paths of
+  `State`s — each state records which events occurred. Operators follow
+  their subclauses: sequences over strictly consecutive segments
+  (12.2.8), yield as a universal check over the lhs's successful
+  prefixes with vacuous hold when it fails (12.2.13), fixed and
+  true-match repeats (12.2.9–12.2.10), first-match repeats as sequence
+  items (12.2.11), `fail`/`not`/`eventually` (12.2.12/16/14).
+  Propositions and repeat bounds are evaluated through caller-supplied
+  callbacks; `change/rise/fall(exp)` edge samples report
+  `EvalError::EdgeSample` (no sampled value history in the pure core)
+  and unresolvable constructs report `EvalError::Unsupported`. Nothing
+  here touches simulation time — wiring `wait`/`emit`/expect monitoring
+  to the run loop is a later milestone.
 - `src/check.rs` — minimal well-formedness checks (duplicate
   declaration/field/parameter/local/enumeral names, unknown type names,
   `keep` identifier roots, zero widths). The CLI runs this once on the
@@ -148,12 +165,12 @@ Deliberately not implemented yet: `when`-subtype resolution, non-linear,
 disjunctive or temporal constraint solving (the solver backend covers
 conjunctive linear constraints and constant ranges over bounded
 integers), an event scheduler
-and time-consuming-method suspension, the coverage data model and
+and time-consuming-method suspension (the clause 12 engine core in
+`src/temporal.rs` evaluates explicit finite paths; it is not driven by
+the run loop), the coverage data model and
 reports (clause 14 groups are recorded, not collected), integer width
 truncation, evaluation of MVL literals, `repeat`, single-statement
-`if ... do`, the clause 12 temporal engine — sampling propagation
-(12.1.4) and evaluation over paths (12.3) of the parsed
-`TemporalExpr` trees; `detach`/`delay`/`exec` TEs, select
+`if ... do`, `detach`/`delay`/`exec` TEs, select
 distribution biasing in the sampler (clause 10; the expressions parse
 and are no-ops), `on
 event-port`, `#else` and `#define` replacement

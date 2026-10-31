@@ -1594,8 +1594,12 @@ impl Parser {
         Some(te)
     }
 
-    /// Repeats (`[n]*te`, `~[l..h]*te`, `[l..h]*te` — 12.2.9–12.2.11)
-    /// and the prefix operators `not`, `fail`, `eventually`.
+    /// Repeats and the prefix operators `not`, `fail`, `eventually`.
+    /// Three repeat spellings (12.2.9–12.2.11): the fixed repeat
+    /// `[n]*te` (a single bound, no `..`), the true-match repeat
+    /// `~[l..h]*te` (`~`; a single bound is the exact count) and the
+    /// first-match repeat `[l..h]*te` (a range without `~`, valid only
+    /// as a sequence item).
     fn parse_te_prefix(&mut self) -> Option<crate::ast::TemporalExpr> {
         if self.eat_keyword("not") {
             let inner = self.parse_te_prefix()?;
@@ -1616,25 +1620,47 @@ impl Parser {
                 matches!(second, Some(TokenKind::Punctuation(p)) if p == "[")
             });
         if bracket_repeat {
-            let kind = if true_match {
+            if true_match {
                 self.bump(); // '~'
-                crate::ast::RepeatKind::TrueMatch
-            } else {
-                crate::ast::RepeatKind::FirstMatch
-            };
+            }
             self.bump(); // '['
-            let low = self.parse_expr()?;
-            let high = if self.eat_punct("..") {
+            // `~[..]*te` / `[..]*te` — an empty low bound is the
+            // unbounded form (12.2.10, 12.2.11).
+            let low = if self.at_punct("..") {
+                None
+            } else {
                 Some(self.parse_expr()?)
+            };
+            let ranged = self.eat_punct("..");
+            let high = if ranged {
+                if self.at_punct("]") {
+                    None
+                } else {
+                    Some(self.parse_expr()?)
+                }
             } else {
                 None
+            };
+            // A range without `~` is the first-match repeat (12.2.11);
+            // a single bound is the fixed repeat (12.2.9) — or, under
+            // `~`, the exact-count form of the true-match repeat
+            // (12.2.10).
+            let kind = match (true_match, ranged) {
+                (true, _) => crate::ast::RepeatKind::TrueMatch,
+                (false, true) => crate::ast::RepeatKind::FirstMatch,
+                (false, false) => crate::ast::RepeatKind::Fixed,
+            };
+            let high = match (true_match, ranged, &low) {
+                // `~[n]*te` is n consecutive successes: n..n.
+                (true, false, Some(expr)) => Some(expr.clone()),
+                _ => high,
             };
             self.expect_punct("]", "E0107", "expected ']' to close the repeat range")?;
             self.expect_punct("*", "E0106", "expected '*' after the repeat range")?;
             let te = self.parse_te_prefix()?;
             return Some(crate::ast::TemporalExpr::Repeat {
                 kind,
-                low: Some(low),
+                low,
                 high,
                 te: Box::new(te),
             });
@@ -3735,4 +3761,36 @@ fn render_expr_path(expr: &Expr) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Parse one standalone temporal expression (clause 12) — the grammar
+/// `expect`/`assume` members use. A tool for tests and future `wait`
+/// integration; returns the first diagnostic's text on failure.
+pub fn parse_temporal_expression(source: &str) -> Result<crate::ast::TemporalExpr, String> {
+    let tokens = match lexer::tokenize(source) {
+        Ok(tokens) => tokens,
+        Err(err) => return Err(err.message.to_owned()),
+    };
+    let eof = tokens.last().map(|t| t.end).unwrap_or(Position {
+        byte: source.len(),
+        line: 1,
+        column: 1,
+    });
+    let mut parser = Parser::new(tokens, eof);
+    let te = parser.parse_temporal_expr().ok_or_else(|| {
+        parser
+            .diagnostics
+            .first()
+            .map(|d| d.render())
+            .unwrap_or_else(|| "expected a temporal expression".to_owned())
+    })?;
+    if parser.peek().is_some() {
+        parser.error_here("E0120", "unexpected token after the temporal expression");
+        return Err(parser
+            .diagnostics
+            .last()
+            .map(|d| d.render())
+            .unwrap_or_default());
+    }
+    Ok(te)
 }

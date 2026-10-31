@@ -23,7 +23,11 @@
 > linear constraints via the Pumpkin CP solver when the `solver-pumpkin`
 > cargo feature is enabled. A single xezim VPI bridge (`src/hdl.rs`,
 > `hdl_load` and quoted signal paths) drives one mixed SystemVerilog
-> example. It does **not** yet do full type checking, `when`-subtype
+> example. The clause 12 temporal-engine core (`src/temporal.rs`)
+> propagates sampling events to sampled normal form and evaluates
+> temporal expressions over explicit finite paths; it is a pure library,
+> not yet driven by the run loop. It does **not** yet do full type
+> checking, `when`-subtype
 > resolution, event-driven temporal evaluation, coverage, non-linear or
 > disjunctive constraint solving, or general testbench execution. No IEEE
 > conformance is claimed. See [docs/ROADMAP.md](docs/ROADMAP.md) for the

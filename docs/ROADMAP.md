@@ -71,9 +71,14 @@
       yield, `and`/`or`/`not`/`fail`/`eventually`, `[n]*`/`~[l..h]*`/
       `[l..h]*` repeats, and the `te @event` sampling operator;
       `detach`/`delay`/`exec` report `E0120`) with the `else` failure
-      body parsed as ordinary actions — sampling propagation (12.1.4)
-      and evaluation over paths (12.3) are the temporal engine, a later
-      milestone. `select { weight : choice; .. }` distribution
+      body parsed as ordinary actions. The temporal-engine core
+      (`src/temporal.rs`) propagates the sampling event to sampled
+      normal form (12.1.4) and evaluates tight satisfaction (12.1.1.2)
+      and last-point success (12.1.1.12) over explicit finite paths
+      (12.3) through caller-supplied expression callbacks — without a
+      simulation clock, which is the interpreter's wait/event scheduler
+      integration, a later milestone. `select { weight : choice; .. }`
+      distribution
       expressions (clause 10) parse — weights structurally, choices
       verbatim — and the rejection sampler treats select constraints as
       no-ops until the distribution arc.
@@ -89,10 +94,11 @@
       match-expression interpretation and expansion
       (clause 15.4–15.5), the coverage data model and reports
       (clause 14 options, buckets, grades), the clause 12 temporal
-      engine — sampling propagation and evaluation over paths,
-      `detach`/`delay`/`exec` TEs, select distribution
-      biasing in the sampler, `$1`-`$27` match captures, `#define`
-      replacement rules, `#else`)
+      engine's simulation integration — the pure core exists
+      (`src/temporal.rs`); `wait`/`emit`/expect monitoring over the
+      run loop is not wired — `detach`/`delay`/`exec` TEs, select
+      distribution biasing in the sampler, `$1`-`$27` match captures,
+      `#define` replacement rules, `#else`)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness
       checks only (duplicate declaration/field names, duplicate
       parameters/local variables/enumerals, unknown named/`like`/`extend`
@@ -160,7 +166,9 @@
       method synchronously,
       and `wait` advances a virtual cycle counter under a fixed budget
       (`E0409`). No `@sim` sampling, no TCM suspension, and `wait` does
-      not advance the HDL simulator
+      not advance the HDL simulator. The clause 12 temporal-engine core
+      (`src/temporal.rs`) evaluates sampled normal forms over explicit
+      finite paths — it is not yet driven by the run loop
 - [ ] Coverage data model and reports
 
 ## M4 — Simulator integration
