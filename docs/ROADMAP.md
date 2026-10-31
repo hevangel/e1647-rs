@@ -26,7 +26,13 @@
       `keep bind`, `when` subtype members (`value'id` modifiers),
       `simple_port`, `event` (trigger stored as written), `on` members
       (clause 11.2: dotted event path and action block; extension is a
-      repeated declaration), `import`, literal `define`, and
+      repeated declaration), `import`, literal `define`, macro
+      definitions (clause 15.2/15.3:
+      `define <name'category> "match expression" as [computed] { body };`
+      — header, pattern and raw body tokens recorded; the
+      match-expression grammar and expansion are later milestones),
+      scalar type declarations (`type name: <type>;` — the underlying
+      representation recorded), and
       `sequence ... using` (synthesized into a type, a driver unit and a
       kind enum). Methods have parameter lists,
       optional `@event` TCM suffixes, and statement bodies: local `var`,
@@ -46,8 +52,9 @@
       diagnostics and declaration/member/statement-level recovery. The
       CLI resolves `import a.b` to `a/b.e` or `a.b.e` beside the source
       and checks the merged declarations (not yet: `when` elaboration,
-      `repeat`, single-statement `if ... do`, `define as`
-      templates, coverage, `$1`-`$27` match captures,
+      `repeat`, single-statement `if ... do`, template types (clause 8),
+      macro match-expression interpretation and expansion
+      (clause 15.4–15.5), coverage, `$1`-`$27` match captures,
       `#define` replacement rules, `#else`)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness
       checks only (duplicate declaration/field names, duplicate

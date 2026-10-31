@@ -42,6 +42,9 @@ pub struct ElaboratedType {
     /// `on` struct members (clause 11.2), base types first, then extends
     /// in declaration order — the accumulated action blocks per event.
     pub ons: Vec<crate::ast::OnDecl>,
+    /// `type name: <type>;` — the underlying representation, recorded
+    /// only (clause 5); distinct-type semantics are a later milestone.
+    pub underlying: Option<crate::ast::TypeExpr>,
     pub enumerals: Vec<Enumeral>,
     /// `simple_port` members with the HDL location resolved from their
     /// `keep name.hdl_path() == "path"` constraints.
@@ -153,6 +156,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                         .collect(),
                     whens: composed.whens.into_iter().cloned().collect(),
                     ons: composed.ons.into_iter().cloned().collect(),
+                    underlying: None,
                     enumerals: Vec::new(),
                     ports: composed
                         .ports
@@ -174,6 +178,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 methods: Vec::new(),
                 whens: Vec::new(),
                 ons: Vec::new(),
+                underlying: declaration.underlying.clone(),
                 ports: Vec::new(),
                 enumerals: declaration
                     .members
@@ -280,6 +285,7 @@ impl<'a> Elaborator<'a> {
                     .collect(),
                 whens: composed.whens.into_iter().cloned().collect(),
                 ons: composed.ons.into_iter().cloned().collect(),
+                underlying: None,
                 enumerals: Vec::new(),
                 ports: composed
                     .ports
@@ -405,7 +411,7 @@ impl<'a> Elaborator<'a> {
                 Member::When(when) => composed.whens.push(when),
                 Member::On(on) => composed.ons.push(on),
                 Member::Port(port) => composed.ports.push((port, block)),
-                Member::Import { .. } | Member::Define { .. } => {}
+                Member::Import { .. } | Member::Define { .. } | Member::Macro(_) => {}
                 Member::Event(_) | Member::Enumeral(_) => {}
             }
         }

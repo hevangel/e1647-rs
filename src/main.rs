@@ -280,6 +280,17 @@ fn print_members(members: &[e1647::ast::Member], indent: &str) {
                 println!("{indent}import {}", names.join(", "));
             }
             Member::Define { name, .. } => println!("{indent}define {name}"),
+            Member::Macro(macro_decl) => println!(
+                "{indent}macro <{}{}> ({} body tokens, line {})",
+                macro_decl.name,
+                macro_decl
+                    .category
+                    .as_ref()
+                    .map(|category| format!("'{category}"))
+                    .unwrap_or_default(),
+                macro_decl.body.len(),
+                macro_decl.span.0.line
+            ),
             Member::Constraint(constraint) => println!(
                 "{indent}keep{} (line {})",
                 if constraint.is_soft { " soft" } else { "" },

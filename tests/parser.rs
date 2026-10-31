@@ -1040,3 +1040,77 @@ fn conditional_directive_at_file_level_is_rejected() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn macro_definitions_record_header_pattern_and_body() {
+    // Clause 15.2/15.3 definitions are recorded uninterpreted: the
+    // match-expression grammar and the expansion engine are later
+    // milestones. Bodies are raw tokens — constructs the parser does
+    // not know (the macro teaches it) must not produce diagnostics.
+    let declarations = expect_clean(
+        "define <e_util_min_value'exp> \"MIN_VALUE[ ]\\(<type>\\)\" as {\n    \
+         set_of_values(<type>).uint_min().as_a(<type>);\n};\n\
+         define <e_util_range'exp> \"RANGE[ ]\\(<type>\\)\" as computed {\n    \
+         if the_type is a rf_numeric (rfn) {\n        return set.uint_size();\n    };\n};\n\
+         define <plain_macro> \"NO_KIND[ ]\" as {\n    out(\"plain\");\n};\n",
+    );
+    let pseudo = declarations
+        .iter()
+        .find(|d| d.kind == DeclarationKind::Extend && d.name == "global")
+        .expect("expected the global pseudo-declaration");
+    assert_eq!(pseudo.members.len(), 3);
+    let Member::Macro(first) = &pseudo.members[0] else {
+        panic!("expected a macro definition");
+    };
+    assert_eq!(first.name, "e_util_min_value");
+    assert_eq!(first.category.as_deref(), Some("exp"));
+    assert_eq!(first.pattern, r"MIN_VALUE[ ]\(<type>\)");
+    assert!(!first.computed);
+    // The body tokens exclude the enclosing braces: identifiers,
+    // punctuation, `<`, `>` and the call.
+    assert!(first.body.len() >= 10);
+    let Member::Macro(second) = &pseudo.members[1] else {
+        panic!("expected a macro definition");
+    };
+    assert!(second.computed);
+    // The computed body nests braces; the capture must survive them.
+    assert!(second.body.iter().any(|token| matches!(
+        token.kind,
+        e1647::lexer::TokenKind::Identifier(ref word) if word == "rf_numeric"
+    )));
+    let Member::Macro(plain) = &pseudo.members[2] else {
+        panic!("expected a macro definition");
+    };
+    assert_eq!(plain.category, None);
+}
+
+#[test]
+fn scalar_type_declaration_records_underlying() {
+    // `type name: <type>;` (clause 5) — the representation is recorded;
+    // unknown names in it are well-formedness errors like any type use.
+    let declarations = expect_clean("type addr_t : int (bits : 8);\n");
+    assert_eq!(declarations[0].kind, DeclarationKind::Type);
+    let Some(underlying) = &declarations[0].underlying else {
+        panic!("expected the underlying representation");
+    };
+    assert!(matches!(
+        underlying,
+        TypeExpr::Scalar {
+            base: ScalarBase::Int,
+            ..
+        }
+    ));
+    let result = parse("type bad_t : no_such_type;\n");
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.render().contains("E0203")),
+        "expected the unknown underlying type to be rejected: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}

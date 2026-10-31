@@ -59,7 +59,13 @@ multi-simulator HDL API, and wasm32.
   (the replacement text is consumed, not substituted; clause 21.3's
   replacement rules are a later milestone), excluded `#ifdef`/`#ifndef`
   branches are skipped without parsing, `#else` is not parsed, and the
-  conditional forms are rejected at module level (`E0117`). Diagnostics
+  conditional forms are rejected at module level (`E0117`). Clause 15
+  macro definitions (`define <name'category> "match expression" as
+  [computed] { body };`) are recorded uninterpreted — header, pattern
+  string and raw body tokens (`E0118` when the pattern string is
+  missing); the match-expression grammar and expansion are later
+  milestones. Clause 5 scalar type declarations (`type name: <type>;`)
+  record the underlying representation. Diagnostics
   are collected (codes
   `E01xx` syntax, `E02xx` well-formedness; see the module documentation)
   and the AST stays partial under errors.
@@ -72,8 +78,9 @@ multi-simulator HDL API, and wasm32.
   into one composed member list per `struct`/`unit` (inheritance-cycle,
   cross-declaration duplicate-field and unmodified-method-redefinition
   diagnostics; codes `E03xx`). Also records `simple_port` HDL paths,
-  `on` members (base types first, extends in declaration order) and
-  recovered `sequence` declarations. **Not** full elaboration: `when`
+  `on` members (base types first, extends in declaration order),
+  recovered `sequence` declarations, and a `type` declaration's
+  underlying representation. **Not** full elaboration: `when`
   subtypes are carried, not resolved; no type checking.
 - `src/builtins.rs` — predeclared names the executed subset relies on:
   the `sys` unit, sequence bases (`any_sequence_item` and siblings), and
@@ -122,4 +129,6 @@ integers), an event scheduler
 and time-consuming-method suspension, coverage, integer width truncation,
 evaluation of MVL literals, `repeat`, single-statement `if ... do`,
 `expect`/`assume`, `on event-port`, `#else` and `#define` replacement
-rules, `define as` templates, a multi-simulator HDL API, and WASM.
+rules, template types (clause 8), macro match-expression
+interpretation and expansion (clause 15.4–15.5), a multi-simulator HDL
+API, and WASM.

@@ -39,6 +39,8 @@
 //! - `E0115` expected `is` in a method declaration
 //! - `E0116` user-written `extend global` (clause 4.3.1.1)
 //! - `E0117` unsupported or misplaced preprocessor directive (clause 21)
+//! - `E0118` expected the match expression string of a macro definition
+//!   (clause 15)
 //! - `E0201` duplicate declaration name
 //! - `E0202` duplicate field name
 //! - `E0203` unknown type name
@@ -425,15 +427,42 @@ impl Parser {
                 {
                     k.clone()
                 }
-                // File-level `define` constants and `import` lists live in
-                // the global scope; they are represented as members of an
-                // `extend global` pseudo-declaration.
-                Some(TokenKind::Keyword(k)) if matches!(k.as_str(), "define" | "import") => {
+                // File-level `define` constants, macro definitions and
+                // `import` lists live in the global scope; they are
+                // represented as members of an `extend global`
+                // pseudo-declaration.
+                Some(TokenKind::Keyword(k)) if k.as_str() == "import" => {
                     let (gstart, _) = self.current_span();
-                    let members = if k.as_str() == "define" {
-                        self.parse_define().map(|m| vec![m])
+                    let Some(members) = self.parse_import() else {
+                        continue;
+                    };
+                    let gend = self.last_end();
+                    match declarations.last_mut() {
+                        Some(last)
+                            if last.kind == DeclarationKind::Extend && last.name == "global" =>
+                        {
+                            last.members.extend(members);
+                        }
+                        _ => declarations.push(Declaration {
+                            kind: DeclarationKind::Extend,
+                            name: "global".to_owned(),
+                            name_span: (gstart, gstart),
+                            underlying: None,
+                            like: None,
+                            like_span: None,
+                            modifiers: Vec::new(),
+                            members,
+                            span: (gstart, gend),
+                        }),
+                    }
+                    continue;
+                }
+                Some(TokenKind::Keyword(k)) if k.as_str() == "define" => {
+                    let (gstart, _) = self.current_span();
+                    let members = if self.peek_second_is_punct("<") {
+                        self.parse_macro_definition().map(|m| vec![m])
                     } else {
-                        self.parse_import()
+                        self.parse_define().map(|m| vec![m])
                     };
                     let Some(members) = members else {
                         continue;
@@ -449,6 +478,7 @@ impl Parser {
                             kind: DeclarationKind::Extend,
                             name: "global".to_owned(),
                             name_span: (gstart, gstart),
+                            underlying: None,
                             like: None,
                             like_span: None,
                             modifiers: Vec::new(),
@@ -577,6 +607,7 @@ impl Parser {
                 kind: DeclarationKind::Type,
                 name: kind,
                 name_span: (start, start),
+                underlying: None,
                 like: None,
                 like_span: None,
                 modifiers: Vec::new(),
@@ -587,6 +618,7 @@ impl Parser {
                 kind: DeclarationKind::Unit,
                 name: driver,
                 name_span: (start, start),
+                underlying: None,
                 like: None,
                 like_span: None,
                 modifiers: Vec::new(),
@@ -617,6 +649,7 @@ impl Parser {
                 kind: DeclarationKind::Struct,
                 name,
                 name_span,
+                underlying: None,
                 like: None,
                 like_span: None,
                 modifiers: Vec::new(),
@@ -626,12 +659,32 @@ impl Parser {
         ])
     }
 
-    /// `type name: [ENUMERAL [= expr] , ..];`
+    /// `type name: [ENUMERAL [= expr] , ..];` or the clause 5 scalar
+    /// form `type name: <type>;` (`type addr_t: int (bits: 8);`) — the
+    /// underlying representation is recorded; distinct-type semantics
+    /// over it are a later milestone.
     fn parse_type_declaration(&mut self) -> Option<Declaration> {
         let start = self.current_span().0;
         self.bump(); // 'type'
         let (name, name_span) = self.expect_identifier("E0102", "expected type name")?;
         self.expect_punct(":", "E0103", "expected ':' after the type name")?;
+        if !self.at_punct("[") {
+            // Scalar/list type declaration: record the representation.
+            let underlying = self.parse_type()?;
+            self.expect_punct(";", "E0105", "expected ';' after the type declaration")?;
+            let end = self.last_end();
+            return Some(Declaration {
+                kind: DeclarationKind::Type,
+                name,
+                name_span,
+                underlying: Some(underlying),
+                like: None,
+                like_span: None,
+                modifiers: Vec::new(),
+                members: Vec::new(),
+                span: (start, end),
+            });
+        }
         if self
             .expect_punct("[", "E0106", "expected '[' to open the enumeral list")
             .is_none()
@@ -641,6 +694,7 @@ impl Parser {
                 kind: DeclarationKind::Type,
                 name,
                 name_span,
+                underlying: None,
                 like: None,
                 like_span: None,
                 modifiers: Vec::new(),
@@ -681,6 +735,7 @@ impl Parser {
                 kind: DeclarationKind::Type,
                 name,
                 name_span,
+                underlying: None,
                 like: None,
                 like_span: None,
                 modifiers: Vec::new(),
@@ -706,6 +761,7 @@ impl Parser {
                 kind: DeclarationKind::Type,
                 name,
                 name_span,
+                underlying: None,
                 like: None,
                 like_span: None,
                 modifiers: Vec::new(),
@@ -718,6 +774,7 @@ impl Parser {
             kind: DeclarationKind::Type,
             name,
             name_span,
+            underlying: None,
             like: None,
             like_span: None,
             modifiers: Vec::new(),
@@ -808,6 +865,7 @@ impl Parser {
                 kind,
                 name,
                 name_span,
+                underlying: None,
                 like,
                 like_span,
                 modifiers,
@@ -824,6 +882,7 @@ impl Parser {
             kind,
             name,
             name_span,
+            underlying: None,
             like,
             like_span,
             modifiers,
@@ -932,6 +991,85 @@ impl Parser {
             value,
             span: (start, end),
         })
+    }
+
+    /// `define <name['category]> "match expression" as [computed] { body };`
+    /// — a macro definition (clause 15.2/15.3), recorded uninterpreted:
+    /// the match-expression grammar (clause 15.4) and the expansion
+    /// engine are later milestones.
+    fn parse_macro_definition(&mut self) -> Option<Member> {
+        let start = self.current_span().0;
+        self.bump(); // 'define'
+        self.expect_punct("<", "E0106", "expected '<' to open the macro name")?;
+        let (name, name_span) = self.expect_identifier("E0102", "expected the macro name")?;
+        let category = if self.eat_punct("'") {
+            let (category, _) =
+                self.expect_identifier("E0102", "expected the macro category after \"'\"")?;
+            Some(category)
+        } else {
+            None
+        };
+        self.expect_punct(">", "E0107", "expected '>' to close the macro name")?;
+        let pattern = match self.peek_kind() {
+            Some(TokenKind::StringLiteral(text)) => {
+                let text = text.clone();
+                self.bump();
+                text
+            }
+            _ => {
+                self.error_here("E0118", "expected the match expression string");
+                return None;
+            }
+        };
+        self.expect_keyword_word("as")?;
+        // `computed` is not a reserved word in the lexer's keyword table.
+        let computed = self.eat_word("computed");
+        self.expect_punct("{", "E0106", "expected '{' to open the macro body")?;
+        let body = self.capture_braced_body();
+        self.eat_punct(";");
+        let end = self.last_end();
+        Some(Member::Macro(crate::ast::MacroDecl {
+            name,
+            name_span,
+            category,
+            pattern,
+            computed,
+            body,
+            span: (start, end),
+        }))
+    }
+
+    /// Whether the token after the current one is the given punctuation.
+    fn peek_second_is_punct(&self, symbol: &str) -> bool {
+        matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == symbol)
+    }
+
+    /// Collect the raw tokens up to and including the `}` matching the
+    /// already-consumed `{`. Macro bodies are recorded, never parsed —
+    /// a simple macro's template may contain constructs the parser does
+    /// not know (the macro teaches the parser about them).
+    fn capture_braced_body(&mut self) -> Vec<Token> {
+        let mut captured = Vec::new();
+        let mut depth = 1usize;
+        while let Some(token) = self.peek() {
+            match &token.kind {
+                TokenKind::Punctuation(p) if p == "{" => {
+                    depth += 1;
+                    captured.push(self.bump());
+                }
+                TokenKind::Punctuation(p) if p == "}" => {
+                    let token = self.bump();
+                    depth -= 1;
+                    if depth == 0 {
+                        return captured;
+                    }
+                    captured.push(token);
+                }
+                _ => captured.push(self.bump()),
+            }
+        }
+        self.error_here("E0107", "expected '}' to close the macro body");
+        captured
     }
 
     /// `on <event-path> { statements };` — an `on` struct member (clause
