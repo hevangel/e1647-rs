@@ -67,7 +67,11 @@
       type filter. `expect`/`assume` members (clause 11.4) record the
       temporal expression as raw tokens with the `else` failure body
       parsed as ordinary actions — the clause 12 temporal-expression
-      grammar and evaluation are later milestones.
+      grammar and evaluation are later milestones. `select { weight :
+      choice; .. }` distribution expressions (clause 10) parse —
+      weights structurally, choices verbatim — and the rejection
+      sampler treats select constraints as no-ops until the
+      distribution arc.
       Preprocessor directives (clause 21): `#ifdef` / `#ifndef` /
       `#define` / `#undef` in statement, struct-member and action
       positions with flag semantics — `#define` records the flag but
@@ -80,8 +84,9 @@
       match-expression interpretation and expansion
       (clause 15.4–15.5), the coverage data model and reports
       (clause 14 options, buckets, grades), the clause 12
-      temporal-expression grammar and evaluation,
-      `$1`-`$27` match captures, `#define` replacement rules, `#else`)
+      temporal-expression grammar and evaluation, select distribution
+      biasing in the sampler, `$1`-`$27` match captures, `#define`
+      replacement rules, `#else`)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness
       checks only (duplicate declaration/field names, duplicate
       parameters/local variables/enumerals, unknown named/`like`/`extend`

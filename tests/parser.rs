@@ -1346,3 +1346,86 @@ fn expect_without_else_and_missing_te_report() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn select_distributions_parse_weights_and_verbatim_choices() {
+    // Clause 10: `select { <weight> : <choice>; .. }` — weights parse,
+    // choices are recorded verbatim (paren-aware so `normal(a, b)`
+    // keeps its arguments), and the whole constraint is a no-op for the
+    // rejection sampler until the distribution arc.
+    let declarations = expect_clean(
+        "type addr_t : uint (bits : 16);\n\
+         struct pkt {\n    address : addr_t;\n};\n\
+         extend pkt {\n    keep soft address == select {\n        50 : min;\n        \
+         25 : max;\n        25 : others;\n    };\n    \
+         keep soft address == select {\n        100 : normal(MAX_UINT/2, MAX_UINT/10);\n    };\n    \
+         keep soft address == select {\n        50 : normal(2, 10);\n        50 : edges;\n    };\n};\n",
+    );
+    let extend = &declarations[2];
+    let Member::Constraint(first) = &extend.members[0] else {
+        panic!("expected a keep constraint");
+    };
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        rhs,
+        ..
+    } = &first.expr
+    else {
+        panic!("expected the equality against the select");
+    };
+    let Expr::Select { arms, .. } = rhs.as_ref() else {
+        panic!("expected a select on the right side");
+    };
+    assert_eq!(arms.len(), 3);
+    let weights: Vec<&str> = arms
+        .iter()
+        .map(|arm| match &arm.weight {
+            Expr::IntLiteral { text, .. } => text.as_str(),
+            _ => "?",
+        })
+        .collect();
+    assert_eq!(weights, vec!["50", "25", "25"]);
+    let choice_texts: Vec<Vec<String>> = arms
+        .iter()
+        .map(|arm| {
+            arm.choice
+                .iter()
+                .map(|token| match &token.kind {
+                    e1647::lexer::TokenKind::Identifier(word) => word.clone(),
+                    e1647::lexer::TokenKind::Punctuation(p) => p.clone(),
+                    e1647::lexer::TokenKind::Keyword(word) => word.clone(),
+                    _ => "?".to_owned(),
+                })
+                .collect()
+        })
+        .collect();
+    assert_eq!(choice_texts[0], vec!["min"]);
+    assert_eq!(choice_texts[1], vec!["max"]);
+    assert_eq!(choice_texts[2], vec!["others"]);
+    let Member::Constraint(second) = &extend.members[1] else {
+        panic!("expected a keep constraint");
+    };
+    let Expr::Binary { rhs, .. } = &second.expr else {
+        panic!("expected an equality");
+    };
+    let Expr::Select { arms, .. } = rhs.as_ref() else {
+        panic!("expected a select");
+    };
+    // `normal(MAX_UINT/2, MAX_UINT/10)` keeps its commas and slashes.
+    let normal_texts: Vec<String> = arms[0]
+        .choice
+        .iter()
+        .map(|token| match &token.kind {
+            e1647::lexer::TokenKind::Identifier(word) => word.clone(),
+            e1647::lexer::TokenKind::Number(text) => text.clone(),
+            e1647::lexer::TokenKind::Punctuation(p) => p.clone(),
+            _ => "?".to_owned(),
+        })
+        .collect();
+    assert_eq!(
+        normal_texts,
+        vec![
+            "normal", "(", "MAX_UINT", "/", "2", ",", "MAX_UINT", "/", "10", ")"
+        ]
+    );
+}

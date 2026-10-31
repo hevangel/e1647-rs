@@ -1384,3 +1384,50 @@ golden's expect shape plus an assume with a braced else);
 `tests/parser.rs` expect/assume recording (kind, raw-TE content with
 the `else` keyword excluded, one-statement and braced else bodies) and
 the no-else form plus the `E0119` empty-expression diagnostic.
+
+## 2026-10-31 (23) — offline arc: clause 10 select distributions recorded; igen-dist parse-clean and running
+
+Scope claimed for this change (nothing broader):
+
+- `select { <weight> : <choice>; .. }` distribution expressions
+  (clause 10) parse: `Expr::Select` with per-arm weight expressions
+  (structural) and choice tokens recorded verbatim (paren-aware, so
+  `normal(MAX_UINT/2, MAX_UINT/10)` keeps its arguments; `min`, `max`,
+  `others`, `edges`, `normal(..)` and value/range expressions all
+  land). Stray empty statements inside the block are tolerated.
+- Runtime: select constraints are no-ops for the rejection sampler —
+  the pre-existing `expr_calls_any(.. "select")` skip now covers the
+  structured `Expr::Select` variant — so `gen` produces uniform values
+  where the reference biases; a select expression evaluated directly
+  (outside a skipped constraint) reports the honest `E0402`
+  "select distribution expressions are not evaluated yet". The
+  distribution arc (weights, `normal` sampling, edges) is a later
+  milestone; `solve.rs` translation reports such constraints as
+  unsupported and falls back, as before.
+
+Corpus movement (absolute paths, `--seed 1`): **igen-dist 5 → 0 parse
+diagnostics** and the run completes, exit 0 — with the sampler
+treating the distributions as no-ops, honestly recorded. Every corpus
+file in `local/` now parses clean or carries only
+external-dependency diagnostics (etl 4 `base_struct`, cover-edges 4
+rf-library types, golden-imports 3 missing tutorial modules;
+golden-combined 0; type-min-max/save-restart/d6w 0).
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(130 passed: 11 elab, 1 fixtures, 36 interp, 24 lexer, 49 parser, 9 solve)
+```
+
+New tests: `tests/fixtures/select_constraint.{e,expected}` (OK — the
+igen-dist shapes plus a value-list choice);
+`tests/parser.rs` select recording (arm weights, verbatim
+paren-aware choices, the equality against `select`);
+`tests/interp.rs` select-as-sampler-no-op (gen still produces
+in-range values) and the honest direct-eval diagnostic.

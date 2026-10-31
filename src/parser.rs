@@ -3390,6 +3390,54 @@ impl Parser {
             };
             return self.parse_postfix_chain(new_expr, start);
         }
+        // `select { <weight> : <choice>; .. }` — a weighted distribution
+        // (clause 10). Weights parse; choices are recorded verbatim
+        // (paren-aware, so `normal(a, b)` keeps its comma and inner
+        // tokens). The sampler treats select constraints as no-ops until
+        // the distribution arc.
+        if self.at_keyword("select") {
+            self.bump();
+            self.expect_punct("{", "E0106", "expected '{' to open the select block")?;
+            let mut arms = Vec::new();
+            while !self.at_punct("}") && self.peek().is_some() {
+                if self.at_punct(";") {
+                    self.bump();
+                    continue;
+                }
+                let weight = self.parse_expr()?;
+                self.expect_punct(":", "E0103", "expected ':' after the select weight")?;
+                let mut choice = Vec::new();
+                let mut depth = 0usize;
+                while let Some(token) = self.peek() {
+                    match &token.kind {
+                        TokenKind::Punctuation(p) if p == ";" && depth == 0 => break,
+                        TokenKind::Punctuation(p) if p == "}" && depth == 0 => break,
+                        TokenKind::Punctuation(p) if p == "(" => {
+                            depth += 1;
+                            choice.push(self.bump());
+                        }
+                        TokenKind::Punctuation(p) if p == ")" => {
+                            depth = depth.saturating_sub(1);
+                            choice.push(self.bump());
+                        }
+                        _ => choice.push(self.bump()),
+                    }
+                }
+                if choice.is_empty() {
+                    self.error_here("E0108", "expected the select choice");
+                    return None;
+                }
+                self.eat_punct(";");
+                arms.push(crate::ast::SelectArm { weight, choice });
+            }
+            self.expect_punct("}", "E0107", "expected '}' to close the select block")?;
+            let end = self.last_end();
+            let select = Expr::Select {
+                arms,
+                span: (start, end),
+            };
+            return self.parse_postfix_chain(select, start);
+        }
         // Predefined e names that appear as bare values in real code
         // (see PREDEFINED_NAMES); treated as plain identifiers in
         // expression position.
