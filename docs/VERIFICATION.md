@@ -1431,3 +1431,58 @@ igen-dist shapes plus a value-list choice);
 paren-aware choices, the equality against `select`);
 `tests/interp.rs` select-as-sampler-no-op (gen still produces
 in-range values) and the honest direct-eval diagnostic.
+
+## 2026-10-31 (24) — offline arc: clause 12 temporal-expression grammar structured behind expect/assume
+
+Scope claimed for this change (nothing broader):
+
+- `expect`/`assume` members now parse their temporal expressions into
+  the clause 12 grammar (`TemporalExpr`) instead of recording raw
+  tokens: `@event` atoms with dotted, `$`-suffixed paths (12.2.4),
+  `cycle` (12.2.2), `true(exp)` propositions (12.2.3),
+  `change/rise/fall(exp)` edge samples (12.2.17), `{a; b}` sequences
+  (12.2.8), `=>` yield (12.2.13), `and`/`or` (12.2.6–12.2.7),
+  `not` (12.2.16), `fail` (12.2.12), `eventually` (12.2.14), the
+  `[n]*te` / `~[l..h]*te` / `[l..h]*te` repeats (12.2.9–12.2.11), the
+  binary sampling operator `te @event` whose operand is a bare dotted
+  event path (12.2.5), and `( te )` grouping. `detach`, `delay` and
+  `exec` TEs are not supported and report `E0120` (which also covers a
+  missing temporal expression; the previous arc's `E0119` is reserved).
+- Precedence, loosest to tightest: `=>`, `or`, `and`, the sampling
+  suffix, repeats/prefix operators, atoms — Table 37 is an image in
+  the local redline copy, so this order follows the prose conventions
+  and is documented in the parser. The golden's
+  `@enter_exec_st => {@fetch1_assert} @sys.cpuclk` structures as
+  Yield(@enter_exec_st, Sampled(Sequence{@fetch1_assert}, sys.cpuclk)):
+  the sampling attaches lexically to the yield's rhs, and the
+  semantic propagation to both sides (12.1.4 sampled normal form,
+  12.2.13) belongs to the temporal engine.
+- Nothing is evaluated: the members are still not collected during
+  elaboration, and the temporal engine (sampling propagation 12.1.4,
+  success/failure over paths 12.3, `wait`-integration) is a later
+  milestone.
+
+Corpus state (absolute paths — the relative-path corpus check bit the
+stale-cwd trap again this arc): golden-combined 0, igen-dist 0,
+type-min-max/save-restart/d6w 0, etl 4, cover-edges 4, golden-imports 3
+— all four-family counts are the external-dependency diagnostics, no
+regressions.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(131 passed: 11 elab, 1 fixtures, 36 interp, 24 lexer, 50 parser, 9 solve)
+```
+
+New tests: the expect/assume shape test rewritten for the structured
+tree (yield under sampling, event paths, sequence items); a new
+clause-12-operators test covering sequences with first-match repeats,
+true-match repeats over propositions, edge-sample or-groups with
+`not`, `fail` + `eventually`, and `[2]*cycle` under sampling; the
+missing-TE diagnostic updated to `E0120`.

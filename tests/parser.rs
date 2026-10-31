@@ -1298,29 +1298,140 @@ fn expect_and_assume_members_record_te_and_else() {
         panic!("expected an expect member");
     };
     assert_eq!(expect.kind, e1647::ast::ExpectKind::Expect);
-    let te_texts: Vec<String> = expect
-        .te
-        .iter()
-        .map(|token| match &token.kind {
-            e1647::lexer::TokenKind::Identifier(word) => word.clone(),
-            e1647::lexer::TokenKind::Keyword(word) => word.clone(),
-            e1647::lexer::TokenKind::Punctuation(p) => p.clone(),
-            _ => "?".to_owned(),
-        })
-        .collect();
-    assert!(te_texts.contains(&"@".to_owned()));
-    assert!(te_texts.contains(&"enter_exec_st".to_owned()));
-    assert!(te_texts.contains(&"=>".to_owned()));
-    assert!(
-        !te_texts.contains(&"else".to_owned()),
-        "the else keyword ends the recorded expression"
-    );
+    // `@enter_exec_st => {@fetch1_assert} @sys.any` structures as
+    // Sampled(Yield(@enter_exec_st, Sequence{@fetch1_assert}), @sys.any)
+    // (clause 12.2.13 yield, 12.2.8 sequence, 12.2.5 sampling).
+    let shape = match &expect.te {
+        // The sampling `@sys.any` attaches lexically to the yield's rhs;
+        // the semantic propagation to both sides (12.1.4, 12.2.13) is
+        // the temporal engine's sampled normal form, a later milestone.
+        e1647::ast::TemporalExpr::Yield { lhs, rhs } => match (&**lhs, &**rhs) {
+            (
+                e1647::ast::TemporalExpr::EventRef { path },
+                e1647::ast::TemporalExpr::Sampled { te, .. },
+            ) => {
+                path == &vec!["enter_exec_st".to_owned()]
+                    && matches!(
+                        &**te,
+                        e1647::ast::TemporalExpr::Sequence { items } if items.len() == 1
+                    )
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    assert!(shape, "te shape: {:?}", expect.te);
     assert_eq!(expect.else_body.len(), 1);
     let Member::Expect(assumption) = &declarations[0].members[2] else {
         panic!("expected an assume member");
     };
     assert_eq!(assumption.kind, e1647::ast::ExpectKind::Assume);
     assert_eq!(assumption.else_body.len(), 1);
+}
+
+#[test]
+fn temporal_grammar_covers_the_clause_12_operators() {
+    // The clause 12 operators the grammar records: sequences, sampling,
+    // yields, repeats, propositions, edge samples, and/or/not/fail/
+    // eventually.
+    let declarations = expect_clean(
+        "extend sys {\n    ev: event;\n    clk: event;\n    \
+         expect {[2]*@ev; @clk} @clk else dut_error(\"SEQ\");\n    \
+         expect ~[1..3]*true(sig == 1) @clk;\n    \
+         expect (change(sig) or rise(sig)) and not @ev;\n    \
+         expect fail{@ev; @ev} and eventually @clk;\n    \
+         expect [2]*cycle @clk;\n};\n",
+    );
+    let extend = &declarations[0];
+    let Member::Expect(fixed_repeat) = &extend.members[2] else {
+        panic!("expected the sequence expect");
+    };
+    let seq_shape = match &fixed_repeat.te {
+        e1647::ast::TemporalExpr::Sampled { te, .. } => match &**te {
+            e1647::ast::TemporalExpr::Sequence { items } => {
+                items.len() == 2
+                    && matches!(
+                        &items[0],
+                        e1647::ast::TemporalExpr::Repeat {
+                            kind: e1647::ast::RepeatKind::FirstMatch,
+                            ..
+                        }
+                    )
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    assert!(seq_shape, "te: {:?}", fixed_repeat.te);
+    let Member::Expect(true_match) = &extend.members[3] else {
+        panic!("expected the repeat expect");
+    };
+    let repeat_shape = match &true_match.te {
+        e1647::ast::TemporalExpr::Sampled { te, .. } => match &**te {
+            e1647::ast::TemporalExpr::Repeat { kind, .. } => {
+                *kind == e1647::ast::RepeatKind::TrueMatch
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    assert!(repeat_shape);
+    let Member::Expect(or_edge) = &extend.members[4] else {
+        panic!("expected the edge-sample expect");
+    };
+    let edge_shape = match &or_edge.te {
+        e1647::ast::TemporalExpr::And(lhs, rhs) => {
+            // The parenthesized or-group arrives as a Group.
+            let lhs_ok = match &**lhs {
+                e1647::ast::TemporalExpr::Group(inner) => match &**inner {
+                    e1647::ast::TemporalExpr::Or(a, b) => {
+                        matches!(
+                            &**a,
+                            e1647::ast::TemporalExpr::EdgeSample {
+                                routine: e1647::ast::EdgeRoutine::Change,
+                                ..
+                            }
+                        ) && matches!(
+                            &**b,
+                            e1647::ast::TemporalExpr::EdgeSample {
+                                routine: e1647::ast::EdgeRoutine::Rise,
+                                ..
+                            }
+                        )
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            lhs_ok && matches!(&**rhs, e1647::ast::TemporalExpr::Not(..))
+        }
+        _ => false,
+    };
+    assert!(edge_shape);
+    let Member::Expect(fail_eventually) = &extend.members[5] else {
+        panic!("expected the fail/eventually expect");
+    };
+    let fail_shape = match &fail_eventually.te {
+        e1647::ast::TemporalExpr::And(lhs, rhs) => {
+            matches!(&**lhs, e1647::ast::TemporalExpr::Fail(..))
+                && matches!(&**rhs, e1647::ast::TemporalExpr::Eventually(..))
+        }
+        _ => false,
+    };
+    assert!(fail_shape);
+    let Member::Expect(cycle_repeat) = &extend.members[6] else {
+        panic!("expected the cycle repeat expect");
+    };
+    let cycle_shape = match &cycle_repeat.te {
+        e1647::ast::TemporalExpr::Sampled { te, .. } => match &**te {
+            e1647::ast::TemporalExpr::Repeat { te: inner, .. } => {
+                matches!(&**inner, e1647::ast::TemporalExpr::Cycle)
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    assert!(cycle_shape);
 }
 
 #[test]
@@ -1332,13 +1443,17 @@ fn expect_without_else_and_missing_te_report() {
         panic!("expected an expect member");
     };
     assert!(expect.else_body.is_empty());
+    assert!(matches!(
+        expect.te,
+        e1647::ast::TemporalExpr::EventRef { .. }
+    ));
     let result = parse("extend sys {\n    expect;\n};\n");
     assert!(
         result
             .diagnostics
             .iter()
-            .any(|d| d.render().contains("E0119")),
-        "expected E0119 for the missing temporal expression: {:?}",
+            .any(|d| d.render().contains("E0120")),
+        "expected E0120 for the missing temporal expression: {:?}",
         result
             .diagnostics
             .iter()

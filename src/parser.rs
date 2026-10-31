@@ -41,8 +41,10 @@
 //! - `E0117` unsupported or misplaced preprocessor directive (clause 21)
 //! - `E0118` expected the match expression string of a macro definition
 //!   (clause 15)
-//! - `E0119` expected the temporal expression of an `expect`/`assume`
-//!   member (clause 11.4)
+//! - `E0119` reserved (the temporal expression of an `expect`/`assume`
+//!   member now reports `E0120` when missing)
+//! - `E0120` unsupported, unexpected or missing temporal-expression
+//!   construct (clause 12)
 //! - `E0201` duplicate declaration name
 //! - `E0202` duplicate field name
 //! - `E0203` unknown type name
@@ -1500,10 +1502,10 @@ impl Parser {
     }
 
     /// `expect <temporal-expression> [else <failure body>];` and the
-    /// `assume` twin (clause 11.4). The temporal expression is recorded
-    /// as raw tokens up to the `else` keyword at brace depth zero — the
-    /// clause 12 grammar (TE operators, sequences, ports) is a later
-    /// milestone. The failure body parses as ordinary actions.
+    /// `assume` twin (clause 11.4). The temporal expression parses into
+    /// the clause 12 grammar; evaluation over paths is the temporal
+    /// engine, a later milestone. The failure body parses as ordinary
+    /// actions.
     fn parse_expect(&mut self) -> Option<crate::ast::ExpectDecl> {
         let start = self.current_span().0;
         let kind = match self.peek_kind() {
@@ -1511,33 +1513,7 @@ impl Parser {
             _ => crate::ast::ExpectKind::Assume,
         };
         self.bump(); // 'expect' / 'assume'
-        let mut te = Vec::new();
-        let mut depth = 0usize;
-        loop {
-            match self.peek() {
-                None => break,
-                Some(token) => match &token.kind {
-                    TokenKind::Keyword(k) if k == "else" && depth == 0 => break,
-                    // A top-level `;` ends the member (sequences carry
-                    // theirs inside braces, at depth >= 1).
-                    TokenKind::Punctuation(p) if p == ";" && depth == 0 => break,
-                    TokenKind::Punctuation(p) if p == "{" => {
-                        depth += 1;
-                        te.push(self.bump());
-                    }
-                    TokenKind::Punctuation(p) if p == "}" => {
-                        depth = depth.saturating_sub(1);
-                        te.push(self.bump());
-                    }
-                    _ => te.push(self.bump()),
-                },
-            }
-        }
-        if te.is_empty() {
-            self.error_here("E0119", "expected the temporal expression");
-            self.recover_to_member_boundary();
-            return None;
-        }
+        let te = self.parse_temporal_expr()?;
         let mut else_body = Vec::new();
         // The one-statement else form consumes its own terminator; the
         // member-level `;` then only applies to the braced/no-else
@@ -1562,6 +1538,191 @@ impl Parser {
             else_body,
             span: (start, end),
         })
+    }
+
+    /// The clause 12 temporal-expression grammar. Precedence, loosest to
+    /// tightest: `=>` (12.2.13), `or` (12.2.7), `and` (12.2.6), the
+    /// binary sampling `@` (12.2.5), repeats and prefix operators, then
+    /// the atoms — Table 37 is an image in the local copy, so this order
+    /// follows the prose conventions (`or` looser than `and`, sampling
+    /// binds over both, yield loosest as the expect shape requires).
+    fn parse_temporal_expr(&mut self) -> Option<crate::ast::TemporalExpr> {
+        let lhs = self.parse_te_or()?;
+        if self.at_punct("=>") {
+            self.bump();
+            let rhs = self.parse_temporal_expr()?;
+            return Some(crate::ast::TemporalExpr::Yield {
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            });
+        }
+        Some(lhs)
+    }
+
+    fn parse_te_or(&mut self) -> Option<crate::ast::TemporalExpr> {
+        let mut lhs = self.parse_te_and()?;
+        while self.eat_keyword("or") {
+            let rhs = self.parse_te_and()?;
+            lhs = crate::ast::TemporalExpr::Or(Box::new(lhs), Box::new(rhs));
+        }
+        Some(lhs)
+    }
+
+    fn parse_te_and(&mut self) -> Option<crate::ast::TemporalExpr> {
+        let mut lhs = self.parse_te_sample()?;
+        while self.eat_keyword("and") {
+            let rhs = self.parse_te_sample()?;
+            lhs = crate::ast::TemporalExpr::And(Box::new(lhs), Box::new(rhs));
+        }
+        Some(lhs)
+    }
+
+    /// The suffix sampling operator: `te @event` (12.2.5) — the operand
+    /// is a bare dotted event path (`@clk`-style atoms are the unary
+    /// operator, 12.2.4).
+    fn parse_te_sample(&mut self) -> Option<crate::ast::TemporalExpr> {
+        let mut te = self.parse_te_prefix()?;
+        while self.at_punct("@") {
+            self.bump();
+            let (path, _) = self.parse_te_event_path()?;
+            let event = crate::ast::TemporalExpr::EventRef { path };
+            te = crate::ast::TemporalExpr::Sampled {
+                te: Box::new(te),
+                event: Box::new(event),
+            };
+        }
+        Some(te)
+    }
+
+    /// Repeats (`[n]*te`, `~[l..h]*te`, `[l..h]*te` — 12.2.9–12.2.11)
+    /// and the prefix operators `not`, `fail`, `eventually`.
+    fn parse_te_prefix(&mut self) -> Option<crate::ast::TemporalExpr> {
+        if self.eat_keyword("not") {
+            let inner = self.parse_te_prefix()?;
+            return Some(crate::ast::TemporalExpr::Not(Box::new(inner)));
+        }
+        if self.eat_keyword("fail") {
+            let inner = self.parse_te_prefix()?;
+            return Some(crate::ast::TemporalExpr::Fail(Box::new(inner)));
+        }
+        if self.eat_keyword("eventually") {
+            let inner = self.parse_te_prefix()?;
+            return Some(crate::ast::TemporalExpr::Eventually(Box::new(inner)));
+        }
+        let true_match = self.at_punct("~");
+        let bracket_repeat = (self.at_punct("[") && !true_match)
+            || (true_match && {
+                let second = self.peek_second_kind();
+                matches!(second, Some(TokenKind::Punctuation(p)) if p == "[")
+            });
+        if bracket_repeat {
+            let kind = if true_match {
+                self.bump(); // '~'
+                crate::ast::RepeatKind::TrueMatch
+            } else {
+                crate::ast::RepeatKind::FirstMatch
+            };
+            self.bump(); // '['
+            let low = self.parse_expr()?;
+            let high = if self.eat_punct("..") {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            self.expect_punct("]", "E0107", "expected ']' to close the repeat range")?;
+            self.expect_punct("*", "E0106", "expected '*' after the repeat range")?;
+            let te = self.parse_te_prefix()?;
+            return Some(crate::ast::TemporalExpr::Repeat {
+                kind,
+                low: Some(low),
+                high,
+                te: Box::new(te),
+            });
+        }
+        self.parse_te_atom()
+    }
+
+    /// The temporal atoms: `cycle`, `true(exp)`, `change/rise/fall(exp)`,
+    /// `@event`, `{ sequences }`, `( te )` (12.2.2–12.2.4, 12.2.8,
+    /// 12.2.17).
+    fn parse_te_atom(&mut self) -> Option<crate::ast::TemporalExpr> {
+        if self.eat_keyword("cycle") {
+            return Some(crate::ast::TemporalExpr::Cycle);
+        }
+        for (routine, edge) in [
+            ("true", None::<crate::ast::EdgeRoutine>),
+            ("change", Some(crate::ast::EdgeRoutine::Change)),
+            ("rise", Some(crate::ast::EdgeRoutine::Rise)),
+            ("fall", Some(crate::ast::EdgeRoutine::Fall)),
+        ] {
+            if self.peek_word_is(routine)
+                && matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == "(")
+            {
+                self.bump();
+                self.expect_punct("(", "E0109", "expected '(' after the temporal routine")?;
+                let expr = self.parse_expr()?;
+                self.expect_punct(")", "E0110", "expected ')' after the sampled expression")?;
+                return match edge {
+                    None => Some(crate::ast::TemporalExpr::True { expr }),
+                    Some(routine) => Some(crate::ast::TemporalExpr::EdgeSample { routine, expr }),
+                };
+            }
+        }
+        if self.at_punct("@") {
+            self.bump();
+            let (path, _) = self.parse_te_event_path()?;
+            return Some(crate::ast::TemporalExpr::EventRef { path });
+        }
+        if self.eat_punct("{") {
+            let mut items = vec![self.parse_temporal_expr()?];
+            while self.eat_punct(";") {
+                if self.at_punct("}") {
+                    break;
+                }
+                items.push(self.parse_temporal_expr()?);
+            }
+            self.expect_punct("}", "E0107", "expected '}' to close the temporal sequence")?;
+            return Some(crate::ast::TemporalExpr::Sequence { items });
+        }
+        if self.eat_punct("(") {
+            let inner = self.parse_temporal_expr()?;
+            self.expect_punct(
+                ")",
+                "E0110",
+                "expected ')' to close the temporal expression",
+            )?;
+            return Some(crate::ast::TemporalExpr::Group(Box::new(inner)));
+        }
+        self.error_here(
+            "E0120",
+            "unsupported or unexpected temporal-expression construct",
+        );
+        None
+    }
+
+    /// `@`-event path: dotted words, each optionally `$`-suffixed
+    /// (`@sys.cpuclk`, `@driver.p$`).
+    fn parse_te_event_path(&mut self) -> Option<(Vec<String>, crate::ast::Span)> {
+        let (start, _) = self.current_span();
+        let (first, _) = self.expect_word("E0102", "expected the event name after '@'")?;
+        let mut first = first;
+        while self.at_punct("$") {
+            self.bump();
+            first.push('$');
+        }
+        let mut path = vec![first];
+        let mut end = self.last_end();
+        while self.eat_punct(".") {
+            let (segment, _) = self.expect_word("E0102", "expected a path segment after '.'")?;
+            let mut segment = segment;
+            while self.at_punct("$") {
+                self.bump();
+                segment.push('$');
+            }
+            path.push(segment);
+            end = self.last_end();
+        }
+        Some((path, (start, end)))
     }
 
     /// `on <event-path> { statements };` — an `on` struct member (clause
