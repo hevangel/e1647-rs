@@ -44,6 +44,10 @@ pub struct ElaboratedType {
     pub ons: Vec<crate::ast::OnDecl>,
     /// Coverage groups (clause 14), recorded not collected.
     pub covers: Vec<crate::ast::CoverGroupDecl>,
+    /// `expect`/`assume` rules (clause 11.4), base types first, then
+    /// extends in declaration order — monitored over the run log by the
+    /// interpreter.
+    pub expects: Vec<crate::ast::ExpectDecl>,
     /// `type name: <type>;` — the underlying representation, recorded
     /// only (clause 5); distinct-type semantics are a later milestone.
     pub underlying: Option<crate::ast::TypeExpr>,
@@ -96,6 +100,7 @@ struct Composed<'a> {
     whens: Vec<&'a WhenDecl>,
     ons: Vec<&'a crate::ast::OnDecl>,
     covers: Vec<&'a crate::ast::CoverGroupDecl>,
+    expects: Vec<&'a crate::ast::ExpectDecl>,
     ports: Vec<(&'a crate::ast::PortDecl, usize)>,
 }
 
@@ -160,6 +165,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                     whens: composed.whens.into_iter().cloned().collect(),
                     ons: composed.ons.into_iter().cloned().collect(),
                     covers: composed.covers.into_iter().cloned().collect(),
+                    expects: composed.expects.into_iter().cloned().collect(),
                     underlying: None,
                     enumerals: Vec::new(),
                     ports: composed
@@ -183,6 +189,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 whens: Vec::new(),
                 ons: Vec::new(),
                 covers: Vec::new(),
+                expects: Vec::new(),
                 underlying: declaration.underlying.clone(),
                 ports: Vec::new(),
                 enumerals: declaration
@@ -291,6 +298,7 @@ impl<'a> Elaborator<'a> {
                 whens: composed.whens.into_iter().cloned().collect(),
                 ons: composed.ons.into_iter().cloned().collect(),
                 covers: composed.covers.into_iter().cloned().collect(),
+                expects: composed.expects.into_iter().cloned().collect(),
                 underlying: None,
                 enumerals: Vec::new(),
                 ports: composed
@@ -417,11 +425,10 @@ impl<'a> Elaborator<'a> {
                 Member::When(when) => composed.whens.push(when),
                 Member::On(on) => composed.ons.push(on),
                 Member::Cover(cover) => composed.covers.push(cover),
+                Member::Expect(expect) => composed.expects.push(expect),
                 Member::Port(port) => composed.ports.push((port, block)),
                 Member::Import { .. } | Member::Define { .. } | Member::Macro(_) => {}
-                // Expect/assume members are recorded in the AST; the
-                // temporal engine (clause 12) is a later milestone.
-                Member::Expect(_) | Member::Event(_) | Member::Enumeral(_) => {}
+                Member::Event(_) | Member::Enumeral(_) => {}
             }
         }
     }

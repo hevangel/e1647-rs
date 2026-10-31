@@ -25,8 +25,10 @@
 > `hdl_load` and quoted signal paths) drives one mixed SystemVerilog
 > example. The clause 12 temporal-engine core (`src/temporal.rs`)
 > propagates sampling events to sampled normal form and evaluates
-> temporal expressions over explicit finite paths; it is a pure library,
-> not yet driven by the run loop. It does **not** yet do full type
+> temporal expressions over explicit finite paths; the run loop drives
+> it: `emit` feeds an event log, temporal `wait`s suspend until their
+> expression succeeds, and `expect`/`assume` rules are checked at
+> quit. It does **not** yet do full type
 > checking, `when`-subtype
 > resolution, event-driven temporal evaluation, coverage, non-linear or
 > disjunctive constraint solving, or general testbench execution. No IEEE

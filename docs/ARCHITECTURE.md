@@ -105,9 +105,15 @@ multi-simulator HDL API, and wasm32.
   Propositions and repeat bounds are evaluated through caller-supplied
   callbacks; `change/rise/fall(exp)` edge samples report
   `EvalError::EdgeSample` (no sampled value history in the pure core)
-  and unresolvable constructs report `EvalError::Unsupported`. Nothing
-  here touches simulation time — wiring `wait`/`emit`/expect monitoring
-  to the run loop is a later milestone.
+  and unresolvable constructs report `EvalError::Unsupported`. The
+  same module hosts the run-loop monitoring helpers:
+  `succeeded_somewhere` (12.3.1 at any point), `rule_failed` (the
+  11.4/12.3.2 expect/assume failure reading over a finished run log —
+  yields fail on unfulfilled obligations, `eventually`/success-required
+  shapes fail when they never succeeded, `not`/`fail` shapes are
+  invariants) and `collect_exprs` (the proposition/bound expressions a
+  caller pre-evaluates). Nothing here touches simulation time itself —
+  the interpreter feeds it the log.
 - `src/check.rs` — minimal well-formedness checks (duplicate
   declaration/field/parameter/local/enumeral names, unknown type names,
   `keep` identifier roots, zero widths). The CLI runs this once on the
@@ -142,7 +148,21 @@ multi-simulator HDL API, and wasm32.
   does not drive the simulator; `emit` records a firing and executes the
   event's `on` action blocks inline, in composition order, on the
   instance the event path resolves to (clause 11.2) — `@sim`-attached
-  events never fire.
+  events never fire. `emit` also records the occurrence in the run's
+  temporal log (one `State` per virtual cycle, clause 12); temporal
+  `wait` statements (`@event`, sequences, propositions, event repeats,
+  with 13.1.3's readability-only `until`) suspend by advancing one
+  cycle at a time until the expression succeeds over the log from the
+  wait's start (12.3.1) — propositions and repeat bounds evaluate once
+  with current field values (no per-cycle value history), a temporal
+  wait unsatisfied after 1,000 cycles reports `E0409` like the runaway
+  guard, and unevaluable TEs (`change/rise/fall`, unresolvable bounds)
+  report `E0402` honestly. `expect`/`assume` rules (elaborated per
+  type, 11.4) are monitored at quit with `rule_failed` (12.3.2): a
+  failed rule runs its `else` body on the sys instance as a check
+  error, or prints the failure when there is no else body. One global
+  timeline — no per-instance sampling, no concurrent execution during
+  a wait (TCM suspension is the next temporal milestone).
 - `src/solve.rs` — constraint IR and the pluggable solver seam: the
   top-level `keep` constraints of one type translate (conservatively) into
   bounded-integer variables plus a conjunction of linear comparisons;
@@ -164,10 +184,11 @@ multi-simulator HDL API, and wasm32.
 Deliberately not implemented yet: `when`-subtype resolution, non-linear,
 disjunctive or temporal constraint solving (the solver backend covers
 conjunctive linear constraints and constant ranges over bounded
-integers), an event scheduler
-and time-consuming-method suspension (the clause 12 engine core in
-`src/temporal.rs` evaluates explicit finite paths; it is not driven by
-the run loop), the coverage data model and
+integers), concurrent TCM scheduling and
+time-consuming-method suspension (temporal `wait`s and expect
+monitoring run over the event log, but nothing executes
+concurrently during a wait), `sync`, `@sim` sampling and per-instance
+timelines, the coverage data model and
 reports (clause 14 groups are recorded, not collected), integer width
 truncation, evaluation of MVL literals, `repeat`, single-statement
 `if ... do`, `detach`/`delay`/`exec` TEs, select

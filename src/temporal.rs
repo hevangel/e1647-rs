@@ -42,6 +42,12 @@ impl State {
         let dotted = path.join(".");
         self.occurred.contains(&dotted)
     }
+
+    /// Record an event occurrence in this state (the interpreter's
+    /// `emit` feeds the run log through this).
+    pub fn record(&mut self, path: &str) {
+        self.occurred.insert(path.to_owned());
+    }
 }
 
 /// `true(exp)` propositions: `Some(TRUE/FALSE)` when evaluated.
@@ -425,5 +431,140 @@ fn edge_routine_name(routine: EdgeRoutine) -> &'static str {
         EdgeRoutine::Change => "change",
         EdgeRoutine::Rise => "rise",
         EdgeRoutine::Fall => "fall",
+    }
+}
+
+/// Whether `te` succeeded at any point of `states`: some sub-path
+/// (12.3.3's legal starts — the path start, or just after any sampling
+/// point; the run loop's single timeline samples every cycle) over
+/// which the TE holds tightly (12.3.1 at any end point). This is the
+/// wait- and rule-side notion of "happened at some time", as opposed
+/// to [`succeeds`]'s success at the last point only.
+pub fn succeeded_somewhere(
+    te: &TemporalExpr,
+    states: &[State],
+    callbacks: &EvalCallbacks,
+) -> Result<bool, EvalError> {
+    for end in 1..=states.len() {
+        for start in 0..end {
+            if holds_tight(te, &states[start..end], callbacks)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Whether an `expect`/`assume` rule (11.4) failed over a finished run
+/// log — 12.3.2: the rule fails where `fail te` succeeds, i.e. where
+/// all possibilities to satisfy the TE are exhausted. The per-shape
+/// readings, over the whole log:
+///
+/// - a yield (the common `@a => eventually @b` shape) fails when the
+///   lhs succeeded somewhere (12.3.3 legal starts) and the rhs never
+///   succeeded after that (12.2.13: "needs to also succeed in
+///   sequence");
+/// - `eventually te` fails when the sub-expression never succeeded
+///   (all possibilities exhausted at quit, 12.2.14);
+/// - `not te` / `fail te` fail when the sub-expression did hold —
+///   `not @a` as a rule is the invariant "a never occurs";
+/// - every other top-level shape is success-required: it fails when it
+///   never succeeded anywhere.
+///
+/// Approximations (documented, per the run loop's model): one global
+/// timeline of per-cycle states (the sampling event's occurrences are
+/// every cycle boundary), and propositions/bounds evaluated with the
+/// values the callbacks supply — the interpreter has no per-cycle
+/// value history. Edge samples propagate [`EvalError::EdgeSample`].
+pub fn rule_failed(
+    te: &TemporalExpr,
+    log: &[State],
+    callbacks: &EvalCallbacks,
+) -> Result<bool, EvalError> {
+    if log.is_empty() {
+        return Ok(false);
+    }
+    match te {
+        // An obligation pair: violated when some lhs success left no
+        // rhs success after it. Enumerate the lhs's tight satisfactions
+        // over legal starts and check each one's rhs window.
+        crate::ast::TemporalExpr::Yield { lhs, rhs } => {
+            for end in 1..=log.len() {
+                for start in 0..end {
+                    if holds_tight(lhs, &log[start..end], callbacks)?
+                        && !succeeded_somewhere(rhs, &log[end..], callbacks)?
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        // The expected event never became possible-and-actual: failed
+        // at quit.
+        crate::ast::TemporalExpr::Eventually(inner) => {
+            Ok(!succeeded_somewhere(inner, log, callbacks)?)
+        }
+        // `not te` / `fail te` rules are invariants: they fail when the
+        // inner behavior did happen (12.2.16 vs 12.2.12, read over the
+        // whole window).
+        crate::ast::TemporalExpr::Not(inner) | crate::ast::TemporalExpr::Fail(inner) => {
+            succeeded_somewhere(inner, log, callbacks)
+        }
+        // Success-required shapes: the rule must have succeeded at
+        // least once before quit.
+        _ => Ok(!succeeded_somewhere(te, log, callbacks)?),
+    }
+}
+
+/// Collect the proposition (`true(exp)`) and numeric repeat-bound
+/// expressions appearing in `te`, in evaluation order — the caller
+/// evaluates them once (the values the callbacks will supply for every
+/// state) and builds a callback set over the results.
+pub fn collect_exprs<'te>(
+    te: &'te TemporalExpr,
+    propositions: &mut Vec<&'te crate::ast::Expr>,
+    bounds: &mut Vec<&'te crate::ast::Expr>,
+) {
+    match te {
+        crate::ast::TemporalExpr::True { expr } => propositions.push(expr),
+        crate::ast::TemporalExpr::Repeat {
+            low,
+            high,
+            te: inner,
+            ..
+        } => {
+            if let Some(expr) = low {
+                bounds.push(expr);
+            }
+            if let Some(expr) = high {
+                bounds.push(expr);
+            }
+            collect_exprs(inner, propositions, bounds);
+        }
+        crate::ast::TemporalExpr::Sequence { items } => {
+            for item in items {
+                collect_exprs(item, propositions, bounds);
+            }
+        }
+        crate::ast::TemporalExpr::Yield { lhs, rhs }
+        | crate::ast::TemporalExpr::And(lhs, rhs)
+        | crate::ast::TemporalExpr::Or(lhs, rhs) => {
+            collect_exprs(lhs, propositions, bounds);
+            collect_exprs(rhs, propositions, bounds);
+        }
+        crate::ast::TemporalExpr::Not(inner)
+        | crate::ast::TemporalExpr::Fail(inner)
+        | crate::ast::TemporalExpr::Eventually(inner)
+        | crate::ast::TemporalExpr::Sampled { te: inner, .. }
+        | crate::ast::TemporalExpr::Group(inner) => {
+            collect_exprs(inner, propositions, bounds);
+        }
+        // Edge samples need the value history the callbacks cannot
+        // supply; evaluation reports EvalError::EdgeSample before any
+        // expression is consulted.
+        crate::ast::TemporalExpr::EventRef { .. }
+        | crate::ast::TemporalExpr::Cycle
+        | crate::ast::TemporalExpr::EdgeSample { .. } => {}
     }
 }

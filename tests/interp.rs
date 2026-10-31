@@ -542,3 +542,161 @@ fn select_expressions_report_an_honest_eval_diagnostic() {
         result.diagnostics[0].render()
     );
 }
+
+#[test]
+fn emit_feeds_the_temporal_log_and_wait_sees_it() {
+    // `emit` records the occurrence in this cycle's state; a temporal
+    // wait started in the same cycle succeeds immediately (12.3.1's
+    // sub-path over the recorded state).
+    let output = clean_output(
+        "extend sys {\n    ev: event;\n    run() is also {\n        emit ev;\n        \
+         wait @ev;\n        out(\"WAIT DONE\");\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("WAIT DONE"), "output: {output}");
+}
+
+#[test]
+fn temporal_wait_sees_events_recorded_by_on_blocks() {
+    // The `on` block's numeric wait advanced the cycle and the emission
+    // landed in the new cycle's state; the temporal wait `until @ev`
+    // (13.1.3's readability-only `until`) succeeds against the log.
+    let output = clean_output(
+        "extend sys {\n    ev: event;\n    on reset_ev {\n        wait [1]*cycle;\n        \
+         emit ev;\n    };\n    reset_ev: event;\n    run() is also {\n        emit reset_ev;\n        \
+         wait until @ev;\n        out(\"RESUMED\");\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("RESUMED"), "output: {output}");
+}
+
+#[test]
+fn unsatisfied_temporal_wait_reports_the_budget_guard() {
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        wait @never_emitted;\n        \
+         out(\"UNREACHABLE\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>(),
+        vec!["E0409"]
+    );
+    assert!(
+        !result.output.contains("UNREACHABLE"),
+        "the wait must not complete: {}",
+        result.output
+    );
+}
+
+#[test]
+fn failed_expect_rule_runs_the_else_body() {
+    // 11.4: `@start => eventually @done` fails when start occurred and
+    // done never did; the else body's dut_error reports it.
+    let result = run_source(
+        "extend sys {\n    start_ev: event;\n    done_ev: event;\n    \
+         expect @start_ev => eventually @done_ev else dut_error(\"NEVER DONE\");\n    \
+         run() is also {\n            emit start_ev;\n        };\n};\n",
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert!(
+        result.output.contains("NEVER DONE"),
+        "output: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("1 DUT error(s)"),
+        "output: {}",
+        result.output
+    );
+}
+
+#[test]
+fn satisfied_and_vacuous_expect_rules_stay_silent() {
+    // The satisfied rule: start then done one cycle later. The vacuous
+    // rule: its lhs never occurs, so nothing is obligated (12.2.13).
+    let output = clean_output(
+        "extend sys {\n    start_ev: event;\n    done_ev: event;\n    other_ev: event;\n    \
+         expect @start_ev => eventually @done_ev else dut_error(\"SATISFIABLE\");\n    \
+         assume @other_ev => eventually @done_ev else dut_error(\"VACUOUS\");\n    \
+         run() is also {\n            emit start_ev;\n            wait [1]*cycle;\n            \
+         emit done_ev;\n        };\n};\n",
+        1,
+    );
+    assert!(
+        !output.contains("SATISFIABLE") && !output.contains("VACUOUS"),
+        "output: {output}"
+    );
+}
+
+#[test]
+fn failed_expect_without_else_body_prints_the_rule() {
+    // 11.4: with no dut_error clause the tool prints the rule failure
+    // itself, as a check error.
+    let result = run_source(
+        "extend sys {\n    start_ev: event;\n    done_ev: event;\n    \
+         expect @start_ev => eventually @done_ev;\n    run() is also {\n            \
+         emit start_ev;\n        };\n};\n",
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert!(
+        result
+            .output
+            .contains("expect rule failed: temporal property not satisfied"),
+        "output: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("1 DUT error(s)"),
+        "output: {}",
+        result.output
+    );
+}
+
+#[test]
+fn eventually_rule_requires_the_event_before_quit() {
+    // `expect eventually @done` is success-required: it fails when the
+    // event never occurred anywhere in the run.
+    let result = run_source(
+        "extend sys {\n    done_ev: event;\n    expect eventually @done_ev else \
+         dut_error(\"NO DONE BY QUIT\");\n    run() is also {\n            wait [2]*cycle;\n        \
+     };\n};\n",
+        1,
+    );
+    assert!(
+        result.output.contains("NO DONE BY QUIT"),
+        "output: {}",
+        result.output
+    );
+}
+
+#[test]
+fn temporal_wait_spins_until_a_later_cycle_satisfies_the_sequence() {
+    // `wait {@a; cycle}` (12.2.8): a occurs in the start cycle; the
+    // tail `cycle` holds on the next cycle, so the wait spins once —
+    // the padded empty state — and succeeds.
+    let output = clean_output(
+        "extend sys {\n    a_ev: event;\n    run() is also {\n        emit a_ev;\n        \
+         wait {@a_ev; cycle};\n        out(\"SEQ HELD\");\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("SEQ HELD"), "output: {output}");
+}
+
+#[test]
+fn proposition_wait_evaluates_with_current_field_values() {
+    // `wait true(x == 3)` evaluates the proposition through the
+    // interpreter with current field values (12.1.1.1: TRUE or
+    // non-zero numeric).
+    let output = clean_output(
+        "extend sys {\n    x: uint;\n    run() is also {\n        x = 3;\n        \
+         wait true(x == 3);\n        out(\"PROP HELD\");\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("PROP HELD"), "output: {output}");
+}

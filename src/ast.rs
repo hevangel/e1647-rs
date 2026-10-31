@@ -461,6 +461,15 @@ pub enum Stmt {
         cycles: Expr,
         span: Span,
     },
+    /// `wait @event;`, `wait {..} @clk;`, `wait [n]*@event;`,
+    /// `wait until <te>;` — a temporal wait (clause 13.1.3; `until` is
+    /// readability-only): suspends until the temporal expression
+    /// succeeds (12.3.1) over the run's event log, under the wait
+    /// budget.
+    WaitTemporal {
+        te: TemporalExpr,
+        span: Span,
+    },
     /// `emit <target>;` — fires an event.
     Emit {
         target: Expr,
@@ -509,6 +518,7 @@ impl Stmt {
             | Stmt::ForEach { span, .. }
             | Stmt::ForTo { span, .. }
             | Stmt::Wait { span, .. }
+            | Stmt::WaitTemporal { span, .. }
             | Stmt::Emit { span, .. }
             | Stmt::Start { span, .. }
             | Stmt::Compute { span, .. }
