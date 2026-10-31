@@ -452,6 +452,13 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
             collect_root_identifiers(high, roots);
         }
         Expr::IsA { expr, .. } => collect_root_identifiers(expr, roots),
+        // A select distribution's weights are the only AST side; the
+        // choices are recorded as raw tokens.
+        Expr::Select { arms, .. } => {
+            for arm in arms {
+                collect_root_identifiers(&arm.weight, roots);
+            }
+        }
         // `new` creates an instance; its type names no field and its
         // init assignments run against the fresh instance.
         Expr::New { inits, .. } => {

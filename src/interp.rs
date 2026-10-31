@@ -2159,6 +2159,11 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Bool(is_a != *negated))
             }
+            Expr::Select { span, .. } => Err(self.error(
+                "E0402",
+                "select distribution expressions are not evaluated yet",
+                *span,
+            )),
             Expr::New { span, .. } => Err(self.error(
                 "E0402",
                 "'new' instance creation is not supported yet",
@@ -2679,6 +2684,9 @@ fn expr_calls_any(expr: &Expr, names: &[&str]) -> bool {
                 || args.iter().any(|arg| expr_calls_any(arg, names))
         }
         Expr::MemberAccess { object, .. } => expr_calls_any(object, names),
+        // A `select { .. }` distribution marks its whole constraint as a
+        // distribution — the rejection predicate treats it as a no-op.
+        Expr::Select { .. } => true,
         Expr::Unary { expr: inner, .. }
         | Expr::Paren { expr: inner, .. }
         | Expr::CastAs { expr: inner, .. } => expr_calls_any(inner, names),

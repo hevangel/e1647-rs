@@ -726,6 +726,17 @@ pub enum Expr {
         inits: Vec<Stmt>,
         span: Span,
     },
+    /// `select { <weight> : <choice>; .. }` — a weighted distribution
+    /// expression (clause 10), typically the right side of a
+    /// `keep soft <field> == select { .. }`. Weights are structural;
+    /// every choice (`min`, `max`, `others`, `edges`,
+    /// `normal(mean, stddev)`, or a value expression) is recorded as
+    /// raw tokens — the sampler treats select constraints as no-ops
+    /// until the distribution arc.
+    Select {
+        arms: Vec<SelectArm>,
+        span: Span,
+    },
     /// `expr.as_a(type)` cast.
     CastAs {
         expr: Box<Expr>,
@@ -767,6 +778,14 @@ pub enum InSetExpr {
     Range(Box<Expr>, Box<Expr>),
 }
 
+/// One weighted arm of a [`Expr::Select`] distribution: the weight
+/// expression and the choice's raw tokens (clause 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectArm {
+    pub weight: Expr,
+    pub choice: Vec<crate::lexer::Token>,
+}
+
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
@@ -788,6 +807,7 @@ impl Expr {
             | Expr::InSet { span, .. }
             | Expr::IsA { span, .. }
             | Expr::New { span, .. }
+            | Expr::Select { span, .. }
             | Expr::HdlPath { span, .. } => *span,
         }
     }

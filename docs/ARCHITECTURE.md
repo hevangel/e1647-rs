@@ -76,7 +76,10 @@ multi-simulator HDL API, and wasm32.
   every option clause verbatim — nothing is collected at run time.
   Clause 11.4 `expect`/`assume` members record the temporal expression
   as raw tokens (the clause 12 grammar is a later milestone) with the
-  `else` failure body parsed as actions. Predefined non-scalar types
+  `else` failure body parsed as actions. Clause 10 `select { weight :
+  choice; .. }` distributions parse — weights structurally, choices
+  verbatim — and the rejection sampler treats select constraints as
+  no-ops until the distribution arc. Predefined non-scalar types
   `file` and `event` are accepted in type
   positions; `for each <type> (v) in list` records the element type
   filter. `package`/`private` member prefixes are recorded on fields.
@@ -145,7 +148,9 @@ and time-consuming-method suspension, the coverage data model and
 reports (clause 14 groups are recorded, not collected), integer width
 truncation, evaluation of MVL literals, `repeat`, single-statement
 `if ... do`, the temporal-expression grammar and evaluation
-(clause 12; `expect`/`assume` members are recorded only), `on
+(clause 12; `expect`/`assume` members are recorded only), select
+distribution biasing in the sampler (clause 10; the expressions parse
+and are no-ops), `on
 event-port`, `#else` and `#define` replacement
 rules, template instantiation and `template extend` (clause 8.2–8.3),
 macro match-expression

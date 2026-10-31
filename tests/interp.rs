@@ -503,3 +503,42 @@ fn new_reports_a_clean_runtime_diagnostic() {
         result.diagnostics[0].render()
     );
 }
+
+#[test]
+fn select_constraints_are_no_ops_for_the_sampler() {
+    // A `keep soft x == select { .. }` distribution parses and is
+    // treated as a no-op by the rejection sampler (clause 10's
+    // distribution biasing is a later arc); gen still produces values.
+    let output = clean_output(
+        "struct s {\n    v: uint (bits: 8);\n};\n\
+         extend s {\n    keep soft v == select {\n        50 : min;\n        25 : max;\n        \
+         25 : others;\n    };\n};\n\
+         extend sys {\n    run() is also {\n        var x: s;\n        gen x;\n        \
+         if x.v < 0 or x.v > 255 {\n            out(\"BAD\\n\");\n        } else {\n            \
+         out(\"OK\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "OK\n");
+}
+
+#[test]
+fn select_expressions_report_an_honest_eval_diagnostic() {
+    let result = run(
+        &elaborate(
+            &parse(
+                "extend sys {\n    run() is also {\n        var x: uint = select {\n            \
+             50 : min;\n        };\n    };\n};\n",
+            )
+            .declarations,
+        ),
+        1,
+    );
+    assert_eq!(result.diagnostics.len(), 1);
+    assert!(
+        result.diagnostics[0]
+            .render()
+            .contains("select distribution expressions are not evaluated yet"),
+        "expected the honest select diagnostic: {:?}",
+        result.diagnostics[0].render()
+    );
+}
