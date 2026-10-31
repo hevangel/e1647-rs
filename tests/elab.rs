@@ -169,3 +169,21 @@ fn builtin_sys_is_synthesized_from_its_extends() {
     assert_eq!(sys.methods.len(), 1);
     assert_eq!(sys.methods[0].name, "run");
 }
+
+#[test]
+fn on_members_compose_through_extends_in_order() {
+    // Repeating an `on` declaration extends it (clause 11.2, the
+    // `is also` effect): the composed list keeps every block, base types
+    // first, extends in declaration order.
+    let result = elaborated(
+        "unit env {\n    event reset_done;\n};\n\
+         extend env {\n    on reset_done { out(\"one\"); };\n};\n\
+         extend env {\n    on reset_done { out(\"two\"); };\n};\n",
+    );
+    let env = find(&result, "env");
+    assert_eq!(env.ons.len(), 2);
+    assert_eq!(env.ons[0].path, vec!["reset_done"]);
+    assert_eq!(env.ons[1].path, vec!["reset_done"]);
+    assert_eq!(env.ons[0].body.len(), 1);
+    assert_eq!(env.ons[1].body.len(), 1);
+}

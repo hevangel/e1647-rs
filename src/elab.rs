@@ -39,6 +39,9 @@ pub struct ElaboratedType {
     pub methods: Vec<MethodDecl>,
     /// `when` subtype members, ancestor types first.
     pub whens: Vec<WhenDecl>,
+    /// `on` struct members (clause 11.2), base types first, then extends
+    /// in declaration order — the accumulated action blocks per event.
+    pub ons: Vec<crate::ast::OnDecl>,
     pub enumerals: Vec<Enumeral>,
     /// `simple_port` members with the HDL location resolved from their
     /// `keep name.hdl_path() == "path"` constraints.
@@ -86,6 +89,7 @@ struct Composed<'a> {
     constraints: Vec<&'a KeepConstraint>,
     methods: Vec<(&'a MethodDecl, usize)>,
     whens: Vec<&'a WhenDecl>,
+    ons: Vec<&'a crate::ast::OnDecl>,
     ports: Vec<(&'a crate::ast::PortDecl, usize)>,
 }
 
@@ -148,6 +152,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                         .map(|(method, _)| method.clone())
                         .collect(),
                     whens: composed.whens.into_iter().cloned().collect(),
+                    ons: composed.ons.into_iter().cloned().collect(),
                     enumerals: Vec::new(),
                     ports: composed
                         .ports
@@ -168,6 +173,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 constraints: Vec::new(),
                 methods: Vec::new(),
                 whens: Vec::new(),
+                ons: Vec::new(),
                 ports: Vec::new(),
                 enumerals: declaration
                     .members
@@ -273,6 +279,7 @@ impl<'a> Elaborator<'a> {
                     .map(|(method, _)| method.clone())
                     .collect(),
                 whens: composed.whens.into_iter().cloned().collect(),
+                ons: composed.ons.into_iter().cloned().collect(),
                 enumerals: Vec::new(),
                 ports: composed
                     .ports
@@ -396,6 +403,7 @@ impl<'a> Elaborator<'a> {
                 Member::Constraint(constraint) => composed.constraints.push(constraint),
                 Member::Method(method) => composed.methods.push((method, block)),
                 Member::When(when) => composed.whens.push(when),
+                Member::On(on) => composed.ons.push(on),
                 Member::Port(port) => composed.ports.push((port, block)),
                 Member::Import { .. } | Member::Define { .. } => {}
                 Member::Event(_) | Member::Enumeral(_) => {}

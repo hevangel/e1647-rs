@@ -1038,6 +1038,68 @@ New tests: `tests/lexer.rs::negative_string_match_is_one_token`;
 `tests/parser.rs` clause 4.5 precedence placements (string match between
 identity and `in`, `is a` between equality and comparisons), bare-`is`
 non-consumption, `extend global` rejection, pseudo-declaration survival;
-`tests/interp.rs` `is a` scalar/named/like/enumeral checks, literal string
+`tests/interp.rs` `is a` scalar/named/`like`/enumeral checks, literal string
 match, `E0410` for AWK and meta-character patterns;
 `tests/fixtures/extend_global.{e,expected}`.
+
+## 2026-10-30 (17) — offline arc: `on` struct members (clause 11.2) and clause 21 preprocessor flags
+
+Scope claimed for this change (nothing broader):
+
+- `on <event-path> { actions };` struct members parse, compose through
+  `like`/`extend` (a repeated declaration extends, clause 11.2's
+  `is also` effect; base types first, extends in declaration order) and
+  execute: `emit` now runs the event's `on` action blocks inline, in
+  composition order, on the instance the event path resolves to (bare
+  name → enclosing instance; dotted path → the object it reads through).
+  Event match is by event name (last path segment) within the owner's
+  type — clause 11.2 keeps the named event local to its struct. Each
+  block runs with a fresh locals frame; `return`/`break`/`continue` end
+  only that block; `emit`-inside-`on` recursion is depth-bounded
+  (`E0406`). The clause's no-TCMs restriction is not enforced, and
+  `@sim`-attached events never fire (unchanged).
+- Preprocessor flags (clause 21.2): `#ifdef` / `#ifndef` / `#define` /
+  `#undef` in statement, struct-member and action positions.
+  `#define NAME <replacement>;` records the flag; the replacement text
+  is consumed per the clause 21.3 single-line rule but NOT substituted
+  (replacement rules are a later milestone). `#undef` takes `;` or the
+  line end. Excluded branches are skipped without parsing ("ignore it").
+  Conditional forms at module level report `E0117` (clause 21.2 lists
+  statement/member/action positions). `#else` is not parsed — its exact
+  syntax example is an image in the local redline copy and was not
+  guessed.
+
+Corpus movement (`local/`, `--seed 1`): save-restart-test1 2 parse
+diagnostics → 0 (parse-clean; it was this arc's first-blocker).
+The run now advances into the MAIN sequence body and stops at
+`E0407` "no solution found for the constraints of 'packet'": packet's
+`keep tail in [1..100]` over an unbounded `int` field. Root cause
+(diagnosed, not fixed in this arc): `sample_type` samples unsized `int`
+over the full 32-bit domain, so rejection sampling essentially never
+hits a bounded range, and `solve.rs::translate_atom` accepts only
+binary comparisons — `Expr::InSet` is `Unsupported` on every backend.
+This is the next first-blocker: a clause 10 (constraints/`gen`) arc —
+set-membership constraints in the solver IR and/or constraint-aware
+sampling. Other corpus parse counts unchanged (etl 22, igen-dist 5,
+type-min-max 2, cover-edges 1 lexical, d6w 0).
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`, Windows):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(107 passed: 11 elab, 1 fixtures, 26 interp, 24 lexer, 39 parser, 6 solve)
+```
+
+New tests: `tests/parser.rs` `on` member shape (bare and dotted paths),
+hash directive include/exclude at member and action level (garbage inside
+an excluded branch produces no diagnostics), module-level conditional
+rejection; `tests/elab.rs` `on` composition order through extends;
+`tests/interp.rs` emit runs `on` blocks in order through a dotted emit,
+and emit without `on` blocks is silent;
+`tests/fixtures/on_member.{e,expected}` (OK) and
+`tests/fixtures/ifdef_skips_excluded_code.{e,expected}` (OK — the
+byte-exact contract that excluded code is ignored, not parsed).

@@ -74,6 +74,16 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
         check_fields(declaration, &declared, &mut diagnostics);
         check_enumerals(declaration, &mut diagnostics);
         check_methods(declaration, &declared, &mut diagnostics);
+        for_each_on(&declaration.members, &mut |on| {
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            check_statements(
+                &on.body,
+                &mut seen,
+                &declared,
+                &on.path.join("."),
+                &mut diagnostics,
+            );
+        });
         if declaration.kind != DeclarationKind::Extend {
             let mut field_names: BTreeSet<&str> = BTreeSet::new();
             for_each_field(&declaration.members, &mut |field| {
@@ -443,6 +453,17 @@ fn for_each_method<'a>(members: &'a [Member], f: &mut impl FnMut(&'a MethodDecl)
         match member {
             Member::Method(method) => f(method),
             Member::When(when) => for_each_method(&when.members, f),
+            _ => {}
+        }
+    }
+}
+
+/// Visit every `on` member, descending into `when` subtype members.
+fn for_each_on<'a>(members: &'a [Member], f: &mut impl FnMut(&'a crate::ast::OnDecl)) {
+    for member in members {
+        match member {
+            Member::On(on) => f(on),
+            Member::When(when) => for_each_on(&when.members, f),
             _ => {}
         }
     }

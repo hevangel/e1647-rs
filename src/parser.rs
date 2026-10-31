@@ -37,6 +37,8 @@
 //! - `E0114` reserved (formerly "unsupported construct"; every construct it
 //!   covered is now either supported or has its own code)
 //! - `E0115` expected `is` in a method declaration
+//! - `E0116` user-written `extend global` (clause 4.3.1.1)
+//! - `E0117` unsupported or misplaced preprocessor directive (clause 21)
 //! - `E0201` duplicate declaration name
 //! - `E0202` duplicate field name
 //! - `E0203` unknown type name
@@ -47,11 +49,12 @@
 
 use crate::ast::{
     BinaryOp, Declaration, DeclarationKind, Enumeral, Expr, Field, KeepConstraint, Member,
-    MethodDecl, MethodModifier, Param, ScalarBase, Stmt, SubtypeModifier, TypeExpr, UnaryOp,
-    WhenDecl,
+    MethodDecl, MethodModifier, OnDecl, Param, ScalarBase, Stmt, SubtypeModifier, TypeExpr,
+    UnaryOp, WhenDecl,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Position, Token, TokenKind};
+use std::collections::BTreeSet;
 
 /// Predefined e names that lex as keywords but appear as bare values or
 /// call targets in real code (`set_config(print, radix, hex)`,
@@ -233,6 +236,19 @@ struct Parser {
     pos: usize,
     eof: Position,
     diagnostics: Vec<Diagnostic>,
+    /// Names currently defined by `#define` preprocessor directives,
+    /// consulted by `#ifdef` / `#ifndef` (clause 21). Directive state
+    /// follows source order.
+    defined: BTreeSet<String>,
+}
+
+/// The included body of one preprocessor directive: members in member
+/// position, statements in action position, or nothing (`#define`,
+/// `#undef`, and excluded `#ifdef` / `#ifndef` branches).
+enum HashBody {
+    Members(Vec<Member>),
+    Statements(Vec<Stmt>),
+    Skipped,
 }
 
 impl Parser {
@@ -242,6 +258,7 @@ impl Parser {
             pos: 0,
             eof,
             diagnostics: Vec::new(),
+            defined: BTreeSet::new(),
         }
     }
 
@@ -449,6 +466,28 @@ impl Parser {
                 Some(TokenKind::Keyword(k)) if k.as_str() == "sequence" => {
                     if let Some(synthesized) = self.parse_sequence_declaration() {
                         declarations.extend(synthesized);
+                    }
+                    continue;
+                }
+                // File-level preprocessor directives: only `#define` /
+                // `#undef` (clause 21.2 lists the conditional forms as
+                // statement, struct-member and action positions, not
+                // module level).
+                Some(TokenKind::Punctuation(p)) if p == "#" => {
+                    match self.peek_second_kind() {
+                        Some(TokenKind::Keyword(k)) if k == "define" => {
+                            self.parse_hash_directive(true);
+                        }
+                        Some(TokenKind::Identifier(w)) if w == "undef" => {
+                            self.parse_hash_directive(true);
+                        }
+                        _ => {
+                            self.error_here(
+                                "E0117",
+                                "expected '#define' or '#undef' at file level; the conditional directives are statement or struct-member forms",
+                            );
+                            self.recover_to_declaration_boundary();
+                        }
                     }
                     continue;
                 }
@@ -833,6 +872,10 @@ impl Parser {
             }
             Some(TokenKind::Keyword(k)) if k == "when" => self.parse_when(),
             Some(TokenKind::Keyword(k)) if k == "event" => self.parse_event().map(|e| vec![e]),
+            Some(TokenKind::Keyword(k)) if k == "on" => {
+                self.parse_on().map(|o| vec![Member::On(o)])
+            }
+            Some(TokenKind::Punctuation(p)) if p == "#" => self.parse_hash_members(),
             // The explicit `method name() …` spelling; the bare
             // `name() …` init style is handled by the identifier arm.
             Some(TokenKind::Keyword(k)) if k == "method" => self.parse_method().map(|m| vec![m]),
@@ -889,6 +932,172 @@ impl Parser {
             value,
             span: (start, end),
         })
+    }
+
+    /// `on <event-path> { statements };` — an `on` struct member (clause
+    /// 11.2). The event is a dotted path; the actions run when the event
+    /// fires. Extending is a repeated declaration, so one `Member::On`
+    /// per source block; composition keeps them in order. The clause's
+    /// no-time-consuming-actions restriction is not enforced.
+    fn parse_on(&mut self) -> Option<OnDecl> {
+        let start = self.current_span().0;
+        self.bump(); // 'on'
+        let (segment, _) = self.expect_identifier("E0102", "expected an event name after 'on'")?;
+        let mut path = vec![segment];
+        while self.eat_punct(".") {
+            let (segment, _) =
+                self.expect_identifier("E0102", "expected a path segment after '.'")?;
+            path.push(segment);
+        }
+        self.expect_punct("{", "E0106", "expected '{' to open the 'on' body")?;
+        let body = self.parse_statements();
+        self.expect_punct("}", "E0107", "expected '}' to close the 'on' body")?;
+        self.eat_punct(";");
+        let end = self.last_end();
+        Some(OnDecl {
+            path,
+            body,
+            span: (start, end),
+        })
+    }
+
+    /// One `#define` / `#undef` / `#ifdef` / `#ifndef` preprocessor
+    /// directive in member position (clause 21.2).
+    fn parse_hash_members(&mut self) -> Option<Vec<Member>> {
+        match self.parse_hash_directive(true)? {
+            HashBody::Members(members) => Some(members),
+            HashBody::Skipped => Some(Vec::new()),
+            HashBody::Statements(_) => unreachable!("member position returns members"),
+        }
+    }
+
+    /// The statement-position twin of [`Self::parse_hash_members`],
+    /// called from the statement loop.
+    fn parse_hash_statements(&mut self) -> Option<Vec<Stmt>> {
+        match self.parse_hash_directive(false)? {
+            HashBody::Statements(statements) => Some(statements),
+            HashBody::Skipped => Some(Vec::new()),
+            HashBody::Members(_) => unreachable!("statement position returns statements"),
+        }
+    }
+
+    /// Consume one `#` directive. `#define NAME <replacement>;` records
+    /// the flag only — the replacement-rule half of clause 21.3 (text
+    /// substitution into later code) is a later milestone. An
+    /// `#ifdef`/`#ifndef` body is parsed only when included; excluded
+    /// code is skipped without parsing ("ignore it", clause 21.2). The
+    /// body grammar follows the position: members in a struct body,
+    /// statements in an action block.
+    fn parse_hash_directive(&mut self, member_position: bool) -> Option<HashBody> {
+        self.bump(); // '#'
+        let directive = match self.peek_kind() {
+            Some(TokenKind::Identifier(word))
+                if word == "ifdef" || word == "ifndef" || word == "undef" =>
+            {
+                word.clone()
+            }
+            Some(TokenKind::Keyword(word)) if word == "define" => word.clone(),
+            _ => {
+                self.error_here(
+                    "E0117",
+                    "expected '#ifdef', '#ifndef', '#define' or '#undef'",
+                );
+                self.recover_to_member_boundary();
+                return None;
+            }
+        };
+        self.bump(); // directive word
+        let (name, name_span) =
+            self.expect_identifier("E0102", "expected a name after the directive")?;
+        match directive.as_str() {
+            "define" => {
+                self.consume_hash_replacement(name_span.1.line);
+                self.defined.insert(name);
+                Some(HashBody::Skipped)
+            }
+            "undef" => {
+                // `#undef NAME;` or the bare flag form terminated by the
+                // line end, mirroring `#define`.
+                if self
+                    .peek()
+                    .is_some_and(|t| t.start.line == name_span.1.line)
+                {
+                    self.expect_punct(";", "E0105", "expected ';' after '#undef'")?;
+                }
+                self.defined.remove(&name);
+                Some(HashBody::Skipped)
+            }
+            _ => {
+                let included = if directive == "ifdef" {
+                    self.defined.contains(&name)
+                } else {
+                    !self.defined.contains(&name)
+                };
+                self.expect_punct("{", "E0106", "expected '{' to open the directive body")?;
+                if !included {
+                    self.skip_balanced_braces();
+                    self.eat_punct(";");
+                    return Some(HashBody::Skipped);
+                }
+                if member_position {
+                    // parse_member_list consumes the closing `}`; the e
+                    // convention writes `};`, so eat the semicolon too.
+                    let members = self.parse_member_list();
+                    self.eat_punct(";");
+                    Some(HashBody::Members(members))
+                } else {
+                    let body = self.parse_statements();
+                    self.expect_punct("}", "E0107", "expected '}' to close the directive body")?;
+                    self.eat_punct(";");
+                    Some(HashBody::Statements(body))
+                }
+            }
+        }
+    }
+
+    /// Consume the `#define` replacement text without recording it
+    /// (replacement rules are a later milestone). A replacement ends at
+    /// `;` or at the end of the name's line — clause 21.3 allows line
+    /// breaks in a replacement only behind a backslash, which the
+    /// lexer does not produce.
+    fn consume_hash_replacement(&mut self, name_line: usize) {
+        while let Some(token) = self.peek() {
+            match &token.kind {
+                TokenKind::Punctuation(p) if p == ";" => {
+                    self.bump();
+                    return;
+                }
+                _ if token.start.line > name_line => return,
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+    }
+
+    /// Skip tokens after a directive's `{` with brace-depth counting, up
+    /// to and including the matching `}`. Skipped code is ignored, not
+    /// parsed (clause 21.2).
+    fn skip_balanced_braces(&mut self) {
+        let mut depth = 1usize;
+        while let Some(token) = self.peek() {
+            match &token.kind {
+                TokenKind::Punctuation(p) if p == "{" => {
+                    depth += 1;
+                    self.bump();
+                }
+                TokenKind::Punctuation(p) if p == "}" => {
+                    self.bump();
+                    depth -= 1;
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
     }
 
     /// `when <modifier> [<modifier> ..] { members };` — a modifier is
@@ -1642,6 +1851,14 @@ impl Parser {
     fn parse_statements(&mut self) -> Vec<Stmt> {
         let mut statements = Vec::new();
         while self.peek().is_some() && !self.at_punct("}") {
+            // `#` directives are actions too (clause 21.2); an excluded
+            // branch contributes no statements and the loop continues.
+            if self.at_punct("#") {
+                if let Some(hash_statements) = self.parse_hash_statements() {
+                    statements.extend(hash_statements);
+                }
+                continue;
+            }
             if let Some(statement) = self.parse_statement() {
                 statements.push(statement);
             } else {

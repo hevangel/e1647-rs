@@ -34,6 +34,12 @@
 //! - `E0407` no solution found for the constraints (1000 attempts)
 //! - `E0408` simulator bridge error from the `hdl_*` routines
 //! - `E0409` cycle budget exceeded (runaway TCM)
+//! - `E0410` unsupported string-match pattern shape (`/.../` or a
+//!   native meta-character)
+//!
+//! `emit` records the firing and immediately executes the event's `on`
+//! action blocks (clause 11.2), in composition order, on the instance
+//! the event path resolves to; `@sim`-attached events never fire.
 
 use crate::ast::{
     BinaryOp, DeclarationKind, Expr, MethodDecl, ScalarBase, Stmt, TypeExpr, UnaryOp,
@@ -627,9 +633,16 @@ impl<'a> Interp<'a> {
                 self.cycle = self.cycle.saturating_add(n as u64);
                 Ok(Flow::Normal)
             }
-            Stmt::Emit { target, .. } => {
+            Stmt::Emit { target, span } => {
                 let path = self.event_path(target)?;
-                self.emitted.insert(path);
+                self.emitted.insert(path.clone());
+                // `emit` executes the event's `on` action blocks
+                // immediately, in declaration order (clause 11.2). No
+                // TCMs wait in this milestone, so "before waiting TCMs"
+                // is trivially satisfied; `@sim`-attached events never
+                // fire here.
+                let owner = self.resolve_event_owner(target, frame, me);
+                self.run_on_blocks(&path, owner, *span)?;
                 Ok(Flow::Normal)
             }
             Stmt::Start { call, span } => {
@@ -1355,6 +1368,77 @@ impl<'a> Interp<'a> {
             }
             _ => Err(self.error("E0402", "unsupported event target", target.span())),
         }
+    }
+
+    /// The instance whose `on` blocks an emitted event triggers: the
+    /// enclosing instance for a bare event name (the event is local to
+    /// its struct, clause 11.2), or the object the dotted path reads
+    /// through. `None` when no instance resolves — the firing is still
+    /// recorded, but no `on` blocks run.
+    fn resolve_event_owner(
+        &mut self,
+        target: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Option<usize> {
+        match target {
+            Expr::Ident { .. } => me,
+            Expr::MemberAccess { object, .. } => {
+                let object_value = self.eval(object, frame, me).ok()?;
+                match object_value {
+                    Value::Object(index) => Some(index),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Execute the `on` action blocks (clause 11.2) registered for an
+    /// emitted event path, in composition order — base types first, then
+    /// extends as written. The event is local to the owner's struct, so
+    /// the match is on the event name (last path segment) within the
+    /// owner's type; each block runs with a fresh locals frame on the
+    /// owning instance, and `return`/`break`/`continue` end that block
+    /// only. The depth guard bounds `emit`-inside-`on` recursion.
+    fn run_on_blocks(
+        &mut self,
+        path: &str,
+        owner: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        let event_name = path.rsplit('.').next().unwrap_or(path);
+        let type_name = self.instances[owner].type_name.clone();
+        let Some(ty) = self.types.iter().find(|t| t.name == type_name) else {
+            return Ok(());
+        };
+        let blocks: Vec<crate::ast::OnDecl> = ty
+            .ons
+            .iter()
+            .filter(|on| on.path.last().map(String::as_str) == Some(event_name))
+            .cloned()
+            .collect();
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        if self.depth > 200 {
+            return Err(self.error("E0406", "recursion too deep", span));
+        }
+        self.depth += 1;
+        for block in &blocks {
+            let mut frame = Frame::default();
+            match self.exec_block(&block.body, &mut frame, Some(owner))? {
+                Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_) => {}
+                Flow::Stop => {
+                    self.stop_requested = true;
+                }
+            }
+        }
+        self.depth -= 1;
+        Ok(())
     }
 
     /// The `hdl_*` routines: drive the external SystemVerilog simulator

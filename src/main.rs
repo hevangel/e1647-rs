@@ -268,6 +268,14 @@ fn print_members(members: &[e1647::ast::Member], indent: &str) {
             Member::Event(event) => {
                 println!("{indent}event {} (line {})", event.name, event.span.0.line)
             }
+            Member::On(on) => {
+                println!(
+                    "{indent}on {} ({} statements, line {})",
+                    on.path.join("."),
+                    on.body.len(),
+                    on.span.0.line
+                );
+            }
             Member::Import { names, .. } => {
                 println!("{indent}import {}", names.join(", "));
             }
