@@ -89,7 +89,9 @@ multi-simulator HDL API, and wasm32.
   case-insensitive full-string literal subset; `/.../` AWK patterns and
   native meta-characters report `E0410`. `gen` uses the
   constraint-solver backend
-  when that compiles in, and rejection sampling otherwise. `start` runs
+  when that compiles in, and rejection sampling otherwise — the sampler
+  narrows each field's domain to the intersection of the type's constant
+  range/equality constraints before sampling. `start` runs
   the called method inline; `wait` advances a virtual cycle counter and
   does not drive the simulator; `emit` records a firing and executes the
   event's `on` action blocks inline, in composition order, on the
@@ -97,8 +99,10 @@ multi-simulator HDL API, and wasm32.
   events never fire.
 - `src/solve.rs` — constraint IR and the pluggable solver seam: the
   top-level `keep` constraints of one type translate (conservatively) into
-  bounded-integer variables plus a conjunction of linear comparisons.
-  Backend: Pumpkin (pure-Rust CP solver) behind the `solver-pumpkin`
+  bounded-integer variables plus a conjunction of linear comparisons;
+  range membership (`x in [lo..hi]`) translates to the two comparisons,
+  item-list membership does not (no disjunction in the IR). Backend:
+  Pumpkin (pure-Rust CP solver) behind the `solver-pumpkin`
   cargo feature — seeded, deterministic; without the feature `solve`
   reports unsupported and `gen` falls back to rejection sampling.
 - `src/hdl.rs` — one SystemVerilog binding. `HdlSession` spawns `xezim`
@@ -113,7 +117,9 @@ multi-simulator HDL API, and wasm32.
 
 Deliberately not implemented yet: `when`-subtype resolution, non-linear,
 disjunctive or temporal constraint solving (the solver backend covers
-conjunctive linear constraints over bounded integers), an event scheduler
+conjunctive linear constraints and constant ranges over bounded
+integers), an event scheduler
 and time-consuming-method suspension, coverage, integer width truncation,
-evaluation of MVL literals, `repeat`, single-statement `if ... do`, `on`
-blocks, `define as` templates, a multi-simulator HDL API, and WASM.
+evaluation of MVL literals, `repeat`, single-statement `if ... do`,
+`expect`/`assume`, `on event-port`, `#else` and `#define` replacement
+rules, `define as` templates, a multi-simulator HDL API, and WASM.

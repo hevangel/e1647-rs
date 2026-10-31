@@ -2,7 +2,10 @@
 //!
 //! `translate` turns the top-level `keep` constraints of one type, over the
 //! integer fields of that type, into a [`Problem`]: bounded-integer
-//! variables plus a conjunction of linear comparisons. The translation is
+//! variables plus a conjunction of linear comparisons. Range membership
+//! (`x in [lo..hi]`) translates to the two comparisons; item-list
+//! membership (`x in [a, b]`) needs a disjunction and is not translated.
+//! The translation is
 //! deliberately conservative — anything outside the supported shape
 //! (non-integer fields, method calls, `||`, `!`, non-linear arithmetic)
 //! reports [`TranslationError::Unsupported`] and the caller falls back to
@@ -160,6 +163,30 @@ fn translate_bool(
             translate_bool(rhs, bounds)?,
         ]));
     }
+    // `x in [lo..hi]` is the conjunction `x >= lo && x <= hi` — no
+    // disjunction needed. Item-list membership (`x in [a, b]`) would
+    // need one and is not translated; the rejection sampler enforces it
+    // by evaluation.
+    if let Expr::InSet {
+        element,
+        set: crate::ast::InSetExpr::Range(low, high),
+        ..
+    } = expr
+    {
+        return Ok(BoolNode::All(vec![
+            BoolNode::Atom(linear_comparison(Cmp::Ge, element, low, bounds)?),
+            BoolNode::Atom(linear_comparison(Cmp::Le, element, high, bounds)?),
+        ]));
+    }
+    if let Expr::InSet {
+        set: crate::ast::InSetExpr::Items(_),
+        ..
+    } = expr
+    {
+        return Err(TranslationError::Unsupported(
+            "set membership over an item list",
+        ));
+    }
     translate_atom(expr, bounds).map(BoolNode::Atom)
 }
 
@@ -185,6 +212,16 @@ fn translate_atom(
             ));
         }
     };
+    linear_comparison(cmp, lhs, rhs, bounds)
+}
+
+/// `lhs (cmp) rhs` as one merged linear atom.
+fn linear_comparison(
+    cmp: Cmp,
+    lhs: &Expr,
+    rhs: &Expr,
+    bounds: &BTreeMap<String, (i64, i64)>,
+) -> Result<Linear, TranslationError> {
     let left = affine_of(lhs, bounds)?;
     let right = affine_of(rhs, bounds)?;
     // l (cmp) r  ⟺  Σ (l.terms - r.terms) (cmp) r.constant - l.constant

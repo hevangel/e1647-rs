@@ -388,3 +388,60 @@ fn emit_of_event_without_on_blocks_is_silent() {
     );
     assert_eq!(output, "done\n");
 }
+
+#[test]
+fn gen_respects_in_range_constraints_on_unsized_int() {
+    // Without domain narrowing, an unsized `int` samples the full 32-bit
+    // domain and rejection sampling never hits `in [1..100]` (E0407);
+    // the sampling domain narrows to the constraint range.
+    let output = clean_output(
+        "struct packet {\n    tail: int;\n};\n\
+         extend packet {\n    keep tail in [1..100];\n};\n\
+         extend sys {\n    run() is also {\n        var p: packet;\n        gen p;\n        \
+         if p.tail < 1 or p.tail > 100 {\n            out(\"BAD\\n\");\n        } else {\n            \
+         out(\"OK\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "OK\n");
+}
+
+#[test]
+fn gen_respects_equality_constraints() {
+    let output = clean_output(
+        "struct s {\n    v: int;\n    w: uint(bits: 8);\n};\n\
+         extend s {\n    keep v == 7;\n    keep 42 == w;\n};\n\
+         extend sys {\n    run() is also {\n        var x: s;\n        gen x;\n        \
+         print x.v, x.w;\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "7 42\n");
+}
+
+#[test]
+fn gen_intersects_overlapping_range_constraints() {
+    // Two conjunctive ranges narrow to their intersection: [5..10].
+    let output = clean_output(
+        "struct s {\n    v: int;\n};\n\
+         extend s {\n    keep v in [1..10];\n    keep v in [5..20];\n};\n\
+         extend sys {\n    run() is also {\n        var x: s;\n        gen x;\n        \
+         if x.v < 5 or x.v > 10 {\n            out(\"BAD\\n\");\n        } else {\n            \
+         out(\"OK\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "OK\n");
+}
+
+#[test]
+fn gen_domain_narrowing_leaves_unconstrained_fields_alone() {
+    // A constrained field must not stop other fields from sampling
+    // structurally (byte stays uniform over 0..255).
+    let output = clean_output(
+        "struct s {\n    t: int;\n    b: byte;\n};\n\
+         extend s {\n    keep t in [1..100];\n};\n\
+         extend sys {\n    run() is also {\n        var x: s;\n        gen x;\n        \
+         if x.t < 1 or x.t > 100 or x.b < 0 or x.b > 255 {\n            out(\"BAD\\n\");\n        \
+         } else {\n            out(\"OK\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "OK\n");
+}

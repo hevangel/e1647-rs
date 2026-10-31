@@ -1103,3 +1103,62 @@ and emit without `on` blocks is silent;
 `tests/fixtures/on_member.{e,expected}` (OK) and
 `tests/fixtures/ifdef_skips_excluded_code.{e,expected}` (OK — the
 byte-exact contract that excluded code is ignored, not parsed).
+
+## 2026-10-30 (18) — offline arc: clause 10 set-membership constraints; save-restart runs to completion
+
+Scope claimed for this change (nothing broader):
+
+- Solver IR: `x in [lo..hi]` translates to the conjunction of the two
+  comparisons (`x >= lo && x <= hi`), with both bounds through the
+  existing affine translation (`2*2`, `a_max - 1` work). Item-list
+  membership (`x in [a, b]`) needs a disjunction the IR does not have
+  and reports `Unsupported("set membership over an item list")` — the
+  caller falls back to the rejection sampler, which enforces it by
+  evaluation.
+- Rejection sampler: `gen_object` narrows each field's sampling domain
+  to the intersection of the type's constant range/equality constraints
+  (`f in [lo..hi]`, `f == c` either orientation, conjuncts combined,
+  instance-independent bounds only). Without this, an unsized `int`
+  samples the full 32-bit domain and a bounded range is essentially
+  unhittable in 1000 attempts — the root cause of the corpus E0407.
+  Contradictory domains fall back to natural sampling and fail the
+  attempt honestly; unconstrained fields and non-integer scalars are
+  untouched; soft keeps feed the same predicate they always did, so
+  their domains narrow consistently.
+
+Corpus movement (`local/`, `--seed 1`): **save-restart-test1 now runs to
+completion, exit 0, no diagnostics** — the run covers the MAIN sequence
+body (21 + 70 `do packet` generations under `keep tail in [1..100]` /
+`keep del in [5..77]`), the `emit sys.env.reset_done` firing `env`'s
+`on reset_done` blocks, and the objections/waits, matching the recorded
+Specman reference's observable behavior (0 DUT errors, clean end, no
+output; the reference's `message(LOW, …)` was verbosity-suppressed
+there too). Staged limits, unchanged: only `sys` `run()` methods
+execute, so the `packet_seqer` driver TCM (`bfm`, `get_next_item`,
+`@clock` waits) is not scheduled yet — that remains the documented
+sequence/TCM milestone.
+
+Both backends verified: the rejection-sampler path locally on Windows
+(default features), and the `solver-pumpkin` path via the repository's
+own Docker route (`docker compose run --rm verify` — fmt + clippy +
+`cargo test --all-targets --all-features` against the bind-mounted
+working tree), since the local windows-gnu toolchain cannot compile
+Pumpkin's build script. New translate tests run on both paths.
+
+Commands and results:
+
+```
+$ cargo fmt --all -- --check                       (pass)
+$ cargo clippy --all-targets -- -D warnings        (pass, no warnings)
+$ cargo test --all-targets                         (114 passed, 0 failed)
+$ docker compose run --rm verify                   (pass: fmt, clippy
+  --all-features, tests --all-features; 118 tests, 0 failed)
+```
+
+New tests: `tests/solve.rs` range-membership IR shape (two atoms,
+`Ge`/`Le`), expression bounds through the affine translation, item-list
+membership reporting the explicit `Unsupported`; `tests/interp.rs` gen
+under `in [1..100]` on an unsized `int` (the E0407 repro), equality
+constraints in both orientations, overlapping ranges intersecting to
+[5..10], and unconstrained fields sampling structurally beside a
+narrowed one.

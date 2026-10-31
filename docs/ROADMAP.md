@@ -73,10 +73,11 @@
       `when` subtypes are carried, not resolved; there is no type checking
 - [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer
-      fields into a solver problem; unsupported shapes fall back to
-      rejection sampling. No disjunctions, negation trees, global
-      constraints or set membership yet. `keep bind` and `hdl_path()` /
-      `delayed()` constraints do not gate `gen`
+      fields into a solver problem; range membership (`x in [lo..hi]`)
+      translates to the two comparisons; unsupported shapes fall back to
+      rejection sampling. No disjunctions (item-list membership, `||`),
+      negation trees or global constraints yet. `keep bind` and
+      `hdl_path()` / `delayed()` constraints do not gate `gen`
 - [~] Pluggable SMT/constraint solver — started: the Pumpkin CP solver
       (pure Rust, consol-lab) is integrated behind the `solver-pumpkin`
       cargo feature and is deterministic per seed; CI verifies the feature
@@ -87,9 +88,13 @@
 - [~] Reproducible seeded randomized objects — started: `gen` is a seeded
       rejection sampler by default and, with `solver-pumpkin`, a seeded
       Pumpkin solve; values may differ between backends for the same seed
-      (different algorithms), but runs are deterministic per backend.
-      Data fields are implicitly generated before `run()` (skipping `!`
-      and unit-typed fields; `keep list.size() == N` sets list lengths)
+      (different algorithms), but runs are deterministic per backend. The
+      rejection sampler narrows each field's sampling domain to the
+      intersection of the type's constant range/equality constraints
+      (without this, a constrained unsized `int` is unhittable in 1000
+      attempts). Data fields are implicitly generated before `run()`
+      (skipping `!` and unit-typed fields; `keep list.size() == N` sets
+      list lengths)
 
 ## M3 — Behavioral execution
 - [~] Interpreter and method calling conventions — started: the
