@@ -9,9 +9,10 @@
 //! subset, including `gen` as a seeded rejection sampler ([`interp`]).
 //! The clause 12 temporal-engine core evaluates sampled normal forms
 //! over explicit finite paths ([`temporal`]), and the run loop drives
-//! it: an event log fed by `emit`, suspending temporal `wait`s, and
-//! quit-time `expect`/`assume` monitoring. See docs/ROADMAP.md for
-//! what is deliberately not implemented yet.
+//! it: an event log fed by `emit`, a clause 13.1.1 scheduler running
+//! started TCMs concurrently (round-robin turns suspending at
+//! `wait`/`sync`), and quit-time `expect`/`assume` monitoring. See
+//! docs/ROADMAP.md for what is deliberately not implemented yet.
 
 pub mod ast;
 pub mod builtins;

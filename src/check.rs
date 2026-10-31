@@ -300,6 +300,7 @@ fn check_statements<'a>(
             | Stmt::Case { .. }
             | Stmt::Wait { .. }
             | Stmt::WaitTemporal { .. }
+            | Stmt::Sync { .. }
             | Stmt::Emit { .. }
             | Stmt::Start { .. }
             | Stmt::Compute { .. }

@@ -1609,3 +1609,39 @@ fn wait_statements_split_numeric_from_temporal_forms() {
         );
     }
 }
+
+#[test]
+fn sync_statements_parse_bare_and_temporal_forms() {
+    // 13.1.2: `sync;` / `sync cycle;` are the bare synchronization
+    // action (no TE); `sync <te>;` carries a temporal expression.
+    let declarations = expect_clean(
+        "struct s {\n    ev: event;\n    clk: event;\n    run() is {\n        \
+         sync;\n        sync cycle;\n        sync @ev;\n        sync {@ev; @clk} @clk;\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[2] else {
+        panic!("expected the run method");
+    };
+    assert_eq!(run.body.len(), 4);
+    for stmt in run.body.iter().take(2) {
+        let Stmt::Sync { te, .. } = stmt else {
+            panic!("expected a bare sync: {stmt:?}");
+        };
+        assert!(te.is_none(), "the bare sync carries no TE: {stmt:?}");
+    }
+    for stmt in run.body.iter().skip(2) {
+        let Stmt::Sync { te, .. } = stmt else {
+            panic!("expected a temporal sync: {stmt:?}");
+        };
+        let Some(te) = te else {
+            panic!("expected a TE: {stmt:?}");
+        };
+        assert!(
+            matches!(
+                te,
+                e1647::ast::TemporalExpr::EventRef { .. }
+                    | e1647::ast::TemporalExpr::Sampled { .. }
+            ),
+            "expected an event atom or sampled sequence: {te:?}"
+        );
+    }
+}

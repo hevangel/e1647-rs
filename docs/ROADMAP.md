@@ -73,7 +73,8 @@
       `detach`/`delay`/`exec` report `E0120`) with the `else` failure
       body parsed as ordinary actions, and temporal `wait` statements
       parse the same grammar (13.1.3, including the readability-only
-      `until`). The temporal-engine core
+      `until`), as do the `sync` synchronization actions (13.1.2, bare
+      and TE forms). The temporal-engine core
       (`src/temporal.rs`) propagates the sampling event to sampled
       normal form (12.1.4) and evaluates tight satisfaction (12.1.1.2)
       and last-point success (12.1.1.12) over explicit finite paths
@@ -96,11 +97,12 @@
       (clause 8.3), template `extend` (clause 8.2), macro
       match-expression interpretation and expansion
       (clause 15.4–15.5), the coverage data model and reports
-      (clause 14 options, buckets, grades), the clause 12 temporal
-      engine's remaining simulation integration — the run loop drives
-      waits and expect monitoring over the event log; TCM suspension
-      (`@`-triggered methods), `sync`, and `@sim` sampling are not
-      wired — `detach`/`delay`/`exec` TEs, select
+      (clause 14 options, buckets, grades), the clause 12/13 temporal
+      engine's remaining simulation integration — the scheduler runs
+      started TCMs concurrently and waits/sync suspend, but
+      `@`-triggered TCM invocation, `@sim` sampling, and suspension
+      re-entry beyond `while` chains are not wired —
+      `detach`/`delay`/`exec` TEs, select
       distribution biasing in the sampler, `$1`-`$27` match captures,
       `#define` replacement rules, `#else`)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness
@@ -162,26 +164,32 @@
       a MAIN sequence start also run when no explicit `run()` exists.
       Integers are unbounded `i128` (widths are not truncated). No
       event-driven scheduling
-- [~] Events, temporal expressions and time-consuming methods — started
-      as syntax plus an inline approximation: event triggers are stored,
-      `emit` records a firing and executes the event's `on` action
-      blocks inline, in composition order (clause 11.2; each block with a
-      fresh locals frame on the owning instance), `start` calls the
-      method synchronously,
-      and `wait` advances a virtual cycle counter under a fixed budget
-      (`E0409`). No `@sim` sampling, no TCM suspension, and `wait` does
-      not advance the HDL simulator. The clause 12 temporal-engine core
+- [~] Events, temporal expressions and time-consuming methods — started:
+      event triggers are stored, `emit` records a firing and executes the
+      event's `on` action blocks inline, in composition order (clause
+      11.2; each block with a fresh locals frame on the owning
+      instance), and `compute` calls a TCM synchronously. The clause
+      13.1.1 scheduler runs concurrent TCMs: `start` enqueues a
+      coroutine with the implicit sync cycle before it commences, and
+      coroutines take round-robin turns that run atomically from one
+      synchronization action to the next — `wait`/`sync` suspend (with
+      the captured locals frame and a skip-cursor that re-enters `while`
+      chains mid-iteration), and a cycle passes when nothing is
+      eligible. The clause 12 temporal-engine core
       (`src/temporal.rs`) is driven by the run loop's event log: `emit`
       records occurrences in per-cycle states, temporal `wait`s
       (`@event`, sequences, propositions, event repeats, with 13.1.3's
-      readability-only `until`) suspend until the expression succeeds
-      or the budget guard reports `E0409`, and `expect`/`assume` rules
-      (elaborated per type) are checked at quit per 12.3.2 — a failed
-      rule runs its `else` body (or prints the failure when there is
-      none) as a check error. One global timeline, and propositions
-      evaluate with current field values (no per-cycle value history);
-      TCM suspension and per-instance timelines are the next temporal
-      milestones
+      readability-only `until`) re-evaluate at every turn against the
+      grown log, a temporal wait unsatisfied for 1,000 cycles (or the
+      5,000-cycle shared budget) reports `E0409`, and
+      `expect`/`assume` rules (elaborated per type) are checked at quit
+      per 12.3.2 — a failed rule runs its `else` body (or prints the
+      failure when there is none) as a check error. One global
+      timeline, and propositions evaluate with current field values
+      (no per-cycle value history). Suspension re-enters `while` chains
+      only — waits inside `if`/`case`/`for` bodies, inline calls,
+      `compute` and `on` blocks keep the inline spin — and `wait` does
+      not advance the HDL simulator
 - [ ] Coverage data model and reports
 
 ## M4 — Simulator integration

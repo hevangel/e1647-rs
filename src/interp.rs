@@ -105,7 +105,7 @@ impl ObjectInstance {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Frame {
     locals: std::collections::HashMap<String, Value>,
     local_types: std::collections::HashMap<String, TypeExpr>,
@@ -118,6 +118,85 @@ enum Flow {
     Return(Value),
     /// `stop_run()` — unwind to the top of the run.
     Stop,
+    /// A synchronization action inside a scheduled coroutine (13.1.1):
+    /// unwind to the scheduler, which queues the coroutine for a later
+    /// cycle. Only raised in coroutine turns — `call_method` and
+    /// `on` blocks run atomically and never produce it.
+    Suspend,
+}
+
+/// Where in the statement tree a coroutine turn currently is (for the
+/// resume cursor built when a synchronization action suspends).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtxKind {
+    /// A statement currently being executed by [`Interp::exec_block`].
+    Leaf,
+    /// A `while` body currently being executed — the one compound whose
+    /// mid-iteration resume is supported (enter the body directly,
+    /// condition first checked when the iteration completes).
+    WhileLoop,
+    /// Any other compound (`if`/`case`/`for` bodies) or atomic region
+    /// (inline method calls, `on` blocks) — waits inside keep the
+    /// inline spin, documented as the v1 limitation.
+    Atomic,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExecCtx {
+    index: usize,
+    kind: CtxKind,
+}
+
+/// A suspension raised by a synchronization action, collected by the
+/// scheduler when the turn unwinds.
+struct PendingSuspension {
+    cursor: Vec<usize>,
+    frame: Frame,
+    eligible_at_cycle: u64,
+    temporal: bool,
+    span: crate::ast::Span,
+    wait_start: Option<usize>,
+}
+
+/// One concurrently scheduled execution (clause 13.1.1): the main
+/// pseudo-coroutine (the `run()` bodies, in order) and every `start`ed
+/// TCM. Suspension state is the skip-cursor into the statement tree,
+/// the captured locals frame, and the cycle gate.
+struct Coroutine<'a> {
+    kind: CoroutineKind<'a>,
+    cursor: Vec<usize>,
+    frame: Frame,
+    me: Option<usize>,
+    eligible_at_cycle: u64,
+    /// Whether the coroutine is suspended at a temporal wait (drives
+    /// the per-wait runaway guard).
+    suspended_temporal: bool,
+    /// Cycles spent suspended at the current temporal wait.
+    temporal_waited: u64,
+    span: crate::ast::Span,
+    wait_start: Option<usize>,
+}
+
+enum CoroutineKind<'a> {
+    /// The `run()` bodies, executed in order as one coroutine.
+    Main {
+        blocks: Vec<&'a [Stmt]>,
+        next_block: usize,
+    },
+    /// A started TCM: instance, method name (resolved per turn, so
+    /// `is also` chains compose), evaluated arguments.
+    Tcm {
+        instance: usize,
+        method: String,
+        args: Vec<Value>,
+        next_block: usize,
+    },
+}
+
+enum TurnOutcome {
+    Complete,
+    Suspended,
+    Error(Diagnostic),
 }
 
 /// splitmix64: small, seedable, deterministic — no external dependency.
@@ -172,6 +251,23 @@ struct Interp<'a> {
     /// temporal `wait`s and `expect` rules read it. One global
     /// timeline: all events share the per-cycle states.
     temporal_log: Vec<crate::temporal::State>,
+    /// The scheduled coroutines (13.1.1): the main `run()` chain first,
+    /// then every `start`ed TCM, run round-robin.
+    coroutines: Vec<Coroutine<'a>>,
+    /// Set while a coroutine turn executes: statement walks record
+    /// their path for the resume cursor.
+    tracing: bool,
+    /// Atomic regions (inline method calls, `on` blocks): waits inside
+    /// keep the inline spin instead of suspending.
+    atomic_depth: usize,
+    /// The statement-tree path of the current turn.
+    exec_context: Vec<ExecCtx>,
+    /// The suspension raised by the current turn's synchronization
+    /// action, collected when the turn unwinds.
+    pending_suspension: Option<PendingSuspension>,
+    /// The log start of a resumed temporal wait, restored before the
+    /// wait statement re-executes.
+    resume_wait_start: Option<usize>,
     /// Set by `stop_run()`; unwinds the whole run.
     stop_requested: bool,
     /// Failed `check that` conditions (`dut_error`), reported like
@@ -181,8 +277,10 @@ struct Interp<'a> {
     defines: std::collections::BTreeMap<String, Value>,
 }
 
-/// How many `wait` statements one run may execute (the runaway-TCM guard).
-const WAIT_BUDGET: u64 = 100_000;
+/// How many `wait` statements and scheduler cycles one run may consume
+/// (the runaway-TCM guard; every suspension cycle in the clause 13.1.1
+/// scheduler draws from the same budget).
+const WAIT_BUDGET: u64 = 5_000;
 
 /// How many cycles one temporal `wait` may stay unsatisfied before it
 /// reports `E0409` — the temporal twin of the runaway guard, bounded
@@ -220,6 +318,12 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
         wait_budget: WAIT_BUDGET,
         emitted: std::collections::BTreeSet::new(),
         temporal_log: Vec::new(),
+        coroutines: Vec::new(),
+        tracing: false,
+        atomic_depth: 0,
+        exec_context: Vec::new(),
+        pending_suspension: None,
+        resume_wait_start: None,
         stop_requested: false,
         dut_errors: 0,
         defines,
@@ -285,12 +389,94 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
             ));
         }
     }
+    // Clause 13.1.1 scheduler: the run() bodies run as the main
+    // coroutine; every `start`ed TCM joins the queue with an implicit
+    // sync cycle before it commences. Round-robin turns run atomically
+    // from one synchronization action to the next; when no coroutine is
+    // eligible, one cycle passes.
+    interp.coroutines.push(Coroutine {
+        kind: CoroutineKind::Main {
+            blocks: run_blocks.iter().map(|b| b.body.as_slice()).collect(),
+            next_block: 0,
+        },
+        cursor: Vec::new(),
+        frame: Frame::default(),
+        me: Some(sys_index),
+        eligible_at_cycle: 0,
+        suspended_temporal: false,
+        temporal_waited: 0,
+        span: origin_span(),
+        wait_start: None,
+    });
     let mut diagnostics = Vec::new();
-    for block in run_blocks {
-        let mut frame = Frame::default();
-        if let Err(diagnostic) = interp.exec_block(&block.body, &mut frame, Some(sys_index)) {
-            diagnostics.push(diagnostic);
-            break;
+    while !interp.coroutines.is_empty() && !interp.stop_requested {
+        let Some(index) = interp
+            .coroutines
+            .iter()
+            .position(|c| c.eligible_at_cycle <= interp.cycle)
+        else {
+            // Nobody eligible: suspended coroutines wait for the next
+            // occurrence of their sampling event — one cycle passes.
+            if interp.wait_budget == 0 {
+                diagnostics.push(interp.error(
+                    "E0409",
+                    format!("cycle budget exceeded at cycle {}", interp.cycle),
+                    origin_span(),
+                ));
+                break;
+            }
+            interp.wait_budget -= 1;
+            interp.cycle += 1;
+            interp.pad_log();
+            let mut expired = Vec::new();
+            for (position, co) in interp.coroutines.iter_mut().enumerate() {
+                if co.suspended_temporal {
+                    co.temporal_waited += 1;
+                    if co.temporal_waited > TEMPORAL_WAIT_CYCLES {
+                        expired.push(position);
+                    }
+                }
+            }
+            for position in expired.into_iter().rev() {
+                let co = interp.coroutines.remove(position);
+                diagnostics.push(interp.error(
+                    "E0409",
+                    format!(
+                        "temporal wait unsatisfied after {} cycles at cycle {}",
+                        co.temporal_waited, interp.cycle
+                    ),
+                    co.span,
+                ));
+            }
+            continue;
+        };
+        let mut co = interp.coroutines.remove(index);
+        interp.tracing = true;
+        interp.exec_context.clear();
+        interp.resume_wait_start = co.wait_start.take();
+        let name = match &co.kind {
+            CoroutineKind::Main { .. } => "run".to_owned(),
+            CoroutineKind::Tcm { method, .. } => method.clone(),
+        };
+        let outcome = interp.run_coroutine_turn(&mut co);
+        interp.tracing = false;
+        interp.exec_context.clear();
+        interp.resume_wait_start = None;
+        match outcome {
+            TurnOutcome::Complete => {}
+            TurnOutcome::Suspended => {
+                co.temporal_waited = 0;
+                interp.coroutines.push(co);
+            }
+            TurnOutcome::Error(diagnostic) => {
+                if matches!(co.kind, CoroutineKind::Main { .. }) {
+                    diagnostics.push(diagnostic);
+                    break;
+                }
+                interp
+                    .output
+                    .push_str(&format!("tcm {name}: {}\n", diagnostic.render()));
+            }
         }
     }
     // 11.4: at quit, report the expect/assume rules that failed over
@@ -364,6 +550,38 @@ type TemporalValues<'te> = (
     Vec<(&'te crate::ast::Expr, Option<bool>)>,
     Vec<(&'te crate::ast::Expr, Option<i128>)>,
 );
+
+/// Resolve a method's `is also` blocks on a type, as written in the
+/// elaborated member lists (base types first, then extends).
+fn resolve_method_blocks<'a>(
+    types: &'a [crate::elab::ElaboratedType],
+    type_name: &str,
+    name: &str,
+    span: crate::ast::Span,
+) -> Result<Vec<&'a MethodDecl>, Diagnostic> {
+    let Some(ty) = types.iter().find(|t| t.name == type_name) else {
+        return Err(Diagnostic::new(
+            "E0401",
+            format!("unknown type '{type_name}'"),
+            span.0,
+            span.1,
+        ));
+    };
+    let blocks: Vec<&'a MethodDecl> = ty
+        .methods
+        .iter()
+        .filter(|method| method.name == name)
+        .collect();
+    if blocks.is_empty() {
+        return Err(Diagnostic::new(
+            "E0401",
+            format!("method '{name}' not found on '{type_name}'"),
+            span.0,
+            span.1,
+        ));
+    }
+    Ok(blocks)
+}
 
 /// The engine callback set over pre-evaluated propositions and bounds:
 /// expressions are matched by identity (the engine passes back the
@@ -463,13 +681,111 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
     ) -> Result<Flow, Diagnostic> {
-        for statement in statements {
-            match self.exec_statement(statement, frame, me)? {
+        for (index, statement) in statements.iter().enumerate() {
+            self.exec_context.push(ExecCtx {
+                index,
+                kind: CtxKind::Leaf,
+            });
+            let flow = self.exec_statement(statement, frame, me);
+            self.exec_context.pop();
+            match flow? {
                 Flow::Normal => {}
                 other => return Ok(other),
             }
         }
         Ok(Flow::Normal)
+    }
+
+    /// Execute a statement chain resuming at the suspension point named
+    /// by `cursor` (13.1.1: "resumes execution from the first action
+    /// following the synchronization action"). The cursor's leading
+    /// indices name enclosing `while` statements — the iteration was in
+    /// flight when the suspension happened, so their conditions are not
+    /// re-checked on the way in; the trailing index names the statement
+    /// to execute (for a skip-resume, one past the completed wait).
+    fn exec_block_resumable(
+        &mut self,
+        statements: &[Stmt],
+        frame: &mut Frame,
+        me: Option<usize>,
+        cursor: &[usize],
+    ) -> Result<Flow, Diagnostic> {
+        let Some(&head) = cursor.first() else {
+            return self.exec_block(statements, frame, me);
+        };
+        for (index, statement) in statements.iter().enumerate() {
+            if index < head {
+                // Already executed before the suspension: skipped, not
+                // replayed.
+                continue;
+            }
+            if index == head && cursor.len() > 1 {
+                // Enter the enclosing while mid-iteration. The
+                // WhileLoop marker stays on the stack across the
+                // loop's continuation: a re-suspension inside the next
+                // iteration must rebuild the same cursor.
+                let rest = cursor[1..].to_vec();
+                let Stmt::While { cond, body, .. } = statement else {
+                    return Err(self.error(
+                        "E0402",
+                        "internal: resume cursor crossed a non-loop statement",
+                        statement.span(),
+                    ));
+                };
+                self.exec_context.push(ExecCtx {
+                    index,
+                    kind: CtxKind::WhileLoop,
+                });
+                let resumed = self.exec_block_resumable(body, frame, me, &rest);
+                let first_flow = resumed?;
+                let flow = self.while_loop(cond, body, frame, me, first_flow);
+                self.exec_context.pop();
+                match flow? {
+                    Flow::Normal => continue,
+                    other => return Ok(other),
+                }
+            }
+            self.exec_context.push(ExecCtx {
+                index,
+                kind: CtxKind::Leaf,
+            });
+            let flow = self.exec_statement(statement, frame, me);
+            self.exec_context.pop();
+            match flow? {
+                Flow::Normal => {}
+                other => return Ok(other),
+            }
+        }
+        Ok(Flow::Normal)
+    }
+
+    /// The shared `while` loop: `first_flow` is the outcome of an
+    /// already-running iteration (a resumed body) or [`Flow::Normal`]
+    /// for a fresh entry.
+    fn while_loop(
+        &mut self,
+        cond: &Expr,
+        body: &[Stmt],
+        frame: &mut Frame,
+        me: Option<usize>,
+        first_flow: Flow,
+    ) -> Result<Flow, Diagnostic> {
+        let mut pending = first_flow;
+        loop {
+            match pending {
+                Flow::Normal => {}
+                Flow::Continue => {}
+                Flow::Break => return Ok(Flow::Normal),
+                other => return Ok(other),
+            }
+            let Value::Bool(keep) = self.eval(cond, frame, me)? else {
+                return Err(self.error("E0402", "while condition must be a boolean", cond.span()));
+            };
+            if !keep {
+                return Ok(Flow::Normal);
+            }
+            pending = self.exec_block(body, frame, me)?;
+        }
     }
 
     fn exec_statement(
@@ -576,31 +892,30 @@ impl<'a> Interp<'a> {
                     let span = statement.span();
                     return Err(self.error("E0402", "condition is not a boolean", span));
                 };
-                if cond_value {
+                // Waits inside an `if` body keep the inline spin: the
+                // resume cursor models `while` chains only.
+                self.exec_context.push(ExecCtx {
+                    index: self.current_ctx_index(),
+                    kind: CtxKind::Atomic,
+                });
+                let flow = if cond_value {
                     self.exec_block(then_body, frame, me)
                 } else if let Some(else_body) = else_body {
                     self.exec_block(else_body, frame, me)
                 } else {
                     Ok(Flow::Normal)
-                }
+                };
+                self.exec_context.pop();
+                flow
             }
             Stmt::While { cond, body, .. } => {
-                loop {
-                    let Value::Bool(cond_value) = self.eval(cond, frame, me)? else {
-                        let span = statement.span();
-                        return Err(self.error("E0402", "condition is not a boolean", span));
-                    };
-                    if !cond_value {
-                        break;
-                    }
-                    match self.exec_block(body, frame, me)? {
-                        Flow::Break => break,
-                        Flow::Continue | Flow::Normal => {}
-                        Flow::Return(value) => return Ok(Flow::Return(value)),
-                        Flow::Stop => return Ok(Flow::Stop),
-                    }
-                }
-                Ok(Flow::Normal)
+                self.exec_context.push(ExecCtx {
+                    index: self.current_ctx_index(),
+                    kind: CtxKind::WhileLoop,
+                });
+                let flow = self.while_loop(cond, body, frame, me, Flow::Normal);
+                self.exec_context.pop();
+                flow
             }
             Stmt::Break { .. } => Ok(Flow::Break),
             Stmt::Continue { .. } => Ok(Flow::Continue),
@@ -741,6 +1056,20 @@ impl<'a> Interp<'a> {
                 if n < 0 {
                     return Err(self.error("E0402", "wait count must be non-negative", *span));
                 }
+                // In a coroutine turn the wait suspends for n
+                // occurrences of the sampling event (13.1.1) — the
+                // scheduler advances time; resumption skips this
+                // statement.
+                if n > 0 && self.suspend_eligible() {
+                    return self.suspend_here(
+                        frame,
+                        *span,
+                        true,
+                        self.cycle + n as u64,
+                        false,
+                        None,
+                    );
+                }
                 if self.wait_budget == 0 {
                     return Err(self.error(
                         "E0409",
@@ -753,50 +1082,29 @@ impl<'a> Interp<'a> {
                 self.pad_log();
                 Ok(Flow::Normal)
             }
-            // A temporal wait (13.1.3): suspend until the TE succeeds
-            // over the run log (12.3.1), advancing one cycle at a time
-            // under the wait budget. Propositions and repeat bounds
-            // evaluate once, with current field values — the log keeps
-            // event occurrences, not value history. A temporal wait
-            // that stays unsatisfied for TEMPORAL_WAIT_CYCLES cycles
-            // is reported like the runaway-TCM guard (the success scan
-            // is quadratic in the log, so the cap is far below the
-            // numeric wait budget).
-            Stmt::WaitTemporal { te, span } => {
-                let start = self.cycle as usize;
-                self.pad_log();
-                let (booleans, numerics) = self.evaluate_temporal_exprs(te, frame, me);
-                let mut waited = 0u64;
-                loop {
-                    let callbacks = temporal_callbacks(&booleans, &numerics);
-                    let slice = &self.temporal_log[start..];
-                    match crate::temporal::succeeds(te, slice, &callbacks) {
-                        Ok(true) => return Ok(Flow::Normal),
-                        Ok(false) => {}
-                        Err(err) => {
-                            return Err(self.error(
-                                "E0402",
-                                format!("temporal wait cannot be evaluated: {err:?}"),
-                                *span,
-                            ));
-                        }
+            Stmt::WaitTemporal { te, span } => self.temporal_wait(te, *span, frame, me),
+            Stmt::Sync { te, span } => match te {
+                Some(te) => self.temporal_wait(te, *span, frame, me),
+                None => {
+                    // 13.1.2: the bare sync suspends for one occurrence
+                    // of the default sampling event; in this model the
+                    // default event fires every cycle.
+                    if self.suspend_eligible() {
+                        return self.suspend_here(frame, *span, true, self.cycle + 1, false, None);
                     }
-                    if self.wait_budget == 0 || waited >= TEMPORAL_WAIT_CYCLES {
+                    if self.wait_budget == 0 {
                         return Err(self.error(
                             "E0409",
-                            format!(
-                                "cycle budget exceeded at cycle {} (temporal wait unsatisfied after {waited} cycles)",
-                                self.cycle
-                            ),
+                            format!("cycle budget exceeded at cycle {}", self.cycle),
                             *span,
                         ));
                     }
                     self.wait_budget -= 1;
-                    waited += 1;
                     self.cycle = self.cycle.saturating_add(1);
                     self.pad_log();
+                    Ok(Flow::Normal)
                 }
-            }
+            },
             Stmt::Emit { target, span } => {
                 let path = self.event_path(target)?;
                 self.emitted.insert(path.clone());
@@ -815,9 +1123,9 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             Stmt::Start { call, span } => {
-                // TCM start: executed inline (synchronously) in this
-                // milestone — event-triggered suspension is a later
-                // milestone; waits inside the body advance virtual time.
+                // 13.1.1: a started TCM joins the scheduler's queue with
+                // an implicit sync cycle before it commences; it runs
+                // concurrently (round-robin turns) with the starter.
                 let Expr::Call { callee, args, .. } = call else {
                     return Err(self.error("E0402", "start expects a method call", *span));
                 };
@@ -825,7 +1133,7 @@ impl<'a> Interp<'a> {
                 for arg in args {
                     values.push(self.eval(arg, frame, me)?);
                 }
-                match callee.as_ref() {
+                let (instance, name) = match callee.as_ref() {
                     Expr::Ident { name, .. } => {
                         let Some(index) = me else {
                             return Err(self.error(
@@ -834,17 +1142,49 @@ impl<'a> Interp<'a> {
                                 *span,
                             ));
                         };
-                        self.call_method(index, name, values, *span)?;
+                        (index, name.clone())
                     }
                     Expr::MemberAccess { object, name, .. } => {
                         let object_value = self.eval(object, frame, me)?;
                         let Value::Object(index) = object_value else {
                             return Err(self.error("E0402", "start requires an object", *span));
                         };
-                        self.call_method(index, name, values, *span)?;
+                        (index, name.clone())
                     }
                     _ => return Err(self.error("E0402", "start target not supported", *span)),
+                };
+                let blocks = self.resolve_method(instance, &name, *span)?;
+                if blocks
+                    .first()
+                    .is_some_and(|block| values.len() != block.params.len())
+                {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "method '{name}' expects {} argument(s), got {}",
+                            blocks.first().map_or(0, |block| block.params.len()),
+                            values.len()
+                        ),
+                        *span,
+                    ));
                 }
+                self.coroutines.push(Coroutine {
+                    kind: CoroutineKind::Tcm {
+                        instance,
+                        method: name,
+                        args: values,
+                        next_block: 0,
+                    },
+                    cursor: Vec::new(),
+                    frame: Frame::default(),
+                    me: Some(instance),
+                    // The implicit "sync cycle" before it commences.
+                    eligible_at_cycle: self.cycle + 1,
+                    suspended_temporal: false,
+                    temporal_waited: 0,
+                    span: *span,
+                    wait_start: None,
+                });
                 Ok(Flow::Normal)
             }
             // `compute <call>;` — without TCM suspension, the call runs
@@ -1466,6 +1806,17 @@ impl<'a> Interp<'a> {
         self.rng.below(1u128 << width_bits(width, default_bits)) as i128
     }
 
+    /// Resolve a method's `is also` blocks on an instance's type.
+    fn resolve_method(
+        &self,
+        object_index: usize,
+        name: &str,
+        span: crate::ast::Span,
+    ) -> Result<Vec<&MethodDecl>, Diagnostic> {
+        let type_name = self.instances[object_index].type_name.clone();
+        resolve_method_blocks(self.types, &type_name, name, span)
+    }
+
     fn call_method(
         &mut self,
         object_index: usize,
@@ -1475,28 +1826,20 @@ impl<'a> Interp<'a> {
     ) -> Result<Value, Diagnostic> {
         let type_name = self.instances[object_index].type_name.clone();
         let types: &[crate::elab::ElaboratedType] = self.types;
-        let Some(ty) = types.iter().find(|t| t.name == type_name) else {
-            return Err(self.error("E0401", format!("unknown type '{type_name}'"), span));
-        };
-        let blocks: Vec<&MethodDecl> = ty
-            .methods
-            .iter()
-            .filter(|method| method.name == name)
-            .collect();
-        if blocks.is_empty() {
-            return Err(self.error(
-                "E0401",
-                format!("method '{name}' not found on '{type_name}'"),
-                span,
-            ));
-        }
+        let blocks = resolve_method_blocks(types, &type_name, name, span)?;
         if self.depth > 200 {
             return Err(self.error("E0406", "recursion too deep", span));
         }
         self.depth += 1;
+        // Inline calls are atomic regions (13.1.1: a called TCM runs to
+        // its return before the callee resumes): waits inside keep the
+        // inline spin.
+        self.atomic_depth += 1;
         let mut result = Value::Void;
         for block in blocks {
             if args.len() != block.params.len() {
+                self.atomic_depth -= 1;
+                self.depth -= 1;
                 return Err(self.error(
                     "E0402",
                     format!(
@@ -1522,8 +1865,11 @@ impl<'a> Interp<'a> {
                 Flow::Stop => {
                     self.stop_requested = true;
                 }
+                // Suspension is disabled in atomic regions.
+                Flow::Suspend => {}
             }
         }
+        self.atomic_depth -= 1;
         self.depth -= 1;
         Ok(result)
     }
@@ -1696,6 +2042,134 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// The statement index of the leaf currently being executed (the
+    /// context stack's top entry, pushed by the enclosing walk).
+    fn current_ctx_index(&self) -> usize {
+        self.exec_context.last().map(|ctx| ctx.index).unwrap_or(0)
+    }
+
+    /// Whether the running statement may suspend to the scheduler: a
+    /// coroutine turn, not inside an atomic region (inline calls,
+    /// `on` blocks), and the enclosing statement chain is all `while`
+    /// loops — the reach of the resume cursor (other compounds keep
+    /// the inline spin, the documented v1 limitation).
+    fn suspend_eligible(&self) -> bool {
+        self.tracing
+            && self.atomic_depth == 0
+            && self
+                .exec_context
+                .iter()
+                .all(|ctx| matches!(ctx.kind, CtxKind::WhileLoop | CtxKind::Leaf))
+    }
+
+    /// Raise a suspension for the scheduler (13.1.1). `skip_resume`
+    /// resumes after this statement (a consumed numeric wait or bare
+    /// sync); otherwise the statement re-executes next turn (a temporal
+    /// wait, re-evaluated against the grown log).
+    fn suspend_here(
+        &mut self,
+        frame: &Frame,
+        span: crate::ast::Span,
+        skip_resume: bool,
+        eligible_at_cycle: u64,
+        temporal: bool,
+        wait_start: Option<usize>,
+    ) -> Result<Flow, Diagnostic> {
+        let own = self.current_ctx_index();
+        let mut cursor: Vec<usize> = self
+            .exec_context
+            .iter()
+            .filter(|ctx| ctx.kind == CtxKind::WhileLoop)
+            .map(|ctx| ctx.index)
+            .collect();
+        cursor.push(if skip_resume { own + 1 } else { own });
+        self.pending_suspension = Some(PendingSuspension {
+            cursor,
+            frame: frame.clone(),
+            eligible_at_cycle,
+            temporal,
+            span,
+            wait_start,
+        });
+        Ok(Flow::Suspend)
+    }
+
+    /// A temporal wait (13.1.3): in a coroutine turn, 13.1.1(b) —
+    /// evaluate the TE once; on success resume immediately, otherwise
+    /// suspend until the next sampling occurrence, when the statement
+    /// re-executes against the grown log. Propositions and repeat
+    /// bounds evaluate once per check, with current field values (the
+    /// log keeps event occurrences, not value history). In atomic
+    /// regions and non-scheduled contexts the wait spins inline,
+    /// advancing one cycle at a time under the budget; a wait
+    /// unsatisfied for TEMPORAL_WAIT_CYCLES cycles there reports
+    /// `E0409` (the scheduler applies the same guard to suspends).
+    fn temporal_wait(
+        &mut self,
+        te: &crate::ast::TemporalExpr,
+        span: crate::ast::Span,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Flow, Diagnostic> {
+        let start = self.resume_wait_start.take().unwrap_or(self.cycle as usize);
+        self.pad_log();
+        let (booleans, numerics) = self.evaluate_temporal_exprs(te, frame, me);
+        if self.suspend_eligible() {
+            let callbacks = temporal_callbacks(&booleans, &numerics);
+            let slice = &self.temporal_log[start..];
+            match crate::temporal::succeeds(te, slice, &callbacks) {
+                Ok(true) => return Ok(Flow::Normal),
+                Ok(false) => {
+                    return self.suspend_here(
+                        frame,
+                        span,
+                        false,
+                        self.cycle + 1,
+                        true,
+                        Some(start),
+                    );
+                }
+                Err(err) => {
+                    return Err(self.error(
+                        "E0402",
+                        format!("temporal wait cannot be evaluated: {err:?}"),
+                        span,
+                    ));
+                }
+            }
+        }
+        let mut waited = 0u64;
+        loop {
+            let callbacks = temporal_callbacks(&booleans, &numerics);
+            let slice = &self.temporal_log[start..];
+            match crate::temporal::succeeds(te, slice, &callbacks) {
+                Ok(true) => return Ok(Flow::Normal),
+                Ok(false) => {}
+                Err(err) => {
+                    return Err(self.error(
+                        "E0402",
+                        format!("temporal wait cannot be evaluated: {err:?}"),
+                        span,
+                    ));
+                }
+            }
+            if self.wait_budget == 0 || waited >= TEMPORAL_WAIT_CYCLES {
+                return Err(self.error(
+                    "E0409",
+                    format!(
+                        "cycle budget exceeded at cycle {} (temporal wait unsatisfied after {waited} cycles)",
+                        self.cycle
+                    ),
+                    span,
+                ));
+            }
+            self.wait_budget -= 1;
+            waited += 1;
+            self.cycle = self.cycle.saturating_add(1);
+            self.pad_log();
+        }
+    }
+
     /// Evaluate a temporal expression's propositions (`true(exp)` —
     /// `TRUE` or non-zero numeric, 12.1.1.1) and numeric repeat bounds
     /// once, with current field values. The results key the callback
@@ -1794,6 +2268,10 @@ impl<'a> Interp<'a> {
             return Err(self.error("E0406", "recursion too deep", span));
         }
         self.depth += 1;
+        // `on` blocks are atomic regions: waits inside keep the inline
+        // spin (the v1 limitation — a suspending on-block would strand
+        // the emitter's continuation).
+        self.atomic_depth += 1;
         for block in &blocks {
             let mut frame = Frame::default();
             match self.exec_block(&block.body, &mut frame, Some(owner))? {
@@ -1801,8 +2279,11 @@ impl<'a> Interp<'a> {
                 Flow::Stop => {
                     self.stop_requested = true;
                 }
+                // Suspension is disabled in atomic regions.
+                Flow::Suspend => {}
             }
         }
+        self.atomic_depth -= 1;
         self.depth -= 1;
         Ok(())
     }
@@ -3057,4 +3538,155 @@ fn unescape(value: &str) -> String {
         }
     }
     out
+}
+
+impl<'a> Interp<'a> {
+    /// One scheduler turn (13.1.1): execute the coroutine atomically
+    /// from its resume point until it completes, suspends at a
+    /// synchronization action, or errors.
+    fn run_coroutine_turn(&mut self, co: &mut Coroutine<'a>) -> TurnOutcome {
+        // The kind's payload is copied out so the turn's &mut self
+        // calls never hold a borrow of `co`.
+        enum Plan<'a> {
+            Main {
+                blocks: Vec<&'a [Stmt]>,
+                next: usize,
+            },
+            Tcm {
+                instance: usize,
+                name: String,
+                args: Vec<Value>,
+                next: usize,
+            },
+        }
+        let plan = match &co.kind {
+            CoroutineKind::Main { blocks, next_block } => Plan::Main {
+                blocks: blocks.clone(),
+                next: *next_block,
+            },
+            CoroutineKind::Tcm {
+                instance,
+                method,
+                args,
+                next_block,
+            } => Plan::Tcm {
+                instance: *instance,
+                name: method.clone(),
+                args: args.clone(),
+                next: *next_block,
+            },
+        };
+        match plan {
+            Plan::Main { blocks, mut next } => {
+                let block_count = blocks.len();
+                while next < block_count {
+                    let body = blocks[next];
+                    match self.run_body(body, co) {
+                        Ok(Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_)) => {
+                            next += 1;
+                            co.cursor.clear();
+                            co.frame = Frame::default();
+                        }
+                        Ok(Flow::Stop) => {
+                            self.stop_requested = true;
+                            if let CoroutineKind::Main { next_block, .. } = &mut co.kind {
+                                *next_block = next;
+                            }
+                            return TurnOutcome::Complete;
+                        }
+                        Ok(Flow::Suspend) => {
+                            if let CoroutineKind::Main { next_block, .. } = &mut co.kind {
+                                *next_block = next;
+                            }
+                            return self.take_suspension(co);
+                        }
+                        Err(diagnostic) => return TurnOutcome::Error(diagnostic),
+                    }
+                }
+                TurnOutcome::Complete
+            }
+            Plan::Tcm {
+                instance,
+                name,
+                args,
+                mut next,
+            } => {
+                let types: &[crate::elab::ElaboratedType] = self.types;
+                let type_name = self.instances[instance].type_name.clone();
+                let Ok(blocks) = resolve_method_blocks(types, &type_name, &name, co.span) else {
+                    return TurnOutcome::Error(Diagnostic::new(
+                        "E0401",
+                        format!("method '{name}' not found for the started TCM"),
+                        co.span.0,
+                        co.span.1,
+                    ));
+                };
+                let block_count = blocks.len();
+                while next < block_count {
+                    let block = blocks[next];
+                    if co.cursor.is_empty() {
+                        // A fresh `is also` block binds its parameters
+                        // from the start-time arguments.
+                        co.frame = Frame::default();
+                        for (param, arg) in block.params.iter().zip(args.iter()) {
+                            if let Some(ty) = &param.ty {
+                                co.frame.local_types.insert(param.name.clone(), ty.clone());
+                            }
+                            co.frame.locals.insert(param.name.clone(), arg.clone());
+                        }
+                    }
+                    match self.run_body(&block.body, co) {
+                        Ok(Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_)) => {
+                            next += 1;
+                            co.cursor.clear();
+                        }
+                        Ok(Flow::Stop) => {
+                            self.stop_requested = true;
+                            break;
+                        }
+                        Ok(Flow::Suspend) => {
+                            if let CoroutineKind::Tcm { next_block, .. } = &mut co.kind {
+                                *next_block = next;
+                            }
+                            return self.take_suspension(co);
+                        }
+                        Err(diagnostic) => return TurnOutcome::Error(diagnostic),
+                    }
+                }
+                if let CoroutineKind::Tcm { next_block, .. } = &mut co.kind {
+                    *next_block = next;
+                }
+                TurnOutcome::Complete
+            }
+        }
+    }
+
+    /// Execute one body, resuming through the cursor when suspended.
+    fn run_body(&mut self, body: &'a [Stmt], co: &mut Coroutine<'a>) -> Result<Flow, Diagnostic> {
+        if co.cursor.is_empty() {
+            self.exec_block(body, &mut co.frame, co.me)
+        } else {
+            self.exec_block_resumable(body, &mut co.frame, co.me, &co.cursor)
+        }
+    }
+
+    /// Collect the suspension the turn raised.
+    fn take_suspension(&mut self, co: &mut Coroutine<'a>) -> TurnOutcome {
+        match self.pending_suspension.take() {
+            Some(suspension) => {
+                co.cursor = suspension.cursor;
+                co.frame = suspension.frame;
+                co.eligible_at_cycle = suspension.eligible_at_cycle;
+                co.suspended_temporal = suspension.temporal;
+                co.span = suspension.span;
+                co.wait_start = suspension.wait_start;
+                TurnOutcome::Suspended
+            }
+            None => TurnOutcome::Error(self.error(
+                "E0402",
+                "internal: suspension without state",
+                origin_span(),
+            )),
+        }
+    }
 }
