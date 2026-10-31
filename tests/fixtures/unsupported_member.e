@@ -1,4 +1,4 @@
 struct packet {
     addr: uint(bits: 8);
-    cover my_cover is { item addr; };
+    assert addr_never_zero: addr != 0;
 };

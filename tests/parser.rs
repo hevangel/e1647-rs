@@ -487,18 +487,100 @@ fn recovery_reports_each_bad_declaration() {
 
 #[test]
 fn unsupported_members_report_explicitly() {
-    let result = parse("struct s {\n    b: uint;\n    cover my_cover is { item a; };\n};\n");
+    // `cover` members are supported now (clause 14); `assert` struct
+    // members (clause 16) are the remaining unsupported family this
+    // diagnostic pins.
+    let result = parse("struct s {\n    b: uint;\n    assert never_zero: b != 0;\n};\n");
     assert_eq!(
         result
             .diagnostics
             .iter()
             .map(|d| d.code)
             .collect::<Vec<_>>(),
-        vec!["E0113", "E0101"]
+        vec!["E0113"]
     );
     // The parser recovers; the well-formed field survives in the partial
     // AST and the diagnostics are authoritative.
     assert_eq!(result.declarations[0].members.len(), 1);
+}
+
+#[test]
+fn cover_groups_parse_with_items_options_and_extensions() {
+    let declarations = expect_clean(
+        "extend sys {\n    ev: event;\n    \
+         cover ev is {\n            per_instance = TRUE;\n            \
+         item a: uint (bits: 8) = sys.x using ranges = {\n                \
+         range([0..10], \"low\");\n            };\n            \
+         item b: bool = sys.y;;\n            cross a, b;\n            \
+         transition a;\n            item c using also per_instance;\n            \
+         item plain;\n            weight = 2;\n        };\n    \
+         cover ev is also {\n            item d;\n        };\n};\n",
+    );
+    let extend = &declarations[0];
+    let Member::Cover(group) = &extend.members[1] else {
+        panic!("expected a cover group");
+    };
+    assert_eq!(group.name, "ev");
+    // Four real items (a, b, c, plain) plus a cross and a transition;
+    // the stray `;;` and the group option entries are tolerated.
+    let item_kinds = group.items.iter().map(|item| item.kind).collect::<Vec<_>>();
+    assert_eq!(
+        item_kinds,
+        vec![
+            e1647::ast::CoverItemKind::Item,
+            e1647::ast::CoverItemKind::Item,
+            e1647::ast::CoverItemKind::Cross,
+            e1647::ast::CoverItemKind::Transition,
+            e1647::ast::CoverItemKind::Item,
+            e1647::ast::CoverItemKind::Item,
+        ]
+    );
+    // The ranges option block is captured verbatim, inner semicolons
+    // included.
+    let with_ranges = group
+        .items
+        .iter()
+        .find(|item| item.ty.is_some() && !item.using.is_empty())
+        .expect("expected the ranged item");
+    let using_texts: Vec<String> = with_ranges
+        .using
+        .iter()
+        .map(|token| match &token.kind {
+            e1647::lexer::TokenKind::Identifier(word) => word.clone(),
+            e1647::lexer::TokenKind::Keyword(word) => word.clone(),
+            e1647::lexer::TokenKind::Punctuation(p) => p.clone(),
+            _ => "?".to_owned(),
+        })
+        .collect();
+    assert!(
+        using_texts.iter().any(|text| text == "range"),
+        "using tokens: {using_texts:?}"
+    );
+    // The `is also` extension form records its marker.
+    let Member::Cover(extended) = &extend.members[2] else {
+        panic!("expected the extended cover group");
+    };
+    assert!(extended.is_also);
+    // Group-level option entries are recorded raw.
+    assert!(!group.options.is_empty());
+}
+
+#[test]
+fn typed_for_each_and_file_types_parse() {
+    let declarations = expect_clean(
+        "extend sys {\n    walk(fs: list of file) is {\n        \
+         var f: file;\n        for each rf_struct (rs) in fs {\n            \
+         out(rs);\n        };\n    };\n};\n",
+    );
+    let Member::Method(walk) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    let Some(Stmt::ForEach { type_filter, .. }) =
+        walk.body.iter().find(|s| matches!(s, Stmt::ForEach { .. }))
+    else {
+        panic!("expected a for-each");
+    };
+    assert_eq!(type_filter.as_deref(), Some("rf_struct"));
 }
 
 #[test]

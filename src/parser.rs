@@ -1187,6 +1187,9 @@ impl Parser {
             Some(TokenKind::Keyword(k)) if k == "on" => {
                 self.parse_on().map(|o| vec![Member::On(o)])
             }
+            Some(TokenKind::Keyword(k)) if k == "cover" => {
+                self.parse_cover_group().map(|c| vec![Member::Cover(c)])
+            }
             Some(TokenKind::Punctuation(p)) if p == "#" => self.parse_hash_members(),
             // The explicit `method name() …` spelling; the bare
             // `name() …` init style is handled by the identifier arm.
@@ -1350,6 +1353,145 @@ impl Parser {
         }
         self.error_here("E0107", "expected '}' to close the macro body");
         captured
+    }
+
+    /// `cover <event> is { [items, crosses, transitions, option
+    /// entries] };` (clause 14.1) or `cover <event> is empty;`. Items
+    /// parse structurally (`item name [: type] [= expr] [using …];`);
+    /// every `using` option clause and non-item body entry is recorded
+    /// as raw tokens — the option semantics belong to the coverage data
+    /// model, a later milestone. Nothing is collected at run time yet.
+    fn parse_cover_group(&mut self) -> Option<crate::ast::CoverGroupDecl> {
+        let start = self.current_span().0;
+        self.bump(); // 'cover'
+        let event = self.parse_expr()?;
+        // The group identifies by its sampling event's path.
+        let name = render_expr_path(&event).unwrap_or_default();
+        let name_span = event.span();
+        self.expect_keyword_word("is")?;
+        // `cover ... is also { .. }` extends the group (clause 14.5).
+        let is_also = self.eat_keyword("also");
+        if self.eat_keyword("empty") {
+            self.expect_stmt_semi("expected ';' after the cover group")?;
+            let end = self.last_end();
+            return Some(crate::ast::CoverGroupDecl {
+                name,
+                name_span,
+                event,
+                empty: true,
+                is_also,
+                items: Vec::new(),
+                options: Vec::new(),
+                span: (start, end),
+            });
+        }
+        self.expect_punct("{", "E0106", "expected '{' to open the cover group body")?;
+        let mut items = Vec::new();
+        let mut options = Vec::new();
+        while !self.at_punct("}") && self.peek().is_some() {
+            if self.at_punct(";") {
+                // A stray empty statement (`;;`) is tolerated.
+                self.bump();
+                continue;
+            }
+            if self.at_keyword("item") || self.at_keyword("cross") || self.at_keyword("transition")
+            {
+                let kind = if self.at_keyword("item") {
+                    crate::ast::CoverItemKind::Item
+                } else if self.at_keyword("cross") {
+                    crate::ast::CoverItemKind::Cross
+                } else {
+                    crate::ast::CoverItemKind::Transition
+                };
+                self.bump(); // kind keyword
+                let mut names = Vec::new();
+                loop {
+                    let (name, name_span) =
+                        self.expect_word("E0102", "expected the cover item name")?;
+                    names.push((name, name_span));
+                    if !self.eat_punct(",") {
+                        break;
+                    }
+                }
+                let mut ty = None;
+                let mut expr = None;
+                if kind == crate::ast::CoverItemKind::Item && self.eat_punct(":") {
+                    ty = Some(self.parse_type()?);
+                    if self.eat_punct("=") {
+                        expr = Some(self.parse_expr()?);
+                    }
+                }
+                // The `using ...` option clause runs to the statement's
+                // `;` and is recorded verbatim; braced option blocks
+                // (`ranges = { range(...); range(...); }`) are skipped
+                // with depth counting so inner semicolons do not end the
+                // clause.
+                let mut using = Vec::new();
+                if self.eat_keyword("using") {
+                    let mut depth = 0usize;
+                    while let Some(token) = self.peek() {
+                        match &token.kind {
+                            TokenKind::Punctuation(p) if p == ";" && depth == 0 => break,
+                            TokenKind::Punctuation(p) if p == "{" => {
+                                depth += 1;
+                                using.push(self.bump());
+                            }
+                            TokenKind::Punctuation(p) if p == "}" => {
+                                depth = depth.saturating_sub(1);
+                                using.push(self.bump());
+                            }
+                            _ => using.push(self.bump()),
+                        }
+                    }
+                }
+                self.expect_stmt_semi("expected ';' after the cover item")?;
+                let end = self.last_end();
+                items.push(crate::ast::CoverItemDecl {
+                    kind,
+                    names,
+                    ty,
+                    expr,
+                    using,
+                    span: (start, end),
+                });
+            } else {
+                // A group-level option entry (`per_instance = TRUE;`,
+                // `weight = ...;`) — recorded verbatim, not interpreted.
+                let mut entry = Vec::new();
+                while let Some(token) = self.peek() {
+                    if matches!(&token.kind, TokenKind::Punctuation(p) if p == ";") {
+                        break;
+                    }
+                    if matches!(&token.kind, TokenKind::Punctuation(p) if p == "}") {
+                        break;
+                    }
+                    entry.push(self.bump());
+                }
+                self.eat_punct(";");
+                if entry.is_empty() {
+                    // No progress — skip a token to avoid looping.
+                    if self.peek().is_some() && !self.at_punct("}") {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                options.push(entry);
+            }
+        }
+        self.expect_punct("}", "E0107", "expected '}' to close the cover group body")?;
+        self.expect_stmt_semi("expected ';' after the cover group")?;
+        let end = self.last_end();
+        Some(crate::ast::CoverGroupDecl {
+            name,
+            name_span,
+            event,
+            empty: false,
+            is_also,
+            items,
+            options,
+            span: (start, end),
+        })
     }
 
     /// `on <event-path> { statements };` — an `on` struct member (clause
@@ -2328,6 +2470,17 @@ impl Parser {
                 span: (start, end),
             });
         }
+        if keyword == "file" || keyword == "event" {
+            // Predefined non-scalar types (`var f: file`, `ev: event;`);
+            // recorded as named types and accepted by the
+            // well-formedness check.
+            self.bump();
+            let end = self.last_end();
+            return Some(TypeExpr::Named {
+                name: keyword,
+                span: (start, end),
+            });
+        }
         self.error_here("E0104", "expected a type");
         None
     }
@@ -2797,6 +2950,15 @@ impl Parser {
         let start = self.current_span().0;
         self.bump(); // 'for'
         if self.eat_keyword("each") {
+            // Optional typed binding: `for each rf_struct (rs) in list` —
+            // the element type filter is recorded, not enforced.
+            let mut type_filter = None;
+            if self.at_identifier()
+                && matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == "(")
+            {
+                let (type_name, _) = self.take_identifier();
+                type_filter = Some(type_name);
+            }
             // Optional named binding: `for each (m) in list do`.
             let var = if self.eat_punct("(") {
                 let (name, _) =
@@ -2849,6 +3011,7 @@ impl Parser {
             let end = self.last_end();
             return Some(Stmt::ForEach {
                 var,
+                type_filter,
                 index_var,
                 using,
                 reversed,
@@ -3277,5 +3440,20 @@ impl Parser {
                 None
             }
         }
+    }
+}
+
+/// The dotted path of an identifier/member-access chain, for naming
+/// cover groups by their sampling event.
+fn render_expr_path(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Ident { name, .. } => Some(name.clone()),
+        Expr::MemberAccess { object, name, .. } => {
+            let mut prefix = render_expr_path(object)?;
+            prefix.push('.');
+            prefix.push_str(name);
+            Some(prefix)
+        }
+        _ => None,
     }
 }

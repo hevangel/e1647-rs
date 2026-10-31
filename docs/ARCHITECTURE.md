@@ -71,7 +71,13 @@ multi-simulator HDL API, and wasm32.
   (`<type>`), template references (`deque of int`) and keyed lists
   (`list (key:it) of t`) are TypeExpr variants, and `new [<type>]
   [with { .. }]` parses to an explicit not-supported runtime diagnostic.
-  `package`/`private` member prefixes are recorded on fields. Diagnostics
+  Clause 14 coverage groups (`cover <event> is [also] { .. };`, `is
+  empty;`) record their item/cross/transition entries structurally and
+  every option clause verbatim — nothing is collected at run time.
+  Predefined non-scalar types `file` and `event` are accepted in type
+  positions; `for each <type> (v) in list` records the element type
+  filter. `package`/`private` member prefixes are recorded on fields.
+  Diagnostics
   are collected (codes
   `E01xx` syntax, `E02xx` well-formedness; see the module documentation)
   and the AST stays partial under errors.
@@ -132,9 +138,11 @@ Deliberately not implemented yet: `when`-subtype resolution, non-linear,
 disjunctive or temporal constraint solving (the solver backend covers
 conjunctive linear constraints and constant ranges over bounded
 integers), an event scheduler
-and time-consuming-method suspension, coverage, integer width truncation,
-evaluation of MVL literals, `repeat`, single-statement `if ... do`,
-`expect`/`assume`, `on event-port`, `#else` and `#define` replacement
+and time-consuming-method suspension, the coverage data model and
+reports (clause 14 groups are recorded, not collected), integer width
+truncation, evaluation of MVL literals, `repeat`, single-statement
+`if ... do`, `expect`/`assume` and the temporal-expression grammar
+(clause 12), `on event-port`, `#else` and `#define` replacement
 rules, template instantiation and `template extend` (clause 8.2–8.3),
 macro match-expression
 interpretation and expansion (clause 15.4–15.5), a multi-simulator HDL

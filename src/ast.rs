@@ -79,6 +79,10 @@ pub enum Member {
     Event(EventDecl),
     /// An `on <event-path> { actions };` struct member (clause 11.2).
     On(OnDecl),
+    /// A `cover <event> is { .. };` coverage group (clause 14.1) —
+    /// recorded, not collected: the coverage data model is a later
+    /// milestone.
+    Cover(CoverGroupDecl),
     /// `import a, b;` — recorded; no cross-file resolution yet.
     Import {
         names: Vec<String>,
@@ -271,6 +275,52 @@ pub struct OnDecl {
     pub span: Span,
 }
 
+/// A `cover <event> is { .. };` coverage group (clause 14.1). The
+/// sampling event is recorded; items, crosses and transitions are
+/// recorded structurally, and every option clause (`using ...`) is kept
+/// as raw tokens — the option semantics (weights, at_least, per_instance)
+/// belong to the coverage data model, a later milestone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverGroupDecl {
+    pub name: String,
+    pub name_span: Span,
+    /// The sampling event expression as written.
+    pub event: Expr,
+    /// `cover name is empty;` — extendable empty group.
+    pub empty: bool,
+    /// `cover name is also { .. };` — a clause 14.5 extension of the
+    /// group defined for the same event.
+    pub is_also: bool,
+    pub items: Vec<CoverItemDecl>,
+    /// Group-level option entries that are not items, recorded as raw
+    /// tokens (one entry per statement).
+    pub options: Vec<Vec<crate::lexer::Token>>,
+    pub span: Span,
+}
+
+/// One `item` / `transition` / `cross` entry of a coverage group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverItemDecl {
+    /// `item` / `transition` / `cross`.
+    pub kind: CoverItemKind,
+    /// The item name; a cross carries the crossed names here.
+    pub names: Vec<(String, Span)>,
+    /// The optional declared type (`item name: uint (bits: 16) = ...`).
+    pub ty: Option<TypeExpr>,
+    /// The sampled expression (`= cur_trans.address`).
+    pub expr: Option<Expr>,
+    /// The `using ...` option clause as raw tokens, if present.
+    pub using: Vec<crate::lexer::Token>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverItemKind {
+    Item,
+    Cross,
+    Transition,
+}
+
 /// One enumerand of a `type` declaration, with its optional explicit value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Enumeral {
@@ -354,11 +404,13 @@ pub enum Stmt {
     },
     /// `for each in list do { .. };` binds `it` to each element;
     /// `for each (m) in list do { .. };` binds `m` instead;
+    /// `for each <type> (m) in list` records the element type filter;
     /// `for each (m) using index (idx) in list` also binds `idx` to the
     /// element position, with the `using` expression recorded; `in
     /// reverse list` iterates in reverse order.
     ForEach {
         var: Option<String>,
+        type_filter: Option<String>,
         index_var: Option<String>,
         using: Option<Expr>,
         reversed: bool,

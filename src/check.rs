@@ -314,7 +314,7 @@ fn check_statements<'a>(
 fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut Vec<Diagnostic>) {
     match ty {
         TypeExpr::Named { name, span } => {
-            if !declared.contains(name.as_str()) {
+            if !declared.contains(name.as_str()) && !crate::builtins::is_builtin_type(name) {
                 diagnostics.push(Diagnostic::new(
                     "E0203",
                     format!("unknown type '{name}'"),
