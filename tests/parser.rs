@@ -1336,17 +1336,17 @@ fn temporal_grammar_covers_the_clause_12_operators() {
     // eventually.
     let declarations = expect_clean(
         "extend sys {\n    ev: event;\n    clk: event;\n    \
-         expect {[2]*@ev; @clk} @clk else dut_error(\"SEQ\");\n    \
+         expect {[2..4]*@ev; @clk} @clk else dut_error(\"SEQ\");\n    \
          expect ~[1..3]*true(sig == 1) @clk;\n    \
          expect (change(sig) or rise(sig)) and not @ev;\n    \
          expect fail{@ev; @ev} and eventually @clk;\n    \
          expect [2]*cycle @clk;\n};\n",
     );
     let extend = &declarations[0];
-    let Member::Expect(fixed_repeat) = &extend.members[2] else {
+    let Member::Expect(first_match_seq) = &extend.members[2] else {
         panic!("expected the sequence expect");
     };
-    let seq_shape = match &fixed_repeat.te {
+    let seq_shape = match &first_match_seq.te {
         e1647::ast::TemporalExpr::Sampled { te, .. } => match &**te {
             e1647::ast::TemporalExpr::Sequence { items } => {
                 items.len() == 2
@@ -1362,7 +1362,7 @@ fn temporal_grammar_covers_the_clause_12_operators() {
         },
         _ => false,
     };
-    assert!(seq_shape, "te: {:?}", fixed_repeat.te);
+    assert!(seq_shape, "te: {:?}", first_match_seq.te);
     let Member::Expect(true_match) = &extend.members[3] else {
         panic!("expected the repeat expect");
     };
@@ -1424,8 +1424,12 @@ fn temporal_grammar_covers_the_clause_12_operators() {
     };
     let cycle_shape = match &cycle_repeat.te {
         e1647::ast::TemporalExpr::Sampled { te, .. } => match &**te {
-            e1647::ast::TemporalExpr::Repeat { te: inner, .. } => {
-                matches!(&**inner, e1647::ast::TemporalExpr::Cycle)
+            // `[2]*cycle` is the fixed repeat (12.2.9's syntax example).
+            e1647::ast::TemporalExpr::Repeat {
+                kind, te: inner, ..
+            } => {
+                *kind == e1647::ast::RepeatKind::Fixed
+                    && matches!(&**inner, e1647::ast::TemporalExpr::Cycle)
             }
             _ => false,
         },

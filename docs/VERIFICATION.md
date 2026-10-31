@@ -1486,3 +1486,86 @@ clause-12-operators test covering sequences with first-match repeats,
 true-match repeats over propositions, edge-sample or-groups with
 `not`, `fail` + `eventually`, and `[2]*cycle` under sampling; the
 missing-TE diagnostic updated to `E0120`.
+
+## 2026-10-31 (25) — offline arc: clause 12 temporal-engine core (sampling propagation 12.1.4, path evaluation 12.3)
+
+Branch `agent/temporal-engine` (off merged main; the nine stacked PRs
+#6–#14 landed in this session's review-and-merge pass). The temporal
+engine stage: a pure evaluation core for the clause 12 `TemporalExpr`
+trees the grammar arc introduced.
+
+- New `src/temporal.rs`: `sampled_normal_form(te, q)` propagates the
+  sampling event to the sampled normal form `S(t, q)` (12.1.4) —
+  matching the clause's worked example `{@a; ~[..]*cycle; @b} @q` →
+  `{@a @q; ~[..]*cycle @q; @b @q} @q`: each direct sub-expression
+  carries the event attached as a unit, sequences keep the outer
+  sampling on the braces, repeats are sampled as units with their
+  interior untouched, and a sub-expression with its own sampling keeps
+  it (12.2.5's override). `holds_tightly`/`succeeds` evaluate tight
+  satisfaction (12.1.1.2) and last-point success (12.1.1.12) over
+  explicit finite paths of `State`s (each = the events that occurred in
+  one sampling period), with propositions and numeric repeat bounds
+  evaluated through caller-supplied callbacks
+  (`EvalCallbacks`; no interpreter wiring yet).
+- Operator semantics per subclause, documented inline: event atoms and
+  `cycle` tight on a single state (12.2.4, 12.2.2 — the atom `cycle`
+  holds at any state, 12.1.2), `true(exp)` via callbacks (12.2.3),
+  sequences over strictly consecutive segments (12.2.8), `and`/`or`/
+  `not` (12.2.6/7/16), `fail` = no success possibility on the slice
+  (12.2.12), `eventually` (12.2.14), yield as a universal obligation
+  over the lhs's successful prefixes with vacuous hold when the lhs
+  fails and failure when the rhs has no room after a last-point lhs
+  success (12.2.13), fixed `[n]*` unrolling with `[0]*` succeeding
+  immediately (12.2.9), true-match `~[l..h]*` as a k-range of
+  consecutive-success unrollings with `~[..]*` starting at zero
+  (12.2.10), first-match repeats as sequence items expanding to k
+  copies + rest with an omitted lower bound at zero (12.2.11's
+  `{@ev_a} or {[1]*TE1; @ev_a} ...` equivalence).
+- Re-classified the repeat spellings per the extracted 12.2.9–12.2.11
+  prose (the grammar arc had labeled every un-tilde bracket repeat
+  first-match): `[n]*te` with a single bound is the **fixed** repeat
+  (12.2.9's own example is `wait [2]*cycle`), `~[n]*te` the
+  exact-count true-match form (`n..n`), and only a `..` range without
+  `~` is the first-match repeat. The parser suite's sequence member now
+  uses 12.2.11's `{[2..4]*@ev; @clk}` shape and pins `[2]*cycle` as
+  Fixed.
+- `parse_temporal_expression` is a public entry point that parses one
+  standalone `TemporalExpr` (used by the engine tests; expect/assume
+  members parse through the same grammar).
+- Honest gaps: `change/rise/fall(exp)` edge samples report
+  `EvalError::EdgeSample` (they need a sampled value history across
+  states — the pure core has none), unresolvable repeat bounds report
+  `EvalError::Unsupported`, and nothing touches simulation time —
+  driving the engine from `wait`/`emit`/expect monitoring over the run
+  loop is the next temporal milestone.
+
+Corpus state (absolute paths; baseline unchanged): golden-combined 0,
+igen-dist 0, type-min-max/save-restart/d6w 0, etl 4 (E0203
+base_struct), cover-edges 4 (rf-library types), golden-imports 3
+(missing tutorial modules) — no regressions.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(139 passed: 11 elab, 1 fixtures, 36 interp, 24 lexer, 50 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests (`tests/temporal.rs`, 8): the 12.1.4 worked example's normal
+form shape (items sampled as units, outer sampling retained on the
+sequence, repeat interior bare); sub-sampling override (12.2.5); atom/
+sequence/cycle holds including the glued-state rejection and the
+12.1.1.2-vs-12.1.1.12 distinction on `cycle @q` (tight on the
+single-state path only, yet succeeds at the last point of a two-cycle
+path via the final cycle — the exact illustration 12.2's preamble
+draws); yield/not/fail distinction with the golden's
+`@enter_exec_st => {@fetch1_assert} @clk` shape over expect-style
+tight satisfaction; fixed/true-match repeats over propositions and
+`eventually` + first-match `{[..]*@a; @b}`; edge-sample error;
+unresolvable-bound error.

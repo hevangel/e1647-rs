@@ -7,7 +7,10 @@
 //! `like` chains and `extend` blocks into per-type member lists
 //! ([`elab`]), and an interpreter that executes the non-temporal statement
 //! subset, including `gen` as a seeded rejection sampler ([`interp`]).
-//! See docs/ROADMAP.md for what is deliberately not implemented yet.
+//! The clause 12 temporal-engine core evaluates sampled normal forms
+//! over explicit finite paths ([`temporal`]); wiring it to the run loop
+//! is a later milestone. See docs/ROADMAP.md for what is deliberately
+//! not implemented yet.
 
 pub mod ast;
 pub mod builtins;
@@ -19,3 +22,4 @@ pub mod interp;
 pub mod lexer;
 pub mod parser;
 pub mod solve;
+pub mod temporal;
