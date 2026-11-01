@@ -57,11 +57,18 @@
       instantiation (monomorphization, clause 8.3) is a later milestone,
       and `new [<type>] [with { .. }]` parses but evaluates to an
       explicit not-supported diagnostic. Coverage groups (clause 14.1)
-      parse and are recorded, not collected: `cover <event> is [also]
+      parse, are recorded, and collect: `cover <event> is [also]
       { item/cross/transition entries; option entries }` and `cover
       <event> is empty;` — item types and sampled expressions are
       structural, every `using` option clause and group option entry is
-      recorded verbatim; the coverage data model is a later milestone.
+      recorded verbatim. The coverage data model (`src/coverage.rs`)
+      merges `is also` extensions into their base group, parses
+      `using ranges = { range([lo..hi], "label"); .. }` into explicit
+      buckets, applies the 14.2 defaults (16 integer buckets, two
+      boolean buckets), samples item values when the group's event
+      fires, and grades covered-buckets-per-item (`run --coverage`
+      prints the report); `cross`/`transition` items and per-instance
+      coverage are recorded, not collected.
       Predefined non-scalar types `file` and `event` are accepted in
       type positions; `for each <type> (v) in list` records the element
       type filter. `expect`/`assume` members (clause 11.4) parse their
@@ -96,8 +103,9 @@
       `repeat`, single-statement `if ... do`, template instantiation
       (clause 8.3), template `extend` (clause 8.2), macro
       match-expression interpretation and expansion
-      (clause 15.4–15.5), the coverage data model and reports
-      (clause 14 options, buckets, grades), the clause 12/13 temporal
+      (clause 15.4–15.5), the remaining clause 14 coverage model —
+      cross/transition items, per-instance coverage and the option
+      tables are recorded, not collected — the clause 12/13 temporal
       engine's remaining simulation integration — the scheduler runs
       started TCMs concurrently and waits/sync suspend, but
       `@`-triggered TCM invocation, `@sim` sampling, and suspension
@@ -190,7 +198,12 @@
       only — waits inside `if`/`case`/`for` bodies, inline calls,
       `compute` and `on` blocks keep the inline spin — and `wait` does
       not advance the HDL simulator
-- [ ] Coverage data model and reports
+- [~] Coverage data model and reports — started: `src/coverage.rs`
+      builds buckets and grades from the recorded groups (14.2's
+      ranges/defaults, 14.5 merging), the interpreter samples on the
+      group's event, and `run --coverage` reports; cross/transition,
+      per-instance and the option tables are not collected
+- [ ] Coverage reports per instance and coverage configuration (28.9)
 
 ## M4 — Simulator integration
 - [~] HDL bridge — started: `src/hdl.rs` spawns `xezim` with the VPI

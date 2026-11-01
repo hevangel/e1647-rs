@@ -49,12 +49,14 @@ use crate::elab::Elaborated;
 use crate::lexer::Position;
 use std::collections::BTreeMap;
 
-/// Outcome of one run: the text produced by `out`/`print` and any run-time
-/// diagnostics.
+/// Outcome of one run: the text produced by `out`/`print`, any run-time
+/// diagnostics, and the coverage collected by the cover groups
+/// (clause 14 — buckets and grades per type).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunResult {
     pub output: String,
     pub diagnostics: Vec<Diagnostic>,
+    pub coverage: Vec<crate::coverage::TypeCoverage>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +270,9 @@ struct Interp<'a> {
     /// The log start of a resumed temporal wait, restored before the
     /// wait statement re-executes.
     resume_wait_start: Option<usize>,
+    /// Coverage data (clause 14), keyed by type; `emit` of a group's
+    /// sampling event records item values into the buckets.
+    coverage: Vec<crate::coverage::TypeCoverage>,
     /// Set by `stop_run()`; unwinds the whole run.
     stop_requested: bool,
     /// Failed `check that` conditions (`dut_error`), reported like
@@ -324,6 +329,7 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
         exec_context: Vec::new(),
         pending_suspension: None,
         resume_wait_start: None,
+        coverage: crate::coverage::build(elaborated),
         stop_requested: false,
         dut_errors: 0,
         defines,
@@ -338,6 +344,7 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
         return RunResult {
             output: interp.output,
             diagnostics: Vec::new(),
+            coverage: interp.coverage,
         };
     };
     let run_blocks: Vec<&MethodDecl> = sys
@@ -529,6 +536,7 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
     RunResult {
         output: interp.output,
         diagnostics,
+        coverage: interp.coverage,
     }
 }
 
@@ -1120,6 +1128,9 @@ impl<'a> Interp<'a> {
                 // fire here.
                 let owner = self.resolve_event_owner(target, frame, me);
                 self.run_on_blocks(&path, owner, *span)?;
+                // 14.1: a coverage group samples when its sampling event
+                // fires — record the items' values into the buckets.
+                self.sample_cover_groups(&path, owner, frame);
                 Ok(Flow::Normal)
             }
             Stmt::Start { call, span } => {
@@ -2046,6 +2057,76 @@ impl<'a> Interp<'a> {
     /// context stack's top entry, pushed by the enclosing walk).
     fn current_ctx_index(&self) -> usize {
         self.exec_context.last().map(|ctx| ctx.index).unwrap_or(0)
+    }
+
+    /// Sample the coverage groups (14.1) of the instance whose event
+    /// fired: each item's recorded expression evaluates in the emitting
+    /// frame, or the item's field is read from the owner, and the value
+    /// lands in the item's buckets.
+    fn sample_cover_groups(&mut self, path: &str, owner: Option<usize>, frame: &mut Frame) {
+        let Some(owner) = owner else {
+            return;
+        };
+        let type_name = self.instances[owner].type_name.clone();
+        let Some(entry_index) = self
+            .coverage
+            .iter()
+            .position(|entry| entry.type_name == type_name)
+        else {
+            return;
+        };
+        let group_indices: Vec<usize> = self.coverage[entry_index]
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| group.event_path.as_deref() == Some(path))
+            .map(|(index, _)| index)
+            .collect();
+        if group_indices.is_empty() {
+            return;
+        }
+        // The items' recorded declarations (expression or field name),
+        // looked up in the elaborated type's cover groups by name.
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let item_sources: Vec<(String, Option<Expr>)> = types
+            .iter()
+            .find(|t| t.name == type_name)
+            .map(|ty| {
+                ty.covers
+                    .iter()
+                    .flat_map(|decl| decl.items.iter())
+                    .filter(|item| item.kind == crate::ast::CoverItemKind::Item)
+                    .filter_map(|item| {
+                        let name = item.names.first().map(|(name, _)| name.clone())?;
+                        Some((name, item.expr.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for group_index in group_indices {
+            // One sampling event: the group's sample count advances once.
+            self.coverage[entry_index].groups[group_index].samples += 1;
+            let item_names: Vec<String> = self.coverage[entry_index].groups[group_index]
+                .items
+                .iter()
+                .map(|item| item.name.clone())
+                .collect();
+            for name in item_names {
+                let Some((_, expr)) = item_sources
+                    .iter()
+                    .find(|(source_name, _)| *source_name == name)
+                else {
+                    continue;
+                };
+                let value = match expr {
+                    Some(expr) => self.eval(expr, frame, Some(owner)).ok(),
+                    None => self.instances[owner].get(&name).cloned(),
+                };
+                if let Some(value) = value {
+                    self.coverage[entry_index].groups[group_index].sample(&name, &value);
+                }
+            }
+        }
     }
 
     /// Whether the running statement may suspend to the scheduler: a

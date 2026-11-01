@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-const USAGE: &str = "Usage: e1647 <command> <source.e> [--seed N]\nCommands:\n  tokens  tokenize the source (does not parse)\n  parse   parse the source and print the AST or diagnostics\n  elab    parse and fold like/extend into elaborated types\n  run     parse, elaborate and execute sys.run() (--seed N for reproducible gen)\n\n`import x.y;` members resolve to `x/y.e` (or `x.y.e`) next to the source\nfile; imported declarations are spliced before the importing file's own.";
+const USAGE: &str = "Usage: e1647 <command> <source.e> [--seed N] [--coverage]\nCommands:\n  tokens  tokenize the source (does not parse)\n  parse   parse the source and print the AST or diagnostics\n  elab    parse and fold like/extend into elaborated types\n  run     parse, elaborate and execute sys.run() (--seed N for reproducible gen)\n\n`run --coverage` prints the coverage groups' buckets and grades after\nthe run (clause 14; collection happens on every run).\n\n`import x.y;` members resolve to `x/y.e` (or `x.y.e`) next to the source\nfile; imported declarations are spliced before the importing file's own.";
 
 /// Parse `source` and splice in the files it imports (`import a.b;` →
 /// `a/b.e` or `a.b.e` beside the source), depth-first, one level wide.
@@ -67,7 +67,7 @@ fn parse_with_imports(path: &str, source: &str) -> e1647::parser::ParseResult {
     }
 }
 
-fn run(command: &str, path: &str, seed: u64) -> ExitCode {
+fn run(command: &str, path: &str, seed: u64, coverage_flag: bool) -> ExitCode {
     let source = match fs::read_to_string(path) {
         Ok(source) => source,
         Err(err) => {
@@ -138,11 +138,15 @@ fn run(command: &str, path: &str, seed: u64) -> ExitCode {
             if !elaborated.diagnostics.is_empty() {
                 return ExitCode::FAILURE;
             }
+            let show_coverage = coverage_flag;
             let outcome = e1647::interp::run(&elaborated, seed);
             for diagnostic in &outcome.diagnostics {
                 eprintln!("{path}:{}", diagnostic.render());
             }
             print!("{}", outcome.output);
+            if show_coverage {
+                print_coverage(&outcome.coverage);
+            }
             if outcome.diagnostics.is_empty() {
                 ExitCode::SUCCESS
             } else {
@@ -167,9 +171,12 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let mut seed: u64 = 1;
+    let mut show_coverage = false;
     let mut path: Option<String> = None;
     while let Some(arg) = args.next() {
-        if arg == "--seed" {
+        if arg == "--coverage" {
+            show_coverage = true;
+        } else if arg == "--seed" {
             let Some(value) = args.next() else {
                 eprintln!("--seed requires a value");
                 return ExitCode::FAILURE;
@@ -200,7 +207,7 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::FAILURE;
     };
-    run(&command, &path, seed)
+    run(&command, &path, seed, show_coverage)
 }
 
 fn render_type(ty: &e1647::ast::TypeExpr) -> String {
@@ -399,5 +406,68 @@ fn print_elaborated_type(elaborated_type: &e1647::elab::ElaboratedType) {
             .join(" ");
         println!("  when {modifiers}");
         print_members(&when.members, "    ");
+    }
+}
+
+/// Print the collected coverage (clause 14) after a `run --coverage`:
+/// per group, the sample count and grade; per item, its buckets with
+/// hits against goals.
+fn print_coverage(coverage: &[e1647::coverage::TypeCoverage]) {
+    let mut printed = false;
+    for entry in coverage {
+        if entry.groups.is_empty() {
+            continue;
+        }
+        println!("coverage for {}:", entry.type_name);
+        for group in &entry.groups {
+            let grade = match group.grade() {
+                Some(grade) => format!("{:.0}%", grade * 100.0),
+                None => "no grade".to_owned(),
+            };
+            println!(
+                "  cover {} ({}): {} samples, grade {grade}",
+                group.name,
+                group.event_path.clone().unwrap_or_else(|| "?".to_owned()),
+                group.samples
+            );
+            for item in &group.items {
+                let covered = item
+                    .buckets
+                    .iter()
+                    .filter(|bucket| bucket.hits >= bucket.goal)
+                    .count();
+                let note = item
+                    .note
+                    .map(|note| format!(" [note: {note}]"))
+                    .unwrap_or_default();
+                println!(
+                    "    item {}: {covered}/{} buckets, {} samples, {} ungradeable{note}",
+                    item.name,
+                    item.buckets.len(),
+                    item.samples,
+                    item.ungradeable_hits
+                );
+                for bucket in &item.buckets {
+                    let range_text = if bucket.lo == bucket.hi {
+                        format!("{}", bucket.lo)
+                    } else {
+                        format!("[{}..{}]", bucket.lo, bucket.hi)
+                    };
+                    let label = if bucket.label.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" \"{}\"", bucket.label)
+                    };
+                    println!(
+                        "      {range_text}{label}: {}/{} hits",
+                        bucket.hits, bucket.goal
+                    );
+                }
+            }
+        }
+        printed = true;
+    }
+    if !printed {
+        println!("coverage: no cover groups declared");
     }
 }
