@@ -1791,3 +1791,66 @@ emit with an out-of-range ungradeable value and a full grade; the
 average group grade); `is also`/`empty` merging into one group; an
 untyped unranged item recording two samples with no grade and its
 honest note.
+
+## 2026-11-01 (29) — offline arc: clause 10 select distributions bias the sampler
+
+Branch `agent/select-biasing` (off main after #18 merged). `select`
+distributions now bias the rejection sampler instead of being no-ops.
+
+- Semantics per the extracted 10.2.12.2 prose: a select specifies the
+  relative probability that a value or set of values is chosen from
+  the current range of legal values ("the range of values as reduced
+  by hard constraints and by soft constraints that have already been
+  applied"); an arm is chosen with probability weight/(sum of all
+  weights), weights being integers. The choice keywords' example
+  figures are images in the local copy, so their readings follow the
+  igen-dist corpus usage: `min`/`max` take the current range's
+  extremes, `edges` picks one of them, `others` draws uniformly
+  strictly inside, and `normal(center, stddev)` draws a Box–Muller
+  normal (seeded, deterministic) clamped into the range.
+- Mechanism: `keep [soft] <field> == select { .. }` (either operand
+  order) narrows the field's domain to the drawn value — the same
+  equality narrowing a constant comparison uses — while the rejection
+  predicate keeps skipping select-shaped constraints, so the bias is
+  their whole effect. The current range is the domain the other
+  constraints already narrowed, or the field type's natural range
+  when none did.
+- Choice arguments evaluate as constant integer expressions over the
+  recorded tokens: literals (decimal/based), the predefined
+  `MAX_UINT`/`MAX_INT` constants, `+`/`-`/`*`/`/` with precedence and
+  parentheses — the igen-dist shape `normal(MAX_UINT/2, MAX_UINT/10)`
+  now biases. An unevaluable arm (unknown name, bad shape) leaves the
+  field unwidened: the sampler draws naturally and no error is
+  reported. In action position (`var x = select ...`) the honest
+  not-evaluated diagnostic is unchanged.
+- Honest gaps: the full choice-expression grammar (list/set choices,
+  methods), soft-order interactions between multiple selects on one
+  field, and per-instance weight expressions are not modeled; the
+  drawn value clamps into the range rather than redistributing
+  probability mass.
+
+Corpus state (absolute paths): etl 4, cover-edges 4, golden-imports 3,
+golden-combined/igen-dist/type-min-max/save-restart/d6w 0 — unchanged.
+igen-dist still runs to completion with exit 0 (its select policies
+live under `when` subtypes, which are carried, not resolved, so their
+constraints are not yet active — the biasing engages once `when`
+elaboration lands).
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(166 passed: 11 elab, 1 fixtures, 61 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 7 interpreter tests — dominant weights driving the draw to
+min then max; `others` strictly inside the range; `edges` at one of
+the extremes; `normal` around its center; the corpus shape
+`normal(MAX_UINT/2, MAX_UINT/10)` over an unsized uint; the select on
+either operand side; and an unevaluable choice leaving the field free.

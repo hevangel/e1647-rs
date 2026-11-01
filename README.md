@@ -31,7 +31,9 @@
 > `wait`/`sync`), temporal waits re-evaluate against the log, and
 > `expect`/`assume` rules are checked at quit. Coverage groups
 > (clause 14) collect basic-item buckets and grades on their sampling
-> event (`run --coverage` reports them). It does **not** yet do
+> event (`run --coverage` reports them), and `select` distributions
+> (clause 10) bias the seeded rejection sampler
+> (weights/min/max/edges/others/normal). It does **not** yet do
 > full type
 > checking, `when`-subtype
 > resolution, event-driven temporal evaluation, coverage, non-linear or

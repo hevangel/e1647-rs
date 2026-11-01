@@ -91,8 +91,14 @@
       `select { weight : choice; .. }`
       distribution
       expressions (clause 10) parse — weights structurally, choices
-      verbatim — and the rejection sampler treats select constraints as
-      no-ops until the distribution arc.
+      verbatim — and the rejection sampler applies them (10.2.12.2):
+      an arm is chosen with probability weight/(sum of all weights)
+      over the field's current range, and `min`/`max`/`edges`/`others`
+      and `normal(center, stddev)` map the choice to a value; choices
+      evaluate constant integer expressions over the recorded tokens
+      (`MAX_UINT`/`MAX_INT` included), and unevaluable choices leave
+      the field unwidened. In action position (`var x = select ...`)
+      the select still reports the honest not-evaluated diagnostic.
       Preprocessor directives (clause 21): `#ifdef` / `#ifndef` /
       `#define` / `#undef` in statement, struct-member and action
       positions with flag semantics — `#define` records the flag but
@@ -111,7 +117,9 @@
       `@`-triggered TCM invocation, `@sim` sampling, and suspension
       re-entry beyond `while` chains are not wired —
       `detach`/`delay`/`exec` TEs, select
-      distribution biasing in the sampler, `$1`-`$27` match captures,
+      choice policies beyond the constant-expression subset (the
+      full choice-expression grammar and soft-order interactions),
+      `$1`-`$27` match captures,
       `#define` replacement rules, `#else`)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness
       checks only (duplicate declaration/field names, duplicate

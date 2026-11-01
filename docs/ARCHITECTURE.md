@@ -81,8 +81,16 @@ multi-simulator HDL API, and wasm32.
   sampling `te @event`; `detach`/`delay`/`exec` report `E0120`) with
   the `else` failure body parsed as actions. Clause 10
   `select { weight : choice; .. }` distributions parse — weights
-  structurally, choices verbatim — and the rejection sampler treats
-  select constraints as no-ops until the distribution arc. Predefined
+  structurally, choices verbatim — and the rejection sampler applies
+  them (10.2.12.2): each `field == select { .. }` leaf draws an arm
+  with probability weight/(sum of all weights) over the field's
+  current (already-narrowed) range, and `min`/`max`/`edges`/`others`/
+  `normal(center, stddev)` map the choice to a value that narrows the
+  field to a point. Choice arguments evaluate as constant integer
+  expressions over the recorded tokens (literals, `MAX_UINT`/`MAX_INT`,
+  `+`/`-`/`*`/`/`, parentheses); unevaluable choices leave the field
+  unwidened. In action position the select still reports the honest
+  not-evaluated diagnostic. Predefined
   non-scalar types `file` and `event` are accepted in type positions;
   `for each <type> (v) in list` records the element type filter.
   `package`/`private` member prefixes are recorded on fields.
@@ -220,8 +228,9 @@ clause 14 coverage model (basic items collect into buckets and grade;
 and the 28.9 configuration are recorded, not applied), integer width
 truncation, evaluation of MVL literals, `repeat`, single-statement
 `if ... do`, `detach`/`delay`/`exec` TEs, select
-distribution biasing in the sampler (clause 10; the expressions parse
-and are no-ops), `on
+choice policies beyond the constant-expression subset (the full
+choice-expression grammar, soft-order interactions between multiple
+selects), `on
 event-port`, `#else` and `#define` replacement
 rules, template instantiation and `template extend` (clause 8.2–8.3),
 macro match-expression
