@@ -984,3 +984,40 @@ fn select_with_an_unevaluable_choice_keeps_the_field_free() {
     );
     assert_eq!(output, "OK\n");
 }
+
+#[test]
+fn when_subtyped_fields_generate_under_their_when_constraints() {
+    // 6.6 + 10.2.12.2 together: a when-qualified field (`LO pkt`)
+    // generates an instance of the synthesized subtype view, whose
+    // when-block constraints — here a select distribution — apply.
+    let output = clean_output(
+        "type mode_t : [LO, HI];\n\
+         struct pkt {\n    kind: mode_t;\n    v: uint (bits: 8);\n    \
+         when LO kind is {\n            keep soft v == select { 1000 : min; };\n        };\n    \
+         when HI kind is {\n            keep soft v == select { 1000 : max; };\n        };\n};\n\
+         extend sys {\n    p_lo: LO pkt;\n    p_hi: HI pkt;\n    run() is also {\n        \
+         gen p_lo;\n        gen p_hi;\n        print p_lo.v;\n        print p_hi.v;\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("0"), "output: {output}");
+    assert!(output.contains("255"), "output: {output}");
+}
+
+#[test]
+fn when_views_carry_methods_and_base_membership() {
+    // A method defined in a when block executes in the subtype's
+    // context (6.7.2) and resolves through the synthesized view; the
+    // view's instances still satisfy `is a` against the base type.
+    let output = clean_output(
+        "type mode_t : [LO, HI];\n\
+         unit u {\n    kind: mode_t;\n    when LO u is {\n        extra: uint (bits: 8);\n        \
+         tag() is {\n            out(\"LO SIDE\");\n        };\n    };\n};\n\
+         extend sys {\n    lo_u: LO u is instance;\n    run() is also {\n        \
+         lo_u.tag();\n        if lo_u is a u {\n            out(\"IS A U\\n\");\n        };\n        \
+         print lo_u.extra;\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("LO SIDE"), "output: {output}");
+    assert!(output.contains("IS A U"), "output: {output}");
+    assert!(output.contains("0"), "output: {output}");
+}

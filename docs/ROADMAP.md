@@ -105,8 +105,7 @@
       applies no text substitution, and `#else` is not parsed. Spanned
       diagnostics and declaration/member/statement-level recovery. The
       CLI resolves `import a.b` to `a/b.e` or `a.b.e` beside the source
-      and checks the merged declarations (not yet: `when` elaboration,
-      `repeat`, single-statement `if ... do`, template instantiation
+      and checks the merged declarations (not yet: `repeat`, single-statement `if ... do`, template instantiation
       (clause 8.3), template `extend` (clause 8.2), macro
       match-expression interpretation and expansion
       (clause 15.4–15.5), the remaining clause 14 coverage model —
@@ -141,8 +140,17 @@
       carry HDL paths taken from `hdl_path()` constraints, and
       `sequence` declarations are recovered into `Elaborated.sequences`.
       `on` members compose through the same fold, base types first and
-      extends in declaration order.
-      `when` subtypes are carried, not resolved; there is no type checking
+      extends in declaration order. `when` subtypes (6.6) resolve:
+      each single-modifier block (`when BUSY'kind` or the corpus's
+      `when NO_CONSTRAINT env` space form) synthesizes a subtype view
+      named `VALUE base` — the base's composed members with the when
+      block's appended, marked with its discriminator — and
+      when-qualified field types (`f: LO pkt`) instantiate that view,
+      so the when members (fields, constraints including select
+      distributions, methods, on blocks) apply for those instances;
+      `is a` checks walk the view's base chain. Chained modifiers and
+      nested when-in-when blocks compose later; base-typed instances
+      do not dynamically match subtypes yet; there is no type checking
 - [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer
       fields into a solver problem; range membership (`x in [lo..hi]`)

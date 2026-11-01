@@ -1949,6 +1949,8 @@ impl Parser {
             self.recover_to_member_boundary();
             return None;
         }
+        // The optional `is` before the body (6.6.1's `when v't is { .. }`).
+        self.eat_keyword("is");
         if self
             .expect_punct("{", "E0106", "expected '{' to open the 'when' body")
             .is_none()
@@ -2638,15 +2640,21 @@ impl Parser {
         }
         if self.at_identifier() {
             let (name, span) = self.take_identifier();
-            // A when-qualified type (`reg cpu_instr_s`, the modifier
-            // naming the subtype variant) — the subtype qualifier is
-            // dropped; subtype dispatch is not modeled yet.
-            let (name, span) = if self.at_identifier() {
+            // A when-qualified type (`NO_CONSTRAINT env` — the subtype
+            // modifier naming the variant of the base type, 6.6): the
+            // qualifier and the base are both recorded.
+            if self.at_identifier() {
                 let (base, base_span) = self.take_identifier();
-                (base, base_span)
-            } else {
-                (name, span)
-            };
+                let end = self.last_end();
+                return Some(TypeExpr::WhenQualified {
+                    value: name,
+                    base: Box::new(TypeExpr::Named {
+                        name: base,
+                        span: base_span,
+                    }),
+                    span: (start, end),
+                });
+            }
             // `deque of int` — a template instantiation in a type
             // position (clause 8.3). `list of` never reaches here: the
             // keyword branch handles it first.

@@ -326,6 +326,9 @@ fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut 
             }
         }
         TypeExpr::List { element, .. } => check_named_type(element, declared, diagnostics),
+        // A when-qualified type resolves if its base resolves (6.6 —
+        // the subtype itself is checked at elaboration).
+        TypeExpr::WhenQualified { base, .. } => check_named_type(base, declared, diagnostics),
         // A template instantiation checks its template name and each
         // argument; a formal parameter is bound by the enclosing
         // template declaration (checked at instantiation, a later

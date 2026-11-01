@@ -223,6 +223,9 @@ fn render_type(ty: &e1647::ast::TypeExpr) -> String {
             None => format!("list of {}", render_type(element)),
         },
         TypeExpr::Named { name, .. } => name.clone(),
+        TypeExpr::WhenQualified { value, base, .. } => {
+            format!("{value} {}", render_type(base))
+        }
         TypeExpr::InlineEnum { names, .. } => format!("[{}]", names.join(", ")),
         TypeExpr::Formal { name, .. } => format!("<{name}>"),
         TypeExpr::TemplateRef { name, args, .. } => {

@@ -596,6 +596,15 @@ pub enum TypeExpr {
     },
     /// A user-defined type name.
     Named { name: String, span: Span },
+    /// A when-qualified type (`NO_CONSTRAINT env` — clause 6.6): the
+    /// subtype variant of a base type. Instances of the field carry the
+    /// subtype's synthesized view (its when members composed onto the
+    /// base).
+    WhenQualified {
+        value: String,
+        base: Box<TypeExpr>,
+        span: Span,
+    },
     /// An inline enumeral list type: `[imm, reg]`.
     InlineEnum { names: Vec<String>, span: Span },
     /// A template's formal parameter used in a type position
@@ -617,6 +626,7 @@ impl TypeExpr {
             TypeExpr::Scalar { span, .. }
             | TypeExpr::List { span, .. }
             | TypeExpr::Named { span, .. }
+            | TypeExpr::WhenQualified { span, .. }
             | TypeExpr::InlineEnum { span, .. }
             | TypeExpr::Formal { span, .. }
             | TypeExpr::TemplateRef { span, .. } => *span,

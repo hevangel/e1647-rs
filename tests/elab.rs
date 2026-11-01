@@ -187,3 +187,29 @@ fn on_members_compose_through_extends_in_order() {
     assert_eq!(env.ons[0].body.len(), 1);
     assert_eq!(env.ons[1].body.len(), 1);
 }
+
+#[test]
+fn when_blocks_synthesize_subtype_views() {
+    // 6.6: a single-modifier `when VALUE'id` block synthesizes a
+    // subtype view named `VALUE base` — the base's composed members
+    // with the when block's appended — marked with its discriminator.
+    let result = elaborated(
+        "type mode_t : [LO, HI];\n\
+         struct pkt {\n    kind: mode_t;\n    v: uint (bits: 8);\n    \
+         when LO kind is {\n            keep soft v == select { 100 : min; };\n        };\n    \
+         when HI kind is {\n            keep soft v == select { 100 : max; };\n        };\n};\n",
+    );
+    let view = find(&result, "LO pkt");
+    assert_eq!(view.when_of, Some(("kind".to_owned(), "LO".to_owned())));
+    assert_eq!(view.base, Some("pkt".to_owned()));
+    // The view carries the base's fields plus the when constraint.
+    assert_eq!(view.fields.len(), 2);
+    assert_eq!(view.constraints.len(), 1);
+    let hi = find(&result, "HI pkt");
+    assert_eq!(hi.when_of, Some(("kind".to_owned(), "HI".to_owned())));
+    assert_eq!(hi.constraints.len(), 1);
+    // The base itself stays unmarked and without the when constraints.
+    let base = find(&result, "pkt");
+    assert_eq!(base.when_of, None);
+    assert_eq!(base.constraints.len(), 0);
+}
