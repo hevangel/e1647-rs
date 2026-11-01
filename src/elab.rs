@@ -262,6 +262,112 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             types.push(view);
         }
     }
+    // 8.3: monomorphize the template instances the code uses. "A
+    // template instance creates a new struct, by substituting an
+    // actual parameter for the corresponding template parameter within
+    // the template body" — and within the parameterized base.
+    // Trailing parameters may be omitted when defaults exist; two
+    // instances with the same actuals are the same instance (the
+    // canonical name). The worklist seeds from every type's member
+    // types and grows with the references substitution uncovers.
+    let mut queue: Vec<(String, Vec<crate::ast::TypeExpr>)> = Vec::new();
+    for entry in &types {
+        enqueue_member_refs(entry, &mut queue);
+    }
+    let mut done: BTreeSet<String> = types.iter().map(|t| t.name.clone()).collect();
+    let mut budget = 500;
+    while let Some((template_name, args)) = queue.pop() {
+        budget -= 1;
+        if budget == 0 {
+            break;
+        }
+        let canonical = crate::ast::template_instance_name(&template_name, &args);
+        if done.contains(&canonical) {
+            continue;
+        }
+        done.insert(canonical.clone());
+        let Some(template) = declarations.iter().find(|declaration| {
+            declaration.name == template_name && !declaration.template_params.is_empty()
+        }) else {
+            continue;
+        };
+        // Bind formals: positional actuals, then defaults (8.3's
+        // trailing-omission rule). A parameter with neither is not
+        // provided for — the instance is skipped, honestly.
+        let mut bindings: BTreeMap<String, crate::ast::TypeExpr> = BTreeMap::new();
+        let mut satisfied = true;
+        for (index, param) in template.template_params.iter().enumerate() {
+            if let Some(actual) = args.get(index) {
+                bindings.insert(param.name.clone(), actual.clone());
+            } else if let Some(default) = &param.default {
+                // A default may reference earlier formals
+                // (`<value'type> = <key'type>`): substitute it through
+                // the bindings built so far.
+                let substituted = substitute_type(default, &bindings, &mut queue);
+                bindings.insert(param.name.clone(), substituted);
+            } else {
+                satisfied = false;
+                break;
+            }
+        }
+        if !satisfied || bindings.is_empty() {
+            continue;
+        }
+        let mut stack = Vec::new();
+        let composed = elaborator.compose(template.name.as_str(), &mut stack);
+        let mut fields = Vec::new();
+        for (field, _) in composed.fields {
+            let mut owned = field.clone();
+            owned.ty = substitute_type(&owned.ty, &bindings, &mut queue);
+            fields.push(owned);
+        }
+        let mut methods = Vec::new();
+        for (method, _) in composed.methods {
+            let mut owned = method.clone();
+            for param in &mut owned.params {
+                if let Some(ty) = &param.ty {
+                    param.ty = Some(substitute_type(ty, &bindings, &mut queue));
+                }
+            }
+            if let Some(return_type) = &owned.return_type {
+                owned.return_type = Some(substitute_type(return_type, &bindings, &mut queue));
+            }
+            // Method bodies keep their written form: references to
+            // other template instances inside bodies (e.g. `new
+            // deque_iterator of <type>`) substitute in a later
+            // milestone.
+            methods.push(owned);
+        }
+        // The parameterized base substitutes to this view's base name —
+        // a plain type's name, or another instance's canonical name
+        // (enqueued above, materialized by the worklist).
+        let base = template.like_type.as_ref().map(|like_type| {
+            match substitute_type(like_type, &bindings, &mut queue) {
+                crate::ast::TypeExpr::TemplateRef { name, args, .. } => {
+                    crate::ast::template_instance_name(&name, &args)
+                }
+                crate::ast::TypeExpr::Named { name, .. } => name,
+                other => other.render(),
+            }
+        });
+        types.push(ElaboratedType {
+            kind: template.kind,
+            name: canonical,
+            base,
+            fields,
+            constraints: composed.constraints.into_iter().cloned().collect(),
+            methods,
+            whens: composed.whens.into_iter().cloned().collect(),
+            ons: composed.ons.into_iter().cloned().collect(),
+            covers: composed.covers.into_iter().cloned().collect(),
+            expects: composed.expects.into_iter().cloned().collect(),
+            when_of: None,
+            underlying: None,
+            enumerals: Vec::new(),
+            ports: Vec::new(),
+            span: template.span,
+        });
+    }
     let mut defines = BTreeMap::new();
     for declaration in declarations {
         for member in &declaration.members {
@@ -538,5 +644,88 @@ impl<'a> Elaborator<'a> {
                 ));
             }
         }
+    }
+}
+
+/// Substitute the bound actuals for the formals of a type position
+/// (8.3), enqueueing every template reference the substitution
+/// uncovers so the worklist materializes their instances.
+fn substitute_type(
+    ty: &crate::ast::TypeExpr,
+    bindings: &BTreeMap<String, crate::ast::TypeExpr>,
+    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
+) -> crate::ast::TypeExpr {
+    match ty {
+        crate::ast::TypeExpr::Formal { name, span } => {
+            bindings
+                .get(name)
+                .cloned()
+                .unwrap_or(crate::ast::TypeExpr::Formal {
+                    name: name.clone(),
+                    span: *span,
+                })
+        }
+        crate::ast::TypeExpr::List { element, key, span } => crate::ast::TypeExpr::List {
+            element: Box::new(substitute_type(element, bindings, queue)),
+            key: key.clone(),
+            span: *span,
+        },
+        crate::ast::TypeExpr::WhenQualified { value, base, span } => {
+            crate::ast::TypeExpr::WhenQualified {
+                value: value.clone(),
+                base: Box::new(substitute_type(base, bindings, queue)),
+                span: *span,
+            }
+        }
+        crate::ast::TypeExpr::TemplateRef { name, args, span } => {
+            let substituted: Vec<crate::ast::TypeExpr> = args
+                .iter()
+                .map(|arg| substitute_type(arg, bindings, queue))
+                .collect();
+            queue.push((name.clone(), substituted.clone()));
+            crate::ast::TypeExpr::TemplateRef {
+                name: name.clone(),
+                args: substituted,
+                span: *span,
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// Seed the monomorphization worklist from one type's member types.
+fn enqueue_member_refs(
+    entry: &ElaboratedType,
+    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
+) {
+    for field in &entry.fields {
+        collect_template_refs(&field.ty, queue);
+    }
+    for method in &entry.methods {
+        for param in &method.params {
+            if let Some(ty) = &param.ty {
+                collect_template_refs(ty, queue);
+            }
+        }
+        if let Some(return_type) = &method.return_type {
+            collect_template_refs(return_type, queue);
+        }
+    }
+}
+
+fn collect_template_refs(
+    ty: &crate::ast::TypeExpr,
+    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
+) {
+    match ty {
+        crate::ast::TypeExpr::TemplateRef { name, args, .. } => {
+            queue.push((name.clone(), args.clone()));
+            for arg in args {
+                collect_template_refs(arg, queue);
+            }
+        }
+        crate::ast::TypeExpr::List { element, .. } => collect_template_refs(element, queue),
+        crate::ast::TypeExpr::WhenQualified { base, .. } => collect_template_refs(base, queue),
+        _ => {}
     }
 }

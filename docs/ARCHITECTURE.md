@@ -70,7 +70,17 @@ multi-simulator HDL API, and wasm32.
   record their `<tag'category>` parameters and defaults; formals
   (`<type>`), template references (`deque of int`) and keyed lists
   (`list (key:it) of t`) are TypeExpr variants, and `new [<type>]
-  [with { .. }]` parses to an explicit not-supported runtime diagnostic.
+  [with { .. }]` parses to an explicit not-supported runtime
+  diagnostic. Template instances monomorphize (8.3): a worklist
+  seeded from every type's member types materializes one struct per
+  distinct instance under its canonical name (`name of (actuals)`,
+  `TypeExpr::render`), substituting actuals for formals in field
+  types and method signatures, filling trailing parameters from
+  defaults (defaults referencing earlier formals substitute through),
+  and substituting the parameterized base to the view's base chain —
+  template-typed fields then generate and dispatch through the view.
+  Method-body references to other instances and category-compliance
+  checks substitute/verify in a later milestone.
   Clause 14 coverage groups (`cover <event> is [also] { .. };`, `is
   empty;`) record their item/cross/transition entries structurally and
   every option clause verbatim.
@@ -245,7 +255,8 @@ choice policies beyond the constant-expression subset (the full
 choice-expression grammar, soft-order interactions between multiple
 selects), `on
 event-port`, `#else` and `#define` replacement
-rules, template instantiation and `template extend` (clause 8.2–8.3),
+rules, `template extend` (8.2) and method-body instance
+substitution, template category-compliance checks (8.3's notes),
 macro match-expression
 interpretation and expansion (clause 15.4–15.5), a multi-simulator HDL
 API, and WASM.

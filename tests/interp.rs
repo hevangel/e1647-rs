@@ -1021,3 +1021,23 @@ fn when_views_carry_methods_and_base_membership() {
     assert!(output.contains("IS A U"), "output: {output}");
     assert!(output.contains("0"), "output: {output}");
 }
+
+#[test]
+fn template_typed_fields_instantiate_their_monomorphized_view() {
+    // 8.3: a field of template-instance type carries the
+    // monomorphized struct — its fields generate, its methods resolve,
+    // and `is a` accepts the canonical instance name.
+    let output = clean_output(
+        "struct base_struct {\n    id: int;\n};\n\
+         template struct box of <type> like base_struct {\n    payload: <type>;\n    \
+         double(): uint is {\n            return payload * 2;\n        };\n};\n\
+         extend sys {\n    b: box of (int (bits: 8));\n    run() is also {\n        \
+         gen b;\n        b.payload = 21;\n        print b.double();\n        \
+         if b is a box of (int (bits: 8)) {\n            out(\"IS THE BOX\\n\");\n        };\n        \
+         if b is a base_struct {\n            out(\"IS A BASE\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("42"), "output: {output}");
+    assert!(output.contains("IS THE BOX"), "output: {output}");
+    assert!(output.contains("IS A BASE"), "output: {output}");
+}

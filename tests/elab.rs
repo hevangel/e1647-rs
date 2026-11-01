@@ -213,3 +213,78 @@ fn when_blocks_synthesize_subtype_views() {
     assert_eq!(base.when_of, None);
     assert_eq!(base.constraints.len(), 0);
 }
+
+#[test]
+fn template_instances_monomorphize() {
+    // 8.3: a template instance creates a new struct by substituting the
+    // actuals for the formals — in field types, method signatures and
+    // the parameterized base; two instances with the same actuals are
+    // the same instance.
+    let result = elaborated(
+        "struct base_struct {\n    id: int;\n};\n\
+         template struct iterator of <type> like base_struct {\n    idx: int;\n};\n\
+         template struct container of <type> like base_struct {\n    \
+         get_iterator(): iterator of <type> is undefined;\n    \
+         add(item: <type>) is undefined;\n};\n\
+         extend sys {\n    c: container of (int);\n};\n",
+    );
+    // The used instance materialized, with its parameterized base.
+    let view = find(&result, "container of (int)");
+    assert_eq!(view.base, Some("base_struct".to_owned()));
+    // The method signature's formal substituted to the actual.
+    let add = view
+        .methods
+        .iter()
+        .find(|method| method.name == "add")
+        .expect("the add method");
+    assert_eq!(
+        add.params[0].ty.as_ref().map(|ty| ty.render()),
+        Some("int".to_owned())
+    );
+    // The substituted `iterator of <type>` reference materialized its
+    // own instance (the worklist feeds itself); like composition gives
+    // it the base's `id` plus its own `idx`.
+    let iterator = find(&result, "iterator of (int)");
+    assert_eq!(iterator.base, Some("base_struct".to_owned()));
+    assert_eq!(iterator.fields.len(), 2);
+    // Same actuals, same instance: exactly one view exists.
+    assert_eq!(
+        result
+            .types
+            .iter()
+            .filter(|t| t.name == "container of (int)")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn template_defaults_fill_trailing_parameters() {
+    // 8.3: trailing parameters may be omitted when defaults exist —
+    // `map of (int)` binds <value'type> to its default, <key'type>.
+    let result = elaborated(
+        "template struct map of (<key'type>, <value'type> = <key'type>) {\n    \
+         put(k: <key'type>, v: <value'type>) is undefined;\n};\n\
+         extend sys {\n    m: map of (int);\n    n: map of (int, string);\n};\n",
+    );
+    let defaulted = find(&result, "map of (int)");
+    let put = defaulted
+        .methods
+        .iter()
+        .find(|method| method.name == "put")
+        .expect("the put method");
+    let render_param = |param: &Option<e1647::ast::TypeExpr>| param.as_ref().map(|ty| ty.render());
+    assert_eq!(render_param(&put.params[0].ty), Some("int".to_owned()));
+    assert_eq!(render_param(&put.params[1].ty), Some("int".to_owned()));
+    // The explicit two-argument instance is a distinct view.
+    let explicit = find(&result, "map of (int, string)");
+    let put_explicit = explicit
+        .methods
+        .iter()
+        .find(|method| method.name == "put")
+        .expect("the put method");
+    assert_eq!(
+        render_param(&put_explicit.params[1].ty),
+        Some("string".to_owned())
+    );
+}

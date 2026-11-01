@@ -53,9 +53,19 @@
       [package] struct|unit name of <params> [like base] { .. }` with
       `<tag'category>` parameters and defaults — formals
       (`<type>`), template references (`deque of int`) and keyed lists
-      (`list (key:it) of t`) are recorded in type positions;
-      instantiation (monomorphization, clause 8.3) is a later milestone,
-      and `new [<type>] [with { .. }]` parses but evaluates to an
+      (`list (key:it) of t`) are recorded in type positions.
+      Instances monomorphize (clause 8.3): every used
+      `name of (actuals)` materializes a struct named by the canonical
+      rendering of its actuals, with the actuals substituted for the
+      formals in field types and method signatures, trailing
+      parameters filled from their defaults (defaults referencing
+      earlier formals substitute through), and the parameterized base
+      substituted to the base chain; identical actuals share one
+      instance, and template-typed fields generate and dispatch under
+      it. Method-body references to other template instances and
+      category-compliance checks (8.3's notes) substitute/verify in a
+      later milestone, and `new [<type>] [with { .. }]` parses but
+      evaluates to an
       explicit not-supported diagnostic. Coverage groups (clause 14.1)
       parse, are recorded, and collect: `cover <event> is [also]
       { item/cross/transition entries; option entries }` and `cover
@@ -105,8 +115,7 @@
       applies no text substitution, and `#else` is not parsed. Spanned
       diagnostics and declaration/member/statement-level recovery. The
       CLI resolves `import a.b` to `a/b.e` or `a.b.e` beside the source
-      and checks the merged declarations (not yet: `repeat`, single-statement `if ... do`, template instantiation
-      (clause 8.3), template `extend` (clause 8.2), macro
+      and checks the merged declarations (not yet: `repeat`, single-statement `if ... do`, template `extend` (clause 8.2) and body-level instance substitution, macro
       match-expression interpretation and expansion
       (clause 15.4–15.5), the remaining clause 14 coverage model —
       cross/transition items, per-instance coverage and the option

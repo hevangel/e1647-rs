@@ -695,10 +695,21 @@ impl<'a> Interp<'a> {
                 self.depth -= 1;
                 Value::Object(index)
             }
-            // A formal is bound only inside a template instance; a
-            // template reference instantiates like a named type would,
-            // after monomorphization (a later milestone).
-            TypeExpr::Formal { .. } | TypeExpr::TemplateRef { .. } => Value::Void,
+            // A template reference instantiates its monomorphized view
+            // (8.3), which elaboration materialized under the canonical
+            // name; a formal is bound only inside a template's own
+            // declaration and stays void here.
+            TypeExpr::TemplateRef { name, args, .. } => {
+                let instance = crate::ast::template_instance_name(name, args);
+                if self.depth > 100 {
+                    return Value::Void;
+                }
+                self.depth += 1;
+                let index = self.instantiate(&instance);
+                self.depth -= 1;
+                Value::Object(index)
+            }
+            TypeExpr::Formal { .. } => Value::Void,
         }
     }
 
@@ -1929,10 +1940,22 @@ impl<'a> Interp<'a> {
                     name: pick,
                 })
             }
-            // Formals are bound only inside template instances and
-            // template references need monomorphization (a later
-            // milestone); sampling yields nothing for them.
-            TypeExpr::Formal { .. } | TypeExpr::TemplateRef { .. } => Ok(Value::Void),
+            // A template reference generates an instance of its
+            // monomorphized view (8.3); formals are bound only inside a
+            // template's own declaration and yield nothing here.
+            TypeExpr::TemplateRef { name, args, .. } => {
+                let instance = crate::ast::template_instance_name(name, args);
+                if self.depth > 50 {
+                    return Err(self.error("E0406", "recursion too deep", origin_span()));
+                }
+                self.depth += 1;
+                let index = self.instantiate(&instance);
+                let result = self.gen_object(index);
+                self.depth -= 1;
+                result?;
+                Ok(Value::Object(index))
+            }
+            TypeExpr::Formal { .. } => Ok(Value::Void),
         }
     }
 
@@ -3106,8 +3129,11 @@ impl<'a> Interp<'a> {
             }
             // A template reference names a template instance; instances
             // come from monomorphization (a later milestone).
-            TypeExpr::TemplateRef { name, .. } => Ok(match value {
-                Value::Object(index) => self.type_is_a(&self.instances[*index].type_name, name),
+            TypeExpr::TemplateRef { name, args, .. } => Ok(match value {
+                Value::Object(index) => self.type_is_a(
+                    &self.instances[*index].type_name,
+                    &crate::ast::template_instance_name(name, args),
+                ),
                 _ => false,
             }),
             TypeExpr::Formal { .. } => Ok(false),
