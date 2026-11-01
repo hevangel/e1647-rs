@@ -778,3 +778,99 @@ fn proposition_wait_evaluates_with_current_field_values() {
     );
     assert!(output.contains("PROP HELD"), "output: {output}");
 }
+
+#[test]
+fn cover_group_samples_explicit_buckets_on_emit() {
+    // 14.1/14.2: the group samples when its event fires; each item
+    // value lands in the bucket whose range contains it, and values
+    // outside every bucket are ungradeable.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
+         item cur: uint using ranges = {\n            range([0..1], \"low\");\n            \
+         range([2..3], \"high\");\n        };\n    };\n    run() is also {\n        \
+         cur = 0; emit cov_e;\n        cur = 3; emit cov_e;\n        cur = 7; emit cov_e;\n        \
+         cur = 1; emit cov_e;\n    };\n};\n",
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(result.coverage.len(), 1);
+    let groups = &result.coverage[0].groups;
+    assert_eq!(groups.len(), 1);
+    let group = &groups[0];
+    assert_eq!(group.event_path.as_deref(), Some("cov_e"));
+    assert_eq!(group.samples, 4);
+    let item = &group.items[0];
+    assert_eq!(item.name, "cur");
+    assert_eq!(item.buckets.len(), 2);
+    assert_eq!(item.buckets[0].label, "low");
+    assert_eq!(item.buckets[0].hits, 2);
+    assert_eq!(item.buckets[1].label, "high");
+    assert_eq!(item.buckets[1].hits, 1);
+    assert_eq!(item.ungradeable_hits, 1);
+    assert_eq!(item.grade(), Some(1.0));
+    assert_eq!(group.grade(), Some(1.0));
+}
+
+#[test]
+fn cover_items_without_ranges_use_the_clause_defaults() {
+    // 14.2: integers default to 16 buckets (0 through 15), booleans to
+    // their two values; out-of-range values do not affect the grade.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    n: uint;\n    flag: bool;\n    cover cov_e is {\n        \
+         item n: uint;\n        item flag: bool;\n    };\n    run() is also {\n        \
+         n = 0; flag = TRUE; emit cov_e;\n        n = 15; flag = FALSE; emit cov_e;\n        \
+         n = 16; emit cov_e;\n    };\n};\n",
+        1,
+    );
+    let group = &result.coverage[0].groups[0];
+    assert_eq!(group.samples, 3);
+    let n_item = &group.items[0];
+    assert_eq!(n_item.buckets.len(), 16);
+    assert_eq!(n_item.buckets[0].hits, 1);
+    assert_eq!(n_item.buckets[15].hits, 1);
+    assert_eq!(n_item.ungradeable_hits, 1);
+    assert_eq!(n_item.grade(), Some(2.0 / 16.0));
+    let flag_item = &group.items[1];
+    assert_eq!(flag_item.buckets.len(), 2);
+    assert_eq!(flag_item.grade(), Some(1.0));
+    // The plain average of the two items' grades.
+    assert_eq!(group.grade(), Some((2.0 / 16.0 + 1.0) / 2.0));
+}
+
+#[test]
+fn cover_is_also_merges_items_into_the_base_group() {
+    // 14.5: `is also` extensions add items to the base group; an
+    // `empty` placeholder receives them too.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    ok: bool;\n    cover cov_e is empty;\n    \
+         cover cov_e is also {\n            item ok: bool;\n        };\n    run() is also {\n        \
+         ok = TRUE; emit cov_e;\n    };\n};\n",
+        1,
+    );
+    assert_eq!(result.coverage[0].groups.len(), 1);
+    let group = &result.coverage[0].groups[0];
+    assert_eq!(group.items.len(), 1);
+    assert_eq!(group.items[0].name, "ok");
+    assert_eq!(group.items[0].buckets[1].hits, 1);
+    assert_eq!(group.samples, 1);
+}
+
+#[test]
+fn untyped_unranged_cover_items_record_without_grading() {
+    // An item with no ranges clause and no typed expression is
+    // recorded but ungradeable (14.2: goals of 0).
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    tag: string;\n    cover cov_e is {\n        \
+         item tag;\n        };\n    run() is also {\n        tag = \"a\"; emit cov_e;\n        \
+     tag = \"b\"; emit cov_e;\n    };\n};\n",
+        1,
+    );
+    let group = &result.coverage[0].groups[0];
+    let item = &group.items[0];
+    assert!(item.buckets.is_empty());
+    assert_eq!(item.samples, 2);
+    assert_eq!(item.ungradeable_hits, 2);
+    assert_eq!(item.grade(), None);
+    assert_eq!(group.grade(), None);
+    assert!(item.note.is_some(), "the honest note is recorded");
+}

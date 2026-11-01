@@ -29,7 +29,9 @@
 > it: `emit` feeds an event log, the clause 13.1.1 scheduler runs
 > `start`ed TCMs concurrently (round-robin turns suspending at
 > `wait`/`sync`), temporal waits re-evaluate against the log, and
-> `expect`/`assume` rules are checked at quit. It does **not** yet do
+> `expect`/`assume` rules are checked at quit. Coverage groups
+> (clause 14) collect basic-item buckets and grades on their sampling
+> event (`run --coverage` reports them). It does **not** yet do
 > full type
 > checking, `when`-subtype
 > resolution, event-driven temporal evaluation, coverage, non-linear or

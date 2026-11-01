@@ -73,7 +73,7 @@ multi-simulator HDL API, and wasm32.
   [with { .. }]` parses to an explicit not-supported runtime diagnostic.
   Clause 14 coverage groups (`cover <event> is [also] { .. };`, `is
   empty;`) record their item/cross/transition entries structurally and
-  every option clause verbatim — nothing is collected at run time.
+  every option clause verbatim.
   Clause 11.4 `expect`/`assume` members parse their temporal
   expressions into the clause 12 grammar (`TemporalExpr`: event atoms,
   `cycle`, propositions and edge samples, `{;}` sequences, `=>` yield,
@@ -132,10 +132,23 @@ multi-simulator HDL API, and wasm32.
   routines such as `out`, `outf`, `message`, `pack`, `append`,
   `dut_error`, `stop_run`, the objection no-ops, and the `hdl_*` bridge
   calls.
+- `src/coverage.rs` — the clause 14 coverage data model, built from
+  the recorded cover groups at run start: `is also`/`empty`
+  extensions merge into their base group by name (14.5, either
+  declaration order), `using ranges = { range([lo..hi], "label");
+  ... }` clauses parse into explicit buckets, and items without them
+  take the 14.2 defaults (16 buckets for integers — "0 through 15" —
+  two for booleans; anything else is ungradeable with a note). The
+  interpreter samples a group when its event fires: each item's
+  recorded expression evaluates in the emitting frame (or the named
+  field is read) and the value lands in the containing bucket;
+  out-of-range values are ungradeable (14.2: "goals of 0"). Grades
+  are covered-buckets-per-item, averaged over gradeable items; cross/
+  transition items, per-instance coverage (14.2.1), the coverage
+  configuration of 28.9 and `range(...)`'s numeric parameters beyond
+  bounds/label are recorded, not applied.
 - `src/interp.rs` — interpreter for the statement subset (codes
   `E0401`–`E0410`). Entry: the built-in `sys` unit's `run()` methods, with
-  implicit field generation before `run()`. Integers are unbounded `i128`
-  (widths are not truncated). `is [not] a` checks scalars by value shape
   and named types by declared name, walking `like` bases — subtype-aware
   dispatch is a later milestone. String matching evaluates only the
   case-insensitive full-string literal subset; `/.../` AWK patterns and
@@ -174,7 +187,9 @@ multi-simulator HDL API, and wasm32.
   quit with `rule_failed` (12.3.2): a failed rule runs its `else` body
   on the sys instance as a check error, or prints the failure when
   there is no else body. One global timeline — no per-instance
-  sampling.
+  sampling. `emit` also samples the cover groups (clause 14) of the
+  instance whose event fired, recording item values into the
+  `src/coverage.rs` buckets; `run --coverage` prints the report.
 - `src/solve.rs` — constraint IR and the pluggable solver seam: the
   top-level `keep` constraints of one type translate (conservatively) into
   bounded-integer variables plus a conjunction of linear comparisons;
@@ -199,9 +214,10 @@ conjunctive linear constraints and constant ranges over bounded
 integers), `@`-triggered TCM invocation, `@sim` sampling and
 per-instance timelines, and suspension re-entry beyond `while` chains
 (waits inside `if`/`case`/`for` bodies, inline calls, `compute` and
-`on` blocks spin inline instead of interleaving), the coverage data
-model and
-reports (clause 14 groups are recorded, not collected), integer width
+`on` blocks spin inline instead of interleaving), the remaining
+clause 14 coverage model (basic items collect into buckets and grade;
+`cross`/`transition` items, per-instance coverage, the option tables
+and the 28.9 configuration are recorded, not applied), integer width
 truncation, evaluation of MVL literals, `repeat`, single-statement
 `if ... do`, `detach`/`delay`/`exec` TEs, select
 distribution biasing in the sampler (clause 10; the expressions parse

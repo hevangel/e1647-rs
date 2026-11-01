@@ -1725,3 +1725,69 @@ later emission; compute stays inline), the inline-start test rewritten
 onto `compute` (the old test encoded the pre-scheduler approximation),
 a parser test for the four `sync` spellings, and the temporal-wait
 fixture extended with `sync` forms and a suspending `while` TCM.
+
+## 2026-10-31 (28) — offline arc: clause 14 coverage data model (buckets, hits, grades)
+
+Branch `agent/cover-data` (off main after #17 merged). Cover groups
+now collect instead of only recording.
+
+- New `src/coverage.rs`: the data model built from the recorded
+  groups at run start. `is also`/`empty` extensions merge into their
+  base group by name (14.5, either declaration order). Items' `using
+  ranges = { range([lo..hi], "label"); ... }` clauses — recorded as
+  raw tokens — parse into explicit buckets; the corpus shape
+  `range([0x21..0xffdf], "", 4000, 10)` parses with the numeric
+  parameters beyond bounds/label recorded but not applied (their
+  semantics live in Table 41, an image in the local redline copy).
+  Items without a ranges clause take the 14.2 prose defaults: 16
+  buckets for integers ("buckets are created by default for only the
+  first 16 possible values (0 through 15)") and the two values for
+  booleans; anything else is ungradeable with an honest note.
+- Collection: the interpreter samples a group when its sampling event
+  fires (14.1) — the emitting instance's type owns the groups, each
+  item's recorded expression evaluates in the emitting frame (or the
+  named field is read from the owner), and the value lands in the
+  containing bucket. Values outside every bucket are ungradeable
+  (14.2: "those values are given goals of 0 and do not affect the
+  grade"). Grades are covered-buckets-per-item, averaged over
+  gradeable items; a group with no gradeable items reports no grade.
+- Reporting: `e1647 run --coverage` prints per group the sample count
+  and grade, per item its buckets with hits against goals, and the
+  ungradeable count with the item's note. Collection happens on every
+  run; the flag only controls printing (default output unchanged —
+  the recorded golden/igen parity runs stay byte-identical).
+- Honest gaps: cross/transition items, per-instance coverage (14.2.1),
+  the option tables (at_least/weight/etc. beyond the range goal) and
+  the 28.9 coverage configuration are recorded, not applied; enums,
+  strings, reals and lists are counted but not graded.
+- Debugging notes for the record: the first ranges parser passed a
+  subslice but indexed it with the absolute cursor (every range entry
+  failed to parse — caught by the explicit-buckets test), and the
+  group's sample counter incremented per item instead of per sampling
+  event (caught by the defaults test's sample count).
+
+Corpus state (absolute paths): etl 4, cover-edges 4, golden-imports 3,
+golden-combined/igen-dist/type-min-max/save-restart/d6w 0 — unchanged.
+`run --coverage` on golden-combined prints its groups' default buckets
+and honest notes; the golden's run still exits 0 with only the
+pre-existing implicit-gen E0407.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(159 passed: 11 elab, 1 fixtures, 54 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 4 interpreter tests — explicit ranges buckets sampled on
+emit with an out-of-range ungradeable value and a full grade; the
+14.2 defaults (16 integer buckets, two boolean buckets, the plain
+average group grade); `is also`/`empty` merging into one group; an
+untyped unranged item recording two samples with no grade and its
+honest note.

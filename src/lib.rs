@@ -17,6 +17,7 @@
 pub mod ast;
 pub mod builtins;
 pub mod check;
+pub mod coverage;
 pub mod diagnostic;
 pub mod elab;
 pub mod hdl;
