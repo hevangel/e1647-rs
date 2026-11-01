@@ -874,3 +874,113 @@ fn untyped_unranged_cover_items_record_without_grading() {
     assert_eq!(group.grade(), None);
     assert!(item.note.is_some(), "the honest note is recorded");
 }
+
+#[test]
+fn select_weights_bias_the_sampler_to_min_and_max() {
+    // 10.2.12.2: an arm is chosen with probability weight/(sum of all
+    // weights) over the current range; `min`/`max` take the extremes.
+    let dominated = |arm_a: &str, arm_b: &str| {
+        clean_output(
+            &format!(
+                "struct s {{\n    v: uint (bits: 8);\n}};\n\
+                 extend s {{\n    keep soft v == select {{\n        {arm_a}\n        {arm_b}\n    }};\n}};\n\
+                 extend sys {{\n    run() is also {{\n        var x: s;\n        gen x;\n        \
+                 print x.v;\n    }};\n}};\n"
+            ),
+            1,
+        )
+    };
+    assert_eq!(dominated("1000 : min;", "1 : max;"), "0\n");
+    assert_eq!(dominated("1 : min;", "1000 : max;"), "255\n");
+}
+
+#[test]
+fn select_others_draws_strictly_inside_the_range() {
+    let output = clean_output(
+        "struct s {\n    v: uint (bits: 8);\n};\n\
+         extend s {\n    keep soft v == select {\n        100 : others;\n    };\n};\n\
+         extend sys {\n    run() is also {\n        var x: s;\n        gen x;\n        \
+         print x.v;\n    };\n};\n",
+        1,
+    );
+    // Strictly inside: neither extreme.
+    let value: u32 = output.trim().parse().expect("the generated value");
+    assert!(value > 0 && value < 255, "output: {output}");
+}
+
+#[test]
+fn select_edges_picks_one_of_the_extremes() {
+    let output = clean_output(
+        "struct s {\n    v: uint (bits: 8);\n};\n\
+         extend s {\n    keep soft v == select {\n        100 : edges;\n    };\n};\n\
+         extend sys {\n    run() is also {\n        var x: s;\n        gen x;\n        \
+         print x.v;\n    };\n};\n",
+        1,
+    );
+    assert!(
+        output.trim() == "0" || output.trim() == "255",
+        "output: {output}"
+    );
+}
+
+#[test]
+fn select_normal_biases_around_its_center() {
+    let output = clean_output(
+        "struct s {\n    v: uint (bits: 16);\n};\n\
+         extend s {\n    keep soft v == select {\n        100 : normal(20000, 1000);\n    };\n};\n\
+         extend sys {\n    run() is also {\n        var x: s;\n        gen x;\n        \
+         print x.v;\n    };\n};\n",
+        1,
+    );
+    let value: u32 = output.trim().parse().expect("the generated value");
+    // 20,000 ± 1,000: five standard deviations around the center —
+    // far outside that would mean the normal is not applied.
+    assert!((15_000..=25_000).contains(&value), "output: {output}");
+}
+
+#[test]
+fn select_normal_accepts_max_uint_expressions_like_the_corpus() {
+    // The igen-dist corpus shape: normal(MAX_UINT/2, MAX_UINT/10) over
+    // an unsized uint (0 ..= 2^32-1). MAX_UINT is a predefined constant
+    // of the choice-expression evaluator.
+    let output = clean_output(
+        "struct s {\n    v: uint;\n};\n\
+         extend s {\n    keep soft v == select {\n        100 : normal(MAX_UINT/2, MAX_UINT/10);\n    };\n};\n\
+         extend sys {\n    run() is also {\n        var x: s;\n        gen x;\n        \
+         print x.v;\n    };\n};\n",
+        1,
+    );
+    let value: u64 = output.trim().parse().expect("the generated value");
+    // Center 2^31 ± five standard deviations of 2^32/10.
+    assert!(
+        value > 100_000_000 && value < 4_200_000_000,
+        "output: {output}"
+    );
+}
+
+#[test]
+fn select_choice_on_either_operand_side_biases() {
+    // `select { .. } == v` biases the same field.
+    let output = clean_output(
+        "struct s {\n    v: uint (bits: 8);\n};\n\
+         extend s {\n    keep soft select {\n        1000 : max;\n    } == v;\n};\n\
+         extend sys {\n    run() is also {\n        var x: s;\n        gen x;\n        \
+         print x.v;\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output.trim(), "255");
+}
+
+#[test]
+fn select_with_an_unevaluable_choice_keeps_the_field_free() {
+    // An arm whose choice cannot be evaluated (an unknown name) leaves
+    // the domain unwidened — the sampler draws naturally, no error.
+    let output = clean_output(
+        "struct s {\n    v: uint (bits: 8);\n};\n\
+         extend s {\n    keep soft v == select {\n        100 : normal(WAT/2, 1);\n    };\n};\n\
+         extend sys {\n    run() is also {\n        var x: s;\n        gen x;\n        \
+         if x.v <= 255 {\n            out(\"OK\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "OK\n");
+}

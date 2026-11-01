@@ -47,6 +47,8 @@ use crate::ast::{
 use crate::diagnostic::Diagnostic;
 use crate::elab::Elaborated;
 use crate::lexer::Position;
+use crate::lexer::Token;
+use crate::lexer::TokenKind;
 use std::collections::BTreeMap;
 
 /// Outcome of one run: the text produced by `out`/`print`, any run-time
@@ -1512,7 +1514,7 @@ impl<'a> Interp<'a> {
             .collect();
         // Simple range/equality constraints narrow the per-field sampling
         // domains; everything else is enforced by the rejection predicate.
-        let domains = self.constraint_domains(&constraints);
+        let domains = self.constraint_domains(&constraints, &field_types);
         // Solver-backed path (feature `solver-pumpkin`): the integer
         // scalar fields are solved, the remaining fields are sampled.
         #[cfg(feature = "solver-pumpkin")]
@@ -1645,10 +1647,36 @@ impl<'a> Interp<'a> {
     /// intersection is left as-is: sampling then uses the declared
     /// bounds and the predicate fails the attempt (E0407), which is the
     /// honest outcome for contradictory constraints.
-    fn constraint_domains(&mut self, constraints: &[Expr]) -> BTreeMap<String, (i128, i128)> {
+    fn constraint_domains(
+        &mut self,
+        constraints: &[Expr],
+        field_types: &[(String, TypeExpr)],
+    ) -> BTreeMap<String, (i128, i128)> {
         let mut domains = BTreeMap::new();
         for constraint in constraints {
             self.collect_domain_leaves(constraint, &mut domains);
+        }
+        // 10.2.12.2: a `select` distribution biases the choice within
+        // the current range of legal values — the range already
+        // narrowed by the other constraints. The drawn value narrows
+        // the field to a point; the rejection predicate skips
+        // select-shaped constraints, so this bias is their whole
+        // effect. When no other constraint narrowed the field, the
+        // bias draws over the field type's natural range.
+        for constraint in constraints {
+            for (field, arms) in select_leaves(constraint) {
+                let base = domains.get(&field).copied().or_else(|| {
+                    field_types
+                        .iter()
+                        .find(|(name, _)| *name == field)
+                        .and_then(|(_, ty)| natural_range(ty))
+                });
+                let Some(base) = base else { continue };
+                let Some(value) = self.sample_select(arms, base) else {
+                    continue;
+                };
+                intersect_domain(&mut domains, &field, (value, value));
+            }
         }
         domains
     }
@@ -1704,31 +1732,85 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Draw one value from a select distribution over the given range
+    /// (10.2.12.2): an arm is chosen with probability weight/(sum of
+    /// all weights), weights being integers, and the arm's choice maps
+    /// to a value of the range — `min`/`max` take the extremes,
+    /// `edges` picks one of them, `others` draws uniformly strictly
+    /// inside, and `normal(center, stddev)` draws a Box–Muller normal
+    /// clamped to the range (the choice keywords' example figures are
+    /// images in the local copy; these readings follow the corpus
+    /// usage). `None` when an arm's weight or choice cannot be
+    /// evaluated — the field then keeps its unwidened domain.
+    fn sample_select(
+        &mut self,
+        arms: &[crate::ast::SelectArm],
+        range: (i128, i128),
+    ) -> Option<i128> {
+        let mut weights = Vec::new();
+        let mut total: i128 = 0;
+        for arm in arms {
+            let weight = self.const_int_eval(&arm.weight)?;
+            if weight < 0 {
+                return None;
+            }
+            total += weight;
+            weights.push(weight);
+        }
+        if total <= 0 {
+            return None;
+        }
+        let mut pick = self.rng.below(total as u128) as i128;
+        let mut chosen = arms.len() - 1;
+        for (index, weight) in weights.iter().enumerate() {
+            if pick < *weight {
+                chosen = index;
+                break;
+            }
+            pick -= weight;
+        }
+        let (lo, hi) = range;
+        let (kind, args) = select_choice(&arms[chosen].choice)?;
+        let drawn = match kind {
+            "min" => lo,
+            "max" => hi,
+            "edges" => {
+                if self.rng.below(2) == 0 {
+                    lo
+                } else {
+                    hi
+                }
+            }
+            "others" => {
+                if hi > lo + 1 {
+                    lo + 1 + self.rng.below((hi - lo - 1) as u128) as i128
+                } else {
+                    lo
+                }
+            }
+            "normal" => {
+                let (center, stddev) = args?;
+                // Box–Muller from the seeded RNG; the draw is clamped
+                // into the range so the bias always lands somewhere
+                // legal.
+                let u1 = self.rng.unit_f64().max(f64::EPSILON);
+                let u2 = self.rng.unit_f64();
+                let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                let value = center as f64 + stddev as f64 * z;
+                let rounded = value.round() as i128;
+                rounded.clamp(lo, hi)
+            }
+            _ => return None,
+        };
+        Some(drawn.clamp(lo, hi))
+    }
+
     /// Sample an integer-valued scalar inside the declared bounds
     /// intersected with `domain`. A contradictory domain falls back to
     /// the natural sampling (the rejection predicate then fails the
     /// attempt); booleans, reals, strings and time are not domain-sampled.
     fn sample_int_in(&mut self, ty: &TypeExpr, domain: (i128, i128)) -> Value {
-        let TypeExpr::Scalar { base, width, .. } = ty else {
-            // Callers only pass integer scalar fields; anything else
-            // samples structurally.
-            return self.sample_type(ty).unwrap_or(Value::Void);
-        };
-        let natural = match base {
-            ScalarBase::Uint => {
-                let bits = width_bits(width, 32);
-                Some((0i128, (1i128 << bits) - 1))
-            }
-            ScalarBase::Int => {
-                let bits = width_bits(width, 32);
-                Some((-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1))
-            }
-            ScalarBase::Bit => Some((0, 1)),
-            ScalarBase::Byte => Some((0, 255)),
-            ScalarBase::Nibble => Some((0, 15)),
-            ScalarBase::Bool | ScalarBase::Real | ScalarBase::String | ScalarBase::Time => None,
-        };
-        let Some((natural_low, natural_high)) = natural else {
+        let Some((natural_low, natural_high)) = natural_range(ty) else {
             return self.sample_type(ty).unwrap_or(Value::Void);
         };
         let low = natural_low.max(domain.0);
@@ -3409,6 +3491,244 @@ fn as_i64(value: &Value) -> Option<i64> {
         Value::Bool(b) => Some(i64::from(*b)),
         _ => None,
     }
+}
+
+/// The natural bounds of an integer scalar type (from `sample_int_in`'s
+/// width table); `None` for non-integer scalars and compound types.
+fn natural_range(ty: &TypeExpr) -> Option<(i128, i128)> {
+    let TypeExpr::Scalar { base, width, .. } = ty else {
+        return None;
+    };
+    match base {
+        ScalarBase::Uint => {
+            let bits = width_bits(width, 32);
+            Some((0i128, (1i128 << bits) - 1))
+        }
+        ScalarBase::Int => {
+            let bits = width_bits(width, 32);
+            Some((-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1))
+        }
+        ScalarBase::Bit => Some((0, 1)),
+        ScalarBase::Byte => Some((0, 255)),
+        ScalarBase::Nibble => Some((0, 15)),
+        ScalarBase::Bool | ScalarBase::Real | ScalarBase::String | ScalarBase::Time => None,
+    }
+}
+
+/// The `field == select { .. }` leaves of a constraint conjunction, as
+/// (field name, arms) pairs — either operand may carry the select.
+fn select_leaves(expr: &Expr) -> Vec<(String, &[crate::ast::SelectArm])> {
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::LogicalAnd,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let mut leaves = select_leaves(lhs);
+            leaves.extend(select_leaves(rhs));
+            leaves
+        }
+        Expr::Paren { expr: inner, .. } => select_leaves(inner),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs,
+            rhs,
+            ..
+        } => {
+            for (side, other) in [(lhs, rhs), (rhs, lhs)] {
+                if let (Expr::Ident { name, .. }, Expr::Select { arms, .. }) =
+                    (side.as_ref(), other.as_ref())
+                {
+                    return vec![(name.clone(), arms)];
+                }
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The choice keyword of a select arm's recorded tokens and, for
+/// `normal(center, stddev)`, its two evaluated arguments.
+fn select_choice(tokens: &[Token]) -> Option<(&'static str, Option<(i128, i128)>)> {
+    let word = match &tokens.first()?.kind {
+        TokenKind::Identifier(word) | TokenKind::Keyword(word) => word.as_str(),
+        _ => return None,
+    };
+    // The literals keep the return kind 'static (no borrow of tokens).
+    let kind: &'static str = match word {
+        "min" => "min",
+        "max" => "max",
+        "others" => "others",
+        "edges" => "edges",
+        "normal" => "normal",
+        _ => return None,
+    };
+    if kind != "normal" {
+        return Some((kind, None));
+    }
+    // `normal(center, stddev)` — two comma-separated constant integer
+    // expressions over the recorded tokens.
+    if !token_kind_is_punct(tokens.get(1), "(") || !token_kind_is_punct(tokens.last(), ")") {
+        return None;
+    }
+    let mut parts: Vec<&[Token]> = Vec::new();
+    let mut start = 2;
+    let mut depth = 0usize;
+    for (index, token) in tokens[2..tokens.len() - 1].iter().enumerate() {
+        match &token.kind {
+            TokenKind::Punctuation(p) if p == "(" => depth += 1,
+            TokenKind::Punctuation(p) if p == ")" => depth = depth.saturating_sub(1),
+            TokenKind::Punctuation(p) if p == "," && depth == 0 => {
+                parts.push(&tokens[start..2 + index]);
+                start = 3 + index;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&tokens[start..tokens.len() - 1]);
+    if parts.len() != 2 {
+        return None;
+    }
+    let center = eval_choice_int(parts[0])?;
+    let stddev = eval_choice_int(parts[1])?;
+    Some((kind, Some((center, stddev))))
+}
+
+/// Evaluate a constant integer expression over the recorded choice
+/// tokens: decimal/based literals, the `MAX_UINT`/`MAX_INT` predefined
+/// constants, `+`/`-`/`*`/`/` with precedence, and parentheses. `None`
+/// on anything else (the arm is then skipped, honestly).
+fn eval_choice_int(tokens: &[Token]) -> Option<i128> {
+    if tokens.is_empty() {
+        return None;
+    }
+    // Split the top-level additive terms.
+    let mut terms: Vec<(bool, &[Token])> = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut negate = false;
+    for (index, token) in tokens.iter().enumerate() {
+        match &token.kind {
+            TokenKind::Punctuation(p) if p == "(" => depth += 1,
+            TokenKind::Punctuation(p) if p == ")" => depth = depth.saturating_sub(1),
+            TokenKind::Punctuation(p) if p == "+" && depth == 0 => {
+                terms.push((negate, &tokens[start..index]));
+                negate = false;
+                start = index + 1;
+            }
+            TokenKind::Punctuation(p) if p == "-" && depth == 0 => {
+                terms.push((negate, &tokens[start..index]));
+                negate = true;
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    terms.push((negate, &tokens[start..]));
+    let mut total: Option<i128> = None;
+    for (negative, term) in terms {
+        if term.is_empty() {
+            return None;
+        }
+        let value = eval_choice_product(term)?;
+        total = Some(match total {
+            None => {
+                if negative {
+                    -value
+                } else {
+                    value
+                }
+            }
+            Some(current) => {
+                if negative {
+                    current - value
+                } else {
+                    current + value
+                }
+            }
+        });
+    }
+    total
+}
+
+/// The multiplicative level of the choice-expression evaluator.
+fn eval_choice_product(tokens: &[Token]) -> Option<i128> {
+    let mut total: Option<i128> = None;
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut operation = "*";
+    for (index, token) in tokens.iter().enumerate() {
+        match &token.kind {
+            TokenKind::Punctuation(p) if p == "(" => depth += 1,
+            TokenKind::Punctuation(p) if p == ")" => depth = depth.saturating_sub(1),
+            TokenKind::Punctuation(p) if (p == "*" || p == "/") && depth == 0 => {
+                let value = eval_choice_atom(&tokens[start..index])?;
+                total = Some(apply_choice_op(total, operation, value)?);
+                operation = p.as_str();
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let value = eval_choice_atom(&tokens[start..])?;
+    apply_choice_op(total, operation, value)
+}
+
+fn apply_choice_op(total: Option<i128>, operation: &str, value: i128) -> Option<i128> {
+    match (total, operation) {
+        (None, "*") => Some(value),
+        (None, "/") => Some(value),
+        (Some(current), "*") => current.checked_mul(value),
+        (Some(current), "/") => {
+            if value == 0 {
+                None
+            } else {
+                Some(current / value)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn eval_choice_atom(tokens: &[Token]) -> Option<i128> {
+    let first = tokens.first()?;
+    match &first.kind {
+        TokenKind::Number(text) => {
+            if tokens.len() != 1 {
+                return None;
+            }
+            crate::interp::parse_int_literal(text)
+        }
+        TokenKind::Identifier(word) | TokenKind::Keyword(word) => {
+            if tokens.len() != 1 {
+                return None;
+            }
+            match word.as_str() {
+                "MAX_UINT" => Some((1i128 << 32) - 1),
+                "MAX_INT" => Some((1i128 << 31) - 1),
+                _ => None,
+            }
+        }
+        TokenKind::Punctuation(p) if p == "(" => {
+            if tokens.len() < 3 || !token_kind_is_punct(tokens.last(), ")") {
+                return None;
+            }
+            eval_choice_int(&tokens[1..tokens.len() - 1])
+        }
+        TokenKind::Punctuation(p) if p == "-" => {
+            if tokens.len() < 2 {
+                return None;
+            }
+            Some(0i128.wrapping_sub(eval_choice_int(&tokens[1..])?))
+        }
+        _ => None,
+    }
+}
+
+fn token_kind_is_punct(token: Option<&Token>, symbol: &str) -> bool {
+    token.is_some_and(|token| matches!(&token.kind, TokenKind::Punctuation(p) if p == symbol))
 }
 
 /// Whether the expression calls any of the named routines anywhere in its
