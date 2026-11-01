@@ -35,7 +35,9 @@
 > (clause 10) bias the seeded rejection sampler
 > (weights/min/max/edges/others/normal). `when` subtypes (clause 6.6)
 > resolve: when-qualified field types instantiate synthesized subtype
-> views whose when members apply. It does **not** yet do
+> views whose when members apply. Template instances (clause 8.3)
+> monomorphize: actuals substitute for formals and template-typed
+> fields carry the instance. It does **not** yet do
 > full type
 > checking,
 > resolution, event-driven temporal evaluation, coverage, non-linear or

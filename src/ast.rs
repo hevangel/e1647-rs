@@ -632,6 +632,36 @@ impl TypeExpr {
             | TypeExpr::TemplateRef { span, .. } => *span,
         }
     }
+
+    /// A canonical textual form, used to name monomorphized template
+    /// instances (8.3: "any two instances of a template, if their
+    /// actual parameters refer to exactly the same types, are
+    /// considered to be the same instance").
+    pub fn render(&self) -> String {
+        match self {
+            TypeExpr::Scalar { base, width, .. } => match width.as_deref() {
+                Some(Expr::IntLiteral { text, .. }) => {
+                    format!("{}(bits: {})", base.name(), text)
+                }
+                _ => base.name().to_owned(),
+            },
+            TypeExpr::List { element, .. } => format!("list of {}", element.render()),
+            TypeExpr::Named { name, .. } => name.clone(),
+            TypeExpr::WhenQualified { value, base, .. } => {
+                format!("{value} {}", base.render())
+            }
+            TypeExpr::InlineEnum { names, .. } => format!("[{}]", names.join(", ")),
+            TypeExpr::Formal { name, .. } => format!("<{name}>"),
+            TypeExpr::TemplateRef { name, args, .. } => template_instance_name(name, args),
+        }
+    }
+}
+
+/// The canonical name of a template instance (8.3):
+/// `name of (arg, arg)` with each argument rendered canonically.
+pub fn template_instance_name(name: &str, args: &[TypeExpr]) -> String {
+    let rendered: Vec<String> = args.iter().map(|arg| arg.render()).collect();
+    format!("{name} of ({})", rendered.join(", "))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1915,3 +1915,65 @@ New tests: an elaboration test (the synthesized view's name,
 and two interpreter tests — when-qualified fields generating under
 their when-block select constraints (min view vs max view), and a
 when view carrying its method, its extra field and the `is a` walk.
+
+## 2026-11-01 (31) — offline arc: clause 8.3 template monomorphization
+
+Branch `agent/template-mono` (off main after #20 merged). Template
+instances become structs: the recorded template declarations stop
+being inert.
+
+- Canonical naming (8.3's "any two instances of a template, if their
+  actual parameters refer to exactly the same types, are considered
+  to be the same instance"): `TypeExpr::render` gives every type a
+  canonical textual form, and an instance's name is
+  `name of (arg, arg)` over the rendered actuals.
+- Monomorphization worklist in the elaborator, seeded from every
+  type's member types (fields, method signatures) and fed by
+  substitution: each `(template, actuals)` materializes an
+  `ElaboratedType` under the canonical name — the template's composed
+  members (like chains and extends included) with the actuals
+  substituted for the formals in field types and method signatures,
+  trailing parameters filled from their defaults, defaults that
+  reference earlier formals substituting through (`<value'type> =
+  <key'type>` under `map of (int)` binds both to the actual), and the
+  parameterized base substituted to the view's base name (another
+  instance's canonical name when the base is itself a template
+  reference — the worklist materializes it first).
+- Interpreter: template-typed fields (`TypeExpr::TemplateRef`)
+  instantiate and generate the canonical view (`default_for`,
+  `sample_type`), methods resolve through the instance's type name,
+  and `is a` accepts both the canonical instance name and the base
+  chain beneath it.
+- Honest v1 limits (documented): method bodies keep their written
+  form — a `new deque_iterator of <type>` inside a template body
+  substitutes in a later milestone (the instance degrades to an
+  empty-typed object, no crash); template extensions (8.2) apply
+  wholesale via name composition without the 8.3 category-compliance
+  checks; non-scalar/category validation of actuals is not performed.
+
+Corpus state (absolute paths): etl 4, cover-edges 4, golden-imports
+3, golden-combined/igen-dist/type-min-max/save-restart/d6w 0 —
+unchanged; golden-combined still runs exit 0 with the pre-existing
+implicit-gen E0407.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(172 passed: 14 elab, 1 fixtures, 64 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: two elaboration tests — the `container of (int)` instance
+materializing with substituted signatures, its parameterized
+`iterator of <type>` reference feeding the worklist into its own
+view, and single-instance identity; and `map of (int)` filling
+`<value'type>` from its default while `map of (int, string)` stays a
+distinct view. One interpreter test — a `box of (int (bits: 8))`
+field generating under the view, its method dispatching (payload
+doubled), and `is a` accepting the canonical name and the base.
