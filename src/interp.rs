@@ -678,6 +678,23 @@ impl<'a> Interp<'a> {
                 self.depth -= 1;
                 Value::Object(index)
             }
+            TypeExpr::WhenQualified { value, base, .. } => {
+                // A when-qualified field carries the synthesized subtype
+                // view (6.6): its when members apply for the instance.
+                let TypeExpr::Named {
+                    name: base_name, ..
+                } = base.as_ref()
+                else {
+                    return Value::Void;
+                };
+                if self.depth > 100 {
+                    return Value::Void;
+                }
+                self.depth += 1;
+                let index = self.instantiate(&when_view_name(value, base_name));
+                self.depth -= 1;
+                Value::Object(index)
+            }
             // A formal is bound only inside a template instance; a
             // template reference instantiates like a named type would,
             // after monomorphization (a later milestone).
@@ -1427,12 +1444,16 @@ impl<'a> Interp<'a> {
     /// Whether the type expression names a unit (instance) type — those
     /// fields are instantiated, never generated.
     fn is_unit_typed(&self, ty: &TypeExpr) -> bool {
-        let TypeExpr::Named { name, .. } = ty else {
-            return false;
-        };
-        self.types
-            .iter()
-            .any(|t| &t.name == name && t.kind == DeclarationKind::Unit)
+        match ty {
+            TypeExpr::Named { name, .. } => self
+                .types
+                .iter()
+                .any(|t| &t.name == name && t.kind == DeclarationKind::Unit),
+            // A when-qualified unit type is unit-typed as well; its
+            // view carries the base's kind.
+            TypeExpr::WhenQualified { base, .. } => self.is_unit_typed(base),
+            _ => false,
+        }
     }
 
     /// The fixed length demanded by a `keep <field>.size() == N`
@@ -1872,6 +1893,26 @@ impl<'a> Interp<'a> {
                 }
                 self.depth += 1;
                 let index = self.instantiate(name);
+                let result = self.gen_object(index);
+                self.depth -= 1;
+                result?;
+                Ok(Value::Object(index))
+            }
+            TypeExpr::WhenQualified { value, base, .. } => {
+                // A when-qualified field generates an instance of the
+                // synthesized subtype view, whose when members (fields,
+                // constraints) apply for it (6.6).
+                let TypeExpr::Named {
+                    name: base_name, ..
+                } = base.as_ref()
+                else {
+                    return Ok(Value::Void);
+                };
+                if self.depth > 50 {
+                    return Err(self.error("E0406", "recursion too deep", origin_span()));
+                }
+                self.depth += 1;
+                let index = self.instantiate(&when_view_name(value, base_name));
                 let result = self.gen_object(index);
                 self.depth -= 1;
                 result?;
@@ -3041,6 +3082,28 @@ impl<'a> Interp<'a> {
                 Value::Enum { type_name, .. } => self.type_is_a(type_name, name),
                 _ => false,
             }),
+            TypeExpr::WhenQualified {
+                value: modifier,
+                base,
+                ..
+            } => {
+                // The instance must carry the synthesized subtype view
+                // (or a like-descendant of it — the view's base chain
+                // reaches the base type).
+                let TypeExpr::Named {
+                    name: base_name, ..
+                } = base.as_ref()
+                else {
+                    return Ok(false);
+                };
+                Ok(match value {
+                    Value::Object(index) => self.type_is_a(
+                        &self.instances[*index].type_name,
+                        &when_view_name(modifier, base_name),
+                    ),
+                    _ => false,
+                })
+            }
             // A template reference names a template instance; instances
             // come from monomorphization (a later milestone).
             TypeExpr::TemplateRef { name, .. } => Ok(match value {
@@ -3491,6 +3554,13 @@ fn as_i64(value: &Value) -> Option<i64> {
         Value::Bool(b) => Some(i64::from(*b)),
         _ => None,
     }
+}
+
+/// The synthesized when-subtype view's name (6.6): `VALUE base`, the
+/// spelling the when-qualified field type uses — matches the
+/// elaborator's synthesized [`crate::elab::ElaboratedType`] entry.
+fn when_view_name(value: &str, base_name: &str) -> String {
+    format!("{value} {base_name}")
 }
 
 /// The natural bounds of an integer scalar type (from `sample_int_in`'s

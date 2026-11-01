@@ -33,9 +33,11 @@
 > (clause 14) collect basic-item buckets and grades on their sampling
 > event (`run --coverage` reports them), and `select` distributions
 > (clause 10) bias the seeded rejection sampler
-> (weights/min/max/edges/others/normal). It does **not** yet do
+> (weights/min/max/edges/others/normal). `when` subtypes (clause 6.6)
+> resolve: when-qualified field types instantiate synthesized subtype
+> views whose when members apply. It does **not** yet do
 > full type
-> checking, `when`-subtype
+> checking,
 > resolution, event-driven temporal evaluation, coverage, non-linear or
 > disjunctive constraint solving, or general testbench execution. No IEEE
 > conformance is claimed. See [docs/ROADMAP.md](docs/ROADMAP.md) for the

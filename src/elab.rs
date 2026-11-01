@@ -48,6 +48,10 @@ pub struct ElaboratedType {
     /// extends in declaration order — monitored over the run log by the
     /// interpreter.
     pub expects: Vec<crate::ast::ExpectDecl>,
+    /// For a synthesized when-subtype view (6.6): the discriminating
+    /// field id and the modifier value (`("kind", "BUSY")` for
+    /// `when BUSY'kind`). `None` for regular types.
+    pub when_of: Option<(String, String)>,
     /// `type name: <type>;` — the underlying representation, recorded
     /// only (clause 5); distinct-type semantics are a later milestone.
     pub underlying: Option<crate::ast::TypeExpr>,
@@ -166,6 +170,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                     ons: composed.ons.into_iter().cloned().collect(),
                     covers: composed.covers.into_iter().cloned().collect(),
                     expects: composed.expects.into_iter().cloned().collect(),
+                    when_of: None,
                     underlying: None,
                     enumerals: Vec::new(),
                     ports: composed
@@ -190,6 +195,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 ons: Vec::new(),
                 covers: Vec::new(),
                 expects: Vec::new(),
+                when_of: None,
                 underlying: declaration.underlying.clone(),
                 ports: Vec::new(),
                 enumerals: declaration
@@ -206,6 +212,56 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         }
     }
     elaborator.compose_builtin_units(&mut types);
+    // 6.6: synthesize one subtype view per single-modifier `when` block
+    // (`when BUSY'kind { .. }` on type `kind`'s owner): the base's
+    // composed members with the when block's members appended, under
+    // the `VALUE base` name the field-type spelling uses. Instances
+    // typed `VALUE base` (TypeExpr::WhenQualified) carry this view, so
+    // the when block's fields, constraints, methods, on blocks and
+    // cover groups apply for them. Chained modifiers and nested
+    // when-in-when blocks compose in a later milestone.
+    let base_count = types.len();
+    for base_index in 0..base_count {
+        let whens: Vec<crate::ast::WhenDecl> = types[base_index].whens.clone();
+        for when in whens {
+            // Two modifier spellings carry the discriminator: the
+            // conventional `when BUSY'kind` and the corpus's space form
+            // `when NO_CONSTRAINT env` (two bare modifiers — value
+            // first, field id second).
+            let Some((field_id, value)) = (match when.modifiers.as_slice() {
+                [one] => one
+                    .id
+                    .as_ref()
+                    .map(|(id, _)| (id.clone(), one.value.clone())),
+                [first, second] if first.id.is_none() && second.id.is_none() => {
+                    Some((second.value.clone(), first.value.clone()))
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            let mut view = types[base_index].clone();
+            view.name = format!("{value} {}", view.name);
+            view.base = Some(types[base_index].name.clone());
+            view.when_of = Some((field_id, value));
+            for member in &when.members {
+                match member {
+                    crate::ast::Member::Field(field) => view.fields.push(field.clone()),
+                    crate::ast::Member::Constraint(constraint) => {
+                        view.constraints.push(constraint.clone())
+                    }
+                    crate::ast::Member::Method(method) => view.methods.push(method.clone()),
+                    crate::ast::Member::On(on) => view.ons.push(on.clone()),
+                    crate::ast::Member::Cover(cover) => view.covers.push(cover.clone()),
+                    crate::ast::Member::Expect(expect) => view.expects.push(expect.clone()),
+                    // Nested when-in-when chains and the other member
+                    // kinds compose in a later milestone.
+                    _ => {}
+                }
+            }
+            types.push(view);
+        }
+    }
     let mut defines = BTreeMap::new();
     for declaration in declarations {
         for member in &declaration.members {
@@ -299,6 +355,7 @@ impl<'a> Elaborator<'a> {
                 ons: composed.ons.into_iter().cloned().collect(),
                 covers: composed.covers.into_iter().cloned().collect(),
                 expects: composed.expects.into_iter().cloned().collect(),
+                when_of: None,
                 underlying: None,
                 enumerals: Vec::new(),
                 ports: composed

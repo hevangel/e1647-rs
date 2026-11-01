@@ -1854,3 +1854,64 @@ min then max; `others` strictly inside the range; `edges` at one of
 the extremes; `normal` around its center; the corpus shape
 `normal(MAX_UINT/2, MAX_UINT/10)` over an unsized uint; the select on
 either operand side; and an unevaluable choice leaving the field free.
+
+## 2026-11-01 (30) — offline arc: clause 6.6 when-subtype resolution (synthesized views)
+
+Branch `agent/when-elab` (off main after #19 merged). `when` subtypes
+resolve: the parsed blocks become first-class types the interpreter
+instantiates.
+
+- Parser: a when-qualified field type (`f: NO_CONSTRAINT env` — the
+  subtype modifier naming the variant of the base type) previously
+  DROPPED the qualifier (`ty: Named{env}`); it now records
+  `TypeExpr::WhenQualified { value, base }`. The optional `is` before
+  a `when` body (6.6.1) parses too.
+- Elaboration: each single-modifier `when` block synthesizes a subtype
+  view named `VALUE base` (the field-type spelling) — the base's
+  composed members with the when block's fields, constraints,
+  methods, `on` blocks, cover groups and expects appended, `base`
+  pointing at the base type, and a `when_of` marker recording the
+  discriminator (field id, value). Both modifier spellings carry the
+  discriminator: `when BUSY'kind` (value'field) and the corpus's
+  space form `when NO_CONSTRAINT env` (two bare modifiers — value
+  first, field id second, per the igen-dist usage).
+- Interpreter: a when-qualified field instantiates the synthesized
+  view (`default_for`, `sample_type`), so the view's members apply
+  for that instance — when fields exist on it, when constraints gate
+  its `gen` (select distributions included: a `LO pkt` field biased
+  to min and an `HI pkt` to max), when methods resolve through the
+  instance's view, and `is a` checks walk the view's base chain.
+- Honest v1 limits (documented): chained modifiers and nested
+  when-in-when blocks do not compose; base-typed instances do not
+  dynamically match subtypes (the subtype rides the when-qualified
+  field's static type); a gen of a base-typed field does not consult
+  an enclosing instance's when constraints (the CFS scoping of
+  10.2.7).
+- Forward effect recorded in NOTES: igen-dist's select policies sit
+  under `when ... env` blocks — with views synthesized, activating
+  them for runs is now a generation-scoping step, not a
+  representation step.
+
+Corpus state (absolute paths): etl 4, cover-edges 4, golden-imports
+3, golden-combined/igen-dist/type-min-max/save-restart/d6w 0 —
+unchanged; igen-dist and golden-combined runs keep exit 0 with the
+same observable output.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(169 passed: 12 elab, 1 fixtures, 63 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: an elaboration test (the synthesized view's name,
+`when_of`, base, and appended constraint — the base stays unmarked);
+and two interpreter tests — when-qualified fields generating under
+their when-block select constraints (min view vs max view), and a
+when view carrying its method, its extra field and the `is a` walk.

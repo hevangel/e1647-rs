@@ -133,8 +133,18 @@ multi-simulator HDL API, and wasm32.
   diagnostics; codes `E03xx`). Also records `simple_port` HDL paths,
   `on` members (base types first, extends in declaration order),
   recovered `sequence` declarations, and a `type` declaration's
-  underlying representation. **Not** full elaboration: `when`
-  subtypes are carried, not resolved; no type checking.
+  underlying representation. `when` subtypes (6.6) resolve: each
+  single-modifier block (`when BUSY'kind`, or the corpus's space form
+  `when NO_CONSTRAINT env` — two bare modifiers, value first, field id
+  second) synthesizes a subtype view named `VALUE base` with
+  `when_of` set to its discriminator — the base's composed members
+  with the when block's fields, constraints, methods, `on` blocks,
+  cover groups and expects appended. When-qualified field types
+  (`TypeExpr::WhenQualified`, `f: LO pkt`) instantiate the view, so
+  those members apply for the instance and `is a` walks the view's
+  base chain. **Not** full elaboration: chained modifiers and nested
+  when-in-when blocks do not compose; base-typed instances do not
+  dynamically match subtypes; no type checking.
 - `src/builtins.rs` — predeclared names the executed subset relies on:
   the `sys` unit, sequence bases (`any_sequence_item` and siblings), and
   routines such as `out`, `outf`, `message`, `pack`, `append`,
@@ -216,7 +226,10 @@ multi-simulator HDL API, and wasm32.
   `run` print diagnostics to stderr
   (`path:line:col: error[code]: message`) and their results on success.
 
-Deliberately not implemented yet: `when`-subtype resolution, non-linear,
+Deliberately not implemented yet: chained `when` modifiers, nested
+when-in-when blocks, and dynamic subtype matching for base-typed
+instances (when views resolve through when-qualified field types),
+non-linear,
 disjunctive or temporal constraint solving (the solver backend covers
 conjunctive linear constraints and constant ranges over bounded
 integers), `@`-triggered TCM invocation, `@sim` sampling and
