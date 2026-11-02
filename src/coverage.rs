@@ -22,6 +22,7 @@
 
 use crate::ast::{CoverGroupDecl, CoverItemDecl, CoverItemKind, Expr, ScalarBase, TypeExpr};
 use crate::lexer::{Token, TokenKind};
+use std::collections::BTreeMap;
 
 /// One bucket of an item: an inclusive integer range with a hit goal
 /// (1 unless a `range(...)` clause says otherwise) and the hits so far.
@@ -64,6 +65,51 @@ impl CoverItemData {
     }
 }
 
+/// A derived coverage item (14.3/14.4): a cross over the group's items
+/// or a transition over one item's consecutive samples. Each sampling
+/// event records one combination — the crossed items' bucket labels,
+/// or the base item's previous→current labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverDerivedData {
+    /// The 14.3/14.4 default names: `cross_a__b` and
+    /// `transition__base`.
+    pub name: String,
+    /// The crossed item names, or the single base item for a
+    /// transition.
+    pub sources: Vec<String>,
+    pub samples: u64,
+    /// Each observed combination (rendered, e.g. `low→high` or
+    /// `(low, high)`) with its hits.
+    pub combos: Vec<(String, u64)>,
+    /// The total combination count when gradeable: the cross product
+    /// of the sources' bucket counts (transitions: n², every ordered
+    /// pair of the base's buckets — Table 44 is an image in the local
+    /// copy, so this v1 reading follows the bucket model). `None` when
+    /// any source is unbucketed.
+    pub total_combos: Option<u64>,
+}
+
+impl CoverDerivedData {
+    /// The derived item's grade: the fraction of combinations observed
+    /// at least once; `None` when not gradeable.
+    pub fn grade(&self) -> Option<f64> {
+        let total = self.total_combos?;
+        if total == 0 {
+            return None;
+        }
+        Some(self.combos.len() as f64 / total as f64)
+    }
+
+    fn record(&mut self, combo: &str) {
+        self.samples += 1;
+        if let Some(entry) = self.combos.iter_mut().find(|(seen, _)| seen == combo) {
+            entry.1 += 1;
+        } else {
+            self.combos.push((combo.to_owned(), 1));
+        }
+    }
+}
+
 /// One coverage group's collected data (a type's base group merged with
 /// its `is also` extensions).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,35 +118,58 @@ pub struct CoverGroupData {
     /// The sampling event as a dotted path, when it resolves to one.
     pub event_path: Option<String>,
     pub items: Vec<CoverItemData>,
+    /// Derived items (crosses and transitions, 14.3/14.4).
+    pub derived: Vec<CoverDerivedData>,
     pub samples: u64,
+    /// Each item's containing-bucket label (or raw value) at the last
+    /// sampling event — the transition source (14.4's previous-value).
+    last_values: BTreeMap<String, String>,
 }
 
 impl CoverGroupData {
     /// The group's grade: the plain average of the gradeable items'
-    /// grades; `None` when no item is gradeable. (Weighted and
-    /// per-instance grades are 14.2.1/28.9, not modeled.)
+    /// (basic and derived) grades; `None` when none is gradeable.
+    /// (Weighted and per-instance grades are 14.2.1/28.9, not modeled.)
     pub fn grade(&self) -> Option<f64> {
-        let grades: Vec<f64> = self.items.iter().filter_map(|item| item.grade()).collect();
+        let mut grades: Vec<f64> = self.items.iter().filter_map(|item| item.grade()).collect();
+        grades.extend(self.derived.iter().filter_map(|item| item.grade()));
         if grades.is_empty() {
             return None;
         }
         Some(grades.iter().sum::<f64>() / grades.len() as f64)
     }
 
-    /// Record one sampled value for the named item. The group's own
-    /// sample count is kept by the caller — once per sampling event,
-    /// not once per item.
+    /// Record one sampled value for the named item, then update the
+    /// transition/cross derived items (14.4: the transition derives
+    /// `previous-value, value` pairs from the base item's consecutive
+    /// samples; 14.3: the cross records every combination of the
+    /// crossed items' values). The group's sample count is kept by the
+    /// caller — once per sampling event, not once per item.
     pub fn sample(&mut self, item_name: &str, value: &crate::interp::Value) {
+        let item = self.items.iter().find(|item| item.name == item_name);
+        let as_int = value_to_int(value);
+        // The bucket label this value lands in (14.2's bucket model),
+        // or the raw value when the item is unbucketed.
+        let label = item.and_then(|item| item_label(item, as_int));
+        let label = label.unwrap_or_else(|| render_value(value));
+        // The transition over this item: previous → current (14.4).
+        let previous = self.last_values.get(item_name).cloned();
+        if let (Some(derived), Some(previous)) = (
+            self.derived
+                .iter_mut()
+                .find(|derived| derived.sources == vec![item_name]),
+            previous,
+        ) {
+            derived.record(&format!("{previous}→{label}"));
+        }
+        self.last_values.insert(item_name.to_owned(), label.clone());
+        // The crosses over combinations including this item record
+        // after all items have their fresh labels, from record_round's
+        // final pass — nothing to do here.
         let Some(item) = self.items.iter_mut().find(|item| item.name == item_name) else {
             return;
         };
         item.samples += 1;
-        let as_int = match value {
-            crate::interp::Value::Int(value) => Some(*value),
-            crate::interp::Value::Bool(true) => Some(1),
-            crate::interp::Value::Bool(false) => Some(0),
-            _ => None,
-        };
         let Some(as_int) = as_int else {
             // Enumerands, strings, reals and lists are recorded but not
             // graded in this milestone.
@@ -121,6 +190,61 @@ impl CoverGroupData {
             // Outside every bucket: ungradeable (14.2).
             item.ungradeable_hits += 1;
         }
+    }
+
+    /// The cross pass of one sampling event (14.3): record each cross
+    /// item's combination from its sources' current labels.
+    pub fn record_crosses(&mut self) {
+        let crosses: Vec<(String, Vec<String>)> = self
+            .derived
+            .iter()
+            .filter(|derived| derived.sources.len() > 1)
+            .map(|derived| (derived.name.clone(), derived.sources.clone()))
+            .collect();
+        for (name, sources) in crosses {
+            let labels: Option<Vec<String>> = sources
+                .iter()
+                .map(|source| self.last_values.get(source).cloned())
+                .collect();
+            let Some(labels) = labels else { continue };
+            let combo = format!("({})", labels.join(", "));
+            if let Some(derived) = self.derived.iter_mut().find(|derived| derived.name == name) {
+                derived.record(&combo);
+            }
+        }
+    }
+}
+
+fn value_to_int(value: &crate::interp::Value) -> Option<i128> {
+    match value {
+        crate::interp::Value::Int(value) => Some(*value),
+        crate::interp::Value::Bool(true) => Some(1),
+        crate::interp::Value::Bool(false) => Some(0),
+        _ => None,
+    }
+}
+
+/// The label of the bucket containing the value (14.2), or `None` when
+/// the item has no buckets or the value misses them all.
+fn item_label(item: &CoverItemData, as_int: Option<i128>) -> Option<String> {
+    let as_int = as_int?;
+    let bucket = item
+        .buckets
+        .iter()
+        .find(|bucket| as_int >= bucket.lo && as_int <= bucket.hi)?;
+    if bucket.label.is_empty() {
+        Some(format!("{as_int}"))
+    } else {
+        Some(bucket.label.clone())
+    }
+}
+
+fn render_value(value: &crate::interp::Value) -> String {
+    match value {
+        crate::interp::Value::Int(value) => format!("{value}"),
+        crate::interp::Value::Bool(value) => format!("{value}"),
+        crate::interp::Value::Enum { name, .. } => name.clone(),
+        _ => "?".to_owned(),
     }
 }
 
@@ -158,11 +282,15 @@ pub fn build(elaborated: &crate::elab::Elaborated) -> Vec<TypeCoverage> {
             if decl.is_also {
                 continue;
             }
+            let items: Vec<CoverItemData> = decl.items.iter().filter_map(build_item).collect();
+            let derived = build_derived(decl, &items);
             groups.push(CoverGroupData {
                 name: decl.name.clone(),
                 event_path: group_event_path(decl),
-                items: decl.items.iter().filter_map(build_item).collect(),
+                items,
+                derived,
                 samples: 0,
+                last_values: BTreeMap::new(),
             });
         }
         // Pass 2: merge every extension's items into its base by name
@@ -171,15 +299,12 @@ pub fn build(elaborated: &crate::elab::Elaborated) -> Vec<TypeCoverage> {
             if !decl.is_also && !decl.empty {
                 continue;
             }
-            let items: Vec<CoverItemData> = decl.items.iter().filter_map(build_item).collect();
-            if items.is_empty() {
-                continue;
-            }
             if let Some(base) = groups
                 .iter_mut()
                 .find(|group| group.name == decl.name && group.event_path == group_event_path(decl))
             {
-                base.items.extend(items);
+                base.items.extend(decl.items.iter().filter_map(build_item));
+                base.derived.extend(build_derived(decl, &base.items));
             }
         }
         result.push(TypeCoverage {
@@ -188,6 +313,62 @@ pub fn build(elaborated: &crate::elab::Elaborated) -> Vec<TypeCoverage> {
         });
     }
     result
+}
+
+/// Synthesize a group's derived items (14.3/14.4) from its recorded
+/// cross/transition entries, with totals over the basic items' buckets.
+fn build_derived(decl: &CoverGroupDecl, items: &[CoverItemData]) -> Vec<CoverDerivedData> {
+    let mut derived = Vec::new();
+    for entry in &decl.items {
+        match entry.kind {
+            CoverItemKind::Transition => {
+                let Some((base, _)) = entry.names.first() else {
+                    continue;
+                };
+                let total = items
+                    .iter()
+                    .find(|item| &item.name == base)
+                    .filter(|item| !item.buckets.is_empty())
+                    .map(|item| (item.buckets.len() * item.buckets.len()) as u64);
+                derived.push(CoverDerivedData {
+                    name: format!("transition__{base}"),
+                    sources: vec![base.clone()],
+                    samples: 0,
+                    combos: Vec::new(),
+                    total_combos: total,
+                });
+            }
+            CoverItemKind::Cross => {
+                let sources: Vec<String> =
+                    entry.names.iter().map(|(name, _)| name.clone()).collect();
+                if sources.is_empty() {
+                    continue;
+                }
+                let bucket_counts: Option<Vec<&CoverItemData>> = sources
+                    .iter()
+                    .map(|source| items.iter().find(|item| item.name == *source))
+                    .collect();
+                let total = bucket_counts.and_then(|items| {
+                    items.iter().try_fold(1u64, |product, item| {
+                        if item.buckets.is_empty() {
+                            None
+                        } else {
+                            Some(product * item.buckets.len() as u64)
+                        }
+                    })
+                });
+                derived.push(CoverDerivedData {
+                    name: format!("cross_{}", sources.join("__")),
+                    sources,
+                    samples: 0,
+                    combos: Vec::new(),
+                    total_combos: total,
+                });
+            }
+            CoverItemKind::Item => {}
+        }
+    }
+    derived
 }
 
 /// The group's sampling event as a dotted path (`cover_trans`,

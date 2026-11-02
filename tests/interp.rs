@@ -1063,3 +1063,71 @@ fn enclosing_when_constraints_gate_gen_of_the_field() {
     assert!(output.contains("V=0"), "output: {output}");
     assert!(output.contains("V=255"), "output: {output}");
 }
+
+#[test]
+fn transition_items_collect_value_pairs_from_the_base() {
+    // 14.4: the transition derives previous-value/value samples from
+    // the base item's consecutive samples; gradeable over the base's
+    // bucket pairs.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
+         item cur: uint using ranges = {\n            range([0..1], \"low\");\n            \
+         range([2..3], \"high\");\n        };\n        transition cur;\n    };\n    \
+         run() is also {\n            cur = 0; emit cov_e;\n            cur = 3; emit cov_e;\n            \
+         cur = 0; emit cov_e;\n        };\n};\n",
+        1,
+    );
+    let group = &result.coverage[0].groups[0];
+    assert_eq!(group.derived.len(), 1);
+    let transition = &group.derived[0];
+    assert_eq!(transition.name, "transition__cur");
+    // n=3 base samples → n-1=2 transition samples (14.4).
+    assert_eq!(transition.samples, 2);
+    // low→high and high→low observed of the 4 ordered bucket pairs.
+    assert_eq!(transition.combos.len(), 2);
+    assert_eq!(transition.total_combos, Some(4));
+    assert_eq!(transition.grade(), Some(0.5));
+    assert_eq!(group.grade(), Some((1.0 + 0.5) / 2.0));
+}
+
+#[test]
+fn cross_items_collect_combinations_of_their_sources() {
+    // 14.3: the cross shows every combination of the crossed items'
+    // values; gradeable over the cross product of the bucket counts.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    a: uint;\n    b: bool;\n    cover cov_e is {\n        \
+         item a: uint using ranges = {\n            range([0..1], \"low\");\n            \
+         range([2..3], \"high\");\n        };\n        item b: bool;\n        cross a, b;\n    };\n    \
+         run() is also {\n            a = 0; b = TRUE; emit cov_e;\n            a = 3; b = FALSE; emit cov_e;\n        };\n};\n",
+        1,
+    );
+    let group = &result.coverage[0].groups[0];
+    assert_eq!(group.derived.len(), 1);
+    let cross = &group.derived[0];
+    assert_eq!(cross.name, "cross_a__b");
+    assert_eq!(cross.sources, vec!["a".to_owned(), "b".to_owned()]);
+    assert_eq!(cross.samples, 2);
+    assert_eq!(cross.combos.len(), 2);
+    // 2 buckets × 2 buckets = 4 combinations; 2 observed.
+    assert_eq!(cross.total_combos, Some(4));
+    assert_eq!(cross.grade(), Some(0.5));
+}
+
+#[test]
+fn transitions_over_unbucketed_items_count_without_grading() {
+    // An unbucketed base (no ranges) records pairs but yields no
+    // grade — the honest v1 reading.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    tag: string;\n    cover cov_e is {\n        \
+         item tag;\n        transition tag;\n    };\n    run() is also {\n            \
+         tag = \"a\"; emit cov_e;\n            tag = \"b\"; emit cov_e;\n        };\n};\n",
+        1,
+    );
+    let group = &result.coverage[0].groups[0];
+    let transition = &group.derived[0];
+    assert_eq!(transition.samples, 1);
+    assert_eq!(transition.combos.len(), 1);
+    assert_eq!(transition.total_combos, None);
+    assert_eq!(transition.grade(), None);
+    assert_eq!(group.grade(), None);
+}

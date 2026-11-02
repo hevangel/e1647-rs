@@ -83,7 +83,12 @@ multi-simulator HDL API, and wasm32.
   checks substitute/verify in a later milestone.
   Clause 14 coverage groups (`cover <event> is [also] { .. };`, `is
   empty;`) record their item/cross/transition entries structurally and
-  every option clause verbatim.
+  every option clause verbatim; the derived entries synthesize
+  `CoverDerivedData` — `transition__item` collects the base item's
+  previous→current bucket-label pairs (14.4: n samples → n-1
+  transitions) and `cross_a__b` records every combination of the
+  crossed items' labels (14.3), each graded over its sources' bucket
+  cross-product when all sources have buckets.
   Clause 11.4 `expect`/`assume` members parse their temporal
   expressions into the clause 12 grammar (`TemporalExpr`: event atoms,
   `cycle`, propositions and edge samples, `{;}` sequences, `=>` yield,
@@ -252,8 +257,8 @@ integers), `@`-triggered TCM invocation, `@sim` sampling and
 per-instance timelines, and suspension re-entry beyond `while` chains
 (waits inside `if`/`case`/`for` bodies, inline calls, `compute` and
 `on` blocks spin inline instead of interleaving), the remaining
-clause 14 coverage model (basic items collect into buckets and grade;
-`cross`/`transition` items, per-instance coverage, the option tables
+clause 14 coverage model (basic and derived items collect and grade;
+per-instance coverage, the option tables
 and the 28.9 configuration are recorded, not applied), integer width
 truncation, evaluation of MVL literals, `repeat`, single-statement
 `if ... do`, `detach`/`delay`/`exec` TEs, select

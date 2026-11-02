@@ -77,8 +77,14 @@
       buckets, applies the 14.2 defaults (16 integer buckets, two
       boolean buckets), samples item values when the group's event
       fires, and grades covered-buckets-per-item (`run --coverage`
-      prints the report); `cross`/`transition` items and per-instance
-      coverage are recorded, not collected.
+      prints the report). Derived items collect too: `transition item`
+      derives previous→current pairs from the base item's consecutive
+      samples (14.4, n samples → n-1 transitions, graded over the
+      base's ordered bucket pairs) and `cross a, b` records every
+      combination of the crossed items' bucket labels (14.3, graded
+      over the cross product); unbucketed sources count without
+      grading. Per-instance coverage and the option tables remain
+      recorded, not collected.
       Predefined non-scalar types `file` and `event` are accepted in
       type positions; `for each <type> (v) in list` records the element
       type filter. `expect`/`assume` members (clause 11.4) parse their
@@ -118,8 +124,8 @@
       and checks the merged declarations (not yet: `repeat`, single-statement `if ... do`, template `extend` (clause 8.2) and body-level instance substitution, macro
       match-expression interpretation and expansion
       (clause 15.4–15.5), the remaining clause 14 coverage model —
-      cross/transition items, per-instance coverage and the option
-      tables are recorded, not collected — the clause 12/13 temporal
+      per-instance coverage and the option tables are recorded, not
+      collected — the clause 12/13 temporal
       engine's remaining simulation integration — the scheduler runs
       started TCMs concurrently and waits/sync suspend, but
       `@`-triggered TCM invocation, `@sim` sampling, and suspension
@@ -232,8 +238,10 @@
 - [~] Coverage data model and reports — started: `src/coverage.rs`
       builds buckets and grades from the recorded groups (14.2's
       ranges/defaults, 14.5 merging), the interpreter samples on the
-      group's event, and `run --coverage` reports; cross/transition,
-      per-instance and the option tables are not collected
+      group's event, derived items collect (14.4 transitions as
+      previous→current pairs, 14.3 crosses over the sources' bucket
+      labels), and `run --coverage` reports; per-instance and the
+      option tables are not collected
 - [ ] Coverage reports per instance and coverage configuration (28.9)
 
 ## M4 — Simulator integration
