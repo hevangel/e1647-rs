@@ -376,22 +376,49 @@ fn parse_range_entry(tokens: &[Token], cursor: &mut usize) -> Option<CoverBucket
         return None;
     }
     *cursor += 1;
-    let lo = token_int(tokens.get(*cursor)?)?;
-    *cursor += 1;
-    if !token_kind_is(tokens.get(*cursor)?, "..") {
-        return None;
-    }
-    *cursor += 1;
-    let hi = token_int(tokens.get(*cursor)?)?;
-    *cursor += 1;
+    // The bounds are constant integer expressions over the recorded
+    // tokens (`0`, `0x21`, `MAX_UINT-9` — the corpus usage), evaluated
+    // with the sampler's choice-expression evaluator.
+    let mut lo_tokens = Vec::new();
+    let ranged = loop {
+        let token = tokens.get(*cursor)?;
+        if token_kind_is(token, "..") {
+            *cursor += 1;
+            break true;
+        }
+        if token_kind_is(token, "]") {
+            break false;
+        }
+        lo_tokens.push(token.clone());
+        *cursor += 1;
+    };
+    let lo = crate::interp::eval_choice_int(&lo_tokens)?;
+    let hi = if ranged {
+        let mut hi_tokens = Vec::new();
+        loop {
+            let token = tokens.get(*cursor)?;
+            if token_kind_is(token, "]") {
+                break;
+            }
+            hi_tokens.push(token.clone());
+            *cursor += 1;
+        }
+        crate::interp::eval_choice_int(&hi_tokens)?
+    } else {
+        // `range([v], ..)` — a single-value bucket has lo == hi.
+        lo
+    };
+    // The bounds loops stop at the closing bracket without consuming it.
     if !token_kind_is(tokens.get(*cursor)?, "]") {
         return None;
     }
     *cursor += 1;
     let mut label = String::new();
     let mut goal = 1u64;
-    // Optional `, "label"` and further numeric parameters (recorded but
-    // not applied — Table 41 is an image in the local copy).
+    // Optional `, "label"` and further parameters — the first positive
+    // numeric value is the bucket's goal; `UNDEF` marks a parameter the
+    // writer left unset (both per the corpus usage; the full option
+    // semantics live in Table 41, an image in the local copy).
     while token_kind_is(tokens.get(*cursor)?, ",") {
         *cursor += 1;
         let token = tokens.get(*cursor)?;
@@ -400,19 +427,28 @@ fn parse_range_entry(tokens: &[Token], cursor: &mut usize) -> Option<CoverBucket
                 label = text.clone();
                 *cursor += 1;
             }
-            TokenKind::Number(text) => {
-                // The first positive numeric parameter is taken as the
-                // bucket's goal; further parameters are recorded and
-                // skipped (Table 41 is an image in the local copy).
-                if let Some(value) = crate::interp::parse_int_literal(text)
+            _ => {
+                // A constant expression parameter (`10`, `MAX_UINT/20`,
+                // `UNDEF`): evaluated with the choice-expression
+                // evaluator, the first positive value taken as the
+                // bucket's goal; `UNDEF` evaluates to nothing and is
+                // skipped, as are unknown expressions (Table 41 is an
+                // image in the local copy).
+                let mut expr_tokens = Vec::new();
+                while let Some(token) = tokens.get(*cursor) {
+                    if token_kind_is(token, ",") || token_kind_is(token, ")") {
+                        break;
+                    }
+                    expr_tokens.push(token.clone());
+                    *cursor += 1;
+                }
+                if let Some(value) = crate::interp::eval_choice_int(&expr_tokens)
                     && goal == 1
                     && value > 0
                 {
                     goal = value as u64;
                 }
-                *cursor += 1;
             }
-            _ => return None,
         }
     }
     if !token_kind_is(tokens.get(*cursor)?, ")") {
@@ -437,11 +473,4 @@ fn token_word(token: &Token) -> Option<&str> {
 
 fn token_kind_is(token: &Token, symbol: &str) -> bool {
     matches!(&token.kind, TokenKind::Punctuation(p) if p == symbol)
-}
-
-fn token_int(token: &Token) -> Option<i128> {
-    match &token.kind {
-        TokenKind::Number(text) => crate::interp::parse_int_literal(text),
-        _ => None,
-    }
 }

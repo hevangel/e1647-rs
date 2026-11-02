@@ -1041,3 +1041,25 @@ fn template_typed_fields_instantiate_their_monomorphized_view() {
     assert!(output.contains("IS THE BOX"), "output: {output}");
     assert!(output.contains("IS A BASE"), "output: {output}");
 }
+
+#[test]
+fn enclosing_when_constraints_gate_gen_of_the_field() {
+    // 10.2.7's connected field sets, v1: `gen p` inside a when-view
+    // instance is gated by the when block's constraints, rebased from
+    // `p.v` to `v` — two sibling instances with different policies
+    // produce opposite extremes, like igen-dist's env policies.
+    let output = clean_output(
+        "type pol_t : [LO, HI];\n\
+         struct pkt {\n    v: uint (bits: 8);\n};\n\
+         unit env {\n    !p: pkt;\n    fill() is {\n        gen p;\n        \
+         if p.v == 0 {\n            out(\"V=0\");\n        };\n        \
+         if p.v == 255 {\n            out(\"V=255\");\n        };\n    };\n    when LO env is {\n            \
+         keep soft p.v == select { 1000 : min; };\n        };\n    when HI env is {\n            \
+         keep soft p.v == select { 1000 : max; };\n        };\n};\n\
+         extend sys {\n    lo_env: LO env is instance;\n    hi_env: HI env is instance;\n    \
+         run() is also {\n            lo_env.fill();\n            hi_env.fill();\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("V=0"), "output: {output}");
+    assert!(output.contains("V=255"), "output: {output}");
+}

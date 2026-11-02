@@ -218,6 +218,12 @@ multi-simulator HDL API, and wasm32.
   sampling. `emit` also samples the cover groups (clause 14) of the
   instance whose event fired, recording item values into the
   `src/coverage.rs` buckets; `run --coverage` prints the report.
+  `gen <obj>` gates the object with the enclosing instance's
+  constraints that reference it (10.2.7's connected field sets, v1):
+  depth-two paths rebase (`p.v == select { .. }` → `v == select
+  { .. }`) so when-view distribution policies drive generation;
+  constraints that do not rebase (other roots, deeper paths,
+  whole-object equalities) drop until full CFS scoping lands.
 - `src/solve.rs` — constraint IR and the pluggable solver seam: the
   top-level `keep` constraints of one type translate (conservatively) into
   bounded-integer variables plus a conjunction of linear comparisons;

@@ -1977,3 +1977,60 @@ view, and single-instance identity; and `map of (int)` filling
 distinct view. One interpreter test — a `box of (int (bits: 8))`
 field generating under the view, its method dispatching (payload
 doubled), and `is a` accepting the canonical name and the base.
+
+## 2026-11-01 (32) — offline arc: clause 10.2.7 CFS-scoped generation; coverage ranges over expressions
+
+Branch `agent/cfs-gen` (off main after #21 merged). Generation gains
+its enclosing scope, and the coverage range parser reaches the corpus
+shapes.
+
+- CFS scoping (10.2.7, v1): `gen <obj>` inside a method now gates the
+  object with the enclosing instance's constraints that reference it.
+  Depth-two paths rebase — `p.v == select { .. }` becomes
+  `v == select { .. }` — so the drawn select value narrows the
+  generated object's field (the constraint list joins the domains and
+  the rejection predicate). Constraints that do not rebase entirely
+  (other roots, deeper paths, whole-object equalities) drop rather
+  than fail evaluation against the generated frame; full CFS scoping
+  is a later milestone. The marquee: two sibling when-view instances
+  with opposite distribution policies produce opposite extremes
+  (`LO env` → v=0, `HI env` → v=255) from the same `gen p` statement —
+  the mini-igen-dist shape.
+- Coverage range buckets over expressions (per the igen-dist usage):
+  bounds are constant integer expressions (`MAX_UINT-9`,
+  `MAX_UINT/20`, `0x21`) evaluated with the sampler's
+  choice-expression evaluator; `range([v], ..)` single-value buckets
+  have lo == hi; non-string parameters (`10`, `UNDEF`) evaluate with
+  the first positive value as the goal, `UNDEF` skipping. With this,
+  igen-dist's five address buckets parse fully (`0/5 buckets` in its
+  `--coverage` report, note gone). Its samples stay at zero in the
+  recorded run because the corpus starts its TCMs from `env.run()`,
+  which the interpreter does not auto-invoke — the policies engage
+  through the same shape as the new test.
+
+Corpus state (absolute paths): etl 4, cover-edges 4, golden-imports
+3, golden-combined/igen-dist/type-min-max/save-restart/d6w 0 —
+unchanged; igen-dist runs exit 0.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(173 passed: 14 elab, 1 fixtures, 65 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New test: one interpreter test — the two-policy env marquee (a
+when-view's `keep soft p.v == select { 1000 : min; }` biases `gen p`
+to 0 while its sibling's max policy biases to 255, exercising the
+rebase, the domain narrowing and the select draw together). Two
+debugging notes for the record: the coverage range rewrite first lost
+the closing-bracket advance (caught by the explicit-buckets test),
+and the args loop initially accepted only single numeric tokens
+(igen-dist's `MAX_UINT/20` parameter forced the expression evaluator
+into the loop).
