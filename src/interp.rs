@@ -2289,6 +2289,9 @@ impl<'a> Interp<'a> {
                     self.coverage[entry_index].groups[group_index].sample(&name, &value);
                 }
             }
+            // The cross items record after all of their sources have
+            // this round's labels (14.3).
+            self.coverage[entry_index].groups[group_index].record_crosses();
         }
     }
 

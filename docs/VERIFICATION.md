@@ -2034,3 +2034,59 @@ the closing-bracket advance (caught by the explicit-buckets test),
 and the args loop initially accepted only single numeric tokens
 (igen-dist's `MAX_UINT/20` parameter forced the expression evaluator
 into the loop).
+
+## 2026-11-01 (33) — offline arc: clause 14.3/14.4 derived coverage items (cross, transition)
+
+Branch `agent/cover-cross-transition` (off main after #22 merged).
+The recorded cross/transition entries now collect.
+
+- Derived-item model in `src/coverage.rs`: each group carries
+  `CoverDerivedData` entries synthesized from its recorded cross and
+  transition declarations, under the prose's default names —
+  `transition__item` (14.4) and `cross_a__b` (14.3, double
+  underscores).
+- Transition (14.4): "if item-name had n samples during the test,
+  then the transition item has n-1 samples, where each sample has the
+  format previous-value, value" — each sampling event records the
+  base item's previous→current bucket-label pair (`low→high`); a
+  ranged base grades over its n² ordered bucket pairs, an unbucketed
+  base counts pairs without a grade.
+- Cross (14.3): "shows every combination of values of the first and
+  second items" — each sampling event records the tuple of the
+  crossed items' current bucket labels (`(low, TRUE)`), graded over
+  the cross product of the sources' bucket counts; any unbucketed
+  source leaves it ungraded.
+- Both join the group's grade average, appear in the `--coverage`
+  report with their combinations and hits, and the golden's shapes
+  (`transition fsm;`, `cross opcode, carry;`) render as derived items.
+- Honest v1 limits: per-instance coverage (14.2.1) and the option
+  tables remain recorded, not collected; the transition's n² total is
+  the v1 bucket-pair reading (Table 44 is an image in the local
+  copy); nested crosses (crossing a cross) flatten to their written
+  source names.
+
+Corpus state (absolute paths): etl 4, cover-edges 4, golden-imports
+3, golden-combined/igen-dist/type-min-max/save-restart/d6w 0 —
+unchanged; golden-combined's `--coverage` renders
+`cross_opcode__carry` and `transition__fsm` with honest no-grade
+zeros (its sampling events never fire in the recorded run).
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(176 passed: 14 elab, 1 fixtures, 68 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: three interpreter tests — a transition over a ranged item
+(3 base samples → 2 pairs, `low→high`/`high→low` of 4 ordered pairs,
+group grade = average of the item's 100% and the transition's 50%); a
+cross over a ranged item and a boolean (2 of the 4 combinations
+observed); and a transition over an unbucketed string item counting
+one pair without a grade.

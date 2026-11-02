@@ -467,6 +467,22 @@ fn print_coverage(coverage: &[e1647::coverage::TypeCoverage]) {
                     );
                 }
             }
+            // Derived items (14.3/14.4): crosses and transitions.
+            for derived in &group.derived {
+                let grade = match derived.grade() {
+                    Some(grade) => format!("{:.0}%", grade * 100.0),
+                    None => "no grade".to_owned(),
+                };
+                println!(
+                    "    derived {}: {} samples, {} combinations, grade {grade}",
+                    derived.name,
+                    derived.samples,
+                    derived.combos.len()
+                );
+                for (combo, hits) in &derived.combos {
+                    println!("      {combo}: {hits} hits");
+                }
+            }
         }
         printed = true;
     }
