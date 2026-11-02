@@ -359,7 +359,7 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
     // (respecting `keep` constraints and skipping `!` fields); mirror
     // that so corpus testbenches see generated lists/scalars. Both this
     // and the sequence start happen even when no explicit run() exists.
-    if let Err(diagnostic) = interp.gen_object(sys_index) {
+    if let Err(diagnostic) = interp.gen_object(sys_index, &[]) {
         interp
             .output
             .push_str(&format!("implicit gen: {}\n", diagnostic.render()));
@@ -1311,9 +1311,25 @@ impl<'a> Interp<'a> {
         let Some(current) = current else {
             return Err(self.error("E0401", format!("unknown variable '{name}' in gen"), span));
         };
-        // A struct instance is randomized in place, recursively.
+        // A struct instance is randomized in place, recursively — under
+        // the enclosing instance's constraints that reference it
+        // (10.2.7's connected field sets, v1: depth-2 paths).
         if let Value::Object(index) = current {
-            self.gen_object(index)?;
+            let obj_type_name = self.instances[me_index].type_name.clone();
+            let types: &[crate::elab::ElaboratedType] = self.types;
+            let enclosing: Vec<Expr> = types
+                .iter()
+                .find(|t| t.name == obj_type_name)
+                .map(|t| {
+                    t.constraints
+                        .iter()
+                        .filter(|c| !c.is_bind)
+                        .map(|c| c.expr.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let rebased = rebase_constraints(&enclosing, name);
+            self.gen_object(index, &rebased)?;
             return Ok(Flow::Normal);
         }
         // Scalar, list or enumeral target: sample candidates and accept one
@@ -1519,7 +1535,7 @@ impl<'a> Interp<'a> {
         None
     }
 
-    fn gen_object(&mut self, index: usize) -> Result<(), Diagnostic> {
+    fn gen_object(&mut self, index: usize, enclosing: &[Expr]) -> Result<(), Diagnostic> {
         let type_name = self.instances[index].type_name.clone();
         let types: &[crate::elab::ElaboratedType] = self.types;
         let Some(ty) = types.iter().find(|t| t.name == type_name) else {
@@ -1538,12 +1554,13 @@ impl<'a> Interp<'a> {
             .filter(|field| !field.no_gen && !self.is_unit_typed(&field.ty))
             .map(|field| (field.name.clone(), field.ty.clone()))
             .collect();
-        let constraints: Vec<Expr> = ty
+        let mut constraints: Vec<Expr> = ty
             .constraints
             .iter()
             .filter(|constraint| !constraint.is_bind)
             .map(|constraint| constraint.expr.clone())
             .collect();
+        constraints.extend(enclosing.iter().cloned());
         // Simple range/equality constraints narrow the per-field sampling
         // domains; everything else is enforced by the rejection predicate.
         let domains = self.constraint_domains(&constraints, &field_types);
@@ -1589,7 +1606,7 @@ impl<'a> Interp<'a> {
                         let element = self.sample_type(&element_ty)?;
                         *slot = element;
                         if let Value::Object(element_index) = *slot {
-                            self.gen_object(element_index)?;
+                            self.gen_object(element_index, &[])?;
                         }
                     }
                     self.instances[index].set(name, Value::List(filled));
@@ -1904,7 +1921,7 @@ impl<'a> Interp<'a> {
                 }
                 self.depth += 1;
                 let index = self.instantiate(name);
-                let result = self.gen_object(index);
+                let result = self.gen_object(index, &[]);
                 self.depth -= 1;
                 result?;
                 Ok(Value::Object(index))
@@ -1924,7 +1941,7 @@ impl<'a> Interp<'a> {
                 }
                 self.depth += 1;
                 let index = self.instantiate(&when_view_name(value, base_name));
-                let result = self.gen_object(index);
+                let result = self.gen_object(index, &[]);
                 self.depth -= 1;
                 result?;
                 Ok(Value::Object(index))
@@ -1950,7 +1967,7 @@ impl<'a> Interp<'a> {
                 }
                 self.depth += 1;
                 let index = self.instantiate(&instance);
-                let result = self.gen_object(index);
+                let result = self.gen_object(index, &[]);
                 self.depth -= 1;
                 result?;
                 Ok(Value::Object(index))
@@ -3589,6 +3606,72 @@ fn when_view_name(value: &str, base_name: &str) -> String {
     format!("{value} {base_name}")
 }
 
+/// Rebase an enclosing instance's constraints onto a generated
+/// object's own field names (10.2.7's connected field sets, v1):
+/// `p.v == select { .. }` gating `gen p` becomes `v == select { .. }`.
+/// A constraint rebases only when every path it references is rooted
+/// at the generated object (depth two — `prefix.field`); anything else
+/// (other roots, deeper paths, whole-object equalities) drops, because
+/// it cannot evaluate against the generated instance's frame. Full
+/// CFS scoping is a later milestone.
+fn rebase_constraints(constraints: &[Expr], prefix: &str) -> Vec<Expr> {
+    constraints
+        .iter()
+        .filter_map(|constraint| rebase_expr(constraint, prefix))
+        .collect()
+}
+
+fn rebase_expr(expr: &Expr, prefix: &str) -> Option<Expr> {
+    match expr {
+        Expr::Binary { op, lhs, rhs, span } => Some(Expr::Binary {
+            op: *op,
+            lhs: Box::new(rebase_expr(lhs, prefix)?),
+            rhs: Box::new(rebase_expr(rhs, prefix)?),
+            span: *span,
+        }),
+        Expr::Unary { op, expr, span } => Some(Expr::Unary {
+            op: *op,
+            expr: Box::new(rebase_expr(expr, prefix)?),
+            span: *span,
+        }),
+        Expr::Paren { expr, span } => Some(Expr::Paren {
+            expr: Box::new(rebase_expr(expr, prefix)?),
+            span: *span,
+        }),
+        // `prefix.field` — depth two: the rebase target.
+        Expr::MemberAccess {
+            object,
+            name,
+            name_span,
+            span,
+        } => {
+            let Expr::Ident { name: root, .. } = object.as_ref() else {
+                return None;
+            };
+            if root == prefix {
+                let _ = name_span;
+                Some(Expr::Ident {
+                    name: name.clone(),
+                    span: *span,
+                })
+            } else {
+                None
+            }
+        }
+        // The select's weights are constants; the choice tokens stay as
+        // written (the sampler evaluates them against the generated
+        // object's frame).
+        Expr::Select { arms, span } => Some(Expr::Select {
+            arms: arms.clone(),
+            span: *span,
+        }),
+        // A bare identifier is either the whole generated object (an
+        // object equality — needs full CFS) or an unrelated name; both
+        // drop.
+        _ => None,
+    }
+}
+
 /// The natural bounds of an integer scalar type (from `sample_int_in`'s
 /// width table); `None` for non-integer scalars and compound types.
 fn natural_range(ty: &TypeExpr) -> Option<(i128, i128)> {
@@ -3696,7 +3779,10 @@ fn select_choice(tokens: &[Token]) -> Option<(&'static str, Option<(i128, i128)>
 /// tokens: decimal/based literals, the `MAX_UINT`/`MAX_INT` predefined
 /// constants, `+`/`-`/`*`/`/` with precedence, and parentheses. `None`
 /// on anything else (the arm is then skipped, honestly).
-fn eval_choice_int(tokens: &[Token]) -> Option<i128> {
+/// Evaluate a constant integer expression over recorded tokens
+/// (literals, the predefined `MAX_UINT`/`MAX_INT`, `+`/`-`/`*`/`/`
+/// with precedence, parentheses); `None` on anything else.
+pub(crate) fn eval_choice_int(tokens: &[Token]) -> Option<i128> {
     if tokens.is_empty() {
         return None;
     }

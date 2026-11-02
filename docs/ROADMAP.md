@@ -166,7 +166,13 @@
       translates to the two comparisons; unsupported shapes fall back to
       rejection sampling. No disjunctions (item-list membership, `||`),
       negation trees or global constraints yet. `keep bind` and
-      `hdl_path()` / `delayed()` constraints do not gate `gen`
+      `hdl_path()` / `delayed()` constraints do not gate `gen`.
+      Connected field sets (10.2.7) scope generation, v1: `gen <obj>`
+      inside a method gates the object with the enclosing instance's
+      constraints that reference it — `p.v == select { .. }` rebases to
+      `v == select { .. }` (depth-two paths; other shapes drop until
+      full CFS lands), so when-view distribution policies drive field
+      generation
 - [~] Pluggable SMT/constraint solver — started: the Pumpkin CP solver
       (pure Rust, consol-lab) is integrated behind the `solver-pumpkin`
       cargo feature and is deterministic per seed; CI verifies the feature
