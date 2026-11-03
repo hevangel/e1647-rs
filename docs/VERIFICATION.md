@@ -2345,3 +2345,54 @@ New tests: 4 interpreter tests — per-bucket instances with the
 holes pulling the group grade to (1.0 + 1/3)/4; `at_least = 2` as the
 bucket goal with the weighted group grade (1.0 + 0.5×3)/4; and the
 group-level `per_instance = TRUE` spelling marking all items.
+
+## 2026-11-03 (38) — offline arc: clause 20 repeat until + the do sugar
+
+Branch `agent/repeat-statement` (off main after #27 merged). Clause
+20's remaining statement forms parse and run.
+
+- `repeat [do] { body } until cond;` (20.2.2): a new `Stmt::RepeatUntil`
+  — "the action block is executed at least once" (the NOTE 1 do-while
+  order): the body runs, then the condition is checked; `break`
+  exits, `continue` restarts. The condition must be boolean
+  (`E0402`); a missing `until` after the body reports `E0112` (the
+  recorded unsupported-statements fixture updated: `repeat` without
+  `until` is now a malformed loop, not an unsupported statement).
+- The optional `do` sugar (20.2's NOTE 2 — "purely syntactic sugar"):
+  `while cond do { .. };` and `if cond do { .. };` accept the keyword,
+  and `if cond do <one statement>;` parses the single-statement form
+  — the inner statement consumes its own `;`, so `parse_if_inner`
+  returns a needs-terminator flag instead of the caller adding one
+  unconditionally (else-if chains propagate it).
+- Honest v1 limits: `repeat until` inside a coroutine suspends like a
+  `while` (the WhileLoop resume context), but the one-statement `do`
+  forms inside `if` bodies keep the inline spin (the documented
+  cursor-reach limit).
+- Debugging note for the record: the first repeat tests hung —
+  sys's uint fields are implicitly randomized before `run()` (the M2
+  implicit-gen behavior), so `until i == 3` over a FIELD never
+  terminates; the tests now use locals, matching the existing while
+  tests' shape.
+
+Corpus state (absolute paths): etl 4, cover-edges 4, golden-imports
+3, golden-combined/igen-dist/type-min-max/save-restart/d6w 0 —
+unchanged.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(197 passed: 14 elab, 1 fixtures, 89 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 5 interpreter tests — repeat until counting to 3; the
+do-while order (an already-TRUE condition still runs the body once);
+`break` exiting a repeat loop; the one-statement `if cond do
+<statement>;` form (true and false branches); and the `while cond do
+{ .. };` sugar.

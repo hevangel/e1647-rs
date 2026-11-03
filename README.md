@@ -39,7 +39,8 @@
 > monomorphize: actuals substitute for formals and template-typed
 > fields carry the instance. Simple macros (clause 15) expand before
 > parsing, and the reflection set (`set_of_values` with the 27.4 set
-> pseudo-methods) evaluates. It does **not** yet do
+> pseudo-methods) evaluates. Clause 20's `repeat until` loops and the
+> `do` sugar run. It does **not** yet do
 > full type
 > checking,
 > resolution, event-driven temporal evaluation, coverage, non-linear or

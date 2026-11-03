@@ -353,6 +353,7 @@ fn check_statements<'a>(
             | Stmt::ExprStmt { .. }
             | Stmt::Return { .. }
             | Stmt::While { .. }
+            | Stmt::RepeatUntil { .. }
             | Stmt::Break { .. }
             | Stmt::Continue { .. }
             | Stmt::Case { .. }

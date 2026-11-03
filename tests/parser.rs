@@ -585,6 +585,8 @@ fn typed_for_each_and_file_types_parse() {
 
 #[test]
 fn unsupported_statements_report_explicitly() {
+    // `repeat` now parses (clause 20.2.2); a missing `until` reports
+    // the honest E0112 at the body's close.
     let result = parse(
         "struct s {\n    run() is {\n        repeat {\n            out(1);\n        };\n    };\n};\n",
     );
@@ -593,7 +595,7 @@ fn unsupported_statements_report_explicitly() {
         .iter()
         .map(|d| d.code)
         .collect::<Vec<_>>();
-    assert_eq!(codes.first().copied(), Some("E0113"), "codes: {codes:?}");
+    assert_eq!(codes.first().copied(), Some("E0112"), "codes: {codes:?}");
 }
 
 #[test]

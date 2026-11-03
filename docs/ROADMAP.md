@@ -132,7 +132,7 @@
       applies no text substitution, and `#else` is not parsed. Spanned
       diagnostics and declaration/member/statement-level recovery. The
       CLI resolves `import a.b` to `a/b.e` or `a.b.e` beside the source
-      and checks the merged declarations (not yet: `repeat`, single-statement `if ... do`, template `extend` (clause 8.2) and body-level instance substitution,
+      and checks the merged declarations (not yet: template `extend` (clause 8.2) and body-level instance substitution,
       computed macros and the full match-expression grammar (clause
       15.4's repetition and the 15.3 computed bodies — simple
       define-as macros expand, see M1), the remaining clause 14
@@ -219,12 +219,16 @@
 ## M3 — Behavioral execution
 - [~] Interpreter and method calling conventions — started: the
       statement subset in `src/interp.rs` executes expressions, `var`,
-      assignment, calls, `if`/`while`/`for`/`case`, `break`/`continue`,
+      assignment, calls, `if`/`while`/`for`/`case`, `repeat until`
+      (clause 20.2.2 — the body at least once), `break`/`continue`,
       `return`, `print`/`out`/`outf`/`message`, `check that` with a
       DUT-error count, `pack`, `append`, lists with `size()`/`push()`,
       struct instances, sequence `do` (generates the item in place; the
-      `keeping` block is not enforced), and `gen`. Entry point is the
-      built-in `sys` unit's `run()` methods, and implicit generation plus
+      `keeping` block is not enforced), and `gen`. The optional `do`
+      sugar on `if`/`while` — including the one-statement
+      `if cond do <statement>;` form — parses and runs. Entry point is
+      the built-in `sys` unit's `run()` methods, and implicit
+      generation plus
       a MAIN sequence start also run when no explicit `run()` exists.
       Integers are unbounded `i128` (widths are not truncated). No
       event-driven scheduling

@@ -51,7 +51,10 @@ multi-simulator HDL API, and wasm32.
   unaffected. Error recovery is at declaration,
   member and statement boundaries. The statement subset includes braced `if`/`while`,
   `for each` and `for i from .. to`, `case`, `check that`, `wait`, `emit`,
-  `start`, sequence `do` and `stop_run`. Struct members include `on`
+  `start`, sequence `do` and `stop_run`; `repeat [do] { .. } until
+  cond;` (20.2.2, the body at least once) and the optional `do` sugar
+  on `if`/`while` — including the one-statement `if cond do
+  <statement>;` form — round out clause 20. Struct members include `on`
   event blocks (clause 11.2: dotted event path, action block; extension
   is a repeated declaration) and `on <port>$` event-port blocks
   (clause 11.3: the 9.4.1 `$` access operator names the port's event;
@@ -284,8 +287,7 @@ clause 14 coverage model (basic and derived items collect and grade;
 per_instance items grade per bucket with holes and the weighted
 group grade; the option tables beyond per_instance/at_least/weight
 and the 28.9 configuration are recorded, not applied), integer width
-truncation, evaluation of MVL literals, `repeat`, single-statement
-`if ... do`, `detach`/`delay`/`exec` TEs, select
+truncation, evaluation of MVL literals, `detach`/`delay`/`exec` TEs, select
 choice policies beyond the constant-expression subset (the full
 choice-expression grammar, soft-order interactions between multiple
 selects), HDL-edge- and bind()-driven event-port triggering (the
