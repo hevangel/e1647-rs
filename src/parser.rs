@@ -60,6 +60,7 @@ use crate::ast::{
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Position, Token, TokenKind};
+use crate::macros;
 use std::collections::BTreeSet;
 
 /// Predefined e names that lex as keywords but appear as bare values or
@@ -169,7 +170,7 @@ pub struct ParseResult {
 pub fn parse(source: &str) -> ParseResult {
     let mut diagnostics = Vec::new();
     let tokens = match lexer::tokenize(source) {
-        Ok(tokens) => tokens,
+        Ok(tokens) => macros::expand_macros(tokens),
         Err(err) => {
             let end = Position {
                 byte: err.position.byte + 1,
@@ -203,7 +204,7 @@ pub fn parse(source: &str) -> ParseResult {
 pub fn parse_unchecked(source: &str) -> ParseResult {
     let mut diagnostics = Vec::new();
     let tokens = match lexer::tokenize(source) {
-        Ok(tokens) => tokens,
+        Ok(tokens) => macros::expand_macros(tokens),
         Err(err) => {
             let end = Position {
                 byte: err.position.byte + 1,

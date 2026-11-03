@@ -37,7 +37,8 @@
 > resolve: when-qualified field types instantiate synthesized subtype
 > views whose when members apply. Template instances (clause 8.3)
 > monomorphize: actuals substitute for formals and template-typed
-> fields carry the instance. It does **not** yet do
+> fields carry the instance. Simple macros (clause 15) expand before
+> parsing. It does **not** yet do
 > full type
 > checking,
 > resolution, event-driven temporal evaluation, coverage, non-linear or

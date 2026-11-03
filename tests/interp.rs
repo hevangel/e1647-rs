@@ -1131,3 +1131,89 @@ fn transitions_over_unbucketed_items_count_without_grading() {
     assert_eq!(transition.grade(), None);
     assert_eq!(group.grade(), None);
 }
+
+#[test]
+fn simple_macro_expansion_substitutes_its_argument() {
+    // 15.2/15.5/15.6: a define-as macro expands at its invocation
+    // sites — the body's parameter references become the matched
+    // text, and the result parses as ordinary code. The v1 interpreter
+    // has no type objects, so the example passes the type's name as a
+    // string actual (the matcher is category-blind, per the
+    // documented limit).
+    let output = clean_output(
+        "type addr_t : int (bits : 8);\n\
+         define <e_util_min_value'exp> \"MIN_VALUE[ ]\\(<type>\\)\" as {\n    \
+         min_of(<type>);\n};\n\
+         extend sys {\n    min_of(t: string): uint is {\n        \
+         if t == \"addr_t\" {\n            return 0;\n        };\n        return 1;\n    };\n    \
+         run() is also {\n            var lo: uint = MIN_VALUE(\"addr_t\");\n            \
+         print lo;\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("0"), "output: {output}");
+}
+
+#[test]
+fn macro_expansion_composes_inside_expressions() {
+    // The corpus shape: `MIN_VALUE(addr_t)+1..MAX_VALUE(addr_t)-1` —
+    // each invocation expands independently inside a larger expression
+    // (with string actuals; see the category note above).
+    let output = clean_output(
+        "type addr_t : int (bits : 8);\n\
+         define <e_util_min_value'exp> \"MIN_VALUE[ ]\\(<type>\\)\" as {\n    \
+         min_of(<type>);\n};\n\
+         define <e_util_max_value'exp> \"MAX_VALUE[ ]\\(<type>\\)\" as {\n    \
+         max_of(<type>);\n};\n\
+         extend sys {\n    min_of(t: string): int is {\n        return 0;\n    };\n    \
+         max_of(t: string): int is {\n        return 200;\n    };\n    run() is also {\n            \
+         var span: int = MAX_VALUE(\"addr_t\") - MIN_VALUE(\"addr_t\");\n            \
+         print span;\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("200"), "output: {output}");
+}
+
+#[test]
+fn macro_argument_with_internal_parens_expands_whole() {
+    // An argument containing its own parentheses (`uint (bits : 8)`
+    // shaped: a nested call) is consumed whole by the bounded
+    // backtracking matcher.
+    let output = clean_output(
+        "type addr_t : int (bits : 8);\n\
+         define <e_util_min_value'exp> \"MIN_VALUE[ ]\\(<type>\\)\" as {\n    \
+         min_of(<type>);\n};\n\
+         extend sys {\n    min_of(t: string): int is {\n        return 7;\n    };\n    \
+         width_of(): string is {\n            return \"addr_t\";\n    };\n    \
+         run() is also {\n            var v: int = MIN_VALUE(width_of());\n            \
+         print v;\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("7"), "output: {output}");
+}
+
+#[test]
+fn later_macro_definitions_have_higher_priority() {
+    // 15.5.1: definitions later in the code take priority — the same
+    // pattern redefined changes the expansion.
+    let output = clean_output(
+        "define <pick_low'exp> \"PICK[ ]\\(\\)\" as {\n    out(\"FIRST\");\n};\n\
+         define <pick_high'exp> \"PICK[ ]\\(\\)\" as {\n    out(\"SECOND\");\n};\n\
+         extend sys {\n    run() is also {\n            PICK();\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("SECOND"), "output: {output}");
+    assert!(!output.contains("FIRST"), "output: {output}");
+}
+
+#[test]
+fn macro_body_invoking_another_macro_expands() {
+    // 15.5.2: the generated code is tested again against the
+    // productions — a body invoking another macro expands too.
+    let output = clean_output(
+        "define <inner'exp> \"INNER[ ]\\(\\)\" as {\n    out(\"INNER RAN\");\n};\n\
+         define <outer'exp> \"OUTER[ ]\\(\\)\" as {\n    INNER();\n};\n\
+         extend sys {\n    run() is also {\n            OUTER();\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("INNER RAN"), "output: {output}");
+}

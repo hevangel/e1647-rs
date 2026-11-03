@@ -2090,3 +2090,77 @@ group grade = average of the item's 100% and the transition's 50%); a
 cross over a ranged item and a boolean (2 of the 4 combinations
 observed); and a transition over an unbucketed string item counting
 one pair without a grade.
+
+## 2026-11-02 (34) — offline arc: clause 15 simple macro expansion
+
+Branch `agent/macro-expansion` (off main after #23 merged). Simple
+define-as macros expand before parsing: `MIN_VALUE(addr_t)`-style
+invocation sites become their body text.
+
+- New `src/macros.rs`, a pre-pass over the token stream wired into
+  both `parse` and `parse_unchecked` (the CLI and the tests take the
+  same path):
+  - Pattern compilation (15.4): the recorded pattern strings compile
+    to term trees — escaped literal terminals (each escaped character
+    its own literal, since `\(` lexes as the token `(`), plain literal
+    runs (`MIN_VALUE` matches one identifier token), `<[tag']type>`
+    non-terminals, `[ ]` option (whitespace-only literals vanish —
+    tokenization ignores whitespace, so the corpus's `MIN_VALUE[ ]\(`
+    optional-space form is vacuous), `( )` grouping and `|`
+    alternation.
+  - Matching (15.5.2): recursive descent with backtracking —
+    non-terminals try every split length longest-first, bounded by
+    bracket depth and depth-0 separators (`,`/`;`), so
+    `MIN_VALUE(uint (bits : 8))`-shaped arguments consume whole while
+    `f(a, b)` args keep their commas. Budget-capped.
+  - Expansion (15.6): the body's `<name>` / `<name'category>`
+    references resolve by tag, else by kind when unambiguous, and the
+    matched subsequence splices in; the body's trailing `;` belongs to
+    the body segment (15.4.5's sequencing rule), not the expansion —
+    the invocation site carries its own. Later definitions have
+    higher priority (15.5.1); bodies may invoke other macros (the
+    pass iterates, definitions re-scoped each round); definitions
+    themselves are never rewritten.
+- Honest v1 limits (documented): computed macros (15.3) stay
+  recorded, not computed — the matcher skips them, so a file's simple
+  definition of the same pattern applies (the type-min-max corpus's
+  `reject_match()` DAC dance is not modeled); the `<type, ...>`
+  repetition form matches as one non-terminal; argument categories
+  are not validated; patterns not starting with a literal are inert
+  (no anchor).
+- The type-min-max corpus (defines only) is untouched by the pass;
+  its sibling example file (`type_min_max_usage_ex.e`, real
+  `MIN_VALUE(addr_t)` invocations) still reports its pre-existing
+  diagnostics — it imports a definitions file the CLI resolves
+  beside it, and the full expansion chain there needs the
+  `set_of_values` reflection routines (Part 2 library), which remain
+  unimplemented.
+
+Debugging notes for the record: the first matcher consumed
+non-terminals greedily to the END of the token stream (the anchor
+then matched the file's last `)` — caught by the composed-expression
+test); the escape handling first merged `\(\)` into one literal `"()"`
+(no token ever equals it — caught by the priority test); and the pass
+was initially wired only into `parse_unchecked`, so the tests (via
+`parse`) saw no expansion while the CLI did — both entries now share
+it.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(181 passed: 14 elab, 1 fixtures, 73 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 5 interpreter tests — simple substitution with the
+argument reaching the helper; the corpus composition shape
+(`MAX_VALUE(t) - MIN_VALUE(t)` expanding independently inside one
+expression); an argument with internal parentheses consumed whole;
+15.5.1 priority (later same-pattern definition wins); and a body
+invoking another macro (15.5.2's re-testing of generated code).

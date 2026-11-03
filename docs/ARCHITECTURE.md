@@ -63,8 +63,13 @@ multi-simulator HDL API, and wasm32.
   macro definitions (`define <name'category> "match expression" as
   [computed] { body };`) are recorded uninterpreted — header, pattern
   string and raw body tokens (`E0118` when the pattern string is
-  missing); the match-expression grammar and expansion are later
-  milestones. Clause 5 scalar type declarations (`type name: <type>;`)
+  missing) — and simple define-as macros expand before parsing:
+  `src/macros.rs` compiles the pattern (15.4), matches invocation
+  sites with backtracking (15.5.2; literals match one token each,
+  non-terminals consume bounded by bracket depth and separators), and
+  splices the matched subsequences at the body's parameter references
+  (15.6), later definitions taking priority; the body's trailing `;`
+  belongs to the body segment, not the expansion. Clause 5 scalar type declarations (`type name: <type>;`)
   record the underlying representation. Clause 8 template declarations
   (`template [package] struct|unit name of <params> [like base] { .. }`)
   record their `<tag'category>` parameters and defaults; formals
@@ -268,6 +273,7 @@ selects), `on
 event-port`, `#else` and `#define` replacement
 rules, `template extend` (8.2) and method-body instance
 substitution, template category-compliance checks (8.3's notes),
-macro match-expression
-interpretation and expansion (clause 15.4–15.5), a multi-simulator HDL
+computed macros and the match-expression grammar's repetition and
+category validation (clause 15.3/15.4 — simple define-as macros
+expand), a multi-simulator HDL
 API, and WASM.
