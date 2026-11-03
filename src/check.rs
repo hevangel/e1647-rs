@@ -86,6 +86,10 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
                 &on.path.join("."),
                 &mut diagnostics,
             );
+            // 11.3: "The on action block shall not contain any
+            // time-consuming actions or TCMs" — wait/sync/start/compute
+            // at any depth of the block are rejected.
+            check_on_body_time_consumption(&on.body, &on.path.join("."), &mut diagnostics);
         });
         if declaration.kind != DeclarationKind::Extend {
             let mut field_names: BTreeSet<&str> = BTreeSet::new();
@@ -240,6 +244,60 @@ fn check_methods(
 
 /// Walk a statement list. `seen` accumulates local variable names across
 /// nested `if` bodies — they are treated as one flat scope for now.
+/// 11.3's restriction: an `on` action block shall not contain any
+/// time-consuming actions or TCMs — `wait`, temporal `wait`, `sync`,
+/// `start` and `compute` at any depth of the block are rejected.
+fn check_on_body_time_consumption(
+    statements: &[Stmt],
+    on_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        let offending: Option<&str> = match statement {
+            Stmt::Wait { .. } | Stmt::WaitTemporal { .. } | Stmt::Sync { .. } => {
+                Some("a time-consuming action")
+            }
+            Stmt::Start { .. } | Stmt::Compute { .. } => Some("a TCM invocation"),
+            _ => None,
+        };
+        if let Some(what) = offending {
+            let span = statement.span();
+            diagnostics.push(Diagnostic::new(
+                "E0210",
+                format!(
+                    "'{on_path}' on block contains {what}; on action blocks shall not contain time-consuming actions or TCMs (11.3)"
+                ),
+                span.0,
+                span.1,
+            ));
+        }
+        match statement {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                check_on_body_time_consumption(then_body, on_path, diagnostics);
+                if let Some(else_body) = else_body {
+                    check_on_body_time_consumption(else_body, on_path, diagnostics);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::ForEach { body, .. } | Stmt::ForTo { body, .. } => {
+                check_on_body_time_consumption(body, on_path, diagnostics);
+            }
+            Stmt::Case { arms, default, .. } => {
+                for (_, body) in arms {
+                    check_on_body_time_consumption(body, on_path, diagnostics);
+                }
+                if let Some(default) = default {
+                    check_on_body_time_consumption(default, on_path, diagnostics);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn check_statements<'a>(
     statements: &'a [Stmt],
     seen: &mut BTreeSet<&'a str>,

@@ -168,7 +168,12 @@
       carry HDL paths taken from `hdl_path()` constraints, and
       `sequence` declarations are recovered into `Elaborated.sequences`.
       `on` members compose through the same fold, base types first and
-      extends in declaration order. `when` subtypes (6.6) resolve:
+      extends in declaration order — `on <port>$` members (clause
+      11.3) included: event ports declare as `name: <dir> event_port
+      [is instance];` (9.4), the `$` access operator names the port's
+      event (9.4.1), `emit p$;` triggers the port, and the 11.3
+      restriction holds — wait/sync/start/compute inside an `on`
+      action block report `E0210`. `when` subtypes (6.6) resolve:
       each single-modifier block (`when BUSY'kind` or the corpus's
       `when NO_CONSTRAINT env` space form) synthesizes a subtype view
       named `VALUE base` — the base's composed members with the when

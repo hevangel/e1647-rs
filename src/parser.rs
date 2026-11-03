@@ -2189,7 +2189,8 @@ impl Parser {
         matches!(direction, "in" | "out" | "inout")
             && matches!(
                 self.tokens.get(self.pos + 3).map(|t| &t.kind),
-                Some(TokenKind::Identifier(id)) if id == "simple_port"
+                Some(TokenKind::Identifier(id))
+                    if id == "simple_port" || id == "event_port"
             )
     }
 
@@ -2228,8 +2229,30 @@ impl Parser {
             Some(TokenKind::Identifier(id)) if id == "simple_port" => {
                 self.bump();
             }
+            // An event port (9.4): carries events, not data — no `of`
+            // element type.
+            Some(TokenKind::Identifier(id)) if id == "event_port" => {
+                self.bump();
+                let span = (self.last_end(), self.last_end());
+                let element = TypeExpr::Named {
+                    name: "event".to_owned(),
+                    span,
+                };
+                if self.eat_keyword("is") {
+                    self.eat_keyword("instance");
+                }
+                self.expect_punct(";", "E0105", "expected ';' after the port declaration")?;
+                let end = self.last_end();
+                return Some(Member::Port(PortDecl {
+                    name,
+                    name_span,
+                    direction,
+                    element,
+                    span: (start, end),
+                }));
+            }
             _ => {
-                self.error_here("E0104", "expected 'simple_port'");
+                self.error_here("E0104", "expected 'simple_port' or 'event_port'");
                 return None;
             }
         }
