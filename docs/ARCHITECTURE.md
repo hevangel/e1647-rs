@@ -161,17 +161,22 @@ multi-simulator HDL API, and wasm32.
   `on` members (base types first, extends in declaration order),
   recovered `sequence` declarations, and a `type` declaration's
   underlying representation. `when` subtypes (6.6) resolve: each
-  single-modifier block (`when BUSY'kind`, or the corpus's space form
-  `when NO_CONSTRAINT env` — two bare modifiers, value first, field id
-  second) synthesizes a subtype view named `VALUE base` with
-  `when_of` set to its discriminator — the base's composed members
-  with the when block's fields, constraints, methods, `on` blocks,
-  cover groups and expects appended. When-qualified field types
-  (`TypeExpr::WhenQualified`, `f: LO pkt`) instantiate the view, so
-  those members apply for the instance and `is a` walks the view's
-  base chain. **Not** full elaboration: chained modifiers and nested
-  when-in-when blocks do not compose; base-typed instances do not
-  dynamically match subtypes; no type checking.
+  block (`when BUSY'kind`, the corpus's space form `when
+  NO_CONSTRAINT env` — two bare modifiers, value first, field id
+  second, or a chained `when LO'kind HI'sel`) synthesizes a subtype
+  view named with its values space-joined before the base type
+  (`LO HI pkt`) with `when_of` carrying every (field, value) pair —
+  the base's composed members with the when block's fields,
+  constraints, methods, `on` blocks, cover groups and expects
+  appended. A `when` member nested inside a when block applies on top
+  of the enclosing view (a further combined view; a worklist applies
+  nested levels until none are left, budget-capped at 200 synthesized
+  views). When-qualified field types (`TypeExpr::WhenQualified`,
+  `f: LO pkt` or chained `f: LO HI pkt` — parsed as nested
+  qualifiers) instantiate the view, so those members apply for the
+  instance and `is a` walks the view's base chain. **Not** full
+  elaboration: base-typed instances do not dynamically match
+  subtypes; no type checking.
 - `src/builtins.rs` — predeclared names the executed subset relies on:
   the `sys` unit, sequence bases (`any_sequence_item` and siblings), and
   routines such as `out`, `outf`, `message`, `pack`, `append`,
@@ -273,10 +278,11 @@ multi-simulator HDL API, and wasm32.
   `run` print diagnostics to stderr
   (`path:line:col: error[code]: message`) and their results on success.
 
-Deliberately not implemented yet: chained `when` modifiers, nested
-when-in-when blocks, and dynamic subtype matching for base-typed
-instances (when views resolve through when-qualified field types),
-non-linear,
+Deliberately not implemented yet: dynamic subtype matching for
+base-typed instances (when views resolve through when-qualified field
+types; chained modifiers and nested when-in-when blocks compose,
+though a view's own when-of pairs are not re-verified against its
+base's fields), non-linear,
 disjunctive or temporal constraint solving (the solver backend covers
 conjunctive linear constraints and constant ranges over bounded
 integers), `@`-triggered TCM invocation, `@sim` sampling and

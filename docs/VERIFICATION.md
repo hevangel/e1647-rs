@@ -2396,3 +2396,100 @@ do-while order (an already-TRUE condition still runs the body once);
 `break` exiting a repeat loop; the one-statement `if cond do
 <statement>;` form (true and false branches); and the `while cond do
 { .. };` sugar.
+
+## 2026-11-03 (40) — offline arc: clause 6.6 when-chaining (chained modifiers, nested when-in-when)
+
+Branch `agent/when-chaining` (off main after #28 merged). Chained
+modifiers and nested when-in-when blocks compose: a when block is no
+longer limited to one modifier, and a `when` member inside a when
+block's members applies on top of the enclosing view.
+
+Prose findings that constrained the design (clause references only,
+local copy under `local/`):
+
+- 6.6.1's subtype examples include combinations of fields (a subtype
+  qualified by one field's value AND another's), and Annex C.2.2
+  states that with when inheritance all combinations of the
+  determinant dimensions exist implicitly and are enumerated only
+  when something is said about them. So multiple modifiers in one
+  block read CONJUNCTIVELY: the subtype requires every determinant
+  field to hold its value. The 30.2.4.5 reflection prose agrees: a
+  subtype's determinant FIELDS are a list (`get_determinant_fields`)
+  and the canonical name joins the qualifying values before the base
+  type name — matching this repo's space-joined `V1 V2 base` spelling
+  (the reference-grammar `value'id` pairing stays our v1 reading of
+  which field each value belongs to).
+- Nested when-in-when is NOT named in the 6.6/6.6.1 prose (its syntax
+  examples are figures, not extractable text). The containment
+  reading is supported by 30.2.4.5's `get_contributors` — "all the
+  explicit subtypes where this subtype is contained" — so the
+  nested-when semantics here (inner modifiers run against the outer
+  synthesized view's fields, producing a further combined view whose
+  base chain walks the outer view) are the v1 reading, documented as
+  such.
+
+Implementation:
+
+- Elaboration (`src/elab.rs`): `when_of` is now a
+  `Vec<(String, String)>` — every (field id, value) pair a block's
+  modifiers declare. Two spellings pair: any number of `value'id`
+  modifiers (each names its determinant field), and the corpus's
+  two-bare-modifier space form (value first, field id second —
+  unchanged). A lone bare modifier still synthesizes nothing.
+  Synthesis is a worklist seeded with every type: each block
+  synthesizes a view named with its values space-joined before the
+  ROOT base type's name (`LO HI pkt`), the combined pairs, and base =
+  the view it applies on top of (`LO HI pkt` → `LO pkt` → `pkt`), so
+  `is a` walks the containment chain. Nested `Member::When` members
+  are carried into the view's whens and reprocessed until no new
+  views appear (budget 200). A view carries only the when-in-when
+  members of the block it came from — the base's sibling when blocks
+  are alternative subtypes, not refinements (re-applying them had
+  cascaded contradictory views before that rule).
+- Parser (`src/parser.rs`): `parse_type`'s when-qualified form now
+  accepts two or more identifiers (`f: LO HI pkt`), parsed as NESTED
+  `TypeExpr::WhenQualified` (value `LO`, base the rest) — the AST
+  shape that keeps `render`, `check`, template substitution and the
+  interpreter recursions composing naturally; the last identifier is
+  the base, the rest nest right-to-left.
+- Interpreter (`src/interp.rs`): `when_view_name` flattens a nested
+  when-qualified chain to its combined view name (`LO HI pkt`);
+  `default_for`, `sample_type`/gen and the `is a` type match resolve
+  the combined name. `is a` needs no change: it walks the declared
+  base chain, now including the view-to-view hop.
+
+Known v1 limits (documented, unchanged where noted): a `'` followed
+by b/o/h/d/x still lexes as a based literal, so a `value'id`-spelled
+modifier whose field id starts with one of those letters (e.g.
+`HI'dir`) does not parse — the space form (`when HI dir`) avoids it;
+the determinant pairs are not re-verified against the base's fields
+or enumeral sets; base-typed instances still do not dynamically match
+subtypes; sibling when blocks are treated as mutually exclusive
+alternatives (their members never merge into one view).
+
+Corpus state (absolute paths): etl 4, cover-edges 4, golden-imports
+3, golden-combined/igen-dist/type-min-max/save-restart/d6w 0 —
+unchanged; the igen-dist and golden-combined `run`s keep exit 0 with
+byte-identical output to the pre-change build.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(200 passed: 16 elab, 1 fixtures, 90 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: two elaboration tests — a chained-modifier block
+(`when LO'kind HI'sel`) synthesizing one combined view with both
+(field, value) pairs, and a two-level when-in-when composing both
+levels' constraints into a `LO HI pkt` view whose base is the outer
+view; one interpreter test — a chained-qualified field
+(`p: LO HI pkt`) generating under both levels' select policies (one
+field to min, the other to max) with `is a` walking the containment
+chain to the base type.
