@@ -68,8 +68,14 @@ pub enum Value {
     Real(f64),
     Bool(bool),
     Str(String),
-    Enum { type_name: String, name: String },
+    Enum {
+        type_name: String,
+        name: String,
+    },
     List(Vec<Value>),
+    /// A set (5.1.10): inclusive intervals in canonical form — sorted,
+    /// non-overlapping, non-neighboring.
+    Set(Vec<(i128, i128)>),
     Object(usize),
     Void,
 }
@@ -649,6 +655,10 @@ impl<'a> Interp<'a> {
                 _ => Value::Int(0),
             },
             TypeExpr::List { .. } => Value::List(Vec::new()),
+            TypeExpr::Named { name, .. } if name == "set" => {
+                // The set type's default is the empty set (5.1.10: `[]`).
+                Value::Set(Vec::new())
+            }
             TypeExpr::InlineEnum { names, .. } => {
                 // The default enumerand is the first one declared.
                 match names.first() {
@@ -2417,6 +2427,128 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Build the set of all legal values of a type (5.8.4): scalars
+    /// from their width and signedness, clause-5 `type` declarations
+    /// from their underlying representation, enumeral types as
+    /// `[0..count-1]`.
+    fn set_of_type(&self, ty: &TypeExpr) -> Result<Value, Diagnostic> {
+        let Some(range) = self.type_value_range(ty) else {
+            return Err(self.error(
+                "E0402",
+                format!(
+                    "set_of_values expects a numeric or enumeral type; '{}' has none",
+                    ty.render()
+                ),
+                ty.span(),
+            ));
+        };
+        Ok(Value::Set(vec![range]))
+    }
+
+    /// The inclusive value range of a type, when it has one.
+    fn type_value_range(&self, ty: &TypeExpr) -> Option<(i128, i128)> {
+        match ty {
+            TypeExpr::Scalar { base, width, .. } => scalar_range(*base, width),
+            TypeExpr::Named { name, .. } => {
+                let types: &[crate::elab::ElaboratedType] = self.types;
+                let declared = types.iter().find(|t| t.name == *name)?;
+                if !declared.enumerals.is_empty() {
+                    // An enumeral type's legal values are the
+                    // enumerands' indices.
+                    return Some((0, declared.enumerals.len() as i128 - 1));
+                }
+                declared
+                    .underlying
+                    .as_ref()
+                    .and_then(|u| self.type_value_range(u))
+            }
+            TypeExpr::InlineEnum { names, .. } => {
+                if names.is_empty() {
+                    None
+                } else {
+                    Some((0, names.len() as i128 - 1))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The set pseudo-methods (27.4) on a set value: queries
+    /// (`size`/`uint_size`/`min`/`uint_min`/`int_min`/`max`/`uint_max`/
+    /// `int_max` and their `_is_*` guards), the algebra
+    /// (`union`/`intersect`/`diff`), and `to_string`. `None` when the
+    /// name is not a set pseudo-method (the caller reports its own
+    /// error).
+    fn call_set_pseudo_method(
+        &mut self,
+        intervals: &[(i128, i128)],
+        name: &str,
+        args: &[Value],
+        span: crate::ast::Span,
+    ) -> Option<Result<Value, Diagnostic>> {
+        let set = Value::Set(intervals.to_vec());
+        let result = match name {
+            "size" | "uint_size" => {
+                // 27.4.4/27.4.5: the number of elements in the set.
+                let size: i128 = intervals.iter().map(|(lo, hi)| hi - lo + 1).sum();
+                Ok(Value::Int(size))
+            }
+            "size_is_uint" => {
+                let size: i128 = intervals.iter().map(|(lo, hi)| hi - lo + 1).sum();
+                Ok(Value::Bool((0..=MAX_UINT_VALUE).contains(&size)))
+            }
+            "min" | "uint_min" | "int_min" => {
+                // 27.4.7-27.4.10: the bottom boundary; empty is an
+                // error (the prose's exception).
+                match intervals.first() {
+                    Some((lo, _)) => Ok(Value::Int(*lo)),
+                    None => Err(self.error("E0402", "min of an empty set", span)),
+                }
+            }
+            "max" | "uint_max" | "int_max" => match intervals.last() {
+                Some((_, hi)) => Ok(Value::Int(*hi)),
+                None => Err(self.error("E0402", "max of an empty set", span)),
+            },
+            "min_is_uint" => match intervals.first() {
+                Some((lo, _)) => Ok(Value::Bool((0..=MAX_UINT_VALUE).contains(lo))),
+                None => Err(self.error("E0402", "min of an empty set", span)),
+            },
+            "union" => {
+                let Some(Value::Set(other)) = args.first() else {
+                    return Some(Err(self.error(
+                        "E0402",
+                        "union expects a set argument",
+                        span,
+                    )));
+                };
+                Ok(union_sets(intervals, other))
+            }
+            "intersect" => {
+                let Some(Value::Set(other)) = args.first() else {
+                    return Some(Err(self.error(
+                        "E0402",
+                        "intersect expects a set argument",
+                        span,
+                    )));
+                };
+                Ok(intersect_sets(intervals, other))
+            }
+            "diff" => {
+                let Some(Value::Set(other)) = args.first() else {
+                    return Some(Err(self.error(
+                        "E0402",
+                        "diff expects a set argument",
+                        span,
+                    )));
+                };
+                Ok(diff_sets(intervals, other))
+            }
+            "to_string" => Ok(Value::Str(self.format_value(&set))),
+            _ => return None,
+        };
+        Some(result)
+    }
+
     /// Evaluate a temporal expression's propositions (`true(exp)` —
     /// `TRUE` or non-zero numeric, 12.1.1.1) and numeric repeat bounds
     /// once, with current field values. The results key the callback
@@ -2865,6 +2997,27 @@ impl<'a> Interp<'a> {
                                     *span,
                                 )),
                             },
+                            Value::Set(intervals) => {
+                                match self.call_set_pseudo_method(&intervals, name, &values, *span)
+                                {
+                                    Some(result) => result,
+                                    None => Err(self.error(
+                                        "E0405",
+                                        format!("set method '{name}' is not supported"),
+                                        *span,
+                                    )),
+                                }
+                            }
+                            // `to_string()` on scalars (the DAC macro
+                            // shapes: `set.min().to_string()`).
+                            value @ (Value::Int(_)
+                            | Value::Bool(_)
+                            | Value::Enum { .. }
+                            | Value::Str(_))
+                                if name == "to_string" && values.is_empty() =>
+                            {
+                                Ok(Value::Str(self.format_value(&value)))
+                            }
                             _ => Err(self.error(
                                 "E0402",
                                 format!("cannot call method '{name}' on this value"),
@@ -2970,10 +3123,42 @@ impl<'a> Interp<'a> {
                     self.eval(else_expr, frame, me)
                 }
             }
-            Expr::CastAs { expr, .. } => {
+            Expr::CastAs { expr, ty, .. } => {
                 // Casts are value-preserving in this subset: integers,
-                // enumerals and booleans flow through unchanged.
-                self.eval(expr, frame, me)
+                // enumerals and booleans flow through unchanged — an
+                // integer cast to an enumeral type maps its value to
+                // the enumerand at that index (5.8.1).
+                let value = self.eval(expr, frame, me)?;
+                if let (Value::Int(index), TypeExpr::Named { name, .. }) = (&value, ty) {
+                    let types: &[crate::elab::ElaboratedType] = self.types;
+                    if let Some(declared) = types.iter().find(|t| t.name == *name)
+                        && !declared.enumerals.is_empty()
+                        && (0..declared.enumerals.len()).contains(&(*index as usize))
+                    {
+                        return Ok(Value::Enum {
+                            type_name: name.clone(),
+                            name: declared.enumerals[*index as usize].name.clone(),
+                        });
+                    }
+                }
+                if let (Value::Int(index), TypeExpr::InlineEnum { names, .. }) = (&value, ty)
+                    && (0..names.len()).contains(&(*index as usize))
+                {
+                    return Ok(Value::Enum {
+                        type_name: inline_enum_key(names),
+                        name: names[*index as usize].clone(),
+                    });
+                }
+                Ok(value)
+            }
+            Expr::SetOfValues { ty, full, .. } => {
+                // 5.8.4/5.8.5: the set of all legal (or possible)
+                // values of the type. No range restrictions are
+                // recorded on declared types yet, so both forms build
+                // the same set (the honest reading of 5.8.5's "for
+                // types that have no range restrictions...").
+                let _ = full;
+                self.set_of_type(ty)
             }
             Expr::BitSlice {
                 base,
@@ -3526,6 +3711,7 @@ impl<'a> Interp<'a> {
                 let parts: Vec<String> = items.iter().map(|item| self.format_value(item)).collect();
                 format!("[{}]", parts.join(", "))
             }
+            Value::Set(intervals) => render_set(intervals),
             Value::Object(index) => {
                 let instance = &self.instances[*index];
                 let parts: Vec<String> = instance
@@ -3546,6 +3732,7 @@ impl<'a> Interp<'a> {
             Value::Str(_) => "a string",
             Value::Enum { .. } => "an enumeral",
             Value::List(_) => "a list",
+            Value::Set(_) => "a set",
             Value::Object(_) => "an object",
             Value::Void => "void",
         }
@@ -3607,6 +3794,105 @@ fn as_i64(value: &Value) -> Option<i64> {
 /// elaborator's synthesized [`crate::elab::ElaboratedType`] entry.
 fn when_view_name(value: &str, base_name: &str) -> String {
     format!("{value} {base_name}")
+}
+
+/// The MAX_UINT predefined constant (the 27.4 guards' bound).
+const MAX_UINT_VALUE: i128 = (1i128 << 32) - 1;
+
+/// The inclusive value range of a scalar type from its base and width.
+fn scalar_range(base: ScalarBase, width: &Option<Box<Expr>>) -> Option<(i128, i128)> {
+    match base {
+        ScalarBase::Uint => {
+            let bits = width_bits(width, 32);
+            Some((0, (1i128 << bits) - 1))
+        }
+        ScalarBase::Int => {
+            let bits = width_bits(width, 32);
+            Some((-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1))
+        }
+        ScalarBase::Bit => Some((0, 1)),
+        ScalarBase::Byte => Some((0, 255)),
+        ScalarBase::Nibble => Some((0, 15)),
+        ScalarBase::Bool => Some((0, 1)),
+        ScalarBase::Real | ScalarBase::String | ScalarBase::Time => None,
+    }
+}
+
+/// Canonicalize intervals (5.1.10): sort, merge overlapping and
+/// neighboring ones, drop empties.
+fn canonical_set(mut intervals: Vec<(i128, i128)>) -> Vec<(i128, i128)> {
+    intervals.retain(|(lo, hi)| lo <= hi);
+    intervals.sort();
+    let mut merged: Vec<(i128, i128)> = Vec::new();
+    for (lo, hi) in intervals {
+        match merged.last_mut() {
+            Some((_, last_hi)) if lo <= last_hi.saturating_add(1) => {
+                if hi > *last_hi {
+                    *last_hi = hi;
+                }
+            }
+            _ => merged.push((lo, hi)),
+        }
+    }
+    merged
+}
+
+fn union_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Value {
+    let mut all = a.to_vec();
+    all.extend_from_slice(b);
+    Value::Set(canonical_set(all))
+}
+
+fn intersect_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Value {
+    let mut result = Vec::new();
+    for (alo, ahi) in a {
+        for (blo, bhi) in b {
+            let lo = (*alo).max(*blo);
+            let hi = (*ahi).min(*bhi);
+            if lo <= hi {
+                result.push((lo, hi));
+            }
+        }
+    }
+    Value::Set(canonical_set(result))
+}
+
+fn diff_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Value {
+    // Remove b's intervals from a's one at a time.
+    let mut current = a.to_vec();
+    for (blo, bhi) in b {
+        let mut next = Vec::new();
+        for (lo, hi) in current {
+            if *bhi < lo || *blo > hi {
+                next.push((lo, hi));
+                continue;
+            }
+            if *blo > lo {
+                next.push((lo, blo - 1));
+            }
+            if *bhi < hi {
+                next.push((bhi + 1, hi));
+            }
+        }
+        current = next;
+    }
+    Value::Set(canonical_set(current))
+}
+
+/// Render a set in canonical form (5.1.10): `[1..5,10]` — single-value
+/// intervals show the value alone.
+fn render_set(intervals: &[(i128, i128)]) -> String {
+    let parts: Vec<String> = intervals
+        .iter()
+        .map(|(lo, hi)| {
+            if lo == hi {
+                format!("{lo}")
+            } else {
+                format!("{lo}..{hi}")
+            }
+        })
+        .collect();
+    format!("[{}]", parts.join(","))
 }
 
 /// Rebase an enclosing instance's constraints onto a generated

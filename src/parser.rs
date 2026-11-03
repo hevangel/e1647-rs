@@ -3785,6 +3785,35 @@ impl Parser {
                     span: (start, end),
                 })
             }
+            Some(TokenKind::Identifier(name))
+                if name == "set_of_values" || name == "full_set_of_values" =>
+            {
+                // 5.8.4/5.8.5: the argument is a TYPE (a numeric or
+                // enumeral type), not an expression.
+                let (name, _) = self.take_identifier();
+                let full = name == "full_set_of_values";
+                if self.at_punct("(") {
+                    self.bump();
+                    let ty = self.parse_type()?;
+                    self.expect_punct(
+                        ")",
+                        "E0110",
+                        "expected ')' to close the set_of_values argument",
+                    )?;
+                    let end = self.last_end();
+                    let expr = Expr::SetOfValues {
+                        ty,
+                        full,
+                        span: (start, end),
+                    };
+                    return self.parse_postfix_chain(expr, start);
+                }
+                let expr = Expr::Ident {
+                    name,
+                    span: (start, end),
+                };
+                self.parse_postfix_chain(expr, start)
+            }
             Some(TokenKind::Identifier(_)) => {
                 let (name, _) = self.take_identifier();
                 let expr = Expr::Ident {

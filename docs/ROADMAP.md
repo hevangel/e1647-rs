@@ -256,6 +256,20 @@
       labels), and `run --coverage` reports; per-instance and the
       option tables are not collected
 - [ ] Coverage reports per instance and coverage configuration (28.9)
+- [~] Part 2 predefined routine library — started with the reflection
+      set: `set_of_values(<type>)`/`full_set_of_values(<type>)`
+      (5.8.4/5.8.5 — the argument parses as a type) build the
+      `Value::Set` of all legal values (5.1.10 canonical intervals:
+      sorted, merged, non-neighboring), the 27.4 set pseudo-methods
+      query and combine (`size`/`uint_size`/`min`/`uint_min`/
+      `int_min`/`max`/`uint_max`/`int_max`, the `_is_uint` guards,
+      `union`/`intersect`/`diff`), `to_string()` renders scalars and
+      sets, and `as_a` to an enumeral type maps the integer index to
+      the enumerand (5.8.1). Set literals in expressions, range
+      modifiers on declared types (so `full_set_of_values` can
+      differ), and bare scalar keywords as type arguments
+      (`set_of_values(int)` — needs type objects in expression
+      position) are not modeled
 
 ## M4 — Simulator integration
 - [~] HDL bridge — started: `src/hdl.rs` spawns `xezim` with the VPI

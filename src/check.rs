@@ -471,6 +471,8 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
                 collect_with_init_roots(statement, roots);
             }
         }
+        // A set_of_values argument names a type, not a variable.
+        Expr::SetOfValues { .. } => {}
         Expr::HdlPath { .. } => {}
         Expr::IntLiteral { .. }
         | Expr::RealLiteral { .. }

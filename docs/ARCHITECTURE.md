@@ -169,7 +169,7 @@ multi-simulator HDL API, and wasm32.
   the `sys` unit, sequence bases (`any_sequence_item` and siblings), and
   routines such as `out`, `outf`, `message`, `pack`, `append`,
   `dut_error`, `stop_run`, the objection no-ops, and the `hdl_*` bridge
-  calls.
+  calls; the predeclared type names `file`, `event` and `set` (5.1.10).
 - `src/coverage.rs` — the clause 14 coverage data model, built from
   the recorded cover groups at run start: `is also`/`empty`
   extensions merge into their base group by name (14.5, either
@@ -233,7 +233,15 @@ multi-simulator HDL API, and wasm32.
   depth-two paths rebase (`p.v == select { .. }` → `v == select
   { .. }`) so when-view distribution policies drive generation;
   constraints that do not rebase (other roots, deeper paths,
-  whole-object equalities) drop until full CFS scoping lands.
+  whole-object equalities) drop until full CFS scoping lands. The
+  reflection set (5.8.4/27.4) evaluates: `set_of_values(type)` builds
+  a `Value::Set` — canonical inclusive intervals (sorted, merged,
+  non-neighboring) over the type's width/signedness or enumeral
+  indices — and the set pseudo-methods (`size`/`uint_size`,
+  `min`/`uint_min`/`int_min` and the `max`/`uint_max`/`int_max`
+  mirrors, the `_is_uint` guards, `union`/`intersect`/`diff`) run on
+  set values; `to_string()` renders scalars and sets, and `as_a` to
+  an enumeral type maps the integer index to the enumerand.
 - `src/solve.rs` — constraint IR and the pluggable solver seam: the
   top-level `keep` constraints of one type translate (conservatively) into
   bounded-integer variables plus a conjunction of linear comparisons;
@@ -275,5 +283,8 @@ rules, `template extend` (8.2) and method-body instance
 substitution, template category-compliance checks (8.3's notes),
 computed macros and the match-expression grammar's repetition and
 category validation (clause 15.3/15.4 — simple define-as macros
-expand), a multi-simulator HDL
+expand), the Part 2 routine library beyond the reflection set
+(`set_of_values`/`full_set_of_values` and the 27.4 set
+pseudo-methods work; set literals, range modifiers on declared
+types, and bare scalar keywords as type arguments do not), a multi-simulator HDL
 API, and WASM.
