@@ -87,7 +87,18 @@
       recorded, not collected.
       Predefined non-scalar types `file` and `event` are accepted in
       type positions; `for each <type> (v) in list` records the element
-      type filter. `expect`/`assume` members (clause 11.4) parse their
+      type filter. Simple macros expand (clause 15): `define <name'
+      category> "pattern" as { body };` compiles the match expression
+      (15.4 — escaped literal terminals, `<[tag']type>` non-terminals,
+      `[ ]` option, `( )` grouping, `|` alternation) and a pre-pass
+      over the token stream expands every invocation site with
+      backtracking matching (15.5.2) and parameter substitution
+      (15.6), later definitions taking priority (15.5.1); bodies may
+      invoke other macros. The v1 approximations: literals match one
+      token each (whitespace literals vanish), the repetition form
+      matches as one non-terminal, categories are not validated, and
+      computed macros (15.3) stay recorded, not computed.
+      `expect`/`assume` members (clause 11.4) parse their
       temporal expressions into the clause 12 grammar
       (`TemporalExpr`: `@event` atoms, `cycle`, `true(exp)`,
       `change/rise/fall(exp)` edge samples, `{;}` sequences, `=>`
@@ -121,9 +132,11 @@
       applies no text substitution, and `#else` is not parsed. Spanned
       diagnostics and declaration/member/statement-level recovery. The
       CLI resolves `import a.b` to `a/b.e` or `a.b.e` beside the source
-      and checks the merged declarations (not yet: `repeat`, single-statement `if ... do`, template `extend` (clause 8.2) and body-level instance substitution, macro
-      match-expression interpretation and expansion
-      (clause 15.4–15.5), the remaining clause 14 coverage model —
+      and checks the merged declarations (not yet: `repeat`, single-statement `if ... do`, template `extend` (clause 8.2) and body-level instance substitution,
+      computed macros and the full match-expression grammar (clause
+      15.4's repetition and the 15.3 computed bodies — simple
+      define-as macros expand, see M1), the remaining clause 14
+      coverage model —
       per-instance coverage and the option tables are recorded, not
       collected — the clause 12/13 temporal
       engine's remaining simulation integration — the scheduler runs

@@ -23,6 +23,7 @@ pub mod elab;
 pub mod hdl;
 pub mod interp;
 pub mod lexer;
+pub mod macros;
 pub mod parser;
 pub mod solve;
 pub mod temporal;
