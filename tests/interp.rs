@@ -1425,3 +1425,64 @@ fn group_level_per_instance_marks_all_items() {
     assert!(group.items[0].per_instance);
     assert_eq!(group.instances().len(), 1);
 }
+
+#[test]
+fn repeat_until_executes_at_least_once() {
+    // 20.2.2: the body executes at least once, then repeatedly until
+    // the condition is TRUE. (Locals, not fields — the implicit gen
+    // randomizes uint fields before run().)
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n            var i: uint = 0;\n            repeat {\n                \
+         i = i + 1;\n            } until i == 3;\n            print i;\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("3"), "output: {output}");
+}
+
+#[test]
+fn repeat_until_runs_the_body_before_the_first_check() {
+    // The do-while order: a body whose condition is already TRUE at
+    // entry still runs once.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n            var done: bool = TRUE;\n            \
+         var ran: uint = 0;\n            repeat {\n                ran = ran + 1;\n            \
+         } until done;\n            print ran;\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("1"), "output: {output}");
+}
+
+#[test]
+fn break_exits_a_repeat_until_loop() {
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n            var i: uint = 0;\n            repeat {\n                \
+         i = i + 1;\n                if i == 2 {\n                    break;\n                };\n            \
+         } until FALSE;\n            print i;\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("2"), "output: {output}");
+}
+
+#[test]
+fn if_do_single_statement_form_parses_and_runs() {
+    // 20.1/20.2's optional `do` sugar, one-statement form: `if cond do
+    // <statement>;`.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n            var i: uint = 3;\n            \
+         if i == 3 do out(\"THREE\");\n            if i == 9 do out(\"NINE\");\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("THREE"), "output: {output}");
+    assert!(!output.contains("NINE"), "output: {output}");
+}
+
+#[test]
+fn while_do_sugar_parses_and_runs() {
+    // The iterative constructs' optional `do` (20.2's NOTE 2).
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n            var i: uint = 0;\n            \
+         while i < 3 do {\n                i = i + 1;\n            };\n            print i;\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("3"), "output: {output}");
+}

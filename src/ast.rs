@@ -395,6 +395,14 @@ pub enum Stmt {
         body: Vec<Stmt>,
         span: Span,
     },
+    /// `repeat [do] { body } until cond;` — the do-while loop (clause
+    /// 20.2.2): the body executes at least once, then repeatedly until
+    /// `cond` is TRUE.
+    RepeatUntil {
+        body: Vec<Stmt>,
+        cond: Expr,
+        span: Span,
+    },
     Break {
         span: Span,
     },
@@ -515,6 +523,7 @@ impl Stmt {
             | Stmt::Return { span, .. }
             | Stmt::If { span, .. }
             | Stmt::While { span, .. }
+            | Stmt::RepeatUntil { span, .. }
             | Stmt::Break { span }
             | Stmt::Continue { span }
             | Stmt::Print { span, .. }

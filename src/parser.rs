@@ -2888,6 +2888,7 @@ impl Parser {
             Some(TokenKind::Keyword(k)) if k == "case" => self.parse_case_statement(),
             Some(TokenKind::Keyword(k)) if k == "wait" => self.parse_wait_statement(),
             Some(TokenKind::Keyword(k)) if k == "sync" => self.parse_sync_statement(),
+            Some(TokenKind::Keyword(k)) if k == "repeat" => self.parse_repeat_statement(),
             Some(TokenKind::Keyword(k)) if k == "for" => self.parse_for_statement(),
             Some(TokenKind::Keyword(k)) if k == "emit" => {
                 self.bump();
@@ -3062,32 +3063,82 @@ impl Parser {
     /// `if cond { statements } else { statements };` — the braced form only;
     /// `if ... do ..` and loops are a later milestone.
     fn parse_if_statement(&mut self) -> Option<Stmt> {
-        let inner = self.parse_if_inner()?;
-        self.expect_stmt_semi("expected ';' after the 'if' statement")?;
+        // The one-statement `do` form's single statement consumes its
+        // own `;` — the tuple's flag tells whether the caller still
+        // owes a terminator.
+        let (inner, needs_semi) = self.parse_if_inner()?;
+        if needs_semi {
+            self.expect_stmt_semi("expected ';' after the 'if' statement")?;
+        }
         Some(inner)
     }
 
     /// The `if`/`else if` shape without its statement terminator —
-    /// `else if` chains share the outer statement's `;`.
-    fn parse_if_inner(&mut self) -> Option<Stmt> {
+    /// `else if` chains share the outer statement's `;`. The body is
+    /// braced, or — with the optional `do` sugar (20.2's NOTE 2) — a
+    /// single statement (which consumes its own `;`; the flag is
+    /// false). Returns the statement and whether the caller owes a `;`.
+    fn parse_if_inner(&mut self) -> Option<(Stmt, bool)> {
         let start = self.current_span().0;
         self.bump(); // 'if'
         let cond = self.parse_expr()?;
-        // Both `if cond { .. }` and `if cond then { .. }` are accepted.
+        // Both `if cond { .. }`, `if cond then { .. }` and `if cond do
+        // <one statement>` are accepted.
         self.eat_keyword("then");
-        if self
-            .expect_punct("{", "E0106", "expected '{' to open the 'if' body")
-            .is_none()
+        let do_sugar = self.eat_keyword("do");
+        let then_body = if !do_sugar
+            && self
+                .expect_punct("{", "E0106", "expected '{' to open the 'if' body")
+                .is_none()
         {
             self.recover_to_member_boundary();
             return None;
-        }
-        let then_body = self.parse_statements();
+        } else if do_sugar && !self.at_punct("{") {
+            // The one-statement `do` form.
+            let statement = self.parse_statement()?;
+            let end = self.last_end();
+            if self.eat_keyword("else") {
+                let else_body = if self.at_keyword("if") {
+                    let (inner, _) = self.parse_if_inner()?;
+                    vec![inner]
+                } else if self
+                    .expect_punct("{", "E0106", "expected '{' to open the 'else' body")
+                    .is_some()
+                {
+                    let body = self.parse_statements();
+                    self.expect_punct("}", "E0107", "expected '}' to close the 'else' body")?;
+                    body
+                } else {
+                    self.recover_to_member_boundary();
+                    return None;
+                };
+                return Some((
+                    Stmt::If {
+                        cond,
+                        then_body: vec![statement],
+                        else_body: Some(else_body),
+                        span: (start, end),
+                    },
+                    false,
+                ));
+            }
+            return Some((
+                Stmt::If {
+                    cond,
+                    then_body: vec![statement],
+                    else_body: None,
+                    span: (start, end),
+                },
+                false,
+            ));
+        } else {
+            self.parse_statements()
+        };
         self.expect_punct("}", "E0107", "expected '}' to close the 'if' body")?;
         let else_body = if self.eat_keyword("else") {
             if self.at_keyword("if") {
                 // `else if` chains nest as a one-statement else body.
-                let inner = self.parse_if_inner()?;
+                let (inner, _) = self.parse_if_inner()?;
                 Some(vec![inner])
             } else {
                 if self
@@ -3105,12 +3156,15 @@ impl Parser {
             None
         };
         let end = self.last_end();
-        Some(Stmt::If {
-            cond,
-            then_body,
-            else_body,
-            span: (start, end),
-        })
+        Some((
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+                span: (start, end),
+            },
+            true,
+        ))
     }
 
     /// `while cond { statements };` — other loop forms are a later
@@ -3119,6 +3173,8 @@ impl Parser {
         let start = self.current_span().0;
         self.bump(); // 'while'
         let cond = self.parse_expr()?;
+        // The optional `do` sugar (20.2's NOTE 2).
+        self.eat_keyword("do");
         if self
             .expect_punct("{", "E0106", "expected '{' to open the 'while' body")
             .is_none()
@@ -3133,6 +3189,35 @@ impl Parser {
         Some(Stmt::While {
             cond,
             body,
+            span: (start, end),
+        })
+    }
+
+    /// `repeat [do] { body } until cond;` — the do-while loop (clause
+    /// 20.2.2): the body executes at least once.
+    fn parse_repeat_statement(&mut self) -> Option<Stmt> {
+        let start = self.current_span().0;
+        self.bump(); // 'repeat'
+        self.eat_keyword("do");
+        if self
+            .expect_punct("{", "E0106", "expected '{' to open the 'repeat' body")
+            .is_none()
+        {
+            self.recover_to_member_boundary();
+            return None;
+        }
+        let body = self.parse_statements();
+        self.expect_punct("}", "E0107", "expected '}' to close the 'repeat' body")?;
+        if !self.eat_keyword("until") {
+            self.error_here("E0112", "expected 'until' after the 'repeat' body");
+            return None;
+        }
+        let cond = self.parse_expr()?;
+        self.expect_stmt_semi("expected ';' after the 'repeat' statement")?;
+        let end = self.last_end();
+        Some(Stmt::RepeatUntil {
+            body,
+            cond,
             span: (start, end),
         })
     }

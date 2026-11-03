@@ -965,6 +965,34 @@ impl<'a> Interp<'a> {
                 self.exec_context.pop();
                 flow
             }
+            // 20.2.2: the body executes at least once, then repeatedly
+            // until the condition is TRUE.
+            Stmt::RepeatUntil { body, cond, .. } => {
+                self.exec_context.push(ExecCtx {
+                    index: self.current_ctx_index(),
+                    kind: CtxKind::WhileLoop,
+                });
+                let flow = loop {
+                    let outcome = self.exec_block(body, frame, me)?;
+                    match outcome {
+                        Flow::Normal | Flow::Continue => {}
+                        Flow::Break => break Ok(Flow::Normal),
+                        other => break Ok(other),
+                    }
+                    let Value::Bool(keep_going) = self.eval(cond, frame, me)? else {
+                        break Err(self.error(
+                            "E0402",
+                            "repeat-until condition must be a boolean",
+                            cond.span(),
+                        ));
+                    };
+                    if keep_going {
+                        break Ok(Flow::Normal);
+                    }
+                };
+                self.exec_context.pop();
+                flow
+            }
             Stmt::Break { .. } => Ok(Flow::Break),
             Stmt::Continue { .. } => Ok(Flow::Continue),
             Stmt::Print { exprs, .. } => {
