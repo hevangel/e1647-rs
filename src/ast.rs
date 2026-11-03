@@ -801,6 +801,15 @@ pub enum Expr {
         ty: TypeExpr,
         span: Span,
     },
+    /// `set_of_values(<type>)` / `full_set_of_values(<type>)`
+    /// (5.8.4/5.8.5) — the set of all legal (or possible) values of a
+    /// numeric or enumeral type. The argument parses as a type, not an
+    /// expression.
+    SetOfValues {
+        ty: TypeExpr,
+        full: bool,
+        span: Span,
+    },
     /// Bit slice `base[high:low]` (integer extraction).
     BitSlice {
         base: Box<Expr>,
@@ -928,6 +937,7 @@ impl Expr {
             | Expr::Paren { span, .. }
             | Expr::Ternary { span, .. }
             | Expr::CastAs { span, .. }
+            | Expr::SetOfValues { span, .. }
             | Expr::BitSlice { span, .. }
             | Expr::InSet { span, .. }
             | Expr::IsA { span, .. }

@@ -38,7 +38,8 @@
 > views whose when members apply. Template instances (clause 8.3)
 > monomorphize: actuals substitute for formals and template-typed
 > fields carry the instance. Simple macros (clause 15) expand before
-> parsing. It does **not** yet do
+> parsing, and the reflection set (`set_of_values` with the 27.4 set
+> pseudo-methods) evaluates. It does **not** yet do
 > full type
 > checking,
 > resolution, event-driven temporal evaluation, coverage, non-linear or

@@ -2164,3 +2164,71 @@ argument reaching the helper; the corpus composition shape
 expression); an argument with internal parentheses consumed whole;
 15.5.1 priority (later same-pattern definition wins); and a body
 invoking another macro (15.5.2's re-testing of generated code).
+
+## 2026-11-02 (35) — offline arc: Part 2 reflection routines (set_of_values, 27.4 set pseudo-methods)
+
+Branch `agent/reflection-routines` (off main after #24 merged). The
+reflection subset of the Part 2 routine library evaluates — the set
+type, its constructor, and its pseudo-methods.
+
+- `Value::Set` (5.1.10): inclusive intervals in canonical form —
+  sorted, overlapping and neighboring merged, empties dropped.
+  `format_value` renders the canonical form (`[-128..127]`,
+  single-value intervals as bare values: `[1..5,10]`).
+- `set_of_values(<type>)` / `full_set_of_values(<type>)` (5.8.4/5.8.5):
+  a new `Expr::SetOfValues` whose argument PARSES AS A TYPE in
+  `parse_primary` — scalar types from width and signedness
+  (`uint (bits : 4)` → `[0..15]`), clause-5 `type` declarations from
+  their underlying representation, enumeral types as `[0..count-1]`.
+  The two routines build the same set today: no range modifiers are
+  recorded on declared types, which is 5.8.5's "for types that have
+  no range restrictions..." case.
+- The 27.4 set pseudo-methods run on set values through the same
+  dispatch as list pseudo-methods: `size`/`uint_size` (27.4.4/5),
+  `min`/`uint_min`/`int_min` and `max`/`uint_max`/`int_max`
+  (27.4.7-27.4.10 — the bottom/top boundary; empty sets error per the
+  prose's exception), the `size_is_uint`/`min_is_uint` guards, the
+  algebra `union`/`intersect`/`diff` (27.4.1-3, canonicalized), and
+  `to_string()`.
+- `to_string()` also renders Int/Bool/Enum/Str values (the DAC macro
+  shapes: `set.min().to_string()`), and `as_a` to an enumeral type
+  maps the integer index to the enumerand (5.8.1) —
+  `2.as_a(color_t)`-shaped casts (via a variable: the lexer reads
+  `2.as_a` as the real `2.`).
+- The set type name is predeclared in type positions
+  (`var s: set`, BUILTIN_TYPES) with the empty set default (5.1.10's
+  `[]`).
+- Honest v1 limits: set literals in expressions (`[-5..-1]`), range
+  modifiers on declared types (`type x : int[1..10]` — so
+  `full_set_of_values` cannot yet differ from `set_of_values`), bare
+  scalar keywords as type arguments (`set_of_values(int)` in
+  expression position — needs type objects), and the rf_* reflection
+  layer (`rf_manager`, `rf_numeric`) are not modeled. The
+  type_min_max example file's remaining diagnostics are exactly its
+  bare-scalar invocations (`print MIN_VALUE(int)`) plus the
+  pre-existing import-list form.
+
+Corpus state (absolute paths): etl 4, cover-edges 4, golden-imports
+3, golden-combined/igen-dist/type-min-max/save-restart/d6w 0 —
+unchanged; type-min-max runs exit 0.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(186 passed: 14 elab, 1 fixtures, 78 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 5 interpreter tests — set construction from scalar and
+enumeral types (canonical rendering); the 27.4 queries
+(size/min/max/uint_size on `[-128..127]`); the algebra with
+canonicalization (`bit ∪ nibble = [0..15]`, `bit ∩ nibble = [0..1]`,
+`nibble − bit = [2..15]`); the type_min_max chain shape
+(`uint_min`/`uint_max`/`uint_size`/`to_string` over a uint-typed
+set); and the int→enumeral `as_a` index mapping.

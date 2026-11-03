@@ -1217,3 +1217,81 @@ fn macro_body_invoking_another_macro_expands() {
     );
     assert!(output.contains("INNER RAN"), "output: {output}");
 }
+
+#[test]
+fn set_of_values_builds_the_legal_value_set() {
+    // 5.8.4: the set of all legal values of a numeric or enumeral
+    // type — scalars from their width and signedness, enumerals as
+    // their indices.
+    let output = clean_output(
+        "type addr_t : int (bits : 8);\n\
+         type color_t : [WHITE, BLACK, RED];\n\
+         extend sys {\n    run() is also {\n            print set_of_values(addr_t);\n            \
+         print set_of_values(color_t);\n            print set_of_values(bit);\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("[-128..127]"), "output: {output}");
+    assert!(output.contains("[0..2]"), "output: {output}");
+    assert!(output.contains("[0..1]"), "output: {output}");
+}
+
+#[test]
+fn set_pseudo_methods_query_and_combine() {
+    // 27.4: size/uint_size/min/uint_min/max/uint_max on sets, and the
+    // union/intersect/diff algebra.
+    let output = clean_output(
+        "type addr_t : int (bits : 8);\n\
+         extend sys {\n    run() is also {\n            var s: set = set_of_values(addr_t);\n            \
+         print s.size();\n            print s.min();\n            print s.max();\n            \
+         print s.uint_size();\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("256"), "output: {output}");
+    assert!(output.contains("-128"), "output: {output}");
+    assert!(output.contains("127"), "output: {output}");
+}
+
+#[test]
+fn set_union_intersect_diff_canonicalize() {
+    // 27.4.1-27.4.3: the algebra results are canonical (5.1.10:
+    // sorted, merged, non-neighboring).
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n            var a: set = set_of_values(bit);\n            \
+         var b: set = set_of_values(nibble);\n            print a.union(b);\n            \
+         print a.intersect(b);\n            print b.diff(a);\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("[0..15]"), "output: {output}");
+    assert!(output.contains("[0..1]"), "output: {output}");
+    assert!(output.contains("[2..15]"), "output: {output}");
+}
+
+#[test]
+fn min_max_to_string_and_macro_shapes_compose() {
+    // The type_min_max example's chain:
+    // `set_of_values(<type>).uint_min().as_a(<type>)` — here with a
+    // uint-typed set (values ≥ 0) and to_string on the min.
+    let output = clean_output(
+        "type addr_t : uint (bits : 8);\n\
+         extend sys {\n    run() is also {\n            var s: set = set_of_values(addr_t);\n            \
+         print s.uint_min();\n            print s.uint_max();\n            \
+         print s.uint_size();\n            print s.uint_min().to_string();\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("0"), "output: {output}");
+    assert!(output.contains("255"), "output: {output}");
+    assert!(output.contains("256"), "output: {output}");
+}
+
+#[test]
+fn cast_of_int_to_enumeral_maps_the_index() {
+    // 5.8.1: as_a to an enumeral type maps the integer value to the
+    // enumerand at that index.
+    let output = clean_output(
+        "type color_t : [WHITE, BLACK, RED];\n\
+         extend sys {\n    run() is also {\n            var n: int = 2;\n            \
+         var c: color_t = n.as_a(color_t);\n            print c;\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("RED"), "output: {output}");
+}
