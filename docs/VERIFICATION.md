@@ -2232,3 +2232,56 @@ canonicalization (`bit ∪ nibble = [0..15]`, `bit ∩ nibble = [0..1]`,
 `nibble − bit = [2..15]`); the type_min_max chain shape
 (`uint_min`/`uint_max`/`uint_size`/`to_string` over a uint-typed
 set); and the int→enumeral `as_a` index mapping.
+
+## 2026-11-02 (36) — offline arc: clause 11.3 on event-port members
+
+Branch `agent/on-event-port` (off main after #25 merged). Event ports
+and their `on` members parse, compose and run.
+
+- Event-port declarations (9.4): `name: <dir> event_port [is
+  instance];` — the port grammar accepts `event_port` alongside
+  `simple_port of <type>`, sharing the in/out/inout direction
+  spellings; the element type records as `event`.
+- `on <port>$ { actions };` members (11.3): the `$` access operator
+  (9.4.1) names the event associated with the port, and the lexer
+  folds it into the identifier (`p$` is one token) — so the member
+  flows through the existing clause 11.2 machinery unchanged: dotted
+  paths compose base-first then extends (repeated declarations extend
+  per 11.3's "same effect as using is also"), and `emit p$;` triggers
+  the port, running the blocks immediately before any waiting TCM
+  (trivially true in the inline-execution model).
+- The 11.3 restriction is enforced: "The on action block shall not
+  contain any time-consuming actions or TCMs" — `wait`, temporal
+  `wait`, `sync`, `start` and `compute` at any depth of an `on` body
+  (if/while/case/for included) report `E0210` at check time. The
+  restriction immediately caught a pre-existing test that violated it
+  (an on block carrying a `wait` to advance the cycle — entry 26);
+  that test now uses a started TCM, which is the legal shape.
+- Honest v1 limits: the trigger side is emit-only — HDL edge- and
+  bind()-driven port triggering rides the `@sim` gap (9.4's
+  bind()/hdl_path()/edge() attributes are not modeled); the 11.3
+  syntax example is an image in the local redline copy, so the port
+  declaration spelling follows the tokens real files use
+  (`event_port`) rather than a guessed figure.
+
+Corpus state (absolute paths): etl 4, cover-edges 4, golden-imports
+3, golden-combined/igen-dist/type-min-max/save-restart/d6w 0 —
+unchanged.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(188 passed: 14 elab, 1 fixtures, 80 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: two interpreter tests — `on p$` with repeated declarations
+both running on `emit p$`, and the E0210 restriction over `wait` and
+`start` in on bodies; the temporal-wait fixture extends with the
+event-port declaration, an `on rst$` block and `emit rst$`.

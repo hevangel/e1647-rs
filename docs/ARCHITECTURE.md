@@ -53,7 +53,11 @@ multi-simulator HDL API, and wasm32.
   `for each` and `for i from .. to`, `case`, `check that`, `wait`, `emit`,
   `start`, sequence `do` and `stop_run`. Struct members include `on`
   event blocks (clause 11.2: dotted event path, action block; extension
-  is a repeated declaration), and the clause 21 preprocessor directives
+  is a repeated declaration) and `on <port>$` event-port blocks
+  (clause 11.3: the 9.4.1 `$` access operator names the port's event;
+  event ports declare as `name: <dir> event_port [is instance];` along
+  the simple_port grammar; the 11.3 restriction — no time-consuming
+  actions or TCMs in the block — reports `E0210`), and the clause 21 preprocessor directives
   `#ifdef` / `#ifndef` / `#define` / `#undef` in statement, struct-member
   and action positions — flag semantics only: `#define` records the name
   (the replacement text is consumed, not substituted; clause 21.3's
@@ -277,8 +281,9 @@ truncation, evaluation of MVL literals, `repeat`, single-statement
 `if ... do`, `detach`/`delay`/`exec` TEs, select
 choice policies beyond the constant-expression subset (the full
 choice-expression grammar, soft-order interactions between multiple
-selects), `on
-event-port`, `#else` and `#define` replacement
+selects), HDL-edge- and bind()-driven event-port triggering (the
+`on p$` members run on `emit p$`; the simulator-side triggers ride
+the `@sim` gap), `#else` and `#define` replacement
 rules, `template extend` (8.2) and method-body instance
 substitution, template category-compliance checks (8.3's notes),
 computed macros and the match-expression grammar's repetition and

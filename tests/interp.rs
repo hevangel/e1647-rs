@@ -635,13 +635,15 @@ fn emit_feeds_the_temporal_log_and_wait_sees_it() {
 }
 
 #[test]
-fn temporal_wait_sees_events_recorded_by_on_blocks() {
-    // The `on` block's numeric wait advanced the cycle and the emission
+fn temporal_wait_sees_events_recorded_by_a_tcm() {
+    // A started TCM's numeric wait advanced the cycle and the emission
     // landed in the new cycle's state; the temporal wait `until @ev`
     // (13.1.3's readability-only `until`) succeeds against the log.
+    // (An `on` block cannot carry the wait: 11.3 forbids
+    // time-consuming actions in on action blocks.)
     let output = clean_output(
-        "extend sys {\n    ev: event;\n    on reset_ev {\n        wait [1]*cycle;\n        \
-         emit ev;\n    };\n    reset_ev: event;\n    run() is also {\n        emit reset_ev;\n        \
+        "extend sys {\n    ev: event;\n    emitter() @sys.any is {\n        wait [1]*cycle;\n        \
+         emit ev;\n    };\n    run() is also {\n        start emitter();\n        \
          wait until @ev;\n        out(\"RESUMED\");\n    };\n};\n",
         1,
     );
@@ -1294,4 +1296,39 @@ fn cast_of_int_to_enumeral_maps_the_index() {
         1,
     );
     assert!(output.contains("RED"), "output: {output}");
+}
+
+#[test]
+fn on_event_port_runs_when_the_port_event_is_emitted() {
+    // 11.3 + 9.4.1: `on p$` runs its block when the event port's event
+    // occurs — here triggered by `emit p$` (the T1 emit trigger; HDL
+    // edge/bind-driven triggering stays with the @sim gap). Repeated
+    // declarations extend the block (11.3's is-also equivalent).
+    let output = clean_output(
+        "extend sys {\n    p$: in event_port is instance;\n    on p$ {\n        \
+         out(\"PORT ONE\");\n    };\n    on p$ {\n        out(\"PORT TWO\");\n    };\n    \
+         run() is also {\n            emit p$;\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("PORT ONE"), "output: {output}");
+    assert!(output.contains("PORT TWO"), "output: {output}");
+}
+
+#[test]
+fn on_event_port_rejects_time_consuming_actions() {
+    // 11.3's restriction: wait/sync/start/compute in an on action
+    // block are rejected at check time (the parse result carries the
+    // diagnostic; running is not required).
+    let parsed = parse(
+        "extend sys {\n    p$: in event_port is instance;\n    on p$ {\n        \
+         wait cycle;\n    };\n    on p$ {\n        start watcher();\n    };\n};\n",
+    );
+    assert_eq!(
+        parsed
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>(),
+        vec!["E0210", "E0210"]
+    );
 }
