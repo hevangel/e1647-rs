@@ -186,9 +186,15 @@ multi-simulator HDL API, and wasm32.
   field is read) and the value lands in the containing bucket;
   out-of-range values are ungradeable (14.2: "goals of 0"). Grades
   are covered-buckets-per-item, averaged over gradeable items; cross/
-  transition items, per-instance coverage (14.2.1), the coverage
-  configuration of 28.9 and `range(...)`'s numeric parameters beyond
-  bounds/label are recorded, not applied.
+  transition items grade over their sources' bucket cross-product.
+  The option tokens apply where the prose names them: `at_least = N`
+  is the per-bucket goal, `per_instance = TRUE` (item or group
+  spelling) makes each bucket its own graded instance (14.2.1 —
+  `CoverInstanceData`, name `item==bucket`, holes for unsampled
+  buckets, the group grade = the weighted instance grades plus the
+  per_type bucket) and `weight = N` scales the grade contribution;
+  the coverage configuration of 28.9 and `range(...)`'s numeric
+  parameters beyond bounds/label are recorded, not applied.
 - `src/interp.rs` — interpreter for the statement subset (codes
   `E0401`–`E0410`). Entry: the built-in `sys` unit's `run()` methods, with
   and named types by declared name, walking `like` bases — subtype-aware
@@ -275,7 +281,8 @@ per-instance timelines, and suspension re-entry beyond `while` chains
 (waits inside `if`/`case`/`for` bodies, inline calls, `compute` and
 `on` blocks spin inline instead of interleaving), the remaining
 clause 14 coverage model (basic and derived items collect and grade;
-per-instance coverage, the option tables
+per_instance items grade per bucket with holes and the weighted
+group grade; the option tables beyond per_instance/at_least/weight
 and the 28.9 configuration are recorded, not applied), integer width
 truncation, evaluation of MVL literals, `repeat`, single-statement
 `if ... do`, `detach`/`delay`/`exec` TEs, select
