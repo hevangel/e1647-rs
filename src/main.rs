@@ -450,6 +450,22 @@ fn print_coverage(coverage: &[e1647::coverage::TypeCoverage]) {
                     item.samples,
                     item.ungradeable_hits
                 );
+                // 14.2.1: per_instance items list their instances
+                // (name = item==bucket); unsampled ones are holes.
+                for instance in group
+                    .instances()
+                    .into_iter()
+                    .filter(|instance| instance.name.starts_with(&format!("{}==", item.name)))
+                {
+                    let hole = if instance.is_hole() { " [hole]" } else { "" };
+                    println!(
+                        "      instance {}: {}/{} hits, grade {:.0}%{hole}",
+                        instance.name,
+                        instance.hits,
+                        instance.goal,
+                        instance.grade() * 100.0
+                    );
+                }
                 for bucket in &item.buckets {
                     let range_text = if bucket.lo == bucket.hi {
                         format!("{}", bucket.lo)

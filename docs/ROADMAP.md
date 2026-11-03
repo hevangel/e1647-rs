@@ -137,8 +137,9 @@
       15.4's repetition and the 15.3 computed bodies — simple
       define-as macros expand, see M1), the remaining clause 14
       coverage model —
-      per-instance coverage and the option tables are recorded, not
-      collected — the clause 12/13 temporal
+      the option tables beyond per_instance/at_least/weight, coverage
+      configuration (28.9) and per-unit-instance options (14.1.1) —
+      the clause 12/13 temporal
       engine's remaining simulation integration — the scheduler runs
       started TCMs concurrently and waits/sync suspend, but
       `@`-triggered TCM invocation, `@sim` sampling, and suspension
@@ -258,9 +259,13 @@
       ranges/defaults, 14.5 merging), the interpreter samples on the
       group's event, derived items collect (14.4 transitions as
       previous→current pairs, 14.3 crosses over the sources' bucket
-      labels), and `run --coverage` reports; per-instance and the
-      option tables are not collected
-- [ ] Coverage reports per instance and coverage configuration (28.9)
+      labels), `per_instance = TRUE` grades per bucket with holes
+      (14.2.1 — the group grade is the weighted instance grades plus
+      the per_type bucket), `at_least`/`weight` apply from the option
+      tokens, and `run --coverage` reports instances; coverage
+      configuration (28.9), per-unit-instance options (14.1.1) and
+      the remaining option tables are not collected
+- [ ] Coverage configuration options (28.9) and per-unit-instance options (14.1.1)
 - [~] Part 2 predefined routine library — started with the reflection
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`
       (5.8.4/5.8.5 — the argument parses as a type) build the

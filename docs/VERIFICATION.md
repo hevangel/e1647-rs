@@ -2285,3 +2285,63 @@ New tests: two interpreter tests — `on p$` with repeated declarations
 both running on `emit p$`, and the E0210 restriction over `wait` and
 `start` in on bodies; the temporal-wait fixture extends with the
 event-port declaration, an `on rst$` block and `emit rst$`.
+
+## 2026-11-03 (37) — offline arc: clause 14.2.1 per-instance coverage; option table readings
+
+Branch `agent/per-instance-coverage` (off main after #26 merged). The
+per_instance option, the option-table readings and per-instance
+grading land.
+
+- Option scanning from the recorded tokens (Tables 40/41 are images
+  in the local redline copy; the common readings apply, documented):
+  `at_least = N` sets the per-bucket goal (both explicit `ranges`
+  buckets and the 14.2 defaults), `per_instance = TRUE` marks the
+  item per-instance — the item-level spelling in `using` and the
+  group-level spelling as a group option entry (which marks every
+  item) — and `weight = N` scales the item's grade contribution.
+- `CoverInstanceData` (14.2.1): "an instance is created for every
+  valid bucket of the per_instance item. Any instance that is not
+  sampled is marked as a hole" — instance name is
+  `item==bucket_label`, grade 1.0 when the bucket's hits reach its
+  goal, 0.0 otherwise, holes = zero hits.
+- Group grading (14.2.1's weighted reading): with per_instance items,
+  the group grade is the weighted grades of all the instances plus
+  the per_type bucket (14.2.1's "sum of all valid buckets for all the
+  per_instance items +1 (the per_type bucket)") — one unit whose
+  grade is the average of the per_type items' grades; without them,
+  the weighted average of the gradeable items' grades (weight 1 when
+  the option is absent). The per_type item still collects its
+  accumulated data (14.2.1's "as if it were not a per_instance
+  item").
+- `run --coverage` lists each per_instance item's instances with
+  hits/goal/grade and `[hole]` marks.
+- Honest v1 limits: instance naming uses the bucket label as written
+  (integer instances use the decimal radix per 14.2.1 — the labels
+  come from the ranges clauses); `weight` applies in the group grade
+  only (no aggregation hierarchy above the group); per-instance items
+  participating in crosses/transitions are excluded from those
+  instances (the exclusion falls out of the derived items' sources
+  reading); per-unit-instance options (14.1.1) are not modeled.
+
+Corpus state (absolute paths): etl 4, cover-edges 4, golden-imports
+3, golden-combined/igen-dist/type-min-max/save-restart/d6w 0 —
+unchanged.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(192 passed: 14 elab, 1 fixtures, 84 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 4 interpreter tests — per-bucket instances with the
+`item==bucket` names and a 100% group grade; unsampled buckets as
+holes pulling the group grade to (1.0 + 1/3)/4; `at_least = 2` as the
+bucket goal with the weighted group grade (1.0 + 0.5×3)/4; and the
+group-level `per_instance = TRUE` spelling marking all items.

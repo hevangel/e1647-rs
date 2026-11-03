@@ -1332,3 +1332,96 @@ fn on_event_port_rejects_time_consuming_actions() {
         vec!["E0210", "E0210"]
     );
 }
+
+#[test]
+fn per_instance_items_grade_per_bucket_with_holes() {
+    // 14.2.1: each bucket of a per_instance item is its own graded
+    // instance (`item==bucket`); unsampled instances are holes; the
+    // group grade is the weighted grades of the instances plus the
+    // per_type bucket.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
+         item cur: uint using per_instance = TRUE, ranges = {\n            \
+         range([0..1], \"low\");\n            range([2..3], \"high\");\n        };\n    };\n    \
+         run() is also {\n            cur = 0; emit cov_e;\n            cur = 3; emit cov_e;\n        };\n};\n",
+        1,
+    );
+    let group = &result.coverage[0].groups[0];
+    let instances = group.instances();
+    assert_eq!(instances.len(), 2);
+    assert_eq!(instances[0].name, "cur==low");
+    assert_eq!(instances[0].hits, 1);
+    assert!(!instances[0].is_hole());
+    assert_eq!(instances[0].grade(), 1.0);
+    assert_eq!(instances[1].name, "cur==high");
+    assert_eq!(instances[1].hits, 1);
+    assert_eq!(instances[1].grade(), 1.0);
+    // Both instances covered (2/2 weight units) + the per_type bucket
+    // (the item's own grade is 2/2 = 1.0): group grade 100%.
+    assert_eq!(group.grade(), Some(1.0));
+}
+
+#[test]
+fn unsampled_per_instance_buckets_are_holes() {
+    // 14.2.1: "any instance that is not sampled is marked as a hole" —
+    // a hole grades 0 and pulls the group grade down.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
+         item cur: uint using per_instance = TRUE, ranges = {\n            \
+         range([0..1], \"low\");\n            range([2..3], \"high\");\n            \
+         range([4..5], \"mid\");\n        };\n    };\n    run() is also {\n            \
+         cur = 0; emit cov_e;\n        };\n};\n",
+        1,
+    );
+    let group = &result.coverage[0].groups[0];
+    let instances = group.instances();
+    assert_eq!(instances.len(), 3);
+    assert!(instances[0].grade() == 1.0);
+    assert!(instances[1].is_hole());
+    assert!(instances[2].is_hole());
+    // 2 covered weight units out of 3 (low covered, high and mid are
+    // holes) + the per_type bucket (the item's own 1/3 grade):
+    // (1.0 + 1/3) / 4.
+    let expected = (1.0 + 1.0 / 3.0) / 4.0;
+    assert!((group.grade().expect("a grade") - expected).abs() < 1e-9);
+}
+
+#[test]
+fn at_least_sets_the_bucket_goal_and_weight_scales_the_grade() {
+    // Table 41's common readings: `at_least = N` is the per-bucket
+    // goal, `weight = N` scales the item's grade contribution.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    a: uint;\n    b: bool;\n    cover cov_e is {\n        \
+         item a: uint using at_least = 2, ranges = {\n            range([0..1], \"low\");\n        };\n        \
+         item b: bool using weight = 3;\n    };\n    run() is also {\n            \
+         a = 0; b = TRUE; emit cov_e;\n            a = 1; b = TRUE; emit cov_e;\n        };\n};\n",
+        1,
+    );
+    let group = &result.coverage[0].groups[0];
+    // `a`'s single bucket has goal 2 and received 2 hits: covered.
+    let a_item = &group.items[0];
+    assert_eq!(a_item.buckets[0].goal, 2);
+    assert_eq!(a_item.buckets[0].hits, 2);
+    assert_eq!(a_item.grade(), Some(1.0));
+    // The weighted group grade over the two items: `a` (grade 1.0,
+    // weight 1) + `b` (grade 1/2 — the FALSE bucket is a hole —
+    // weight 3): (1.0 + 1.5)/4.
+    let expected = (1.0 + 0.5 * 3.0) / 4.0;
+    assert!((group.grade().expect("a grade") - expected).abs() < 1e-9);
+}
+
+#[test]
+fn group_level_per_instance_marks_all_items() {
+    // The group-level `per_instance = TRUE` spelling marks every item
+    // of the group per-instance.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
+         per_instance = TRUE;\n        item cur: uint using ranges = {\n            \
+         range([0..1], \"low\");\n        };\n    };\n    run() is also {\n            \
+         cur = 0; emit cov_e;\n        };\n};\n",
+        1,
+    );
+    let group = &result.coverage[0].groups[0];
+    assert!(group.items[0].per_instance);
+    assert_eq!(group.instances().len(), 1);
+}

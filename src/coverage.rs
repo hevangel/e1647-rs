@@ -47,6 +47,12 @@ pub struct CoverItemData {
     pub samples: u64,
     /// Why the item has no buckets, when it does not.
     pub note: Option<&'static str>,
+    /// 14.2.1: the `per_instance = TRUE` option — each bucket becomes
+    /// its own graded instance.
+    pub per_instance: bool,
+    /// The `weight` option (Table 41 is an image in the local copy;
+    /// the common reading — a grade multiplier — is applied).
+    pub weight: u64,
 }
 
 impl CoverItemData {
@@ -62,6 +68,32 @@ impl CoverItemData {
             .filter(|bucket| bucket.hits >= bucket.goal)
             .count();
         Some(covered as f64 / self.buckets.len() as f64)
+    }
+}
+
+/// One per-instance unit of a `per_instance` item (14.2.1): "an
+/// instance is created for every valid bucket of the per_instance
+/// item. Any instance that is not sampled is marked as a hole." The
+/// instance name is the per_type item's name, `==`, and the bucket's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverInstanceData {
+    pub name: String,
+    pub hits: u64,
+    pub goal: u64,
+    /// The owning item's weight (the group grade is the weighted
+    /// grades of the per_instance items).
+    pub weight: u64,
+}
+
+impl CoverInstanceData {
+    /// The instance's grade: covered (1.0) when the hits reach the
+    /// goal, 0.0 otherwise; unsampled instances are holes.
+    pub fn grade(&self) -> f64 {
+        if self.hits >= self.goal { 1.0 } else { 0.0 }
+    }
+
+    pub fn is_hole(&self) -> bool {
+        self.hits == 0
     }
 }
 
@@ -127,16 +159,94 @@ pub struct CoverGroupData {
 }
 
 impl CoverGroupData {
-    /// The group's grade: the plain average of the gradeable items'
-    /// (basic and derived) grades; `None` when none is gradeable.
-    /// (Weighted and per-instance grades are 14.2.1/28.9, not modeled.)
+    /// The group's grade (14.2/14.2.1). With no `per_instance` items:
+    /// the plain average of the gradeable items' (basic and derived)
+    /// grades. With `per_instance` items: "the grade of the cover
+    /// group is the weighted grades of all the per_instance items" —
+    /// one weighted unit per instance (per valid bucket), plus the
+    /// per_type data as one bucket (14.2.1's "sum of all valid buckets
+    /// for all the per_instance items +1 (the per_type bucket)"), whose
+    /// grade is the average of the per_type items' grades. `None` when
+    /// nothing is gradeable.
     pub fn grade(&self) -> Option<f64> {
-        let mut grades: Vec<f64> = self.items.iter().filter_map(|item| item.grade()).collect();
-        grades.extend(self.derived.iter().filter_map(|item| item.grade()));
-        if grades.is_empty() {
+        let per_instance: Vec<&CoverItemData> = self
+            .items
+            .iter()
+            .filter(|item| item.per_instance && !item.buckets.is_empty())
+            .collect();
+        if per_instance.is_empty() {
+            // The weighted average of the gradeable items' (basic and
+            // derived) grades; weight 1 when the option is absent.
+            let mut weighted_sum = 0.0f64;
+            let mut weight_total = 0u64;
+            for item in self.items.iter().filter(|item| !item.per_instance) {
+                if let Some(grade) = item.grade() {
+                    weighted_sum += grade * item.weight as f64;
+                    weight_total += item.weight;
+                }
+            }
+            for item in &self.derived {
+                if let Some(grade) = item.grade() {
+                    weighted_sum += grade;
+                    weight_total += 1;
+                }
+            }
+            if weight_total == 0 {
+                return None;
+            }
+            return Some(weighted_sum / weight_total as f64);
+        }
+        let mut weighted_sum = 0.0f64;
+        let mut weight_total = 0u64;
+        for item in &per_instance {
+            for bucket in &item.buckets {
+                let instance = CoverInstanceData {
+                    name: format!("{}=={}", item.name, bucket.label),
+                    hits: bucket.hits,
+                    goal: bucket.goal,
+                    weight: item.weight,
+                };
+                weighted_sum += instance.grade() * instance.weight as f64;
+                weight_total += instance.weight;
+            }
+        }
+        // The per_type bucket: one unit whose grade is the average of
+        // the per_type (non-per-instance) gradeable items.
+        let per_type_grades: Vec<f64> = self
+            .items
+            .iter()
+            .filter(|item| !item.per_instance)
+            .filter_map(|item| item.grade())
+            .collect();
+        if !per_type_grades.is_empty() {
+            let per_type_grade = per_type_grades.iter().sum::<f64>() / per_type_grades.len() as f64;
+            weighted_sum += per_type_grade;
+            weight_total += 1;
+        }
+        if weight_total == 0 {
             return None;
         }
-        Some(grades.iter().sum::<f64>() / grades.len() as f64)
+        Some(weighted_sum / weight_total as f64)
+    }
+
+    /// The per-instance units (14.2.1) of the group's `per_instance`
+    /// items, in item-then-bucket order.
+    pub fn instances(&self) -> Vec<CoverInstanceData> {
+        let mut instances = Vec::new();
+        for item in &self.items {
+            if !item.per_instance {
+                continue;
+            }
+            for bucket in &item.buckets {
+                instances.push(CoverInstanceData {
+                    name: format!("{}=={}", item.name, bucket.label),
+                    hits: bucket.hits,
+                    goal: bucket.goal,
+                    weight: item.weight,
+                });
+            }
+        }
+        instances
     }
 
     /// Record one sampled value for the named item, then update the
@@ -307,6 +417,26 @@ pub fn build(elaborated: &crate::elab::Elaborated) -> Vec<TypeCoverage> {
                 base.derived.extend(build_derived(decl, &base.items));
             }
         }
+        // Group-level options: `per_instance = TRUE` marks every item
+        // per-instance (the group-level spelling of 14.2.1).
+        for decl in &ty.covers {
+            if decl.is_also {
+                continue;
+            }
+            let group_per_instance = decl
+                .options
+                .iter()
+                .any(|entry| scan_bool_option(entry, "per_instance") == Some(true));
+            if group_per_instance
+                && let Some(group) = groups.iter_mut().find(|group| {
+                    group.name == decl.name && group.event_path == group_event_path(decl)
+                })
+            {
+                for item in &mut group.items {
+                    item.per_instance = true;
+                }
+            }
+        }
         result.push(TypeCoverage {
             type_name: ty.name.clone(),
             groups,
@@ -410,6 +540,17 @@ fn build_item(item: &CoverItemDecl) -> Option<CoverItemData> {
         .first()
         .map(|(name, _)| name.clone())
         .unwrap_or_default();
+    // The item options (Table 41 is an image in the local copy; the
+    // common readings apply): `at_least = N` is the per-bucket goal,
+    // `per_instance = TRUE` makes each bucket its own graded instance
+    // (14.2.1), `weight = N` weights the grade.
+    let at_least = scan_uint_option(&item.using, "at_least")
+        .unwrap_or_default()
+        .unwrap_or(1);
+    let per_instance = scan_bool_option(&item.using, "per_instance").unwrap_or(false);
+    let weight = scan_uint_option(&item.using, "weight")
+        .unwrap_or_default()
+        .unwrap_or(1);
     let mut ranges = Vec::new();
     if let Some(note) = parse_ranges(&item.using, &mut ranges) {
         return Some(CoverItemData {
@@ -418,9 +559,11 @@ fn build_item(item: &CoverItemDecl) -> Option<CoverItemData> {
             ungradeable_hits: 0,
             samples: 0,
             note: Some(note),
+            per_instance,
+            weight,
         });
     }
-    let (buckets, note) = if ranges.is_empty() {
+    let (mut buckets, note) = if ranges.is_empty() {
         // 14.2 defaults: integers grade over the first 16 values;
         // booleans over their two values; anything else has no default
         // bucket set and is ungradeable.
@@ -435,13 +578,52 @@ fn build_item(item: &CoverItemDecl) -> Option<CoverItemData> {
     } else {
         (ranges, None)
     };
+    for bucket in &mut buckets {
+        bucket.goal = at_least;
+    }
     Some(CoverItemData {
         name,
         buckets,
         ungradeable_hits: 0,
         samples: 0,
         note,
+        per_instance,
+        weight,
     })
+}
+
+/// Scan `name = <uint>` in recorded option tokens; `None` when the
+/// option is absent, `Some(None)` when present but not a readable
+/// uint.
+fn scan_uint_option(tokens: &[Token], name: &str) -> Option<Option<u64>> {
+    for index in 0..tokens.len() {
+        if token_word(&tokens[index]) == Some(name) && token_kind_is(tokens.get(index + 1)?, "=") {
+            let value = tokens.get(index + 2)?;
+            return Some(match &value.kind {
+                TokenKind::Number(text) => {
+                    crate::interp::parse_int_literal(text).map(|v| v.max(0) as u64)
+                }
+                _ => None,
+            });
+        }
+    }
+    None
+}
+
+/// Scan `name = TRUE|FALSE` in recorded option tokens.
+fn scan_bool_option(tokens: &[Token], name: &str) -> Option<bool> {
+    for index in 0..tokens.len() {
+        if token_word(&tokens[index]) == Some(name) && token_kind_is(tokens.get(index + 1)?, "=") {
+            let value = tokens.get(index + 2)?;
+            return match &value.kind {
+                TokenKind::Identifier(word) | TokenKind::Keyword(word) => {
+                    Some(word == "TRUE" || word == "true")
+                }
+                _ => Some(false),
+            };
+        }
+    }
+    None
 }
 
 fn bool_buckets() -> Vec<CoverBucket> {
