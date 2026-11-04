@@ -1510,3 +1510,48 @@ fn while_do_sugar_parses_and_runs() {
     );
     assert!(output.contains("3"), "output: {output}");
 }
+
+#[test]
+fn define_replacement_substitutes_before_running() {
+    // Clause 21.3's replacement rules: the token pre-pass
+    // (src/preproc.rs) rewrites the defined name in subsequent code, so
+    // the interpreter sees the literal 3.
+    let output = clean_output(
+        "#define N 3\nextend sys {\n    run() is also {\n        var x: uint = N * 2;\n        \
+         out(\"x=\", x, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("x=6"), "output: {output}");
+}
+
+#[test]
+fn define_replacement_leaves_string_literals_alone() {
+    // The substitution stops at string literals (21.3's "except inside
+    // string literals").
+    let output = clean_output(
+        "#define N 3\nextend sys {\n    run() is also {\n        out(\"N=\", \"N\", \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("N=N"), "output: {output}");
+}
+
+#[test]
+fn hash_else_branches_run() {
+    // 21.2's `#else`: the alternative group runs when the condition
+    // fails, and the primary group runs (the alternative skipped
+    // without parsing) when it holds.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        #ifdef MISSING {\n            \
+         out(\"no\\n\");\n        } #else {\n            out(\"yes\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("yes"), "output: {output}");
+    assert!(!output.contains("no"), "output: {output}");
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        #define MISSING\n        #ifdef MISSING {\n            \
+         out(\"flag\\n\");\n        } #else {\n            out(\"other\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("flag"), "output: {output}");
+    assert!(!output.contains("other"), "output: {output}");
+}

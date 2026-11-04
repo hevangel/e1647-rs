@@ -127,9 +127,16 @@
       the field unwidened. In action position (`var x = select ...`)
       the select still reports the honest not-evaluated diagnostic.
       Preprocessor directives (clause 21): `#ifdef` / `#ifndef` /
-      `#define` / `#undef` in statement, struct-member and action
-      positions with flag semantics — `#define` records the flag but
-      applies no text substitution, and `#else` is not parsed. Spanned
+      `#define` / `#undef` / `#else` in statement, struct-member and
+      action positions — `#define` records the flag and applies the
+      21.3 replacement rules as a token pre-pass (the replacement
+      text substitutes for every occurrence of the name in subsequent
+      code, except inside string literals and the directives
+      themselves; single-pass, per-file), `#else` flips the included
+      side of a conditional (both `} #else { .. };` and `}; #else {
+      .. };` spellings; the 21.2 syntax examples are images in the
+      local redline copy, so only the prose is implemented), and
+      excluded branches are skipped without parsing. Spanned
       diagnostics and declaration/member/statement-level recovery. The
       CLI resolves `import a.b` to `a/b.e` or `a.b.e` beside the source
       and checks the merged declarations (not yet: template `extend` (clause 8.2) and body-level instance substitution,
@@ -148,7 +155,10 @@
       choice policies beyond the constant-expression subset (the
       full choice-expression grammar and soft-order interactions),
       `$1`-`$27` match captures,
-      `#define` replacement rules, `#else`)
+      the preprocessor's rescanned/repeated substitution (replacement
+      rules apply in one pass; the backtick Verilog-style names of
+      4.1.5.4 and the cross-file include-order visibility of B.5 are
+      not modeled)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness
       checks only (duplicate declaration/field names, duplicate
       parameters/local variables/enumerals, unknown named/`like`/`extend`

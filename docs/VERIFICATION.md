@@ -2397,6 +2397,86 @@ do-while order (an already-TRUE condition still runs the body once);
 <statement>;` form (true and false branches); and the `while cond do
 { .. };` sugar.
 
+## 2026-11-03 (39) — offline arc: clause 21 `#define` replacement rules and `#else`
+
+Branch `agent/define-else` (off main after #28 merged). The
+preprocessor's remaining halves land: clause 21.3 replacement rules
+and 21.2's `#else`.
+
+- Standard-source note: the local redline PDF renders the 21.2/21.3
+  syntax examples as images (confirmed with pdftotext — the prose
+  extracts, the example blocks do not). Only the PROSE was
+  implemented: 21.2's "the optional #else syntax provides an
+  alternative statement when the condition does not hold" with the
+  primary code "inside the (first) braces", and 21.3's "the given
+  text is substituted for every occurrence of the name in subsequent
+  code, except inside string literals" / "applies only to code that
+  comes later". No `#endif` appears anywhere in the extractable text,
+  so none is accepted — a stray `#endif` reports `E0117`.
+- `#define` replacement rules (`src/preproc.rs`, new): a token-level
+  pre-pass before the clause 15 macro expansion (Annex B.5.1's two
+  phases: preprocessor directives execute first). It walks the stream
+  in source order keeping the rules defined so far, splices each
+  defined name's replacement tokens (the span
+  `Parser::consume_hash_replacement` consumes: to `;` or the name's
+  line end) in place of the identifier, skips the
+  `#define`/`#undef` directives themselves and string literals (they
+  are single tokens), and carries excluded `#ifdef`/`#ifndef`
+  branches through untouched — a `#define` inside an excluded branch
+  defines nothing. `#undef` removes the rule from that point onward.
+- `#else` (21.2) parses at statement, struct-member and action
+  positions: the failing side's group is skipped without parsing, the
+  winning side parses through the same position-dependent grammar.
+  Both `} #else { .. };` and `}; #else { .. };` spellings are
+  accepted — the prose does not fix the terminator's position (the
+  syntax example is an image), so both the parser and the pre-pass
+  tolerate the `;` between the groups.
+- Honest v1 limits, documented in the module: substitution is
+  single-pass (a name that only appears inside another rule's
+  replacement stays as written; 21.3's "the replacement shall not
+  contain the name" runtime error cannot loop and is not diagnosed);
+  redefinition takes the last value; the backtick-prefixed
+  Verilog-style preprocessor names of 4.1.5.4 are not accepted;
+  cross-file visibility (B.5's include order through `import`) is not
+  modeled — each file preprocesses independently; substituted tokens
+  keep their `#define`-line spans, so a diagnostic inside substituted
+  text points at the definition (the clause 15 macro pre-pass does
+  the same); the parser's `defined` flag set and the pre-pass's rule
+  map update on the same directives in the same order (directive
+  headers are never substituted).
+
+Corpus state (absolute paths): etl 4 (the same four `E0203
+base_struct` lines), cover-edges 4, golden-imports 3,
+golden-combined/igen-dist/type-min-max/save-restart/d6w 0 —
+unchanged. The etl corpus's `#define INCREASE_SIZE 2` /
+`#define REDUCE_SIZE 4` sites (`size * REDUCE_SIZE`,
+`tmp.resize(size * INCREASE_SIZE)`) now genuinely substitute.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(206 passed: 14 elab, 1 fixtures, 92 interp, 24 lexer, 58 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 7 golden fixtures — replacement as a type (`#define T
+int` + `f: T;`), substitution reaching the well-formedness pass
+(`#define N 0` + `uint(bits: N)` → `E0205` at the definition-side
+span), a `#define` inside an excluded branch registering nothing,
+`#undef` stopping the replacement (`E0203` at the use site), and
+`#else` at member/action positions in both directions; and 9 unit
+tests — 6 parser (substitution into a var initializer, the
+single-pass limit, directives and string literals untouched,
+`#else` branch selection at member and action levels in both
+spellings, and the excluded-branch registration guard) and 3
+interpreter (substitution visible at run time, string literals
+untouched, and both `#else` branches running).
 ## 2026-11-03 (40) — offline arc: clause 6.6 when-chaining (chained modifiers, nested when-in-when)
 
 Branch `agent/when-chaining` (off main after #28 merged). Chained

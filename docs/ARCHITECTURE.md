@@ -61,12 +61,19 @@ multi-simulator HDL API, and wasm32.
   event ports declare as `name: <dir> event_port [is instance];` along
   the simple_port grammar; the 11.3 restriction — no time-consuming
   actions or TCMs in the block — reports `E0210`), and the clause 21 preprocessor directives
-  `#ifdef` / `#ifndef` / `#define` / `#undef` in statement, struct-member
-  and action positions — flag semantics only: `#define` records the name
-  (the replacement text is consumed, not substituted; clause 21.3's
-  replacement rules are a later milestone), excluded `#ifdef`/`#ifndef`
-  branches are skipped without parsing, `#else` is not parsed, and the
-  conditional forms are rejected at module level (`E0117`). Clause 15
+  `#ifdef` / `#ifndef` / `#define` / `#undef` / `#else` in statement, struct-member
+  and action positions — `#define` records the flag and the 21.3
+  replacement rules apply as a token pre-pass (`src/preproc.rs`, before
+  the clause 15 macro expansion per B.5.1's two phases): the
+  replacement text substitutes for every occurrence of the name in
+  subsequent code, except inside string literals and the directives
+  themselves, excluded branches define nothing and are skipped without
+  parsing (21.2), and `#else` flips the included side — both
+  `} #else { .. };` and `}; #else { .. };` spellings (the 21.2 syntax
+  examples are images in the local redline copy, so only the prose is
+  implemented; substitution is single-pass and per-file, and no
+  `#endif` is accepted). The conditional forms are rejected at module
+  level (`E0117`). Clause 15
   macro definitions (`define <name'category> "match expression" as
   [computed] { body };`) are recorded uninterpreted — header, pattern
   string and raw body tokens (`E0118` when the pattern string is
@@ -298,8 +305,10 @@ choice policies beyond the constant-expression subset (the full
 choice-expression grammar, soft-order interactions between multiple
 selects), HDL-edge- and bind()-driven event-port triggering (the
 `on p$` members run on `emit p$`; the simulator-side triggers ride
-the `@sim` gap), `#else` and `#define` replacement
-rules, `template extend` (8.2) and method-body instance
+the `@sim` gap), the preprocessor's rescanned/repeated substitution
+and backtick preprocessor names (replacement rules apply in one
+pass, per file — B.5's include-order visibility through `import` is
+not modeled), `template extend` (8.2) and method-body instance
 substitution, template category-compliance checks (8.3's notes),
 computed macros and the match-expression grammar's repetition and
 category validation (clause 15.3/15.4 — simple define-as macros
