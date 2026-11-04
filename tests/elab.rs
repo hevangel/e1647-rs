@@ -349,3 +349,128 @@ fn template_defaults_fill_trailing_parameters() {
         Some("string".to_owned())
     );
 }
+
+#[test]
+fn template_extensions_apply_to_complying_instances() {
+    // 8.2 with 8.3's NOTE 3: a template extension applies to an
+    // instance only if every actual complies with the types or
+    // categories the extension's parameters specify. The
+    // enumerated-category extension's members append (its tags may
+    // differ from the template's) with the actuals substituted; the
+    // scalar-parametered instance does not get it.
+    let result = elaborated(
+        "type color_e: [RED, GREEN];\n\
+         template struct packet of (<kind'type>, <data'type>) {\n    k: <kind'type>;\n};\n\
+         template extend packet of (<k'enumerated>, <d'type>) {\n    extra: <d'type>;\n    \
+         describe(): uint is also { return 1; };\n};\n\
+         extend sys {\n    p: packet of (color_e, int);\n    q: packet of (int, int);\n};\n",
+    );
+    // The enumerated actual complies: the extension's field and method
+    // are on the view, with the actual substituted for the extension's
+    // own formal.
+    let applied = find(&result, "packet of (color_e, int)");
+    assert_eq!(field_names(applied), vec!["k", "extra"]);
+    assert_eq!(applied.fields[1].ty.render(), "int".to_owned());
+    assert!(
+        applied
+            .methods
+            .iter()
+            .any(|method| method.name == "describe")
+    );
+    // The non-enumerated actual does not comply: no extension members.
+    let not_applied = find(&result, "packet of (int, int)");
+    assert_eq!(field_names(not_applied), vec!["k"]);
+    assert!(
+        not_applied
+            .methods
+            .iter()
+            .all(|method| method.name != "describe")
+    );
+    // The template declaration's own composed members stay
+    // extension-free — the extension applies per instance.
+    let template_view = find(&result, "packet of (color_e, int)");
+    assert_eq!(template_view.fields.len(), 2);
+}
+
+#[test]
+fn template_extension_specific_type_parameter_form() {
+    // 8.2: "the specific type where type-name is specified" — a
+    // non-category spelling after the tag requires the actual to be
+    // exactly that type.
+    let result = elaborated(
+        "type color_e: [RED, GREEN];\n\
+         type width_e: [W8, W16];\n\
+         template struct packet of (<kind'type>) {\n    k: <kind'type>;\n};\n\
+         template extend packet of (<k'color_e>) {\n    extra: uint;\n};\n\
+         extend sys {\n    p: packet of (color_e);\n    q: packet of (width_e);\n};\n",
+    );
+    assert_eq!(
+        field_names(find(&result, "packet of (color_e)")),
+        vec!["k", "extra"]
+    );
+    assert_eq!(field_names(find(&result, "packet of (width_e)")), vec!["k"]);
+}
+
+#[test]
+fn template_extension_arity_mismatch_is_reported_once() {
+    // 8.2: the extension's parameter count must equal the original
+    // template declaration's — reported once, and the extension does
+    // not apply.
+    let parsed = parse(
+        "template struct box of <type> {\n    v: <type>;\n};\n\
+         template extend box of (<a'type>, <b'type>) {\n    w: <b'type>;\n};\n\
+         extend sys {\n    b: box of (int);\n};\n",
+    );
+    assert!(parsed.diagnostics.is_empty());
+    let result = elaborate(&parsed.declarations);
+    let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
+    assert_eq!(
+        rendered,
+        vec![
+            "4:17: error[E0304]: template extension 'box' declares 2 parameter(s) but template 'box' declares 1"
+        ]
+    );
+    // The instance still materializes without the extension's members.
+    assert_eq!(field_names(find(&result, "box of (int)")), vec!["v"]);
+}
+
+#[test]
+fn method_body_instance_references_substitute_and_materialize() {
+    // 8.3: the substitution reaches into method bodies — the `new
+    // iterator of <type>` inside a body is the instance's only
+    // reference, and the worklist still materializes it with the
+    // actual substituted in the body's type position.
+    let result = elaborated(
+        "struct base_struct {\n    id: int;\n};\n\
+         template struct container of <type> like base_struct {\n    \
+         make(): base_struct is {\n        return new iterator of <type> with { };\n    };\n};\n\
+         template struct iterator of <type> like base_struct {\n    idx: int;\n};\n\
+         extend sys {\n    c: container of (int);\n};\n",
+    );
+    // No field or signature references `iterator of (type>` — only the
+    // method body does, and its instance materialized.
+    let iterator = find(&result, "iterator of (int)");
+    assert_eq!(iterator.base, Some("base_struct".to_owned()));
+    // The body's `new` now names the materialized instance.
+    let view = find(&result, "container of (int)");
+    let make = view
+        .methods
+        .iter()
+        .find(|method| method.name == "make")
+        .expect("the make method");
+    let e1647::ast::Stmt::Return {
+        value: Some(e1647::ast::Expr::New {
+            ty: Some(new_ty), ..
+        }),
+        ..
+    } = &make.body[0]
+    else {
+        panic!("expected a returning new expression");
+    };
+    let e1647::ast::TypeExpr::TemplateRef { name, args, .. } = new_ty else {
+        panic!("expected a template reference in the new expression");
+    };
+    assert_eq!(name, "iterator");
+    assert_eq!(args.len(), 1);
+    assert_eq!(args[0].render(), "int".to_owned());
+}

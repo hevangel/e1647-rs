@@ -3597,11 +3597,49 @@ impl<'a> Interp<'a> {
                 "select distribution expressions are not evaluated yet",
                 *span,
             )),
-            Expr::New { span, .. } => Err(self.error(
-                "E0402",
-                "'new' instance creation is not supported yet",
-                *span,
-            )),
+            Expr::New { ty, inits, span } => {
+                // `new [<type>] [with { .. }]` (clause 6.2): a typed
+                // creation instantiates the named type — the
+                // monomorphized template instance's canonical name for a
+                // template reference — and runs the `with` assignments
+                // against the fresh instance. Untyped `new` and other
+                // type spellings stay the explicit not-supported
+                // diagnostic.
+                let Some(new_ty) = ty else {
+                    return Err(self.error(
+                        "E0402",
+                        "untyped 'new' instance creation is not supported yet",
+                        *span,
+                    ));
+                };
+                let name = match new_ty {
+                    TypeExpr::Named { name, .. } => name.clone(),
+                    TypeExpr::TemplateRef { name, args, .. } => {
+                        crate::ast::template_instance_name(name, args)
+                    }
+                    _ => {
+                        return Err(self.error(
+                            "E0402",
+                            "'new' supports named and template-instance types only",
+                            new_ty.span(),
+                        ));
+                    }
+                };
+                if self.depth > 100 {
+                    return Ok(Value::Void);
+                }
+                self.depth += 1;
+                let index = self.instantiate(&name);
+                let mut frame = Frame::default();
+                let flow = self.exec_block(inits, &mut frame, Some(index))?;
+                self.depth -= 1;
+                // The `with` block is an assignment list; a `stop_run`
+                // inside it unwinds the run like any other statement.
+                if matches!(flow, Flow::Stop) {
+                    self.stop_requested = true;
+                }
+                Ok(Value::Object(index))
+            }
             Expr::HdlPath { path, span } => {
                 if self.hdl.is_none() {
                     return Err(self.error(

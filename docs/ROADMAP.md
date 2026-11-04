@@ -54,17 +54,32 @@
       `<tag'category>` parameters and defaults — formals
       (`<type>`), template references (`deque of int`) and keyed lists
       (`list (key:it) of t`) are recorded in type positions.
-      Instances monomorphize (clause 8.3): every used
+      Template extensions (clause 8.2) parse too (`template extend
+      name of <params> { .. };`, the extension's own parameter list
+      recorded). Instances monomorphize (clause 8.3): every used
       `name of (actuals)` materializes a struct named by the canonical
       rendering of its actuals, with the actuals substituted for the
-      formals in field types and method signatures, trailing
+      formals in field types, method signatures and method bodies
+      (type positions inside actions — `new <template> of <type>`,
+      casts, `is a` checks, local types — substitute, and every
+      instance a body names joins the worklist), trailing
       parameters filled from their defaults (defaults referencing
       earlier formals substitute through), and the parameterized base
       substituted to the base chain; identical actuals share one
       instance, and template-typed fields generate and dispatch under
-      it. Method-body references to other template instances and
-      category-compliance checks (8.3's notes) substitute/verify in a
-      later milestone, and `new [<type>] [with { .. }]` parses but
+      it. Each template extension applies to an instance when every
+      actual complies with the extension's parameter specifications
+      (8.3's NOTE 3): the prose-named `scalar` and `enumerated`
+      categories check the actual's shape (8.1.2's full category table
+      is an image, so any other spelling reads as the specific-type
+      form and can only ever mismatch), the original template's own
+      parameter categories stay unvalidated (8.3's NOTE 2), and an
+      extension with a mismatched parameter count reports `E0304` and
+      does not apply — a complying extension's fields, constraints,
+      methods and `on` blocks substitute the extension's formals with
+      the instance's actuals and append. Typed `new
+      <named-or-template-instance> [with { .. }]` instantiates and
+      runs the `with` assignments (clause 6.2); untyped `new` still
       evaluates to an
       explicit not-supported diagnostic. Coverage groups (clause 14.1)
       parse, are recorded, and collect: `cover <event> is [also]
@@ -155,8 +170,12 @@
       excluded branches are skipped without parsing. Spanned
       diagnostics and declaration/member/statement-level recovery. The
       CLI resolves `import a.b` to `a/b.e` or `a.b.e` beside the source
-      and checks the merged declarations (not yet: template `extend` (clause 8.2) and body-level instance substitution,
-      the full match-expression grammar (clause 15.4's repetition and
+      and checks the merged declarations (not yet: clause 8.4's
+      template when-subtype instances, extension members beyond
+      fields/constraints/methods/`on` blocks and the 8.2 subtype
+      propagation of applied extensions (8.3's NOTE 2
+      actual-category validation stays out with the original
+      template's), the full match-expression grammar (clause 15.4's repetition and
       category validation — computed macros evaluate their restricted
       body subset, see M1), the remaining clause 14
       coverage model —

@@ -45,6 +45,12 @@ pub struct Declaration {
     /// type parameters, recorded. Instantiation (monomorphization) is a
     /// later milestone.
     pub template_params: Vec<TemplateParam>,
+    /// `template extend name of <params> { .. };` (clause 8.2): a
+    /// template extension declaration. Its members apply to the
+    /// instances whose actuals comply with the parameters' types or
+    /// categories (8.3's NOTE 3), substituted with the instance's
+    /// actuals — elaboration applies them, not name composition.
+    pub template_extend: bool,
     /// `package` visibility prefix recorded (clause 22); not enforced.
     pub packaged: bool,
     /// `struct derived like base { .. }` inheritance clause. For
