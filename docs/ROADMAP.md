@@ -185,16 +185,19 @@
       event (9.4.1), `emit p$;` triggers the port, and the 11.3
       restriction holds — wait/sync/start/compute inside an `on`
       action block report `E0210`. `when` subtypes (6.6) resolve:
-      each single-modifier block (`when BUSY'kind` or the corpus's
-      `when NO_CONSTRAINT env` space form) synthesizes a subtype view
-      named `VALUE base` — the base's composed members with the when
-      block's appended, marked with its discriminator — and
-      when-qualified field types (`f: LO pkt`) instantiate that view,
-      so the when members (fields, constraints including select
-      distributions, methods, on blocks) apply for those instances;
-      `is a` checks walk the view's base chain. Chained modifiers and
-      nested when-in-when blocks compose later; base-typed instances
-      do not dynamically match subtypes yet; there is no type checking
+      each block (`when BUSY'kind`, the corpus's `when NO_CONSTRAINT
+      env` space form, or a chained `when LO'kind HI'sel`) synthesizes
+      a subtype view named with its values space-joined before the
+      base (`LO HI pkt`) — the base's composed members with the when
+      block's appended, marked with every (field, value) pair — and
+      when-qualified field types (`f: LO pkt`, chained
+      `f: LO HI pkt`) instantiate that view, so the when members
+      (fields, constraints including select distributions, methods, on
+      blocks) apply for those instances; a `when` member nested inside
+      a when block applies on top of the enclosing view (a further
+      combined view, budget-capped); `is a` checks walk the view's
+      base chain. Base-typed instances do not dynamically match
+      subtypes yet; there is no type checking
 - [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer
       fields into a solver problem; range membership (`x in [lo..hi]`)

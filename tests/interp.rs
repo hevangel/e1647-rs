@@ -1025,6 +1025,30 @@ fn when_views_carry_methods_and_base_membership() {
 }
 
 #[test]
+fn chained_when_views_compose_both_levels_constraints() {
+    // 6.6 chained: a chained-qualified field (`LO HI pkt`) carries the
+    // combined view — the outer when's constraint and the when-in-when
+    // member's constraint both gate its gen (here two select policies:
+    // one field biased to min, the other to max) — and `is a` walks
+    // the combined view's containment chain to the base type.
+    let output = clean_output(
+        "type mode_t : [LO, HI];\n\
+         type dir_t : [UP, DOWN];\n\
+         struct pkt {\n    kind: mode_t;\n    dir: dir_t;\n    v: uint (bits: 8);\n    w: uint (bits: 8);\n    \
+         when LO kind is {\n            keep soft v == select { 1000 : min; };\n        \
+         when HI dir is {\n                keep soft w == select { 1000 : max; };\n            };\n        };\n};\n\
+         extend sys {\n    p: LO HI pkt;\n    run() is also {\n        gen p;\n        print p.v;\n        print p.w;\n        \
+         if p is a pkt {\n            out(\"IS A PKT\");\n        };\n        \
+         if p is a LO pkt {\n            out(\"IS A LO PKT\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("0"), "output: {output}");
+    assert!(output.contains("255"), "output: {output}");
+    assert!(output.contains("IS A PKT"), "output: {output}");
+    assert!(output.contains("IS A LO PKT"), "output: {output}");
+}
+
+#[test]
 fn template_typed_fields_instantiate_their_monomorphized_view() {
     // 8.3: a field of template-instance type carries the
     // monomorphized struct — its fields generate, its methods resolve,

@@ -2731,18 +2731,30 @@ impl Parser {
             let (name, span) = self.take_identifier();
             // A when-qualified type (`NO_CONSTRAINT env` — the subtype
             // modifier naming the variant of the base type, 6.6): the
-            // qualifier and the base are both recorded.
+            // qualifier and the base are both recorded. Chained
+            // qualifiers (`LO HI pkt` — 6.6.1's subtype combinations,
+            // one value per determinant field) nest: the last
+            // identifier is the base, the preceding ones qualify it
+            // right-to-left, so the rendered name joins the values in
+            // written order (`LO HI pkt`).
             if self.at_identifier() {
-                let (base, base_span) = self.take_identifier();
-                let end = self.last_end();
-                return Some(TypeExpr::WhenQualified {
-                    value: name,
-                    base: Box::new(TypeExpr::Named {
-                        name: base,
-                        span: base_span,
-                    }),
-                    span: (start, end),
-                });
+                let mut identifiers = vec![(name, span)];
+                while self.at_identifier() {
+                    identifiers.push(self.take_identifier());
+                }
+                let (base, base_span) = identifiers.pop().expect("at least two identifiers");
+                let mut base = TypeExpr::Named {
+                    name: base,
+                    span: base_span,
+                };
+                while let Some((value, _)) = identifiers.pop() {
+                    base = TypeExpr::WhenQualified {
+                        value,
+                        base: Box::new(base),
+                        span: (start, self.last_end()),
+                    };
+                }
+                return Some(base);
             }
             // `deque of int` — a template instantiation in a type
             // position (clause 8.3). `list of` never reaches here: the
