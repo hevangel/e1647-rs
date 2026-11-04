@@ -150,6 +150,307 @@ fn lists_support_push_size_and_indexing() {
     assert_eq!(output, "2 7\n10\n");
 }
 
+// --- Clause 26 list pseudo-methods ---
+
+/// The rendered diagnostics of a run expected to fail.
+fn run_error(source: &str) -> Vec<String> {
+    let result = run_source(source, 1);
+    assert!(
+        !result.diagnostics.is_empty(),
+        "expected a diagnostic for: {source}"
+    );
+    result
+        .diagnostics
+        .iter()
+        .map(|d| d.render())
+        .collect::<Vec<_>>()
+}
+
+#[test]
+fn list_pop_pop0_remove_and_return_the_ends() {
+    // 26.3.10 pop(): removes and returns the last item. 26.3.11 pop0():
+    // removes and returns the first item, renumbering the rest.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
+         xs.push(1); xs.push(2); xs.push(3);\n        \
+         print xs.pop();\n        print xs;\n        print xs.pop0();\n        print xs;\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "3\nxs = [1, 2]\n1\nxs = [2]\n");
+}
+
+#[test]
+fn list_top_top0_read_without_removing() {
+    // 26.4.26 top(): the last item, not removed (pairs with pop).
+    // 26.4.27 top0(): the first item, not removed (pairs with pop0 for
+    // queues, per the prose's note).
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
+         xs.push(1); xs.push(2); xs.push(3);\n        \
+         print xs.top(), xs.top0(), xs.size();\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "3 1 3\n");
+}
+
+#[test]
+fn list_push0_insert_place_items_by_position() {
+    // 26.3.13 push0(item): the item becomes index 0. 26.3.8
+    // insert(index, item): index == size appends (the prose's stated
+    // case), earlier positions shift the rest back.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
+         xs.push(1); xs.push(2); xs.push(3);\n        \
+         xs.push0(9);\n        print xs;\n        \
+         xs.insert(2, 5);\n        print xs;\n        \
+         xs.insert(xs.size(), 7);\n        print xs;\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        output,
+        "xs = [9, 1, 2, 3]\nxs = [9, 1, 5, 2, 3]\nxs = [9, 1, 5, 2, 3, 7]\n"
+    );
+}
+
+#[test]
+fn list_delete_fast_delete_remove_items() {
+    // 26.3.6 delete(index): removes the item at the index, renumbering
+    // sequentially. 26.3.7 fast_delete(index): the last item's value
+    // moves into the deleted slot, so the other indexes stay.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
+         xs.push(1); xs.push(2); xs.push(3); xs.push(4);\n        \
+         xs.fast_delete(0);\n        print xs;\n        \
+         xs.delete(1);\n        print xs;\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "xs = [4, 2, 3]\nxs = [4, 3]\n");
+}
+
+#[test]
+fn list_clear_and_is_empty() {
+    // 26.3.5 clear(): deletes all items. 26.4.12 is_empty(): TRUE only
+    // when the list has no items.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
+         print xs.is_empty();\n        \
+         xs.push(1);\n        print xs.is_empty();\n        \
+         xs.clear();\n        print xs.is_empty(), xs.size();\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUE\nFALSE\nTRUE 0\n");
+}
+
+#[test]
+fn list_push_push0_add_add0_of_a_list_extend() {
+    // 26.3.2 add(list) / 26.3.14 push(list): a copy of the argument list
+    // is appended. 26.3.4 add0(list) / 26.3.15 push0(list): it is placed
+    // at the head. e declares no lists of lists (26.4.25), so a
+    // list-valued argument is unambiguously the list form.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var a: list of int;\n        \
+         var b: list of int;\n        a.push(1); a.push(2);\n        b.push(7); b.push(8);\n        \
+         a.add0(b);\n        print a;\n        \
+         a.push(b);\n        print a;\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "a = [7, 8, 1, 2]\na = [7, 8, 1, 2, 7, 8]\n");
+}
+
+#[test]
+fn list_reverse_copy_and_exists() {
+    // 26.4.21 reverse(): a new list in reverse order, receiver unchanged.
+    // 26.4.3 copy(): a new list; modifying the copy leaves the original.
+    // 26.4.5 exists(): TRUE only for an index number that exists.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
+         xs.push(1); xs.push(2); xs.push(3);\n        \
+         print xs.reverse();\n        print xs;\n        \
+         var ys: list of int = xs.copy();\n        ys.delete(0);\n        \
+         print xs.size(), ys.size();\n        \
+         print xs.exists(0), xs.exists(2), xs.exists(3);\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "[3, 2, 1]\nxs = [1, 2, 3]\n3 2\nTRUE TRUE FALSE\n");
+}
+
+#[test]
+fn list_min_max_prefer_the_latest_on_ties() {
+    // 26.4.15 max()/26.4.18 min(): the item with the largest/smallest
+    // value. 26.4.16 max_index()/26.4.19 min_index(): the same scan as an
+    // index — and on ties the latest item wins, which the index forms
+    // make observable.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
+         xs.push(3); xs.push(1); xs.push(4); xs.push(1); xs.push(5);\n        \
+         print xs.max(), xs.min();\n        \
+         var ys: list of int;\n        ys.push(5); ys.push(1); ys.push(5);\n        \
+         print ys.max_index(), ys.min_index();\n        \
+         var ws: list of string;\n        ws.push(\"b\"); ws.push(\"a\");\n        \
+         print ws.max(), ws.min();\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "5 1\n2 1\nb a\n");
+}
+
+#[test]
+fn list_sum_product_and_all_or_all_with_empty_results() {
+    // 26.5.5 sum(): the integer sum, 0 when empty. 26.5.4 product(): the
+    // integer product, 1 when empty. 26.5.1 and_all(): TRUE when empty.
+    // 26.5.2 or_all(): FALSE when empty. The no-argument forms read the
+    // items themselves; the exp-parameter forms are a documented gap.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
+         xs.push(2); xs.push(3); xs.push(4);\n        \
+         print xs.sum(), xs.product();\n        \
+         var none_yet: list of int;\n        print none_yet.sum(), none_yet.product();\n        \
+         var bs: list of bool;\n        bs.push(TRUE); bs.push(FALSE);\n        \
+         print bs.and_all(), bs.or_all();\n        \
+         var none: list of bool;\n        print none.and_all(), none.or_all();\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "9 24\n0 1\nFALSE TRUE\nTRUE FALSE\n");
+}
+
+#[test]
+fn list_is_a_permutation_ignores_order() {
+    // 26.4.11 is_a_permutation(): TRUE when the argument holds the same
+    // items with the same multiplicities, in any order.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var a: list of int;\n        \
+         a.push(1); a.push(2); a.push(2);\n        \
+         var b: list of int;\n        b.push(2); b.push(1); b.push(2);\n        \
+         print a.is_a_permutation(b);\n        \
+         var short: list of int;\n        short.push(2); short.push(1);\n        \
+         print a.is_a_permutation(short);\n        \
+         var other: list of int;\n        other.push(1); other.push(3); other.push(2);\n        \
+         print a.is_a_permutation(other);\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUE\nFALSE\nFALSE\n");
+}
+
+#[test]
+fn list_modifiers_work_through_struct_fields() {
+    // The pseudo-methods attach to any list expression (26.2) — a struct
+    // field receiver writes back through the field.
+    let output = clean_output(
+        "struct queue_s {\n    items: list of int;\n};\n\
+         extend sys {\n    run() is also {\n        var q: queue_s;\n        \
+         q.items.push(1); q.items.push(2); q.items.push(3);\n        \
+         print q.items.pop();\n        print q.items.size();\n        \
+         q.items.insert(0, 9);\n        print q.items;\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "3\n2\n[9, 1, 2]\n");
+}
+
+#[test]
+fn empty_list_accessors_report_e0402() {
+    // 26.3.10/26.3.11 and 26.4.26/26.4.27: "If the list is empty, an
+    // error shall be issued." 26.4.15/26.4.18: "If the list is empty, an
+    // error shall be issued." Reported like the set pseudo-methods'
+    // empty-set errors (E0402).
+    for (call, name) in [
+        ("pop()", "pop"),
+        ("pop0()", "pop0"),
+        ("top()", "top"),
+        ("top0()", "top0"),
+        ("max()", "max"),
+        ("min()", "min"),
+    ] {
+        let source = format!(
+            "extend sys {{\n    run() is also {{\n        var xs: list of int;\n        print xs.{call};\n    }};\n}};\n"
+        );
+        let diagnostics = run_error(&source);
+        assert_eq!(diagnostics.len(), 1, "{name}: {diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("E0402") && diagnostics[0].contains("empty list"),
+            "{name}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn list_index_pseudo_methods_report_e0404() {
+    // 26.3.6/26.3.7: an index that does not exist in the list issues an
+    // error; 26.3.8: a size smaller than index issues an error. E0404 is
+    // the list index out-of-range code (the same one the [i] expression
+    // reports).
+    let cases = [
+        "xs.delete(3);",
+        "xs.fast_delete(3);",
+        "xs.insert(3, 9);",
+        "xs.delete(-1);",
+    ];
+    for call in cases {
+        let source = format!(
+            "extend sys {{\n    run() is also {{\n        var xs: list of int;\n        \
+             xs.push(1); xs.push(2);\n        {call}\n    }};\n}};\n"
+        );
+        let diagnostics = run_error(&source);
+        assert_eq!(diagnostics.len(), 1, "{call}: {diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("E0404") && diagnostics[0].contains("out of range"),
+            "{call}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn list_aggregates_reject_wrong_item_types() {
+    // 26.5.4/26.5.5 define integer results; 26.5.1/26.5.2 read boolean
+    // items; the 26.4.15-26.4.19 extremes order items the way the
+    // relational operators do. Anything else is a type error.
+    let cases = [
+        (
+            "var xs: list of string; xs.push(\"a\"); print xs.sum();",
+            "sum()",
+        ),
+        (
+            "var xs: list of string; xs.push(\"a\"); print xs.product();",
+            "product()",
+        ),
+        (
+            "var xs: list of int; xs.push(1); print xs.and_all();",
+            "and_all()",
+        ),
+        (
+            "var xs: list of int; xs.push(1); print xs.or_all();",
+            "or_all()",
+        ),
+        (
+            "var xs: list of bool; xs.push(TRUE); xs.push(FALSE); print xs.max();",
+            "max()",
+        ),
+    ];
+    for (source, name) in cases {
+        let diagnostics = run_error(&format!(
+            "extend sys {{\n    run() is also {{\n        {source}\n    }};\n}};\n"
+        ));
+        assert_eq!(diagnostics.len(), 1, "{name}: {diagnostics:?}");
+        assert!(diagnostics[0].contains("E0402"), "{name}: {diagnostics:?}");
+    }
+}
+
+#[test]
+fn unsupported_list_methods_report_e0405() {
+    // The expression-taking pseudo-methods (apply 26.4.2, sort 26.4.23 —
+    // documented gaps) and unknown names stay E0405.
+    for call in ["xs.apply(1);", "xs.sort();", "xs.foo();"] {
+        let source = format!(
+            "extend sys {{\n    run() is also {{\n        var xs: list of int;\n        \
+             xs.push(1);\n        {call}\n    }};\n}};\n"
+        );
+        let diagnostics = run_error(&source);
+        assert_eq!(diagnostics.len(), 1, "{call}: {diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("E0405") && diagnostics[0].contains("not supported"),
+            "{call}: {diagnostics:?}"
+        );
+    }
+}
+
 #[test]
 fn gen_respects_keep_constraints_and_is_deterministic() {
     let source = "struct pixel_s {\n    intensity: uint(bits: 8);\n    keep intensity < 128;\n};\nextend sys {\n    run() is also {\n        var p: pixel_s;\n        gen p;\n        print p.intensity;\n    };\n};\n";
