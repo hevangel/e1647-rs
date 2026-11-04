@@ -1,32 +1,42 @@
-//! The macro engine (clause 15): match-expression parsing (15.4) and
-//! simple-macro expansion (15.5/15.6) as a pre-pass over the token
-//! stream.
+//! The macro engine (clause 15): match-expression parsing (15.4),
+//! simple-macro expansion (15.5/15.6) and computed-macro evaluation
+//! (15.3) as a pre-pass over the token stream.
 //!
-//! A macro definition (`define <name'category> "pattern" as { body };`)
-//! associates a new production with the non-terminal named by its
-//! category. This module compiles the recorded pattern strings into a
-//! term tree (15.4: escaped literal terminals, `<[tag']type>`
+//! A macro definition (`define <name'category> "pattern" as [computed]
+//! { body };`) associates a new production with the non-terminal named
+//! by its category. This module compiles the recorded pattern strings
+//! into a term tree (15.4: escaped literal terminals, `<[tag']type>`
 //! non-terminals, `[ ]` option, `( )` grouping, `|` alternation),
 //! matches token sequences against them with backtracking (15.5.2's
-//! recursive-descent reading), and expands a simple macro's body by
-//! splicing the matched subsequence at the parameter references
+//! recursive-descent reading), and expands the body: a simple macro's
+//! body splices the matched subsequence at the parameter references
 //! (15.6: "the expansion segment is taken literally, except for
-//! occurrences of syntactic parameters").
+//! occurrences of syntactic parameters"); a computed macro's body is
+//! evaluated at match time by a restricted parse-time interpreter
+//! (15.3: "the block of actions is treated as the body of a method
+//! that returns a string") and the returned string tokenizes into the
+//! expansion.
 //!
 //! The pass runs before the parser reads the token stream, so
 //! `MIN_VALUE(addr_t)`-style invocation sites anywhere in ordinary
 //! code become their body text and parse like any other code. Later
 //! definitions have higher priority (15.5.1); the first macro whose
-//! whole pattern matches wins. V1 approximations, documented: a
-//! literal terminal matches one token whose whole text equals it
-//! (whitespace-only literals vanish — tokenization ignores
-//! whitespace, so the `[ ]` optional-space form is vacuous);
-//! non-terminals consume by backtracking over split lengths; the
-//! `<type, ...>` repetition form matches as one non-terminal; computed
-//! macros (define-as-computed) are recorded, not computed — the
-//! matcher skips them, so a file's simple definition of the same
-//! pattern applies (the corpus's `reject_match()` dance is not
-//! modeled); pattern-argument categories are not validated.
+//! whole pattern matches wins, and a computed definition that declines
+//! (a `reject_match()` action, an unevaluable body, or an illegal
+//! result) falls through to the next lower-priority definition — the
+//! type-min-max corpus's define-as-computed/define-as pair relies on
+//! that order. V1 approximations, documented: a literal terminal
+//! matches one token whose whole text equals it (whitespace-only
+//! literals vanish — tokenization ignores whitespace, so the `[ ]`
+//! optional-space form is vacuous); non-terminals consume by
+//! backtracking over split lengths; the `<type, ...>` repetition form
+//! matches as one non-terminal; the computed-body interpreter reads
+//! only a restricted statement subset (see `evaluate_computed_body`)
+//! — method-style calls, `is a` checks, `else if` chains, and
+//! list/number expressions are not evaluated, and such bodies decline;
+//! pattern-argument categories are not validated.
+
+use std::collections::HashMap;
 
 use crate::lexer::{Token, TokenKind};
 
@@ -348,18 +358,17 @@ fn anchor(terms: &[MatchTerm]) -> Option<&str> {
 }
 
 /// Try the macros at `position` (later definitions first — 15.5.1's
-/// priority; computed definitions are skipped) and render the
-/// expansion with the matched parameters. Returns the expansion and
-/// the position after the matched span.
+/// priority) and render the expansion with the matched parameters.
+/// Returns the expansion and the position after the matched span. A
+/// computed definition that declines (see `evaluate_computed_body`)
+/// falls through to the next lower-priority definition, per 15.5.2's
+/// "backtracking proceeds further".
 fn expand_at(
     macros: &[ScannedMacro],
     tokens: &[Token],
     position: usize,
 ) -> Option<(Expansion, usize)> {
     for scanned in macros.iter().rev() {
-        if scanned.computed {
-            continue;
-        }
         let Some(anchor) = anchor(&scanned.terms) else {
             continue;
         };
@@ -370,20 +379,44 @@ fn expand_at(
         let mut cursor = position;
         let mut parameters = Vec::new();
         let mut budget = 10_000u32;
-        if match_terms(
+        if !match_terms(
             &scanned.terms,
             tokens,
             &mut cursor,
             &mut parameters,
             &mut budget,
         ) {
-            return Some((
-                Expansion {
-                    tokens: render_body(&scanned.body, &parameters),
-                },
-                cursor,
-            ));
+            continue;
         }
+        if scanned.computed {
+            let Some(result) = evaluate_computed_body(&scanned.body, &parameters) else {
+                // Declined: a `reject_match()` action executed, the body
+                // uses a construct the evaluator does not read, or the
+                // result is not a legal expansion. The next lower-priority
+                // definition (e.g. the file's simple define-as of the same
+                // pattern) applies.
+                continue;
+            };
+            let Ok(expansion) = crate::lexer::tokenize(&result) else {
+                // 15.3: the returned string must be a legal e construct;
+                // one that does not even tokenize declines.
+                continue;
+            };
+            if expansion.is_empty() {
+                // A whitespace/comment-only result is not a construct of
+                // the category — decline.
+                continue;
+            }
+            // Note: the expansion's token spans are relative to the
+            // returned string, not the original source (generated code).
+            return Some((Expansion { tokens: expansion }, cursor));
+        }
+        return Some((
+            Expansion {
+                tokens: render_body(&scanned.body, &parameters),
+            },
+            cursor,
+        ));
     }
     None
 }
@@ -649,4 +682,506 @@ fn resolve_reference(
         return Some(matching[0].2.clone());
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Clause 15.3 computed bodies: a restricted parse-time interpreter.
+//
+// 15.3 treats the block of actions as the body of a method that returns
+// a string: either the `result` variable or the `return` action is used,
+// and the returned string must be a legal e construct of the same
+// category. The body executes at parse time whenever the match
+// expression matched, with the syntactic parameters available as string
+// variables (15.3/15.6); definitions in the same module cannot be
+// presupposed by the computation (15.3), so there are no global or
+// method lookups here.
+//
+// The interpreter reads a restricted statement subset: `var name :=
+// expr;` (also `var name = expr;` and `var name: type = expr;`),
+// assignments, `if cond { .. } [else { .. }]`, `return expr;`, and
+// expression statements (`reject_match();`). Expressions are string
+// literals, the implicit boolean literals TRUE/FALSE, `<...>` parameter
+// references (their matched text as a string), variables (locals and
+// parameters by name), `+` concatenation, `==`/`!=` comparisons, parenthesized
+// expressions, and calls — of which only `reject_match()` is known.
+//
+// Anything else — a call to another routine (`rf_manager`, `out`, method
+// calls like `s.to_string()`), an `is a` check, an `else if` chain, a
+// number/list expression — makes the evaluation fail. A failing body, a
+// body executing `reject_match()`, a non-string `return`, and an empty
+// or lexically illegal result ALL decline the definition: the matcher
+// continues with the next lower-priority definition (15.5.1's order), so
+// the type-min-max corpus's define-as-computed bodies (which call
+// `rf_manager` and reject non-numeric types) yield to the file's simple
+// define-as of the same pattern. This is the honest v1 reading: parse
+// time has no type objects to reflect on, so a body that branches on
+// reflection cannot succeed here.
+// ---------------------------------------------------------------------------
+
+/// One statement of the restricted computed-body subset.
+#[derive(Debug, Clone)]
+enum CompStmt {
+    /// `var name := expr;` (or `=`) and plain `name = expr;` — both set
+    /// the local string variable.
+    Assign { name: String, expr: CompExpr },
+    /// `if cond { .. } [else { .. }]` — only a braced `else`.
+    If {
+        cond: CompExpr,
+        then_body: Vec<CompStmt>,
+        else_body: Option<Vec<CompStmt>>,
+    },
+    /// `return expr;` — a bare `return;` parses but fails evaluation
+    /// (15.3's method returns a string).
+    Return(Option<CompExpr>),
+    /// An expression statement, e.g. `reject_match();`.
+    Expr(CompExpr),
+}
+
+/// One expression of the restricted computed-body subset.
+#[derive(Debug, Clone)]
+enum CompExpr {
+    /// A string literal token's raw value.
+    Str(String),
+    /// The implicit boolean literals.
+    Bool(bool),
+    /// A variable: a local, or a syntactic parameter by name (15.3/15.6:
+    /// parameters are string variables).
+    Var(String),
+    /// `+` concatenation (both operands must be strings).
+    Concat(Box<CompExpr>, Box<CompExpr>),
+    /// `==` / `!=` on two same-kind values.
+    Equal(Box<CompExpr>, Box<CompExpr>),
+    NotEqual(Box<CompExpr>, Box<CompExpr>),
+    /// A call; only `reject_match()` with no arguments is known.
+    Call {
+        name: String,
+        args: Vec<CompExpr>,
+    },
+}
+
+/// An evaluated value. Locals hold strings only; booleans exist for
+/// conditions and comparisons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompValue {
+    Str(String),
+    Bool(bool),
+}
+
+/// Why a definition declined. `Reject` is the standard's mechanism (a
+/// `reject_match()` action executed); `Error` is any other evaluation
+/// failure. Both decline the definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompFail {
+    Reject,
+    Error,
+}
+
+/// Control flow out of a statement block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompFlow {
+    Next,
+    Return(String),
+}
+
+/// The text a matched subsequence renders to when a computed body reads
+/// it as a string. Tokens are joined with single spaces: tokenization
+/// ignores whitespace, so the text re-tokenizes to the same tokens, and
+/// the spaces keep adjacent `-`/`/` punctuation from forming a comment.
+/// String literals are re-quoted (their stored value keeps escapes).
+fn render_tokens_text(tokens: &[Token]) -> String {
+    let parts: Vec<String> = tokens
+        .iter()
+        .map(|token| match &token.kind {
+            TokenKind::Punctuation(symbol) => symbol.clone(),
+            TokenKind::Identifier(word) | TokenKind::Keyword(word) => word.clone(),
+            TokenKind::Number(text) => text.clone(),
+            TokenKind::StringLiteral(value) => format!("\"{value}\""),
+        })
+        .collect();
+    parts.join(" ")
+}
+
+/// Evaluate a computed body over the matched parameters; `None` means
+/// the definition declines. The body must parse wholly into the
+/// restricted subset; on success the returned string is the expansion
+/// text.
+fn evaluate_computed_body(
+    body: &[Token],
+    parameters: &[(Option<String>, String, Vec<Token>)],
+) -> Option<String> {
+    let mut parser = CompParser {
+        tokens: body,
+        parameters,
+        cursor: 0,
+    };
+    let stmts = parser.parse_statement_list(true).ok()?;
+    if parser.cursor != body.len() {
+        return None;
+    }
+    let mut env = HashMap::new();
+    // Parameters as string variables: by tag always; by non-terminal
+    // kind only when unique (15.6(a): otherwise the reference is
+    // undefined). Locals later shadow them by plain assignment.
+    for (tag, _, tokens) in parameters {
+        if let Some(tag) = tag {
+            env.insert(tag.clone(), render_tokens_text(tokens));
+        }
+    }
+    for (_, kind, tokens) in parameters {
+        if parameters
+            .iter()
+            .filter(|(parameter_tag, parameter_kind, _)| {
+                parameter_tag.is_none() && parameter_kind == kind
+            })
+            .count()
+            == 1
+        {
+            env.entry(kind.clone())
+                .or_insert_with(|| render_tokens_text(tokens));
+        }
+    }
+    let result = match exec_statements(&stmts, &mut env) {
+        Ok(CompFlow::Return(text)) => Some(text),
+        // Falling off the end: the `result` variable is the return value
+        // (15.3). A body that assigned neither declines.
+        Ok(CompFlow::Next) => env.get("result").cloned(),
+        Err(_) => None,
+    };
+    // An empty string is not a legal construct of the category (15.3).
+    result.filter(|text| !text.is_empty())
+}
+
+fn exec_statements(
+    stmts: &[CompStmt],
+    env: &mut HashMap<String, String>,
+) -> Result<CompFlow, CompFail> {
+    for stmt in stmts {
+        match stmt {
+            CompStmt::Assign { name, expr } => match eval_expr(expr, env)? {
+                CompValue::Str(text) => {
+                    env.insert(name.clone(), text);
+                }
+                CompValue::Bool(_) => return Err(CompFail::Error),
+            },
+            CompStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => match eval_expr(cond, env)? {
+                CompValue::Bool(taken) => {
+                    let branch: &[CompStmt] = if taken {
+                        then_body
+                    } else {
+                        else_body.as_deref().unwrap_or(&[])
+                    };
+                    if let CompFlow::Return(text) = exec_statements(branch, env)? {
+                        return Ok(CompFlow::Return(text));
+                    }
+                }
+                CompValue::Str(_) => return Err(CompFail::Error),
+            },
+            CompStmt::Return(Some(expr)) => match eval_expr(expr, env)? {
+                CompValue::Str(text) => return Ok(CompFlow::Return(text)),
+                CompValue::Bool(_) => return Err(CompFail::Error),
+            },
+            CompStmt::Return(None) => return Err(CompFail::Error),
+            CompStmt::Expr(expr) => {
+                eval_expr(expr, env)?;
+            }
+        }
+    }
+    Ok(CompFlow::Next)
+}
+
+fn eval_expr(expr: &CompExpr, env: &HashMap<String, String>) -> Result<CompValue, CompFail> {
+    match expr {
+        CompExpr::Str(text) => Ok(CompValue::Str(text.clone())),
+        CompExpr::Bool(value) => Ok(CompValue::Bool(*value)),
+        CompExpr::Var(name) => env
+            .get(name)
+            .map(|text| CompValue::Str(text.clone()))
+            .ok_or(CompFail::Error),
+        CompExpr::Concat(left, right) => match (eval_expr(left, env)?, eval_expr(right, env)?) {
+            (CompValue::Str(a), CompValue::Str(b)) => Ok(CompValue::Str(a + &b)),
+            _ => Err(CompFail::Error),
+        },
+        CompExpr::Equal(left, right) | CompExpr::NotEqual(left, right) => {
+            let negate = matches!(expr, CompExpr::NotEqual(..));
+            let equal = match (eval_expr(left, env)?, eval_expr(right, env)?) {
+                (CompValue::Str(a), CompValue::Str(b)) => a == b,
+                (CompValue::Bool(a), CompValue::Bool(b)) => a == b,
+                _ => return Err(CompFail::Error),
+            };
+            Ok(CompValue::Bool(equal != negate))
+        }
+        CompExpr::Call { name, args } => {
+            // Arguments evaluate first, so a nested reject_match()
+            // declines even inside an unknown call.
+            for arg in args {
+                eval_expr(arg, env)?;
+            }
+            if name == "reject_match" && args.is_empty() {
+                // The standard's decline action: the definition does not
+                // take this match.
+                return Err(CompFail::Reject);
+            }
+            // Any other routine is unknown at parse time (15.3: module
+            // definitions cannot be presupposed) — the evaluation fails
+            // and the definition declines.
+            Err(CompFail::Error)
+        }
+    }
+}
+
+/// Recursive-descent parser for the restricted computed-body subset
+/// over the recorded body tokens. Any construct outside the subset is a
+/// parse failure (the body then declines).
+struct CompParser<'a> {
+    tokens: &'a [Token],
+    parameters: &'a [(Option<String>, String, Vec<Token>)],
+    cursor: usize,
+}
+
+impl<'a> CompParser<'a> {
+    fn kind_at(&self, index: usize) -> Option<&'a TokenKind> {
+        self.tokens.get(index).map(|token| &token.kind)
+    }
+
+    fn at_punct(&self, symbol: &str) -> bool {
+        matches!(self.kind_at(self.cursor), Some(TokenKind::Punctuation(p)) if p == symbol)
+    }
+
+    /// Consume the punctuation `symbol` when present.
+    fn take_punct(&mut self, symbol: &str) -> bool {
+        if self.at_punct(symbol) {
+            self.cursor += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_punct(&mut self, symbol: &str) -> Result<(), ()> {
+        if self.take_punct(symbol) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    fn at_keyword(&self, word: &str) -> bool {
+        matches!(self.kind_at(self.cursor), Some(TokenKind::Keyword(w)) if w == word)
+    }
+
+    /// The `;` terminating a simple statement. The body segment's
+    /// trailing `;` is consumed by the definition scanner (15.4.5 — it
+    /// terminates the body segment, not the expansion), so the last
+    /// statement of the body may end without one.
+    fn expect_statement_end(&mut self) -> Result<(), ()> {
+        if self.take_punct(";") || self.cursor == self.tokens.len() {
+            return Ok(());
+        }
+        Err(())
+    }
+
+    fn take_keyword(&mut self, word: &str) -> bool {
+        if self.at_keyword(word) {
+            self.cursor += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Statements until end of tokens (`top`) or the closing `}`.
+    fn parse_statement_list(&mut self, top: bool) -> Result<Vec<CompStmt>, ()> {
+        let mut stmts = Vec::new();
+        loop {
+            match self.kind_at(self.cursor) {
+                None => {
+                    if top {
+                        return Ok(stmts);
+                    }
+                    return Err(()); // unterminated block
+                }
+                Some(TokenKind::Punctuation(p)) if p == "}" => {
+                    if top {
+                        return Err(()); // stray closing brace
+                    }
+                    return Ok(stmts);
+                }
+                Some(_) => stmts.push(self.parse_statement()?),
+            }
+        }
+    }
+
+    fn parse_statement(&mut self) -> Result<CompStmt, ()> {
+        if self.take_keyword("var") {
+            let name = self.parse_name()?;
+            if !self.take_punct(":=") {
+                if self.take_punct(":") {
+                    // `var name: <type> = expr;` — the type is recorded
+                    // shape only; skip to the initializer.
+                    while !self.take_punct("=") {
+                        self.kind_at(self.cursor).ok_or(())?;
+                        self.cursor += 1;
+                    }
+                } else {
+                    self.expect_punct("=")?;
+                }
+            }
+            let expr = self.parse_expr()?;
+            self.expect_statement_end()?;
+            return Ok(CompStmt::Assign { name, expr });
+        }
+        if self.take_keyword("return") {
+            if self.take_punct(";") {
+                return Ok(CompStmt::Return(None));
+            }
+            let expr = self.parse_expr()?;
+            self.expect_statement_end()?;
+            return Ok(CompStmt::Return(Some(expr)));
+        }
+        if self.take_keyword("if") {
+            let cond = self.parse_expr()?;
+            self.expect_punct("{")?;
+            let then_body = self.parse_statement_list(false)?;
+            self.expect_punct("}")?;
+            let mut else_body = None;
+            if self.take_keyword("else") {
+                self.expect_punct("{")?;
+                let body = self.parse_statement_list(false)?;
+                self.expect_punct("}")?;
+                else_body = Some(body);
+            }
+            // The corpus style terminates an if with `};` — the
+            // semicolon after the block is optional.
+            self.take_punct(";");
+            return Ok(CompStmt::If {
+                cond,
+                then_body,
+                else_body,
+            });
+        }
+        // A plain assignment `name = expr;` (the `==` comparison lexes
+        // as one token, so a lone `=` is unambiguous).
+        if let Some(TokenKind::Identifier(name)) = self.kind_at(self.cursor)
+            && matches!(self.kind_at(self.cursor + 1), Some(TokenKind::Punctuation(p)) if p == "=")
+        {
+            let name = name.clone();
+            self.cursor += 2;
+            let expr = self.parse_expr()?;
+            self.expect_statement_end()?;
+            return Ok(CompStmt::Assign { name, expr });
+        }
+        let expr = self.parse_expr()?;
+        self.expect_statement_end()?;
+        Ok(CompStmt::Expr(expr))
+    }
+
+    /// A local-variable name: a plain identifier.
+    fn parse_name(&mut self) -> Result<String, ()> {
+        match self.kind_at(self.cursor) {
+            Some(TokenKind::Identifier(word)) => {
+                let name = word.clone();
+                self.cursor += 1;
+                Ok(name)
+            }
+            _ => Err(()),
+        }
+    }
+
+    /// `expr := cmp [('=='|'!=') cmp]` — comparisons bind loosest.
+    fn parse_expr(&mut self) -> Result<CompExpr, ()> {
+        let left = self.parse_concat()?;
+        if self.take_punct("==") {
+            let right = self.parse_concat()?;
+            return Ok(CompExpr::Equal(Box::new(left), Box::new(right)));
+        }
+        if self.take_punct("!=") {
+            let right = self.parse_concat()?;
+            return Ok(CompExpr::NotEqual(Box::new(left), Box::new(right)));
+        }
+        Ok(left)
+    }
+
+    /// `cmp := primary ('+' primary)*` — `+` concatenates strings.
+    fn parse_concat(&mut self) -> Result<CompExpr, ()> {
+        let mut left = self.parse_primary()?;
+        while self.take_punct("+") {
+            let right = self.parse_primary()?;
+            left = CompExpr::Concat(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_primary(&mut self) -> Result<CompExpr, ()> {
+        match self.kind_at(self.cursor) {
+            Some(TokenKind::StringLiteral(value)) => {
+                // The token value keeps the escape sequences raw; the
+                // string's value interprets them (matching how e string
+                // values read everywhere else).
+                let text = crate::interp::unescape(value);
+                self.cursor += 1;
+                Ok(CompExpr::Str(text))
+            }
+            Some(TokenKind::Keyword(word)) if word == "TRUE" => {
+                self.cursor += 1;
+                Ok(CompExpr::Bool(true))
+            }
+            Some(TokenKind::Keyword(word)) if word == "FALSE" => {
+                self.cursor += 1;
+                Ok(CompExpr::Bool(false))
+            }
+            // A `<...>` parameter reference: the matched submatch's text
+            // as a string (the same resolution rules the simple body's
+            // splicing uses). An unresolvable reference fails the body.
+            Some(TokenKind::Punctuation(p)) if p == "<" => {
+                self.cursor += 1;
+                let mut inner = Vec::new();
+                let mut closed = false;
+                while self.cursor < self.tokens.len() {
+                    if matches!(self.kind_at(self.cursor), Some(TokenKind::Punctuation(p)) if p == ">")
+                    {
+                        closed = true;
+                        break;
+                    }
+                    inner.push(&self.tokens[self.cursor]);
+                    self.cursor += 1;
+                }
+                if !closed {
+                    return Err(());
+                }
+                self.cursor += 1; // '>'
+                let submatch = resolve_reference(&inner, self.parameters).ok_or(())?;
+                Ok(CompExpr::Str(render_tokens_text(&submatch)))
+            }
+            Some(TokenKind::Punctuation(p)) if p == "(" => {
+                self.cursor += 1;
+                let expr = self.parse_expr()?;
+                self.expect_punct(")")?;
+                Ok(expr)
+            }
+            Some(TokenKind::Identifier(name)) => {
+                let name = name.clone();
+                self.cursor += 1;
+                if self.take_punct("(") {
+                    let mut args = Vec::new();
+                    if !self.take_punct(")") {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if self.take_punct(",") {
+                                continue;
+                            }
+                            self.expect_punct(")")?;
+                            break;
+                        }
+                    }
+                    return Ok(CompExpr::Call { name, args });
+                }
+                Ok(CompExpr::Var(name))
+            }
+            _ => Err(()),
+        }
+    }
 }

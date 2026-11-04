@@ -75,15 +75,24 @@ multi-simulator HDL API, and wasm32.
   `#endif` is accepted). The conditional forms are rejected at module
   level (`E0117`). Clause 15
   macro definitions (`define <name'category> "match expression" as
-  [computed] { body };`) are recorded uninterpreted — header, pattern
-  string and raw body tokens (`E0118` when the pattern string is
-  missing) — and simple define-as macros expand before parsing:
-  `src/macros.rs` compiles the pattern (15.4), matches invocation
-  sites with backtracking (15.5.2; literals match one token each,
-  non-terminals consume bounded by bracket depth and separators), and
-  splices the matched subsequences at the body's parameter references
-  (15.6), later definitions taking priority; the body's trailing `;`
-  belongs to the body segment, not the expansion. Clause 5 scalar type declarations (`type name: <type>;`)
+  [computed] { body };`) are recorded — header, pattern string and raw
+  body tokens (`E0118` when the pattern string is missing) — and both
+  kinds expand before parsing: `src/macros.rs` compiles the pattern
+  (15.4), matches invocation sites with backtracking (15.5.2; literals
+  match one token each, non-terminals consume bounded by bracket depth
+  and separators), and either splices the matched subsequences at the
+  simple body's parameter references (15.6) or evaluates the computed
+  body (15.3) with a restricted parse-time interpreter — `var`
+  declarations and assignments, braced `if`/`else`, `return`, the
+  implicit `result` variable, string parameters (their matched text),
+  string literals, `+` concatenation, `==`/`!=` comparisons and calls —
+  where `reject_match()` and any unevaluable construct (method calls,
+  `is a` checks, `else if` chains, list/number expressions, unknown
+  routines, non-string results) decline the definition so the next
+  lower-priority definition applies (15.5.1), the returned string
+  tokenizing into the expansion; later definitions take priority, and
+  the body's trailing `;` belongs to the body segment, not the
+  expansion. Clause 5 scalar type declarations (`type name: <type>;`)
   record the underlying representation. Clause 8 template declarations
   (`template [package] struct|unit name of <params> [like base] { .. }`)
   record their `<tag'category>` parameters and defaults; formals
@@ -310,9 +319,11 @@ and backtick preprocessor names (replacement rules apply in one
 pass, per file — B.5's include-order visibility through `import` is
 not modeled), `template extend` (8.2) and method-body instance
 substitution, template category-compliance checks (8.3's notes),
-computed macros and the match-expression grammar's repetition and
-category validation (clause 15.3/15.4 — simple define-as macros
-expand), the Part 2 routine library beyond the reflection set
+computed macros beyond the evaluated body subset (method calls,
+`is a` checks, `else if` chains, list/number expressions — such
+bodies decline, clause 15.3) and the match-expression grammar's
+repetition and category validation (clause 15.4), the Part 2 routine
+library beyond the reflection set
 (`set_of_values`/`full_set_of_values` and the 27.4 set
 pseudo-methods work; set literals, range modifiers on declared
 types, and bare scalar keywords as type arguments do not), a multi-simulator HDL
