@@ -232,12 +232,19 @@ multi-simulator HDL API, and wasm32.
   the called method inline; `wait` advances a virtual cycle counter and
   does not drive the simulator; `emit` records a firing and executes the
   event's `on` action blocks inline, in composition order, on the
-  instance the event path resolves to (clause 11.2) — `@sim`-attached
-  events never fire. `emit` also records the occurrence in the run's
-  temporal log (one `State` per virtual cycle, clause 12). The clause
+  instance the event path resolves to (clause 11.2). `emit` also records
+  the occurrence in the run's temporal log (one `State` per virtual
+  cycle, clause 12), and the simulator-side triggers fire through the
+  same path: `rise/fall/change(HDL expression) @sim` events (11.1.4.2)
+  and `hdl_path()`-bound event ports (9.4, 9.7.2.8) are edge-sampled
+  every virtual cycle while an HDL source is loaded — a live session or
+  the injected signal-history test seam (`hdl::SignalSource::Injected`;
+  without one they never fire). The clause
   13.1.1 scheduler runs concurrent TCMs: the `run()` bodies are the
   main coroutine and every `start`ed TCM joins the queue with the
-  implicit sync cycle before it commences; coroutines take round-robin
+  implicit sync cycle before it commences (a TCM declared `@event` with
+  a declared sampling event commences when that event occurs — 17.1.2,
+  17.2.1); coroutines take round-robin
   turns that run atomically from one synchronization action to the
   next, and when nothing is eligible one cycle passes (the 5,000-cycle
   shared budget guards runaway programs, `E0409`). Suspending
@@ -301,8 +308,10 @@ though a view's own when-of pairs are not re-verified against its
 base's fields), non-linear,
 disjunctive or temporal constraint solving (the solver backend covers
 conjunctive linear constraints and constant ranges over bounded
-integers), `@`-triggered TCM invocation, `@sim` sampling and
-per-instance timelines, and suspension re-entry beyond `while` chains
+integers), per-instance temporal timelines (the run log stays one
+global timeline; the simulator-side `@sim`/event-port triggers fire
+per instance at the scheduler's cycle boundaries), and suspension
+re-entry beyond `while` chains
 (waits inside `if`/`case`/`for` bodies, inline calls, `compute` and
 `on` blocks spin inline instead of interleaving), the remaining
 clause 14 coverage model (basic and derived items collect and grade;
@@ -312,9 +321,11 @@ and the 28.9 configuration are recorded, not applied), integer width
 truncation, evaluation of MVL literals, `detach`/`delay`/`exec` TEs, select
 choice policies beyond the constant-expression subset (the full
 choice-expression grammar, soft-order interactions between multiple
-selects), HDL-edge- and bind()-driven event-port triggering (the
-`on p$` members run on `emit p$`; the simulator-side triggers ride
-the `@sim` gap), the preprocessor's rescanned/repeated substitution
+selects), event-port triggering beyond the `hdl_path()`-bound edge
+sampling (`on p$` members run on `emit p$` and on the bound object's
+edges per the `edge()` attribute — the MVL edge spellings and
+`bind()` connections are not modeled), the preprocessor's
+rescanned/repeated substitution
 and backtick preprocessor names (replacement rules apply in one
 pass, per file — B.5's include-order visibility through `import` is
 not modeled), `template extend` (8.2) and method-body instance

@@ -26,6 +26,37 @@ fn run_source(source: &str, seed: u64) -> RunResult {
     run(&elaborated, seed)
 }
 
+/// Like [`run_source`], but the `hdl_*` routines and the `@sim`/event-port
+/// sampling read the injected per-cycle signal history instead of a
+/// spawned simulator (the `xezim` binary is not available in tests).
+fn run_source_with_signals(
+    source: &str,
+    seed: u64,
+    signals: e1647::hdl::InjectedSignals,
+) -> RunResult {
+    let parsed = parse(source);
+    assert!(
+        parsed.diagnostics.is_empty(),
+        "parse diagnostics: {:?}",
+        parsed
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    let elaborated = elaborate(&parsed.declarations);
+    assert!(
+        elaborated.diagnostics.is_empty(),
+        "elaboration diagnostics: {:?}",
+        elaborated
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    e1647::interp::run_with_signals(&elaborated, seed, signals)
+}
+
 fn clean_output(source: &str, seed: u64) -> String {
     let result = run_source(source, seed);
     assert!(
@@ -1623,4 +1654,181 @@ fn hash_else_branches_run() {
     );
     assert!(output.contains("flag"), "output: {output}");
     assert!(!output.contains("other"), "output: {output}");
+}
+
+#[test]
+fn sim_rise_event_fires_on_rising_edges_only() {
+    // 11.1.4.2: `rise(HDL expression) @sim` monitors the expression each
+    // cycle and fires on the rise. The injected signal history stands in
+    // for the simulator (the xezim binary is container-only): the value
+    // rises in cycles 1 and 4, stays flat in 2, and falls in 3. The
+    // cycle-0 sample only establishes the baseline.
+    let mut signals = e1647::hdl::InjectedSignals::new();
+    signals
+        .at("top.clk", 0, 0)
+        .at("top.clk", 1, 1)
+        .at("top.clk", 2, 1)
+        .at("top.clk", 3, 0)
+        .at("top.clk", 4, 1);
+    let output = run_source_with_signals(
+        "extend sys {\n    event tick is rise('top.clk') @sim;\n    on tick {\n        \
+         out(\"RISE\\n\");\n    };\n    run() is also {\n        out(\"START\\n\");\n        \
+         wait [4]*cycle;\n        out(\"END\\n\");\n    };\n};\n",
+        1,
+        signals,
+    )
+    .output;
+    assert_eq!(output, "START\nRISE\nRISE\nEND\n");
+}
+
+#[test]
+fn sim_change_event_fires_on_every_change() {
+    // 11.1.4.2: `change(HDL expression) @sim` fires on every value
+    // change — cycles 1 and 3 in the injected history; the flat cycle 2
+    // does not fire again.
+    let mut signals = e1647::hdl::InjectedSignals::new();
+    signals
+        .at("top.sig", 0, 0)
+        .at("top.sig", 1, 1)
+        .at("top.sig", 2, 1)
+        .at("top.sig", 3, 0);
+    let output = run_source_with_signals(
+        "extend sys {\n    event flip is change('top.sig') @sim;\n    on flip {\n        \
+         out(\"CHANGE\\n\");\n    };\n    run() is also {\n        out(\"START\\n\");\n        \
+         wait [3]*cycle;\n        out(\"END\\n\");\n    };\n};\n",
+        1,
+        signals,
+    )
+    .output;
+    assert_eq!(output, "START\nCHANGE\nCHANGE\nEND\n");
+}
+
+#[test]
+fn sim_events_never_fire_without_a_simulator() {
+    // Without an HDL source there is nothing to sample: the `@sim`
+    // event's on block never runs and the run stays clean — the honest
+    // "HDL signals without a simulator" behavior.
+    let result = run_source(
+        "extend sys {\n    event tick is rise('top.clk') @sim;\n    on tick {\n        \
+         out(\"RISE\\n\");\n    };\n    run() is also {\n        wait [3]*cycle;\n        \
+         out(\"END\\n\");\n    };\n};\n",
+        1,
+    );
+    assert!(result.diagnostics.is_empty());
+    assert_eq!(result.output, "END\n");
+}
+
+#[test]
+fn started_tcm_commences_when_its_sampling_event_occurs() {
+    // 17.1.2: a TCM implicitly synchronizes on its designated sampling
+    // event upon entry, as if `sync @ev` were added at the top — the
+    // `tcm() @ev` TCM below starts only when `ev` fires in cycle 2, not
+    // one cycle after its `start` (the watcher's per-cycle prints pin
+    // the timing).
+    let output = clean_output(
+        "extend sys {\n    event ev;\n    tcm() @ev is {\n        out(\"TCM AFTER EV\\n\");\n    };\n    \
+         watcher() @sys.any is {\n        var i: uint = 0;\n        while i < 4 {\n            \
+         out(\"tick \", i, \"\\n\");\n            wait [1]*cycle;\n            i = i + 1;\n        };\n    };\n    \
+         run() is also {\n        start watcher();\n        start tcm();\n        \
+         wait [2]*cycle;\n        emit ev;\n    };\n};\n",
+        1,
+    );
+    // The TCM did not commence one cycle after its start (it prints
+    // after the watcher's cycle-1 turn) and it ran within ev's cycle 2
+    // (before the watcher's cycle-3 turn). Which same-cycle turn goes
+    // first is the scheduler's queue order.
+    let tick0 = output.find("tick 0").expect("tick 0");
+    let fired = output.find("TCM AFTER EV").expect("TCM AFTER EV");
+    let tick2 = output.find("tick 2").expect("tick 2");
+    assert!(
+        tick0 < fired,
+        "the TCM starts only when ev occurs: {output}"
+    );
+    assert!(fired < tick2, "the TCM runs in ev's cycle: {output}");
+}
+
+#[test]
+fn tcm_with_already_emitted_sampling_event_starts_this_tick() {
+    // 17.2.1: a TCM begins "immediately if the sampling event has
+    // already been emitted for the current tick" — the emit precedes the
+    // start in cycle 0, so the TCM runs before the watcher's first
+    // cycle-1 print.
+    let output = clean_output(
+        "extend sys {\n    event ev;\n    tcm() @ev is {\n        out(\"TCM NOW\\n\");\n    };\n    \
+         watcher() @sys.any is {\n        out(\"TICK0\\n\");\n        wait [1]*cycle;\n        \
+         out(\"TICK1\\n\");\n    };\n    run() is also {\n        start watcher();\n        \
+         emit ev;\n        start tcm();\n        out(\"MAIN\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "MAIN\nTCM NOW\nTICK0\nTICK1\n");
+}
+
+#[test]
+fn tcm_parked_on_a_never_firing_event_holds_the_run_to_the_budget() {
+    // The parked TCM keeps the run alive (13.1.1: it stays idle until
+    // the next occurrence of its sampling event); with the event never
+    // occurring, the shared cycle budget is what stops the run (E0409).
+    let result = run_source(
+        "extend sys {\n    ev: event;\n    tcm() @ev is {\n        out(\"NEVER\");\n    };\n    \
+         run() is also {\n        start tcm();\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>(),
+        vec!["E0409"]
+    );
+    assert!(
+        !result.output.contains("NEVER"),
+        "output: {}",
+        result.output
+    );
+}
+
+#[test]
+fn bound_event_port_fires_on_its_hdl_object_edge() {
+    // 9.4 + 9.7.2.9: the external event port's hdl_path() attribute
+    // names the simulated object; the port's event fires on the bound
+    // object's edge (the default `change` of 9.7.2.8) and runs the `on
+    // rst$` blocks (11.3) — here driven by the injected history instead
+    // of a simulator.
+    let mut signals = e1647::hdl::InjectedSignals::new();
+    signals
+        .at("top.rst", 0, 0)
+        .at("top.rst", 1, 1)
+        .at("top.rst", 2, 1);
+    let output = run_source_with_signals(
+        "extend sys {\n    rst$: in event_port is instance;\n    keep rst$.hdl_path() == \"top.rst\";\n    \
+         on rst$ {\n        out(\"PORT RST\\n\");\n    };\n    run() is also {\n        \
+         out(\"BEGIN\\n\");\n        wait [3]*cycle;\n        out(\"AFTER\\n\");\n    };\n};\n",
+        1,
+        signals,
+    )
+    .output;
+    assert_eq!(output, "BEGIN\nPORT RST\nAFTER\n");
+}
+
+#[test]
+fn event_port_edge_attribute_selects_the_edge() {
+    // 9.7.2.8: `keep p.edge() == rise` restricts the port's event to
+    // rising edges. The injected history 0,1,0,1 crosses two rises (a
+    // plain change edge would fire three times).
+    let mut signals = e1647::hdl::InjectedSignals::new();
+    signals
+        .at("top.sig", 0, 0)
+        .at("top.sig", 1, 1)
+        .at("top.sig", 2, 0)
+        .at("top.sig", 3, 1);
+    let output = run_source_with_signals(
+        "extend sys {\n    p$: in event_port is instance;\n    keep p$.hdl_path() == \"top.sig\";\n    \
+         keep p$.edge() == rise;\n    on p$ {\n        out(\"EDGE\\n\");\n    };\n    \
+         run() is also {\n        wait [4]*cycle;\n        out(\"DONE\\n\");\n    };\n};\n",
+        1,
+        signals,
+    )
+    .output;
+    assert_eq!(output, "EDGE\nEDGE\nDONE\n");
 }
