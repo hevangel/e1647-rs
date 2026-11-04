@@ -5,11 +5,12 @@
                                                   |
                           constraint IR (conjunctive linear keep) + interpreter
                                                   |
-                          xezim VPI bridge (line protocol; one simulator)
+                          xezim VPI bridge (line protocol; Simulator backend)
 ```
 
-Still ahead of the code: a typed IR, coverage, an event scheduler, a
-multi-simulator HDL API, and wasm32.
+Still ahead of the code: a typed IR, and simulator bindings beyond the
+xezim bridge (VHPI among them). The library compiles for wasm32; a
+browser sandbox API is not started.
 
 ## Principles
 
@@ -312,10 +313,20 @@ multi-simulator HDL API, and wasm32.
   Pumpkin (pure-Rust CP solver) behind the `solver-pumpkin`
   cargo feature — seeded, deterministic; without the feature `solve`
   reports unsupported and `gen` falls back to rejection sampling.
-- `src/hdl.rs` — one SystemVerilog binding. `HdlSession` spawns `xezim`
-  with `c/xezim_bridge.c` and exchanges `SET` / `GET` / `RUN` / `FINISH`
-  lines. Arguments are allowlisted; there is no shell. Quoted HDL paths
-  and the `hdl_*` routines use this session.
+- `src/hdl.rs` — the simulator seam: the `Simulator` trait
+  (`load`/`name`/`set`/`get`/`run`/`finish`), a small explicit registry
+  (`registered_backends`, `default_backend`, `load_backend`, `load`),
+  and two backends. `XezimSimulator` (native targets) wraps `HdlSession`,
+  which spawns `xezim` with `c/xezim_bridge.c` and exchanges `SET` /
+  `GET` / `RUN` / `FINISH` lines; arguments are allowlisted and there is
+  no shell. `NullSimulator` is the no-op backend where no simulator
+  exists — under wasm32 it is the only registered one (the spawning
+  backend is not compiled there, so `hdl_load` fails with the honest
+  no-simulator error) and it doubles as the tests' dispatch check. A
+  third backend (VHPI — not implemented) plugs in with one `Simulator`
+  impl and one registry arm. Quoted HDL paths and the `hdl_*` routines
+  read through `SignalSource`, which holds whichever backend loaded (or
+  the injected per-cycle history).
 - `src/main.rs` — `e1647 tokens`, `e1647 parse`, `e1647 elab` and
   `e1647 run [--seed N]`. `import a.b` loads `a/b.e` or `a.b.e` next to
   the source and splices those declarations in front. `parse`, `elab` and
@@ -366,5 +377,9 @@ repetition and category validation (clause 15.4), the Part 2 routine
 library beyond the reflection set
 (`set_of_values`/`full_set_of_values` and the 27.4 set
 pseudo-methods work; set literals, range modifiers on declared
-types, and bare scalar keywords as type arguments do not), a multi-simulator HDL
-API, and WASM.
+types, and bare scalar keywords as type arguments do not), simulator
+bindings beyond the xezim bridge (the `Simulator` seam is registered;
+VHPI among the bindings that are not written), a backend selection knob
+(`hdl_load` resolves through the default backend), and a browser
+sandbox API (the wasm32 compilation check passes; there is no sandbox
+API and no wasm runtime test).
