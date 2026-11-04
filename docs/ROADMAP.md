@@ -187,9 +187,12 @@
       names (the configuration itself is a builder API) —
       the clause 12/13 temporal
       engine's remaining simulation integration — the scheduler runs
-      started TCMs concurrently and waits/sync suspend, but
-      `@`-triggered TCM invocation, `@sim` sampling, and suspension
-      re-entry beyond `while` chains are not wired —
+      started TCMs concurrently and waits/sync suspend, `@`-triggered
+      TCM invocation gates the entry on the declared sampling event's
+      occurrence (17.1.2), and `@sim`/event-port edge sampling
+      (11.1.4.2, 9.7.2.8) fires at the scheduler's cycle boundaries
+      through a real session or the injected signal-history test seam —
+      suspension re-entry beyond `while` chains is not wired —
       `detach`/`delay`/`exec` TEs, select
       choice policies beyond the constant-expression subset (the
       full choice-expression grammar and soft-order interactions),

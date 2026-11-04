@@ -16,12 +16,17 @@
 //! Lines the simulator prints on its own are ignored by the reader —
 //! only the response prefixes are matched.
 //!
+//! Tests and offline runs cannot spawn the simulator, so values can also
+//! come from an injected per-cycle history ([`SignalSource::Injected`]):
+//! the interpreter's virtual cycles are the sampled timeline there.
+//!
 //! Security posture: the spawned program is the fixed name `xezim`
 //! resolved through `PATH` (the container provides it); every argument
 //! (bridge module, design file, top name) is validated against a strict
 //! character allowlist before the argv-list spawn — there is no shell
 //! and no string concatenation into a command line.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -173,5 +178,110 @@ impl Drop for HdlSession {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Where signal values come from: a live external simulator session
+/// (spawned by `hdl_load`), or an injected per-cycle signal history.
+///
+/// The injected form is the offline/test seam: the `xezim` binary is only
+/// provided inside the container (`compose mixed` service), so interpreter
+/// tests and offline runs feed the `hdl_*` routines and the `@sim`
+/// sampling (11.1.4.2) from a predetermined per-virtual-cycle history
+/// instead. An injected source never advances real HDL time — the
+/// interpreter's virtual cycles ARE the sampled timeline.
+pub enum SignalSource {
+    /// A live simulator session driven over the line protocol.
+    Real(HdlSession),
+    /// A predetermined signal history (see [`InjectedSignals`]).
+    Injected(InjectedSignals),
+}
+
+impl SignalSource {
+    /// Read a signal's value as of the given virtual cycle. The cycle is
+    /// the interpreter's sampling clock; a real session ignores it (the
+    /// bridge reads the current simulated value).
+    pub fn get(&mut self, path: &str, cycle: u64) -> Result<i128, String> {
+        match self {
+            SignalSource::Real(session) => session.get(path),
+            SignalSource::Injected(signals) => signals.get(path, cycle).ok_or_else(|| {
+                format!(
+                    "no value injected for '{path}' at cycle {cycle} (an unsampleable \
+                     signal never produces an edge)"
+                )
+            }),
+        }
+    }
+
+    /// Assign a value to a signal. An injected source records the value
+    /// from `cycle` on (until a later record overrides it).
+    pub fn set(&mut self, path: &str, value: i64, cycle: u64) -> Result<(), String> {
+        match self {
+            SignalSource::Real(session) => session.set(path, value),
+            SignalSource::Injected(signals) => {
+                signals.record(path, cycle, i128::from(value));
+                Ok(())
+            }
+        }
+    }
+
+    /// Advance HDL simulation time. An injected source has none — its
+    /// timeline is the interpreter's virtual cycles — so this is a no-op.
+    pub fn run(&mut self, delay: u64) -> Result<(), String> {
+        match self {
+            SignalSource::Real(session) => session.run(delay),
+            SignalSource::Injected(_) => Ok(()),
+        }
+    }
+
+    /// End the session. An injected source has nothing to end.
+    pub fn finish(&mut self) {
+        if let SignalSource::Real(session) = self {
+            session.finish();
+        }
+    }
+}
+
+/// A predetermined per-virtual-cycle signal history for the injected
+/// [`SignalSource`]: per path, a sparse, non-decreasing sequence of
+/// (cycle, value) records. A read returns the value of the latest record
+/// at or before the queried cycle; before the first record the signal has
+/// no value (reads fail, so no edge can be detected off it — the honest
+/// counterpart of an uninitialized signal).
+#[derive(Debug, Clone, Default)]
+pub struct InjectedSignals {
+    records: BTreeMap<String, Vec<(u64, i128)>>,
+}
+
+impl InjectedSignals {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `value` for `path` from virtual `cycle` on. Records for the
+    /// same path stay sorted by cycle; recording at an already-recorded
+    /// cycle overrides that record.
+    pub fn at(&mut self, path: &str, cycle: u64, value: i128) -> &mut Self {
+        self.record(path, cycle, value);
+        self
+    }
+
+    fn record(&mut self, path: &str, cycle: u64, value: i128) {
+        let entries = self.records.entry(path.to_owned()).or_default();
+        match entries.binary_search_by_key(&cycle, |(recorded, _)| *recorded) {
+            Ok(index) => entries[index].1 = value,
+            Err(index) => entries.insert(index, (cycle, value)),
+        }
+    }
+
+    fn get(&self, path: &str, cycle: u64) -> Option<i128> {
+        let entries = self.records.get(path)?;
+        let index = match entries.binary_search_by_key(&cycle, |(recorded, _)| *recorded) {
+            Ok(index) => index,
+            // Before the first record the signal has no value yet.
+            Err(0) => return None,
+            Err(insert_at) => insert_at - 1,
+        };
+        Some(entries[index].1)
     }
 }

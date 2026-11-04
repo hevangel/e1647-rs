@@ -43,7 +43,11 @@
 > expand before
 > parsing, and the reflection set (`set_of_values` with the 27.4 set
 > pseudo-methods) evaluates. Clause 20's `repeat until` loops and the
-> `do` sugar run. It does **not** yet do
+> `do` sugar run. The simulator-side temporal integration samples
+> `rise/fall/change(HDL expression) @sim` events and `hdl_path()`-bound
+> event ports each virtual cycle (a live session, or an injected signal
+> history where the simulator is unavailable), and TCMs declared
+> `@event` commence when that event occurs. It does **not** yet do
 > full type
 > checking,
 > resolution, event-driven temporal evaluation, coverage, non-linear or
