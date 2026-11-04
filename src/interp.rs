@@ -7,8 +7,14 @@
 //!
 //! Supported at run time: `uint`/`int`/`bit`/`byte`/`nibble`/`bool`/`real`/
 //! `string` values (integers are unbounded `i128`; declared widths are not
-//! truncated), enumerals, `list of` values with the `size()`/`push()`
-//! methods, struct instances, method calls (every composed block with the
+//! truncated), enumerals, `list of` values with the clause 26 pseudo-method
+//! subset (26.4.22 `size`, 26.4.12 `is_empty`, 26.4.5 `exists`, 26.4.3
+//! `copy`, 26.4.21 `reverse`, 26.4.26/26.4.27 `top`/`top0`, the 26.3
+//! modifiers `push`/`push0`/`add`/`add0`/`pop`/`pop0`/`insert`/`delete`/
+//! `fast_delete`/`clear`, the 26.4.15-26.4.19 extremes
+//! `min`/`max`/`min_index`/`max_index`, the 26.5.1/26.5.2/26.5.4/26.5.5
+//! aggregates `and_all`/`or_all`/`product`/`sum`, and 26.4.11
+//! `is_a_permutation`), struct instances, method calls (every composed block with the
 //! name runs, in composition order; the last returned value wins), local
 //! variables, assignments, `if`/`else`, `while` with `break`/`continue`,
 //! `return`, `print`, the built-in `out` routine, and `gen`.
@@ -36,6 +42,32 @@
 //! - `E0409` cycle budget exceeded (runaway TCM)
 //! - `E0410` unsupported string-match pattern shape (`/.../` or a
 //!   native meta-character)
+//!
+//! ## Clause 26 list pseudo-methods — documented gaps
+//!
+//! Pseudo-methods are macros, not struct methods (26.1). The ones whose
+//! semantics take a per-item expression argument cannot pass through the
+//! v1 dispatch (it evaluates arguments to values only), so they report
+//! `E0405` "list method ... is not supported": `apply` (26.4.2),
+//! `sort`/`sort_by_field` (26.4.23/26.4.24), `all`/`all_indices`
+//! (26.4.29/26.4.30), `has` (26.4.10), `count` (26.4.4), `first`/`last`
+//! (26.4.6/26.4.13), `first_index`/`last_index` (26.4.7/26.4.14),
+//! `all_different` (26.4.1), `unique` (26.4.28), `split` (26.4.25), the
+//! `exp`-parameter forms of `min`/`max`/`min_index`/`max_index`
+//! (26.4.15-26.4.19) and of the 26.5 aggregates, and `max_value`/
+//! `min_value` (26.4.17/26.4.20 — their empty-list return is Table 54,
+//! keyed by an element type the value model does not carry). Also not
+//! modeled: `average` (26.5.3 — the empty-list result is UNDEF, which the
+//! value model has no representation for), `resize` (26.3.16 — the
+//! `filler`/`keep_old` parameters are expressions and new items need the
+//! element type's default value), `get_indices` (26.4.9 — the prose does
+//! not state the out-of-range index behavior; element access is the `[i]`
+//! index expression, `E0404`), `flatten` (26.4.8 — no language surface of
+//! this subset can produce a nested list: a list argument to a modifying
+//! pseudo-method is the 26.3.2/26.3.4/26.3.14/26.3.15 list form, because e
+//! declares no lists of lists), the CRC family (26.6.1-26.6.3 — the prose
+//! notes the polynomials but not the full algorithm parameters), and keyed
+//! lists (26.7).
 //!
 //! `emit` records the firing and immediately executes the event's `on`
 //! action blocks (clause 11.2), in composition order, on the instance
@@ -3153,6 +3185,407 @@ impl<'a> Interp<'a> {
         Some(result)
     }
 
+    /// The clause 26 list pseudo-methods, dispatched on a `Value::List`
+    /// receiver. Pseudo-methods are macros, not struct methods (26.1) —
+    /// they attach to any list expression, and a modifying one writes the
+    /// changed list back through the receiver expression (the same slot
+    /// `push` has always used). `None` when the name is not one of this
+    /// subset (the caller reports `E0405`).
+    ///
+    /// The methods taking a per-item expression (`apply`, `sort`, `all`,
+    /// `has`, ...) cannot pass through this value-only dispatch — see the
+    /// documented gaps in the module docs.
+    #[allow(clippy::too_many_arguments)]
+    fn call_list_pseudo_method(
+        &mut self,
+        items: &[Value],
+        receiver: &Expr,
+        name: &str,
+        args: &[Value],
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Option<Result<Value, Diagnostic>> {
+        let result = match (name, args) {
+            // 26.4.22 size(): the number of items in the list.
+            ("size", []) => Ok(Value::Int(items.len() as i128)),
+            // 26.4.12 is_empty(): TRUE when the list has no items.
+            ("is_empty", []) => Ok(Value::Bool(items.is_empty())),
+            // 26.4.5 exists(): TRUE when an item with the given index
+            // number exists in the list, FALSE when the index does not.
+            ("exists", [Value::Int(index)]) => {
+                Ok(Value::Bool(*index >= 0 && (*index as usize) < items.len()))
+            }
+            ("exists", _) => {
+                Err(self.error("E0402", "exists() expects an integer index", span))
+            }
+            // 26.4.3 copy(): a copy of the list — the list case of
+            // exp.copy() (27.4.1). Values clone; struct items stay shared
+            // by instance index.
+            ("copy", []) => Ok(Value::List(items.to_vec())),
+            // 26.4.21 reverse(): a new list of all the items in reverse
+            // order (the receiver is unchanged).
+            ("reverse", []) => {
+                let mut reversed = items.to_vec();
+                reversed.reverse();
+                Ok(Value::List(reversed))
+            }
+            // 26.4.26 top(): the last item, not removed; empty is an
+            // error (the prose's exception).
+            ("top", []) => match items.last() {
+                Some(item) => Ok(item.clone()),
+                None => Err(self.error("E0402", "top of an empty list", span)),
+            },
+            // 26.4.27 top0(): the first item, not removed; empty is an
+            // error (the prose's exception; pairs with pop0 for queues).
+            ("top0", []) => match items.first() {
+                Some(item) => Ok(item.clone()),
+                None => Err(self.error("E0402", "top0 of an empty list", span)),
+            },
+            // 26.3.10 pop(): removes and returns the last item; empty is
+            // an error (the prose's exception).
+            ("pop", []) => match items.split_last() {
+                Some((last, rest)) => {
+                    let popped = last.clone();
+                    return Some(
+                        self.store_list(receiver, rest.to_vec(), popped, frame, me, span),
+                    );
+                }
+                None => Err(self.error("E0402", "pop of an empty list", span)),
+            },
+            // 26.3.11 pop0(): removes and returns the first item; empty
+            // is an error (the prose's exception).
+            ("pop0", []) => match items.split_first() {
+                Some((first, rest)) => {
+                    let popped = first.clone();
+                    return Some(
+                        self.store_list(receiver, rest.to_vec(), popped, frame, me, span),
+                    );
+                }
+                None => Err(self.error("E0402", "pop0 of an empty list", span)),
+            },
+            // 26.3.1 add(item) / 26.3.12 push(item): the same function —
+            // the item goes to the end of the list.
+            // 26.3.2 add(list) / 26.3.14 push(list): a copy of the
+            // argument list is appended. e declares no lists of lists
+            // (26.4.25), so a list-valued argument is unambiguously the
+            // list form.
+            ("push" | "add", [Value::List(added)]) => {
+                let mut grown = items.to_vec();
+                grown.extend(added.iter().cloned());
+                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+            }
+            ("push" | "add", [item]) => {
+                let mut grown = items.to_vec();
+                grown.push(item.clone());
+                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+            }
+            // 26.3.3 add0(item) / 26.3.13 push0(item): the item becomes
+            // the first position (index 0); later items reindex by +1.
+            // 26.3.4 add0(list) / 26.3.15 push0(list): the argument list
+            // is placed at the head (same list-form reading as above).
+            ("push0" | "add0", [Value::List(added)]) => {
+                let mut grown = added.clone();
+                grown.extend(items.iter().cloned());
+                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+            }
+            ("push0" | "add0", [item]) => {
+                let mut grown = Vec::with_capacity(items.len() + 1);
+                grown.push(item.clone());
+                grown.extend(items.iter().cloned());
+                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+            }
+            ("push" | "add" | "push0" | "add0", _) => {
+                Err(self.error("E0402", "push/add expects exactly one argument", span))
+            }
+            // 26.3.8 insert(index, item): the item goes at the index
+            // location; index == size appends; a size smaller than index
+            // is an error (the prose's exception; indexes count from 0,
+            // 26.3.6).
+            // 26.3.9 insert(index, list): all items of the argument list
+            // go in starting at index (a list-valued second argument is
+            // the list form; the prose's "positive integer" index is read
+            // with the 0-based numbering of 26.3.6).
+            ("insert", [Value::Int(index), Value::List(inserted)]) => {
+                let at = match self.list_insert_position(items, *index, span) {
+                    Ok(at) => at,
+                    Err(diagnostic) => return Some(Err(diagnostic)),
+                };
+                let mut grown = Vec::with_capacity(items.len() + inserted.len());
+                grown.extend_from_slice(&items[..at]);
+                grown.extend(inserted.iter().cloned());
+                grown.extend_from_slice(&items[at..]);
+                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+            }
+            ("insert", [Value::Int(index), item]) => {
+                let at = match self.list_insert_position(items, *index, span) {
+                    Ok(at) => at,
+                    Err(diagnostic) => return Some(Err(diagnostic)),
+                };
+                let mut grown = items.to_vec();
+                grown.insert(at, item.clone());
+                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+            }
+            ("insert", _) => Err(self.error(
+                "E0402",
+                "insert expects an integer index and an item",
+                span,
+            )),
+            // 26.3.6 delete(index): removes item number index (indexes
+            // start counting from 0) and renumbers sequentially; an index
+            // that does not exist is an error (the prose's exception).
+            ("delete", [Value::Int(index)]) => {
+                let at = match self.list_index_position(items, *index, span) {
+                    Ok(at) => at,
+                    Err(diagnostic) => return Some(Err(diagnostic)),
+                };
+                let mut shrunk = items.to_vec();
+                shrunk.remove(at);
+                return Some(self.store_list(receiver, shrunk, Value::Void, frame, me, span));
+            }
+            ("delete", _) => Err(self.error("E0402", "delete expects an integer index", span)),
+            // 26.3.7 fast_delete(index): the last item's value moves into
+            // the deleted slot, so every other item keeps its index; an
+            // index that does not exist is an error (the prose's
+            // exception).
+            ("fast_delete", [Value::Int(index)]) => {
+                let at = match self.list_index_position(items, *index, span) {
+                    Ok(at) => at,
+                    Err(diagnostic) => return Some(Err(diagnostic)),
+                };
+                let mut shrunk = items.to_vec();
+                let last = shrunk.pop().expect("index in range implies a last item");
+                if at < shrunk.len() {
+                    shrunk[at] = last;
+                }
+                return Some(self.store_list(receiver, shrunk, Value::Void, frame, me, span));
+            }
+            ("fast_delete", _) => {
+                Err(self.error("E0402", "fast_delete expects an integer index", span))
+            }
+            // 26.3.5 clear(): deletes all items in the list.
+            ("clear", []) => {
+                return Some(self.store_list(receiver, Vec::new(), Value::Void, frame, me, span));
+            }
+            // 26.5.1 and_all(): TRUE when every item is TRUE; empty is
+            // TRUE (the prose's stated empty result). The exp-parameter
+            // form is a documented gap; the no-argument form reads the
+            // items themselves.
+            ("and_all", []) => {
+                let mut all = true;
+                for item in items {
+                    match item {
+                        Value::Bool(value) => all &= *value,
+                        _ => {
+                            return Some(Err(self.error(
+                                "E0402",
+                                "and_all() expects a list of booleans",
+                                span,
+                            )))
+                        }
+                    }
+                }
+                Ok(Value::Bool(all))
+            }
+            // 26.5.2 or_all(): TRUE when any item is TRUE; empty is
+            // FALSE (the prose's stated empty result).
+            ("or_all", []) => {
+                let mut any = false;
+                for item in items {
+                    match item {
+                        Value::Bool(value) => any |= *value,
+                        _ => {
+                            return Some(Err(self.error(
+                                "E0402",
+                                "or_all() expects a list of booleans",
+                                span,
+                            )))
+                        }
+                    }
+                }
+                Ok(Value::Bool(any))
+            }
+            // 26.5.4 product(): the integer product over the items; 1
+            // when empty (the prose's stated empty result).
+            ("product", []) => {
+                let mut product: i128 = 1;
+                for item in items {
+                    match item {
+                        Value::Int(value) => product = product.wrapping_mul(*value),
+                        _ => {
+                            return Some(Err(self.error(
+                                "E0402",
+                                "product() expects a list of integers",
+                                span,
+                            )))
+                        }
+                    }
+                }
+                Ok(Value::Int(product))
+            }
+            // 26.5.5 sum(): the integer sum over the items; 0 when empty
+            // (the prose's stated empty result).
+            ("sum", []) => {
+                let mut sum: i128 = 0;
+                for item in items {
+                    match item {
+                        Value::Int(value) => sum = sum.wrapping_add(*value),
+                        _ => {
+                            return Some(Err(self.error(
+                                "E0402",
+                                "sum() expects a list of integers",
+                                span,
+                            )))
+                        }
+                    }
+                }
+                Ok(Value::Int(sum))
+            }
+            // 26.4.15 max() / 26.4.18 min(): the item with the largest /
+            // smallest value — on ties the item latest in the list; empty
+            // is an error (the prose's exception).
+            // 26.4.16 max_index() / 26.4.19 min_index(): the same scan,
+            // returning the winning index.
+            ("max" | "min" | "max_index" | "min_index", []) => {
+                self.list_extreme(items, name, span)
+            }
+            ("max" | "min" | "max_index" | "min_index", _) => Err(self.error(
+                "E0402",
+                "the no-argument form of min/max is the supported one (the exp form is a documented gap)",
+                span,
+            )),
+            // 26.4.11 is_a_permutation(): TRUE when the argument holds
+            // the same items with the same multiplicities (order
+            // irrelevant); struct items compare by instance index — the
+            // prose's "compares the addresses of the struct items".
+            ("is_a_permutation", [Value::List(other)]) => {
+                let mut remaining: Vec<&Value> = other.iter().collect();
+                let mut permutation = true;
+                for item in items {
+                    match remaining
+                        .iter()
+                        .position(|candidate| values_equal(candidate, item))
+                    {
+                        Some(position) => {
+                            remaining.remove(position);
+                        }
+                        None => {
+                            permutation = false;
+                            break;
+                        }
+                    }
+                }
+                Ok(Value::Bool(permutation && remaining.is_empty()))
+            }
+            ("is_a_permutation", _) => Err(self.error(
+                "E0402",
+                "is_a_permutation expects a list argument",
+                span,
+            )),
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    /// Write a modified list back through the receiver expression (the
+    /// pseudo-method attaches to any list expression, 26.2 — the write
+    /// goes to the slot the receiver denotes) and return the
+    /// pseudo-method's own result.
+    fn store_list(
+        &mut self,
+        receiver: &Expr,
+        items: Vec<Value>,
+        result: Value,
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        self.write_slot(receiver, Value::List(items), frame, me, span)?;
+        Ok(result)
+    }
+
+    /// The valid index positions for the 26.3.6 `delete` / 26.3.7
+    /// `fast_delete` family: an index that does not exist in the list is
+    /// an error (the prose's exception; `E0404` matches the `[i]` index
+    /// expression's out-of-range code).
+    fn list_index_position(
+        &self,
+        items: &[Value],
+        index: i128,
+        span: crate::ast::Span,
+    ) -> Result<usize, Diagnostic> {
+        let len = items.len() as i128;
+        if index < 0 || index >= len {
+            Err(self.error(
+                "E0404",
+                format!("list index {index} out of range (size {len})"),
+                span,
+            ))
+        } else {
+            Ok(index as usize)
+        }
+    }
+
+    /// The valid insertion positions for 26.3.8/26.3.9 `insert`: index ==
+    /// size appends (the prose's stated case), a size smaller than index
+    /// is an error (the prose's exception).
+    fn list_insert_position(
+        &self,
+        items: &[Value],
+        index: i128,
+        span: crate::ast::Span,
+    ) -> Result<usize, Diagnostic> {
+        let len = items.len() as i128;
+        if index < 0 || index > len {
+            Err(self.error(
+                "E0404",
+                format!("insert index {index} out of range (size {len})"),
+                span,
+            ))
+        } else {
+            Ok(index as usize)
+        }
+    }
+
+    /// 26.4.15/26.4.16/26.4.18/26.4.19: the extreme item or its index.
+    /// On ties the item latest in the list wins (the prose's rule); empty
+    /// is an error (the prose's exception, reported like the set
+    /// pseudo-methods' empty-set errors), and items the relational
+    /// operators do not order are a type error.
+    fn list_extreme(
+        &self,
+        items: &[Value],
+        name: &str,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        if items.is_empty() {
+            return Err(self.error("E0402", format!("{name} of an empty list"), span));
+        }
+        let want_max = name.starts_with("max");
+        let want_index = name.ends_with("_index");
+        let mut best = 0usize;
+        for (i, item) in items.iter().enumerate().skip(1) {
+            let ordering = compare_values(item, &items[best]).ok_or_else(|| {
+                self.error("E0402", format!("{name}() items are not comparable"), span)
+            })?;
+            use std::cmp::Ordering::*;
+            // Equal takes over, so the latest of a tie wins.
+            let takes_over = if want_max {
+                ordering != Less
+            } else {
+                ordering != Greater
+            };
+            if takes_over {
+                best = i;
+            }
+        }
+        if want_index {
+            Ok(Value::Int(best as i128))
+        } else {
+            Ok(items[best].clone())
+        }
+    }
+
     /// Evaluate a temporal expression's propositions (`true(exp)` —
     /// `TRUE` or non-zero numeric, 12.1.1.1) and numeric repeat bounds
     /// once, with current field values. The results key the callback
@@ -3311,7 +3744,7 @@ impl<'a> Interp<'a> {
                         span,
                     ));
                 };
-                match crate::hdl::HdlSession::load(file, top) {
+                match crate::hdl::load(file, top) {
                     Ok(session) => {
                         self.hdl = Some(crate::hdl::SignalSource::Real(session));
                         Ok(Value::Void)
@@ -3589,20 +4022,18 @@ impl<'a> Interp<'a> {
                         let object_value = self.eval(object, frame, me)?;
                         match object_value {
                             Value::Object(index) => self.call_method(index, name, values, *span),
-                            Value::List(items) => match (name.as_str(), values.as_slice()) {
-                                ("size", []) => Ok(Value::Int(items.len() as i128)),
-                                ("push", [pushed]) => {
-                                    let mut items = items;
-                                    items.push(pushed.clone());
-                                    self.write_slot(object, Value::List(items), frame, me, *span)?;
-                                    Ok(Value::Void)
+                            Value::List(items) => {
+                                match self.call_list_pseudo_method(
+                                    &items, object, name, &values, frame, me, *span,
+                                ) {
+                                    Some(result) => result,
+                                    None => Err(self.error(
+                                        "E0405",
+                                        format!("list method '{name}' is not supported"),
+                                        *span,
+                                    )),
                                 }
-                                _ => Err(self.error(
-                                    "E0405",
-                                    format!("list method '{name}' is not supported"),
-                                    *span,
-                                )),
-                            },
+                            }
                             Value::Set(intervals) => {
                                 match self.call_set_pseudo_method(&intervals, name, &values, *span)
                                 {
@@ -5008,6 +5439,46 @@ fn as_f64(value: &Value) -> Option<f64> {
         Value::Int(i) => Some(*i as f64),
         Value::Real(r) => Some(*r),
         _ => None,
+    }
+}
+
+/// The ordering used by the list `min`/`max` family (26.4.15-26.4.19):
+/// the operand rules of the relational operators (the `Lt`..`Ge` arms of
+/// `apply_binary`). `None` when the pair is not comparable.
+fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
+        (Value::Real(x), Value::Real(y)) => x.partial_cmp(y),
+        (Value::Int(x), Value::Real(y)) => (*x as f64).partial_cmp(y),
+        (Value::Real(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)),
+        (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
+/// The equality used by `is_a_permutation()` (26.4.11): the operand rules
+/// of `==` (the `Eq` arm of `apply_binary`), with struct items compared by
+/// instance index — the prose's "compares the addresses of the struct
+/// items". Pairs `==` does not accept compare unequal.
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Real(x), Value::Real(y)) => x == y,
+        (Value::Int(x), Value::Real(y)) | (Value::Real(y), Value::Int(x)) => *x as f64 == *y,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (
+            Value::Enum {
+                type_name: type_x,
+                name: name_x,
+            },
+            Value::Enum {
+                type_name: type_y,
+                name: name_y,
+            },
+        ) => type_x == type_y && name_x == name_y,
+        (Value::Object(x), Value::Object(y)) => x == y,
+        _ => false,
     }
 }
 

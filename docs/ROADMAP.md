@@ -282,7 +282,15 @@
       assignment, calls, `if`/`while`/`for`/`case`, `repeat until`
       (clause 20.2.2 — the body at least once), `break`/`continue`,
       `return`, `print`/`out`/`outf`/`message`, `check that` with a
-      DUT-error count, `pack`, `append`, lists with `size()`/`push()`,
+      DUT-error count, `pack`, `append`, lists with the clause 26
+      pseudo-method subset (the 26.3 modifiers
+      `push`/`push0`/`add`/`add0`/`pop`/`pop0`/`insert`/`delete`/
+      `fast_delete`/`clear`, the no-argument general forms
+      `size`/`is_empty`/`exists`/`copy`/`reverse`/`top`/`top0`, the
+      no-argument `min`/`max`/`min_index`/`max_index` extremes, the
+      no-argument `sum`/`product`/`and_all`/`or_all` aggregates with
+      their stated empty-list results, and `is_a_permutation`; the
+      expression-taking forms are documented gaps reporting `E0405`),
       struct instances, sequence `do` (generates the item in place; the
       `keeping` block is not enforced), and `gen`. The optional `do`
       sugar on `if`/`while` — including the one-statement
@@ -352,7 +360,12 @@
       `int_min`/`max`/`uint_max`/`int_max`, the `_is_uint` guards,
       `union`/`intersect`/`diff`), `to_string()` renders scalars and
       sets, and `as_a` to an enumeral type maps the integer index to
-      the enumerand (5.8.1). Set literals in expressions, range
+      the enumerand (5.8.1). The clause 26 list pseudo-methods run the
+      no-expression subset on list values (the 26.3 modifiers, the
+      no-argument general forms, extremes and aggregates — the
+      expression-taking forms, `resize`, the 26.6 CRC family and 26.7
+      keyed lists are documented gaps in `src/interp.rs`). Set literals
+      in expressions, range
       modifiers on declared types (so `full_set_of_values` can
       differ), and bare scalar keywords as type arguments
       (`set_of_values(int)` — needs type objects in expression
@@ -364,12 +377,27 @@
       (`SET`/`GET`/`RUN`/`FINISH`). The interpreter exposes `hdl_load` /
       `hdl_set` / `hdl_get` / `hdl_run` / `hdl_finish` and routes quoted
       HDL paths (`'top.count'`) through that session (`E0408` when no
-      simulator is loaded). This is one simulator binding, not a
-      multi-backend abstract API, and there is no VHPI
+      simulator is loaded). The binding sits behind a `Simulator` seam
+      (`load`/`name`/`set`/`get`/`run`/`finish`): the xezim VPI bridge is
+      the `XezimSimulator` backend (native targets — under wasm32 it is
+      not compiled), the `NullSimulator` is the no-op backend where no
+      simulator exists (its operations report the honest no-simulator
+      error, and it is the tests' dispatch double), and a third backend
+      (VHPI — not implemented) plugs in with one `Simulator` impl and one
+      registry arm. Still one real simulator binding, and no backend
+      selection knob yet (`hdl_load` resolves through the default
+      backend)
 - [~] SystemVerilog integration tests and event ordering — started: the
       compose `mixed` service runs `examples/mixed_counter.e` against
       `examples/mixed/counter.sv`. Event ordering between e and the HDL
       simulator is not implemented
-- [ ] WASM build and browser sandbox API
+- [~] WASM build and browser sandbox API — started: the core library
+      (lexer/parser/elaborator/interpreter) compiles for
+      `wasm32-unknown-unknown` (CI runs `cargo check --target
+      wasm32-unknown-unknown`); nothing had to be excluded from the
+      build, and the process-spawning xezim backend is native-only by
+      cfg there (`hdl_load` under wasm32 fails with the honest
+      no-simulator error). No browser sandbox API and no wasm runtime
+      test yet
 
 All stages require standards-aware conformance testing; compatibility with commercial products is not assumed.

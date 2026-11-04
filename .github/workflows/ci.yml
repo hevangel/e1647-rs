@@ -27,3 +27,19 @@ jobs:
           components: clippy
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features
+
+  # The core library (lexer/parser/elaborator/interpreter) compiles for
+  # wasm32. The one backend that needs a child process (the xezim VPI
+  # bridge) is native-only — under target_arch = "wasm32" it is not
+  # compiled and the null simulator backend answers there (see
+  # src/hdl.rs). A compilation check only: there is no browser sandbox
+  # API and no wasm runtime test yet.
+  check-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: cargo check --target wasm32-unknown-unknown
+      - run: cargo check --target wasm32-unknown-unknown --all-targets

@@ -2996,6 +2996,227 @@ instance across the chain sys → `container of (int)` →
 `iterator of (int)` (the instance referenced only in the body; field
 read and method dispatch on the returned object).
 
+## 2026-11-05 (47) — offline arc: multi-simulator HDL abstraction and the wasm32 target
+
+Branch `agent/hdl-abstraction` (off main after #34 merged). Two M4 items
+in one arc: the simulator backend seam (hdl.rs is no longer "one
+simulator binding" structurally) and the wasm32 compilation check.
+
+No standard-text findings constrained this arc — it is structural work
+on the bridge side; no clause of IEEE 1647 names a simulator API (the
+standard's procedural interface concerns are the e side's
+`hdl_path()`/port bindings already covered by earlier entries). The
+VHPI shape is named only as the documented example of a future third
+backend; it is not implemented.
+
+Implementation:
+
+- `src/hdl.rs` — the seam. `Simulator` is the backend contract:
+  `load(design_file, top)` (sized-only — it constructs the session),
+  `name()`, `set`, `get`, `run`, `finish` (the object methods dispatch
+  through `dyn Simulator`). Registered explicitly:
+  `registered_backends()` / `default_backend()` / `load_backend(name,
+  ..)` / `load(design_file, top)` — the last is the constructor the
+  interpreter's `hdl_load` resolves through. Two backends:
+  `XezimSimulator` (native targets; delegates 1:1 to the unchanged
+  `HdlSession`, which keeps its public surface and its allowlist/argv
+  security posture) and `NullSimulator` (every operation reports the
+  honest no-simulator error, `load` fails up front, `finish` is a
+  no-op). `SignalSource::Real` now holds `Box<dyn Simulator>` — the
+  interpreter's other call sites and the injected seam are untouched
+  (semantics unchanged; interp.rs changed by one hunk, the `hdl_load`
+  constructor call).
+- wasm32 posture: the whole toolchain probe showed **nothing blocks
+  wasm32 compilation** — `std::process` types compile for
+  `wasm32-unknown-unknown` (a spawn would only fail at runtime), and
+  `cargo check --target wasm32-unknown-unknown` passed on the
+  pre-change branch already. The cfg gate (`not(target_arch =
+  "wasm32")` around `valid_location`/`HdlSession`/`XezimSimulator`) is
+  therefore the honest *runtime* posture, not a compile fix: under
+  wasm32 the spawning backend is not compiled at all, the null backend
+  is the only registered one, and `hdl_load` there fails up front with
+  the no-simulator error instead of a misleading PATH/container spawn
+  message. Native defaults are unchanged (default backend is still
+  xezim; identical error strings through the delegation).
+- `.github/workflows/ci.yml` — `check-wasm` job on ubuntu:
+  `rust-toolchain` with `targets: wasm32-unknown-unknown` (the rustup
+  target add) and `cargo check --target wasm32-unknown-unknown` plus
+  the `--all-targets` form. Compilation check only — no wasm runtime
+  test, no browser sandbox API.
+- Docs: ROADMAP M4 (the "one simulator binding, not a multi-backend
+  abstract API" wording replaced by the seam description; the WASM item
+  moved from `[ ]` to `[~]` with what actually lands) and ARCHITECTURE
+  (the hdl.rs bullet, the sketch line, the still-ahead list and the
+  not-implemented list shrunk to what remains: bindings beyond xezim,
+  a backend selection knob, a browser sandbox API).
+
+Honest v1 limits: no VHPI (the registry's `vhpi` arm is deliberately
+absent — the unknown-name test exercises exactly that answer); no
+backend selection knob (`hdl_load` always resolves the default backend;
+`load_backend` is the explicit form for tests and future
+configuration); the `XezimSimulator` delegation is name-and-registration
+asserted only — spawning is exercised solely by the container's
+`compose mixed` service (unchanged), since `xezim` is unavailable
+outside it; the wasm check is compile-only.
+
+Corpus state (absolute paths, release build of this branch, parse
+diagnostic counts): `B:/e1647-rs/local/corpora/etl-simple-examples.e` 4,
+`B:/e1647-rs/local/corpora/cover-edges.e` 4, `B:/e1647-rs/local/
+sn-cpu-tutorial/golden-combined-imports.e` 3, `golden-combined.e`
+/ `igen-dist.e` / `type-min-max-usage.e` / `save-restart-test1.e` /
+`d6w/testbench.e` 0 — unchanged; the d6w `run --seed 1` still ends with
+the reference line and exit 0.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(240 passed: 7 hdl (lib unittests), 20 elab, 1 fixtures, 113 interp,
+ 24 lexer, 58 parser, 9 solve, 8 temporal)
+$ rustup target add wasm32-unknown-unknown
+(done locally; the target was not installed before this arc)
+$ cargo check --target wasm32-unknown-unknown
+(pass)
+$ cargo check --target wasm32-unknown-unknown --all-targets
+(pass)
+```
+
+New tests: 7 hdl tests (in `src/hdl.rs`, no simulator binary needed) —
+the null backend reporting the no-simulator error from every operation
+under its registry name with a no-op finish; its up-front load failure;
+the registry answering the null backend the same way; unknown backend
+names answering with the registered list (the `vhpi` spelling — the
+documented future third backend, deliberately not registered);
+`SignalSource::Real` dispatching to whatever backend is in the box
+(verbatim error surfacing, the path the interpreter's `E0408` rides);
+the default backend being one of the registered ones (xezim native /
+null wasm, cfg-split); and the xezim backend keeping its registry name
+and registration on native targets.
+
+## 2026-11-04 (45) — offline arc: clause 26 list pseudo-methods
+
+Branch `agent/list-pseudomethods` (off main after #34 merged). The
+clause 26 list pseudo-methods go from `size()`/`push()` to the subset
+whose semantics the extractable prose fully defines for a value-only
+dispatch.
+
+Prose findings that constrained the design (clause references only,
+local copy under `local/`; the syntax-example boxes are images in the
+redline PDF):
+
+- 26.1: pseudo-methods "are e macros that look like methods", "not
+  restricted to structs" and "cannot be extended" — they attach to any
+  list expression, and the ones that take a per-item expression
+  (`apply`, `sort`, `all`, `has`, ...) cannot pass through the v1
+  dispatch, which evaluates arguments to values only. Those are
+  documented gaps, not silent mis-evaluations.
+- 26.3 modify: `pop()` "removes the last item ... and returns it"; an
+  empty list "shall issue an error" (same for `pop0`/`top`/`top0`);
+  `delete(index)`/`fast_delete(index)` issue an error when "the index
+  does not exist in the list" (indexes "start counting from 0");
+  `insert(index, item)` appends when index is the size and errors when
+  "the number of items in the list is smaller than index";
+  `push(list)`/`add(list)`/`push0(list)`/`add0(list)` append/place a
+  copy of the argument list — since "e does not support lists of
+  lists" (26.4.25), a list-valued argument is unambiguously the list
+  form; `clear()` "deletes all items in the list".
+- 26.4 general: `is_empty()` (TRUE only when empty), `exists()` (TRUE
+  "if an item with the index number exists"), `copy()` (the list case
+  of exp.copy(), 27.4.1), `reverse()` ("a new list of all the items in
+  reverse order"), `min()`/`max()` — "the item latest in the list"
+  wins ties, "If the list is empty, an error shall be issued";
+  `min_index()`/`max_index()` the same scan as an index.
+- 26.5 math: `sum()` returns 0 on empty, `product()` returns 1 on
+  empty (both "integer" results), `and_all()` returns TRUE on empty,
+  `or_all()` returns FALSE on empty; `average()` returns UNDEF on
+  empty — unrepresentable in the value model, so it stays a gap.
+- Not extractable / not implementable here (documented gaps in the
+  `src/interp.rs` module docs): the expression-taking forms of
+  26.4.1-26.4.30 and 26.5 (macro expression arguments),
+  `max_value`/`min_value` (their empty-list return is Table 54, keyed
+  by an element type the value model does not carry), `resize`
+  (26.3.16 — `filler`/`keep_old` are expressions and new items need
+  the element type's default), `get_indices` (26.4.9 — the prose does
+  not state the out-of-range index behavior; element access is the
+  `[i]` expression), `flatten` (26.4.8 — no language surface of this
+  subset can produce a nested list: a list argument to a modifier is
+  the list form), the CRC family (26.6 — the prose notes the
+  polynomials but not the full algorithm parameters), and keyed lists
+  (26.7).
+
+Implementation (all in `src/interp.rs`, the `Value::List` call
+dispatch plus private helpers):
+
+- A `call_list_pseudo_method` method (beside the set pseudo-method
+  dispatcher) implements: 26.3 `push`/`add`/`push0`/`add0` (item and
+  list forms), `pop`/`pop0` (return the removed end; empty is `E0402`,
+  matching the set pseudo-methods' empty-set errors), `insert` (item
+  and list forms; index == size appends; out of range is `E0404`),
+  `delete`/`fast_delete` (fast_delete moves the last item into the
+  deleted slot; out of range is `E0404`), `clear`; 26.4 `size`,
+  `is_empty`, `exists`, `copy`, `reverse`, `top`/`top0`, and the
+  no-argument `min`/`max`/`min_index`/`max_index` (ties to the latest
+  item via the relational operators' ordering; empty or
+  non-comparable items are `E0402`); 26.5 no-argument `sum`/`product`
+  (integer results, `wrapping` like the arithmetic operators, stated
+  empty results 0/1) and `and_all`/`or_all` (booleans, stated empty
+  results TRUE/FALSE); 26.4.11 `is_a_permutation` (same items with the
+  same multiplicities; struct items compare by instance index — the
+  prose's address comparison). Unknown names keep the `E0405` "list
+  method ... is not supported" diagnostic.
+- Modifying pseudo-methods write the changed list back through the
+  receiver expression (the same slot `push` has always used), so they
+  work on variables and struct fields alike. Behavior change riding
+  along: `push`/`add` of a list-typed argument now extends the list
+  per 26.3.2/26.3.14 instead of nesting the list as an item (e has no
+  lists of lists to nest).
+
+Honest v1 limits: everything in the gaps paragraph above; the
+`exp`-parameter forms of the implemented names (`min(it.x)`,
+`sum(it.f)`-style) report the arity/type diagnostics rather than
+evaluating per-item expressions.
+
+Corpus state (absolute paths, release build of this branch, `--seed 1`):
+`B:/e1647-rs/local/corpora/etl-simple-examples.e` 4, `cover-edges.e` 4,
+`B:/e1647-rs/local/sn-cpu-tutorial/golden-combined-imports.e` 3,
+`golden-combined.e`/`igen-dist.e`/`type-min-max-usage.e`/
+`save-restart-test1.e`/`d6w/testbench.e` 0 — unchanged. The etl 4 are
+elaboration-time `E0203` unknown-type diagnostics that stop the run
+before list pseudo-methods execute; all eight corpus outputs are
+byte-identical to the pre-change build.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(248 passed: 20 elab, 1 fixtures, 128 interp, 24 lexer, 58 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 15 interpreter tests in a clause 26 section — pop/pop0
+returning the removed ends; top/top0 reading without removing;
+push0/insert placement including insert-at-size appending;
+delete/fast_delete (fast_delete moving the last item into the slot);
+clear + is_empty; push/add of a list argument extending; reverse (new
+list, receiver unchanged), copy (copy mutations leave the original)
+and exists; min/max/min_index/max_index with the tie-to-latest rule
+observable through the index forms; sum/product/and_all/or_all
+including all four stated empty-list results; is_a_permutation
+(order-insensitive, multiplicity-sensitive); modifiers through a
+struct field receiver; and the error paths — empty-list accessors as
+`E0402`, out-of-range delete/fast_delete/insert indexes as `E0404`,
+wrong item types as `E0402`, and the gap names (`apply`, `sort`) plus
+unknown methods as `E0405`.
 ## 2026-11-05 (46) — offline arc: suspension re-entry beyond while chains
 
 Branch `agent/suspend-reentry` (off main). The clause 13.1.1
