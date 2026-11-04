@@ -143,32 +143,66 @@ enum Flow {
     Suspend,
 }
 
-/// Where in the statement tree a coroutine turn currently is (for the
-/// resume cursor built when a synchronization action suspends).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CtxKind {
-    /// A statement currently being executed by [`Interp::exec_block`].
-    Leaf,
-    /// A `while` body currently being executed — the one compound whose
-    /// mid-iteration resume is supported (enter the body directly,
-    /// condition first checked when the iteration completes).
-    WhileLoop,
-    /// Any other compound (`if`/`case`/`for` bodies) or atomic region
-    /// (inline method calls, `on` blocks) — waits inside keep the
-    /// inline spin, documented as the v1 limitation.
-    Atomic,
+/// Which child of a compound statement a turn's continuation lives in.
+///
+/// The resume-path design (13.1.1): a synchronization action delimits
+/// the atomic fragments of a TCM, and resumption "commences executing
+/// from the first action following the synchronization action". The
+/// suspension therefore records the full descent through the statement
+/// tree — one [`PathLevel`] per nesting level, each naming the
+/// statement index it entered and the child its continuation descended
+/// into — and resumption replays nothing that already ran: the
+/// executed statement prefix is skipped, an `if`/`case` branch is
+/// re-entered without re-evaluating its condition/scrutinee, and a
+/// loop body is re-entered mid-iteration (the condition is re-checked
+/// only when the iteration completes, exactly like the `while` model
+/// this generalizes). The descent reaches every compound; only the
+/// atomic regions (inline method calls, `compute`, `on` blocks, and a
+/// `check` else body, which continue their enclosing fragment) keep
+/// the conservative run-to-completion model.
+#[derive(Debug, Clone)]
+enum Child {
+    /// A `while` body mid-iteration — the condition is re-checked only
+    /// when the iteration completes.
+    WhileBody,
+    /// A `repeat until` body mid-iteration (20.2.2) — likewise, the
+    /// condition is evaluated only when the iteration completes.
+    RepeatBody,
+    /// A numeric `for` body mid-iteration, carrying the in-flight
+    /// iteration's counter and the loop's once-evaluated end bound, so
+    /// the continuation neither resets the counter nor replays the
+    /// bounds (the body's reads go through the frame's bound
+    /// temporary).
+    ForBody { counter: i128, end: i128 },
+    /// A `for each` body mid-iteration, carrying the list snapshot
+    /// taken at loop entry (post-reversal) and the in-flight element's
+    /// position; the element and index bindings live in the frame.
+    ForeachBody { position: usize, items: Vec<Value> },
+    /// The `then` branch of an `if` — the condition was evaluated
+    /// before the suspension; resume does not re-evaluate it.
+    IfThen,
+    /// The `else` branch of an `if`.
+    IfElse,
+    /// The matched arm of a `case` (`None` = the default arm) — the
+    /// scrutinee is not re-matched on resume.
+    CaseArm { index: Option<usize> },
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ExecCtx {
+/// One level of a turn's statement walk: the statement index within
+/// the enclosing block and, once the walk descends into a compound
+/// statement, which child it entered. The turn's stack of levels is
+/// its position in the statement tree; captured at a suspension it
+/// becomes the resume path.
+#[derive(Debug, Clone)]
+struct PathLevel {
     index: usize,
-    kind: CtxKind,
+    child: Option<Child>,
 }
 
 /// A suspension raised by a synchronization action, collected by the
 /// scheduler when the turn unwinds.
 struct PendingSuspension {
-    cursor: Vec<usize>,
+    path: Vec<PathLevel>,
     frame: Frame,
     eligible_at_cycle: u64,
     temporal: bool,
@@ -178,11 +212,12 @@ struct PendingSuspension {
 
 /// One concurrently scheduled execution (clause 13.1.1): the main
 /// pseudo-coroutine (the `run()` bodies, in order) and every `start`ed
-/// TCM. Suspension state is the skip-cursor into the statement tree,
-/// the captured locals frame, and the cycle gate.
+/// TCM. Suspension state is the statement path into the tree (the
+/// walk's position when the synchronization action suspended), the
+/// captured locals frame, and the cycle gate.
 struct Coroutine<'a> {
     kind: CoroutineKind<'a>,
-    cursor: Vec<usize>,
+    path: Vec<PathLevel>,
     frame: Frame,
     me: Option<usize>,
     eligible_at_cycle: u64,
@@ -305,13 +340,14 @@ struct Interp<'a> {
     /// then every `start`ed TCM, run round-robin.
     coroutines: Vec<Coroutine<'a>>,
     /// Set while a coroutine turn executes: statement walks record
-    /// their path for the resume cursor.
+    /// their descent for the resume path.
     tracing: bool,
-    /// Atomic regions (inline method calls, `on` blocks): waits inside
-    /// keep the inline spin instead of suspending.
+    /// Atomic regions (inline method calls, `compute`, `on` blocks,
+    /// `check` else bodies): waits inside keep the inline spin instead
+    /// of suspending.
     atomic_depth: usize,
-    /// The statement-tree path of the current turn.
-    exec_context: Vec<ExecCtx>,
+    /// The statement-tree descent of the current turn.
+    exec_context: Vec<PathLevel>,
     /// The suspension raised by the current turn's synchronization
     /// action, collected when the turn unwinds.
     pending_suspension: Option<PendingSuspension>,
@@ -521,7 +557,7 @@ fn run_inner(
             blocks: run_blocks.iter().map(|b| b.body.as_slice()).collect(),
             next_block: 0,
         },
-        cursor: Vec::new(),
+        path: Vec::new(),
         frame: Frame::default(),
         me: Some(sys_index),
         eligible_at_cycle: 0,
@@ -843,10 +879,7 @@ impl<'a> Interp<'a> {
         me: Option<usize>,
     ) -> Result<Flow, Diagnostic> {
         for (index, statement) in statements.iter().enumerate() {
-            self.exec_context.push(ExecCtx {
-                index,
-                kind: CtxKind::Leaf,
-            });
+            self.exec_context.push(PathLevel { index, child: None });
             let flow = self.exec_statement(statement, frame, me);
             self.exec_context.pop();
             match flow? {
@@ -857,59 +890,70 @@ impl<'a> Interp<'a> {
         Ok(Flow::Normal)
     }
 
-    /// Execute a statement chain resuming at the suspension point named
-    /// by `cursor` (13.1.1: "resumes execution from the first action
-    /// following the synchronization action"). The cursor's leading
-    /// indices name enclosing `while` statements — the iteration was in
-    /// flight when the suspension happened, so their conditions are not
-    /// re-checked on the way in; the trailing index names the statement
-    /// to execute (for a skip-resume, one past the completed wait).
+    /// Execute a statement chain resuming at the position named by
+    /// `path` (13.1.1: resumption "commences executing from the first
+    /// action following the synchronization action"). The path's first
+    /// level names the statement to continue at: an already-executed
+    /// prefix is skipped (no replay), a level whose child is set
+    /// re-enters that compound mid-flight via
+    /// [`Interp::exec_statement_resumable`], and the final childless
+    /// level executes its statement (a re-evaluated temporal wait, or
+    /// the first action following a consumed sync). Every compound on
+    /// the way keeps its context level on the stack across its whole
+    /// execution — a re-suspension inside a later iteration or a fresh
+    /// statement after the resumed one rebuilds the same path.
     fn exec_block_resumable(
         &mut self,
         statements: &[Stmt],
         frame: &mut Frame,
         me: Option<usize>,
-        cursor: &[usize],
+        path: &[PathLevel],
     ) -> Result<Flow, Diagnostic> {
-        let Some(&head) = cursor.first() else {
+        if path.is_empty() {
             return self.exec_block(statements, frame, me);
-        };
+        }
+        let head = path[0].index;
         for (index, statement) in statements.iter().enumerate() {
             if index < head {
                 // Already executed before the suspension: skipped, not
                 // replayed.
                 continue;
             }
-            if index == head && cursor.len() > 1 {
-                // Enter the enclosing while mid-iteration. The
-                // WhileLoop marker stays on the stack across the
-                // loop's continuation: a re-suspension inside the next
-                // iteration must rebuild the same cursor.
-                let rest = cursor[1..].to_vec();
-                let Stmt::While { cond, body, .. } = statement else {
-                    return Err(self.error(
-                        "E0402",
-                        "internal: resume cursor crossed a non-loop statement",
-                        statement.span(),
-                    ));
+            if index == head {
+                let Some(child) = path[0].child.clone() else {
+                    if path.len() > 1 {
+                        return Err(self.error(
+                            "E0402",
+                            "internal: resume path continues past a leaf statement",
+                            statement.span(),
+                        ));
+                    }
+                    // The final level: the statement itself. A position
+                    // past the block's end (a sync consumed by the
+                    // block's last statement) falls out of the loop and
+                    // reports the block complete.
+                    self.exec_context.push(PathLevel { index, child: None });
+                    let flow = self.exec_statement(statement, frame, me);
+                    self.exec_context.pop();
+                    match flow? {
+                        Flow::Normal => continue,
+                        other => return Ok(other),
+                    }
                 };
-                self.exec_context.push(ExecCtx {
+                // Mid-flight compound: resume its interior, then run
+                // the statement to completion.
+                self.exec_context.push(PathLevel {
                     index,
-                    kind: CtxKind::WhileLoop,
+                    child: Some(child.clone()),
                 });
-                let resumed = self.exec_block_resumable(body, frame, me, &rest);
-                let first_flow = resumed?;
-                let flow = self.while_loop(cond, body, frame, me, first_flow);
+                let flow = self.exec_statement_resumable(statement, &child, &path[1..], frame, me);
                 self.exec_context.pop();
                 match flow? {
                     Flow::Normal => continue,
                     other => return Ok(other),
                 }
             }
-            self.exec_context.push(ExecCtx {
-                index,
-                kind: CtxKind::Leaf,
-            });
+            self.exec_context.push(PathLevel { index, child: None });
             let flow = self.exec_statement(statement, frame, me);
             self.exec_context.pop();
             match flow? {
@@ -918,6 +962,121 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(Flow::Normal)
+    }
+
+    /// Execute one compound statement whose interior is mid-flight at
+    /// a suspension: `child` names the branch the continuation
+    /// descended into, `rest` the path within it. The statement's own
+    /// header actions (a condition evaluation, a scrutinee match, the
+    /// loop-bound evaluation) ran before the suspension and are not
+    /// replayed; the resumed body then flows into the statement's
+    /// ordinary continuation, which keeps the context level on the
+    /// stack so a re-suspension rebuilds the matching path.
+    fn exec_statement_resumable(
+        &mut self,
+        statement: &Stmt,
+        child: &Child,
+        rest: &[PathLevel],
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Flow, Diagnostic> {
+        if rest.is_empty() {
+            // A descent always carries the position it continues at
+            // (the leaf level); reaching a compound without one is a
+            // malformed path, not a fresh re-entry (which would replay
+            // the body).
+            return Err(self.error(
+                "E0402",
+                "internal: resume path descends without a position",
+                statement.span(),
+            ));
+        }
+        match (statement, child) {
+            (Stmt::While { cond, body, .. }, Child::WhileBody) => {
+                let first_flow = self.exec_block_resumable(body, frame, me, rest)?;
+                self.while_loop(cond, body, frame, me, first_flow)
+            }
+            (Stmt::RepeatUntil { body, cond, .. }, Child::RepeatBody) => {
+                self.repeat_until_loop(body, cond, frame, me, Some(rest))
+            }
+            (
+                Stmt::ForTo {
+                    var, down, body, ..
+                },
+                Child::ForBody { counter, end },
+            ) => {
+                // The in-flight iteration's counter and the
+                // once-evaluated end bound come from the path; the
+                // frame already binds the loop's temporary (inserted
+                // when the iteration started).
+                let first_flow = self.exec_block_resumable(body, frame, me, rest)?;
+                self.for_to_loop(
+                    var,
+                    *down,
+                    *end,
+                    body,
+                    frame,
+                    me,
+                    *counter,
+                    Some(first_flow),
+                )
+            }
+            (
+                Stmt::ForEach {
+                    var,
+                    index_var,
+                    body,
+                    ..
+                },
+                Child::ForeachBody { position, items },
+            ) => {
+                // The in-flight element's binding lives in the frame;
+                // the list snapshot from loop entry rides the path.
+                let binding = var.clone().unwrap_or_else(|| "it".to_owned());
+                self.for_each_loop(
+                    &binding,
+                    index_var.as_deref(),
+                    items,
+                    body,
+                    frame,
+                    me,
+                    *position,
+                    Some(rest),
+                )
+            }
+            (Stmt::If { then_body, .. }, Child::IfThen) => {
+                self.exec_block_resumable(then_body, frame, me, rest)
+            }
+            (Stmt::If { else_body, .. }, Child::IfElse) => {
+                let Some(else_body) = else_body else {
+                    return Err(self.error(
+                        "E0402",
+                        "internal: resume path descends into a missing else body",
+                        statement.span(),
+                    ));
+                };
+                self.exec_block_resumable(else_body, frame, me, rest)
+            }
+            (Stmt::Case { arms, default, .. }, Child::CaseArm { index }) => {
+                let body = match index {
+                    Some(arm) => arms.get(*arm).map(|(_, body)| body),
+                    None => default.as_ref(),
+                };
+                let Some(body) = body else {
+                    return Err(self.error(
+                        "E0402",
+                        "internal: resume path descends into a missing case arm",
+                        statement.span(),
+                    ));
+                };
+                self.exec_block_resumable(body, frame, me, rest)
+            }
+            _ => Err(self.error(
+                "E0402",
+                "internal: resume path crossed a statement without a matching child",
+                statement.span(),
+            )),
+        }
     }
 
     /// The shared `while` loop: `first_flow` is the outcome of an
@@ -947,6 +1106,141 @@ impl<'a> Interp<'a> {
             }
             pending = self.exec_block(body, frame, me)?;
         }
+    }
+
+    /// The shared `repeat until` loop (20.2.2): the body executes at
+    /// least once, then repeatedly until the condition is TRUE.
+    /// `in_flight` is the resume path of an already-running iteration
+    /// (a suspension inside the body) or `None` for a fresh entry.
+    fn repeat_until_loop(
+        &mut self,
+        body: &[Stmt],
+        cond: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+        in_flight: Option<&[PathLevel]>,
+    ) -> Result<Flow, Diagnostic> {
+        let mut pending = match in_flight {
+            Some(rest) => self.exec_block_resumable(body, frame, me, rest)?,
+            None => self.exec_block(body, frame, me)?,
+        };
+        loop {
+            match pending {
+                Flow::Normal | Flow::Continue => {}
+                Flow::Break => return Ok(Flow::Normal),
+                other => return Ok(other),
+            }
+            let Value::Bool(keep_going) = self.eval(cond, frame, me)? else {
+                return Err(self.error(
+                    "E0402",
+                    "repeat-until condition must be a boolean",
+                    cond.span(),
+                ));
+            };
+            if keep_going {
+                return Ok(Flow::Normal);
+            }
+            pending = self.exec_block(body, frame, me)?;
+        }
+    }
+
+    /// The shared numeric `for` loop: `i` is the next iteration's
+    /// counter (the in-flight iteration's when resuming — read back
+    /// from the path, never reset to the start), `first_outcome` the
+    /// outcome of an already-running iteration (`None` for a fresh
+    /// entry). The loop's end bound is carried, not re-evaluated, so
+    /// resumption replays none of the header's actions; the temporary
+    /// is bound in the frame for the body's reads.
+    #[allow(clippy::too_many_arguments)]
+    fn for_to_loop(
+        &mut self,
+        var: &str,
+        down: bool,
+        end: i128,
+        body: &[Stmt],
+        frame: &mut Frame,
+        me: Option<usize>,
+        mut i: i128,
+        first_outcome: Option<Flow>,
+    ) -> Result<Flow, Diagnostic> {
+        let mut pending = first_outcome;
+        loop {
+            match pending.take() {
+                None => {}
+                // A completed iteration advances the counter; a
+                // `continue` from the body re-checks the bound without
+                // advancing (the fresh arm's shape).
+                Some(Flow::Normal) => {
+                    if down {
+                        i -= 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+                Some(Flow::Continue) => {}
+                Some(Flow::Break) => return Ok(Flow::Normal),
+                Some(other) => return Ok(other),
+            }
+            let in_bounds = if down { i >= end } else { i <= end };
+            if !in_bounds {
+                return Ok(Flow::Normal);
+            }
+            // The in-flight iteration's counter and the carried end
+            // bound ride the context stack: a suspension inside the
+            // body builds a path that resumes this iteration without
+            // replaying the bounds or resetting the counter.
+            self.set_ctx_child(Child::ForBody { counter: i, end });
+            frame.locals.insert(var.to_owned(), Value::Int(i));
+            pending = Some(self.exec_block(body, frame, me)?);
+        }
+    }
+
+    /// The shared `for each` loop: `items` is the list snapshot taken
+    /// at loop entry (post-reversal), `position` the next element's
+    /// index, and `in_flight` the resume path of the element whose body
+    /// was executing when a synchronization action suspended (`None`
+    /// for a fresh entry). The element and index bindings live in the
+    /// frame; the snapshot rides the path so resumption neither
+    /// re-evaluates the list expression nor re-runs completed elements.
+    #[allow(clippy::too_many_arguments)]
+    fn for_each_loop(
+        &mut self,
+        binding: &str,
+        index_var: Option<&str>,
+        items: &[Value],
+        body: &[Stmt],
+        frame: &mut Frame,
+        me: Option<usize>,
+        mut position: usize,
+        in_flight: Option<&[PathLevel]>,
+    ) -> Result<Flow, Diagnostic> {
+        if let Some(rest) = in_flight {
+            match self.exec_block_resumable(body, frame, me, rest)? {
+                Flow::Normal | Flow::Continue => position += 1,
+                Flow::Break => return Ok(Flow::Normal),
+                other => return Ok(other),
+            }
+        }
+        while position < items.len() {
+            self.set_ctx_child(Child::ForeachBody {
+                position,
+                items: items.to_vec(),
+            });
+            frame
+                .locals
+                .insert(binding.to_owned(), items[position].clone());
+            if let Some(index_name) = index_var {
+                frame
+                    .locals
+                    .insert(index_name.to_owned(), Value::Int(position as i128));
+            }
+            match self.exec_block(body, frame, me)? {
+                Flow::Normal | Flow::Continue => position += 1,
+                Flow::Break => return Ok(Flow::Normal),
+                other => return Ok(other),
+            }
+        }
+        Ok(Flow::Normal)
     }
 
     fn exec_statement(
@@ -1053,58 +1347,34 @@ impl<'a> Interp<'a> {
                     let span = statement.span();
                     return Err(self.error("E0402", "condition is not a boolean", span));
                 };
-                // Waits inside an `if` body keep the inline spin: the
-                // resume cursor models `while` chains only.
-                self.exec_context.push(ExecCtx {
-                    index: self.current_ctx_index(),
-                    kind: CtxKind::Atomic,
-                });
-                let flow = if cond_value {
+                if cond_value {
+                    // The taken branch is recorded on the context stack:
+                    // a suspension inside builds a path that re-enters
+                    // it without re-evaluating the condition (the
+                    // condition's actions ran before the suspension).
+                    self.set_ctx_child(Child::IfThen);
                     self.exec_block(then_body, frame, me)
                 } else if let Some(else_body) = else_body {
+                    self.set_ctx_child(Child::IfElse);
                     self.exec_block(else_body, frame, me)
                 } else {
                     Ok(Flow::Normal)
-                };
-                self.exec_context.pop();
-                flow
+                }
             }
             Stmt::While { cond, body, .. } => {
-                self.exec_context.push(ExecCtx {
-                    index: self.current_ctx_index(),
-                    kind: CtxKind::WhileLoop,
-                });
-                let flow = self.while_loop(cond, body, frame, me, Flow::Normal);
-                self.exec_context.pop();
-                flow
+                // The loop's context level stays on the stack across
+                // the whole loop — including its continuation after a
+                // resumed iteration — so a re-suspension rebuilds the
+                // same path (the condition is re-checked only when an
+                // iteration completes).
+                self.set_ctx_child(Child::WhileBody);
+                self.while_loop(cond, body, frame, me, Flow::Normal)
             }
             // 20.2.2: the body executes at least once, then repeatedly
             // until the condition is TRUE.
             Stmt::RepeatUntil { body, cond, .. } => {
-                self.exec_context.push(ExecCtx {
-                    index: self.current_ctx_index(),
-                    kind: CtxKind::WhileLoop,
-                });
-                let flow = loop {
-                    let outcome = self.exec_block(body, frame, me)?;
-                    match outcome {
-                        Flow::Normal | Flow::Continue => {}
-                        Flow::Break => break Ok(Flow::Normal),
-                        other => break Ok(other),
-                    }
-                    let Value::Bool(keep_going) = self.eval(cond, frame, me)? else {
-                        break Err(self.error(
-                            "E0402",
-                            "repeat-until condition must be a boolean",
-                            cond.span(),
-                        ));
-                    };
-                    if keep_going {
-                        break Ok(Flow::Normal);
-                    }
-                };
-                self.exec_context.pop();
-                flow
+                self.set_ctx_child(Child::RepeatBody);
+                self.repeat_until_loop(body, cond, frame, me, None)
             }
             Stmt::Break { .. } => Ok(Flow::Break),
             Stmt::Continue { .. } => Ok(Flow::Continue),
@@ -1159,7 +1429,14 @@ impl<'a> Interp<'a> {
                     // Specman counts DUT errors and keeps running; the
                     // else body (typically `dut_error(...)`) reports.
                     self.dut_errors += 1;
-                    self.exec_block(else_body, frame, me)?;
+                    // The else body continues the same atomic fragment
+                    // (the check is a leaf statement; the resume path
+                    // does not descend into it) — waits inside keep the
+                    // inline spin.
+                    self.atomic_depth += 1;
+                    let result = self.exec_block(else_body, frame, me);
+                    self.atomic_depth -= 1;
+                    result?;
                 }
                 Ok(Flow::Normal)
             }
@@ -1178,27 +1455,21 @@ impl<'a> Interp<'a> {
                 let _ = using;
                 let list_value = self.eval(list, frame, me)?;
                 match list_value {
-                    Value::List(items) => {
+                    Value::List(mut items) => {
                         let binding = var.clone().unwrap_or_else(|| "it".to_owned());
-                        let mut items = items;
                         if *reversed {
                             items.reverse();
                         }
-                        for (position, item) in items.into_iter().enumerate() {
-                            frame.locals.insert(binding.clone(), item);
-                            if let Some(index_name) = index_var {
-                                frame
-                                    .locals
-                                    .insert(index_name.clone(), Value::Int(position as i128));
-                            }
-                            match self.exec_block(body, frame, me)? {
-                                Flow::Normal => {}
-                                Flow::Break => break,
-                                Flow::Continue => continue,
-                                other => return Ok(other),
-                            }
-                        }
-                        Ok(Flow::Normal)
+                        self.for_each_loop(
+                            &binding,
+                            index_var.as_deref(),
+                            &items,
+                            body,
+                            frame,
+                            me,
+                            0,
+                            None,
+                        )
                     }
                     other => Err(self.error(
                         "E0402",
@@ -1221,22 +1492,7 @@ impl<'a> Interp<'a> {
                 let Value::Int(end_v) = self.eval(to, frame, me)? else {
                     return Err(self.error("E0402", "for upper bound must be an integer", *span));
                 };
-                let mut i = start_v;
-                while if *down { i >= end_v } else { i <= end_v } {
-                    frame.locals.insert(var.clone(), Value::Int(i));
-                    match self.exec_block(body, frame, me)? {
-                        Flow::Normal => {}
-                        Flow::Break => break,
-                        Flow::Continue => continue,
-                        other => return Ok(other),
-                    }
-                    if *down {
-                        i -= 1;
-                    } else {
-                        i += 1;
-                    }
-                }
-                Ok(Flow::Normal)
+                self.for_to_loop(var, *down, end_v, body, frame, me, start_v, None)
             }
             Stmt::Wait { cycles, span } => {
                 let Value::Int(n) = self.eval(cycles, frame, me)? else {
@@ -1381,7 +1637,7 @@ impl<'a> Interp<'a> {
                         args: values,
                         next_block: 0,
                     },
-                    cursor: Vec::new(),
+                    path: Vec::new(),
                     frame: Frame::default(),
                     me: Some(instance),
                     // The implicit "sync cycle" before it commences; a
@@ -1436,21 +1692,29 @@ impl<'a> Interp<'a> {
                 span,
             } => {
                 let value = self.eval(scrutinee, frame, me)?;
-                let mut matched: Option<&Vec<Stmt>> = None;
-                'arms: for (alternatives, body) in arms {
+                let mut matched: Option<(Option<usize>, &Vec<Stmt>)> = None;
+                'arms: for (arm_index, (alternatives, body)) in arms.iter().enumerate() {
                     for alternative in alternatives {
                         let alt_value = self.eval(alternative, frame, me)?;
                         if matches!(
                             self.apply_binary(BinaryOp::Eq, value.clone(), alt_value, *span)?,
                             Value::Bool(true)
                         ) {
-                            matched = Some(body);
+                            matched = Some((Some(arm_index), body));
                             break 'arms;
                         }
                     }
                 }
-                match matched.or(default.as_ref()) {
-                    Some(body) => self.exec_block(body, frame, me),
+                let matched = matched.or_else(|| default.as_ref().map(|body| (None, body)));
+                match matched {
+                    Some((arm, body)) => {
+                        // The matched arm is recorded on the context
+                        // stack: a suspension inside builds a path that
+                        // re-enters it without re-matching the
+                        // scrutinee.
+                        self.set_ctx_child(Child::CaseArm { index: arm });
+                        self.exec_block(body, frame, me)
+                    }
                     None => Ok(Flow::Normal),
                 }
             }
@@ -2565,10 +2829,14 @@ impl<'a> Interp<'a> {
         samples
     }
 
-    /// The statement index of the leaf currently being executed (the
-    /// context stack's top entry, pushed by the enclosing walk).
-    fn current_ctx_index(&self) -> usize {
-        self.exec_context.last().map(|ctx| ctx.index).unwrap_or(0)
+    /// Record the child the walk descends into on the context stack's
+    /// top entry (the enclosing block walk pushed the statement's
+    /// level; the compound marks its descent so a suspension inside
+    /// builds the matching resume path).
+    fn set_ctx_child(&mut self, child: Child) {
+        if let Some(level) = self.exec_context.last_mut() {
+            level.child = Some(child);
+        }
     }
 
     /// Sample the coverage groups (14.1) of the instance whose event
@@ -2645,23 +2913,24 @@ impl<'a> Interp<'a> {
     }
 
     /// Whether the running statement may suspend to the scheduler: a
-    /// coroutine turn, not inside an atomic region (inline calls,
-    /// `on` blocks), and the enclosing statement chain is all `while`
-    /// loops — the reach of the resume cursor (other compounds keep
-    /// the inline spin, the documented v1 limitation).
+    /// coroutine turn, not inside an atomic region (inline method
+    /// calls, `compute`, `on` blocks, `check` else bodies — 13.1.1
+    /// delimits atomic fragments at the synchronization actions, and
+    /// these regions keep the conservative run-to-completion model of
+    /// v1; `on` bodies may not contain time-consuming actions at all,
+    /// 11.3). Every compound the walk descends into records its child
+    /// on the context stack, so outside those regions the resume path
+    /// reaches any statement.
     fn suspend_eligible(&self) -> bool {
-        self.tracing
-            && self.atomic_depth == 0
-            && self
-                .exec_context
-                .iter()
-                .all(|ctx| matches!(ctx.kind, CtxKind::WhileLoop | CtxKind::Leaf))
+        self.tracing && self.atomic_depth == 0
     }
 
-    /// Raise a suspension for the scheduler (13.1.1). `skip_resume`
-    /// resumes after this statement (a consumed numeric wait or bare
-    /// sync); otherwise the statement re-executes next turn (a temporal
-    /// wait, re-evaluated against the grown log).
+    /// Raise a suspension for the scheduler (13.1.1): the turn's walk
+    /// stack becomes the resume path. `skip_resume` resumes after this
+    /// statement (a consumed numeric wait or bare sync — the first
+    /// action following the synchronization action); otherwise the
+    /// statement re-executes next turn (a temporal wait, re-evaluated
+    /// against the grown log).
     fn suspend_here(
         &mut self,
         frame: &Frame,
@@ -2671,16 +2940,12 @@ impl<'a> Interp<'a> {
         temporal: bool,
         wait_start: Option<usize>,
     ) -> Result<Flow, Diagnostic> {
-        let own = self.current_ctx_index();
-        let mut cursor: Vec<usize> = self
-            .exec_context
-            .iter()
-            .filter(|ctx| ctx.kind == CtxKind::WhileLoop)
-            .map(|ctx| ctx.index)
-            .collect();
-        cursor.push(if skip_resume { own + 1 } else { own });
+        let mut path = self.exec_context.clone();
+        if skip_resume && let Some(last) = path.last_mut() {
+            last.index += 1;
+        }
         self.pending_suspension = Some(PendingSuspension {
-            cursor,
+            path,
             frame: frame.clone(),
             eligible_at_cycle,
             temporal,
@@ -4938,7 +5203,7 @@ impl<'a> Interp<'a> {
                     match self.run_body(body, co) {
                         Ok(Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_)) => {
                             next += 1;
-                            co.cursor.clear();
+                            co.path.clear();
                             co.frame = Frame::default();
                         }
                         Ok(Flow::Stop) => {
@@ -4978,7 +5243,7 @@ impl<'a> Interp<'a> {
                 let block_count = blocks.len();
                 while next < block_count {
                     let block = blocks[next];
-                    if co.cursor.is_empty() {
+                    if co.path.is_empty() {
                         // A fresh `is also` block binds its parameters
                         // from the start-time arguments.
                         co.frame = Frame::default();
@@ -4992,7 +5257,7 @@ impl<'a> Interp<'a> {
                     match self.run_body(&block.body, co) {
                         Ok(Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_)) => {
                             next += 1;
-                            co.cursor.clear();
+                            co.path.clear();
                         }
                         Ok(Flow::Stop) => {
                             self.stop_requested = true;
@@ -5015,12 +5280,13 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Execute one body, resuming through the cursor when suspended.
+    /// Execute one body, resuming through the statement path when
+    /// suspended.
     fn run_body(&mut self, body: &'a [Stmt], co: &mut Coroutine<'a>) -> Result<Flow, Diagnostic> {
-        if co.cursor.is_empty() {
+        if co.path.is_empty() {
             self.exec_block(body, &mut co.frame, co.me)
         } else {
-            self.exec_block_resumable(body, &mut co.frame, co.me, &co.cursor)
+            self.exec_block_resumable(body, &mut co.frame, co.me, &co.path)
         }
     }
 
@@ -5028,7 +5294,7 @@ impl<'a> Interp<'a> {
     fn take_suspension(&mut self, co: &mut Coroutine<'a>) -> TurnOutcome {
         match self.pending_suspension.take() {
             Some(suspension) => {
-                co.cursor = suspension.cursor;
+                co.path = suspension.path;
                 co.frame = suspension.frame;
                 co.eligible_at_cycle = suspension.eligible_at_cycle;
                 co.suspended_temporal = suspension.temporal;
