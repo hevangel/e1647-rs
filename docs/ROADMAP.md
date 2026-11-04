@@ -83,8 +83,15 @@
       base's ordered bucket pairs) and `cross a, b` records every
       combination of the crossed items' bucket labels (14.3, graded
       over the cross product); unbucketed sources count without
-      grading. Per-instance coverage and the option tables remain
-      recorded, not collected.
+      grading. Per-instance coverage grades per bucket with holes
+      (14.2.1), the option entries the prose defines apply
+      (`at_least`/`weight`/`per_instance` at item and group level,
+      `no_collect`/`instance_no_collect` dropping the un-presented
+      group/item per 14.1.1/14.2.3, the cross/transition `name`
+      option per 14.3/14.4), and the 28.9 configuration is honored
+      through the builder API (`max_int_buckets`, the coverage mode);
+      the bool-exp option forms, the per-unit-instance scoping and
+      the option-table-image semantics remain not collected.
       Predefined non-scalar types `file` and `event` are accepted in
       type positions; `for each <type> (v) in list` records the element
       type filter. Simple macros expand (clause 15): `define <name'
@@ -153,8 +160,12 @@
       category validation — computed macros evaluate their restricted
       body subset, see M1), the remaining clause 14
       coverage model —
-      the option tables beyond per_instance/at_least/weight, coverage
-      configuration (28.9) and per-unit-instance options (14.1.1) —
+      the bool-exp option forms (`no_collect`/`instance_no_collect`
+      with the implicit `inst` variable, `instance_ignore`/
+      `instance_illegal`), the per-unit-instance scoping (14.1.1), the
+      `radix`/`when`/`never` option semantics (the option tables are
+      images) and the `set_config()` routine the 28.9 configuration
+      names (the configuration itself is a builder API) —
       the clause 12/13 temporal
       engine's remaining simulation integration — the scheduler runs
       started TCMs concurrently and waits/sync suspend, but
@@ -288,10 +299,23 @@
       labels), `per_instance = TRUE` grades per bucket with holes
       (14.2.1 — the group grade is the weighted instance grades plus
       the per_type bucket), `at_least`/`weight` apply from the option
-      tokens, and `run --coverage` reports instances; coverage
-      configuration (28.9), per-unit-instance options (14.1.1) and
-      the remaining option tables are not collected
-- [ ] Coverage configuration options (28.9) and per-unit-instance options (14.1.1)
+      tokens (the group-level spellings included, 14.8.2/14.8.3), the
+      constant-TRUE `no_collect`/`instance_no_collect` options drop
+      the group/item from the collected model (14.1.1/14.2.3), the
+      cross/transition `name` option renames the derived item
+      (14.3/14.4), and `run --coverage` reports instances; the 28.9
+      configuration is honored through the builder API
+      (`max_int_buckets`, the coverage mode), while `set_config()` is
+      not wired and the bool-exp forms, per-unit-instance scoping
+      (14.1.1) and option-table-image semantics are not collected
+- [~] Coverage configuration options (28.9) and per-unit-instance options (14.1.1) —
+      started: the configuration record (`CoverageConfig`: the
+      coverage mode per 14.1's NOTE, `max_int_buckets` per 14.2's
+      bracket) is honored through the `build_with_config` builder API,
+      and the constant-TRUE `no_collect`/`instance_no_collect`
+      spellings suppress presentation; the `set_config()` routine, the
+      bool-exp option forms and the `per_unit_instance` scoping are
+      not modeled
 - [~] Part 2 predefined routine library — started with the reflection
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`
       (5.8.4/5.8.5 — the argument parses as a type) build the

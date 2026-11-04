@@ -216,9 +216,17 @@ multi-simulator HDL API, and wasm32.
   spelling) makes each bucket its own graded instance (14.2.1 —
   `CoverInstanceData`, name `item==bucket`, holes for unsampled
   buckets, the group grade = the weighted instance grades plus the
-  per_type bucket) and `weight = N` scales the grade contribution;
-  the coverage configuration of 28.9 and `range(...)`'s numeric
-  parameters beyond bounds/label are recorded, not applied.
+  per_type bucket), `weight = N` scales the grade contribution, the
+  group-level `at_least`/`weight` spellings apply to items without
+  their own (14.8.2/14.8.3), `no_collect`/`instance_no_collect`
+  (group, 14.1.1; item, 14.2.3) drop the group/item from the
+  collected model when TRUE, and the cross/transition `name` option
+  renames the derived item (14.3/14.4). The 28.9 coverage
+  configuration (`CoverageConfig`: the coverage mode per 14.1's NOTE
+  and `max_int_buckets` per 14.2's bracket) is honored through the
+  `build_with_config` builder API — the `set_config()` routine the
+  prose names is not wired; `range(...)`'s numeric parameters beyond
+  bounds/label are recorded, not applied.
 - `src/interp.rs` — interpreter for the statement subset (codes
   `E0401`–`E0410`). Entry: the built-in `sys` unit's `run()` methods, with
   and named types by declared name, walking `like` bases — subtype-aware
@@ -307,8 +315,14 @@ per-instance timelines, and suspension re-entry beyond `while` chains
 `on` blocks spin inline instead of interleaving), the remaining
 clause 14 coverage model (basic and derived items collect and grade;
 per_instance items grade per bucket with holes and the weighted
-group grade; the option tables beyond per_instance/at_least/weight
-and the 28.9 configuration are recorded, not applied), integer width
+group grade; the group/item `no_collect`/`instance_no_collect`
+options, the cross/transition `name` option and the group-level
+`at_least`/`weight` apply; the bool-exp option forms with the
+implicit `inst` variable, the per-unit-instance scoping
+(14.1.1/14.2.3), the `radix`/`when`/`never` option semantics (the
+option tables are images) and the `set_config()` routine the 28.9
+configuration names are not modeled — the configuration is the
+`build_with_config` builder API), integer width
 truncation, evaluation of MVL literals, `detach`/`delay`/`exec` TEs, select
 choice policies beyond the constant-expression subset (the full
 choice-expression grammar, soft-order interactions between multiple
