@@ -651,6 +651,139 @@ fn bare_sync_suspends_for_one_cycle() {
 }
 
 #[test]
+fn wait_inside_an_if_body_suspends_and_resumes() {
+    // The marquee generalization: the wait inside the `then` branch
+    // suspends the TCM (13.1.1) while the emitter advances; the resume
+    // path re-enters the branch without re-evaluating the condition or
+    // replaying the branch's executed statements.
+    let output = clean_output(
+        "extend sys {\n    ev: event;\n    waiter() @sys.any is {\n        var go: bool = TRUE;\n        \
+         if go {\n            wait @ev;\n            out(\"A RESUMED\");\n        };\n        \
+         out(\"A DONE\");\n    };\n    emitter() @sys.any is {\n        wait [2]*cycle;\n        \
+         emit ev;\n        out(\"B EMITTED\");\n    };\n    run() is also {\n        \
+         start waiter();\n        start emitter();\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("B EMITTED"), "output: {output}");
+    assert!(output.contains("A RESUMED"), "output: {output}");
+    assert!(output.contains("A DONE"), "output: {output}");
+    let b_pos = output.find("B EMITTED").expect("B");
+    let a_pos = output.find("A RESUMED").expect("A");
+    assert!(b_pos < a_pos, "the waiter resumes after the emit: {output}");
+}
+
+#[test]
+fn wait_inside_an_if_else_body_suspends_and_resumes() {
+    // The resume path records the else branch too: the TCM re-enters
+    // it directly, without re-evaluating the condition.
+    let output = clean_output(
+        "extend sys {\n    ev: event;\n    tcm() @sys.any is {\n        var go: bool = FALSE;\n        \
+         if go {\n            out(\"THEN\\n\");\n        } else {\n            wait @ev;\n            \
+         out(\"ELSE RESUMED\\n\");\n        };\n    };\n    emitter() @sys.any is {\n        \
+         wait [2]*cycle;\n        emit ev;\n    };\n    run() is also {\n        start tcm();\n        \
+         start emitter();\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("ELSE RESUMED"), "output: {output}");
+    assert!(!output.contains("THEN"), "output: {output}");
+}
+
+#[test]
+fn wait_inside_a_for_body_keeps_the_counter() {
+    // The for loop's temporary is bound in the frame and the
+    // in-flight counter rides the resume path: three suspensions (one
+    // per iteration) resume mid-iteration without resetting the
+    // counter or re-evaluating the bounds.
+    let output = clean_output(
+        "extend sys {\n    tcm() @sys.any is {\n        for i from 1 to 3 {\n            \
+         wait [1]*cycle;\n            outf(\"%d\\n\", i);\n        };\n    };\n    run() is also {\n        \
+         start tcm();\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "1\n2\n3\n");
+}
+
+#[test]
+fn wait_inside_a_case_arm_suspends_and_resumes() {
+    // The matched arm is recorded on the resume path: the TCM
+    // re-enters it without re-matching the scrutinee.
+    let output = clean_output(
+        "extend sys {\n    ev: event;\n    tcm() @sys.any is {\n        var x: uint = 2;\n        \
+         case x {\n            1: { out(\"ONE\\n\"); };\n            [2, 7]: {\n                \
+         wait @ev;\n                out(\"TWO-OR-SEVEN RESUMED\\n\");\n            };\n            \
+         default: { out(\"OTHER\\n\"); };\n        };\n    };\n    emitter() @sys.any is {\n        \
+         wait [2]*cycle;\n        emit ev;\n    };\n    run() is also {\n        start tcm();\n        \
+         start emitter();\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("TWO-OR-SEVEN RESUMED"), "output: {output}");
+    assert!(!output.contains("OTHER"), "output: {output}");
+}
+
+#[test]
+fn wait_inside_a_repeat_until_body_suspends_and_resumes() {
+    // A repeat-until body re-enters mid-iteration (the condition is
+    // only evaluated when the iteration completes, 20.2.2): the first
+    // wait resumes on the emission and the second succeeds in the same
+    // cycle's log (the occurrence is behind the fresh wait's start).
+    let output = clean_output(
+        "extend sys {\n    ev: event;\n    tcm() @sys.any is {\n        var n: uint = 0;\n        \
+         repeat {\n            n = n + 1;\n            wait @ev;\n            outf(\"%d\\n\", n);\n        \
+         } until n == 2;\n    };\n    emitter() @sys.any is {\n        for j from 1 to 2 {\n            \
+         wait [2]*cycle;\n            emit ev;\n        };\n    };\n    run() is also {\n        \
+         start tcm();\n        start emitter();\n    };\n};\n",
+        1,
+    );
+    // The body counts exactly two waits (the second succeeds on the
+    // same cycle's log); a third line would mean the loop ran past its
+    // condition.
+    assert!(output.contains("1\n2\n"), "output: {output}");
+    assert!(!output.contains("3"), "output: {output}");
+}
+
+#[test]
+fn wait_inside_a_for_each_body_suspends_and_resumes() {
+    // The list snapshot rides the resume path: the element and index
+    // bindings persist in the frame across the suspension.
+    let output = clean_output(
+        "extend sys {\n    tcm() @sys.any is {\n        var l: list of uint;\n        l.push(1);\n        \
+         l.push(2);\n        for each (v) using index (idx) in l {\n            wait [1]*cycle;\n            \
+         print v, idx;\n        };\n    };\n    run() is also {\n        start tcm();\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "v = 1 idx = 0\nv = 2 idx = 1\n");
+}
+
+#[test]
+fn wait_inside_an_if_inside_a_while_suspends_and_resumes() {
+    // A multi-level path: the suspension inside while > if > wait
+    // re-enters through both compounds, the branch's statement after
+    // the wait executes first (skip-resume), and the loop's
+    // mid-iteration semantics survive the added nesting.
+    let output = clean_output(
+        "extend sys {\n    tcm() @sys.any is {\n        var i: uint = 0;\n        while i < 2 {\n            \
+         i = i + 1;\n            if TRUE {\n                wait [1]*cycle;\n                \
+         out(\"WAITED\\n\");\n            };\n            out(\"ITER\\n\");\n        };\n        print i;\n    };\n    \
+         run() is also {\n        start tcm();\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "WAITED\nITER\nWAITED\nITER\ni = 2\n");
+}
+
+#[test]
+fn wait_at_the_end_of_an_if_body_resumes_past_the_branch() {
+    // The sync consumed by a branch's last statement resumes past the
+    // body's end (the skip position falls out of the branch), and the
+    // statement following the compound runs.
+    let output = clean_output(
+        "extend sys {\n    tcm() @sys.any is {\n        if TRUE {\n            wait [1]*cycle;\n        };\n        \
+         out(\"AFTER\\n\");\n    };\n    run() is also {\n        start tcm();\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "AFTER\n");
+}
+
+#[test]
 fn runaway_tcm_hits_the_wait_budget() {
     let result = run_source(
         "extend sys {\n    run() is also {\n        while TRUE {\n            wait cycle;\n        };\n    };\n};\n",

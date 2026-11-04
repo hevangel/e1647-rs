@@ -192,7 +192,12 @@
       occurrence (17.1.2), and `@sim`/event-port edge sampling
       (11.1.4.2, 9.7.2.8) fires at the scheduler's cycle boundaries
       through a real session or the injected signal-history test seam —
-      suspension re-entry beyond `while` chains is not wired —
+      suspension re-entry reaches every compound statement now (waits
+      inside `if`/`case`/`for`/`for each`/`repeat until` bodies suspend
+      and resume through the statement-path cursor), while re-entry
+      into inline method calls and `compute` (a per-coroutine
+      call-stack continuation behind 13.1.1's return-resumes-callee
+      boundary) is not wired —
       `detach`/`delay`/`exec` TEs, select
       choice policies beyond the constant-expression subset (the
       full choice-expression grammar and soft-order interactions),

@@ -3217,3 +3217,128 @@ struct field receiver; and the error paths — empty-list accessors as
 `E0402`, out-of-range delete/fast_delete/insert indexes as `E0404`,
 wrong item types as `E0402`, and the gap names (`apply`, `sort`) plus
 unknown methods as `E0405`.
+## 2026-11-05 (46) — offline arc: suspension re-entry beyond while chains
+
+Branch `agent/suspend-reentry` (off main). The clause 13.1.1
+scheduler's suspension re-entry generalizes from the while-chain
+skip-cursor to a full statement path: a wait inside an
+`if`/`case`/`for`/`for each`/`repeat until` body now suspends the
+coroutine turn and resumes mid-flight, instead of keeping the inline
+spin (or, for three compounds, silently corrupting the resume — see
+the debugging note).
+
+Prose reading this is built on (13.1.1): "When a TCM resumes, it
+commences executing from the first action following the
+synchronization action and continues execution without interruption"
+— the synchronization actions delimit the atomic fragments, and
+resumption replays nothing that already ran. Concretely, on resume
+the walk skips the executed statement prefix, re-enters a taken
+`if`/`case` branch without re-evaluating the condition or
+re-matching the scrutinee (those actions ran before the suspension),
+and re-enters a loop body mid-iteration — the condition is
+re-checked only when the iteration completes, exactly like the
+while model this generalizes (a `for`'s bounds are never
+re-evaluated: the in-flight counter and the once-evaluated end bound
+ride the path; the temporary stays bound in the captured frame; a
+`for each` carries its list snapshot and element position the same
+way).
+
+Implementation shape (all inside `src/interp.rs`'s scheduler/exec
+sections):
+
+- `CtxKind`/`ExecCtx` (Leaf/WhileLoop/Atomic markers) become
+  `PathLevel { index, child }` with a `Child` naming the descent:
+  `WhileBody`/`RepeatBody`/`ForBody{counter,end}`/
+  `ForeachBody{position,items}`/`IfThen`/`IfElse`/`CaseArm{index}`.
+  The turn's `exec_context` stack is the walk's position; at a
+  suspension `suspend_here` clones it into the resume path (the
+  skip-resume advances the leaf level past the consumed sync, the
+  temporal wait keeps its own level and re-executes).
+- `exec_block_resumable` dispatches on the path's child through a new
+  `exec_statement_resumable`, which re-enters the compound mid-flight
+  and flows the resumed iteration into the statement's ordinary
+  continuation (the shared `while_loop` gains `repeat_until_loop`/
+  `for_to_loop`/`for_each_loop` siblings, each taking the in-flight
+  outcome or resume path so fresh and resumed entries share one
+  loop). Every compound keeps its context level on the stack across
+  its whole execution — a re-suspension inside a later iteration or
+  a fresh statement after the resumed one rebuilds the matching path
+  (the entry-27 marker-persistence property, now per level).
+- `suspend_eligible` shrinks to "a coroutine turn outside the atomic
+  regions" — the context-stack scan is gone because the path now
+  reaches every compound.
+- What stays atomic, deliberately: inline method calls and
+  `compute` (13.1.1's "if a called TCM returns, the callee resumes
+  execution immediately" makes the return the fragment boundary, but
+  suspending inside a call needs a per-coroutine call-stack
+  continuation with return-value capture — a later arc; the v1 model
+  keeps the call run-to-completion), `on` blocks (11.3 bans
+  time-consuming actions in on bodies anyway — nothing to suspend),
+  and a `check` else body (a leaf statement's continuation; waits
+  there keep the inline spin under the same conservative reading).
+
+Debugging notes for the record: (1) the pre-arc compounds were
+broken in two distinct ways — `case`/`for`/`for each` pushed no
+context marker, so a suspension inside built a cursor with the
+body's indices applied at the top-level block (resumption silently
+skipped everything), and `repeat until` reused the `while` marker,
+so the resume hit the "cursor crossed a non-loop statement" internal
+`E0402`; both are now covered by tests. (2) The first else-branch
+probe hung to the `E0409` budget — not a resume-path bug: the
+temporal engine's success is last-point (`succeeds` scans suffixes,
+and an event atom holds tightly only on a single-state path), so a
+re-executed `wait @ev` observes an emission made in the SAME cycle
+only when the emitter's turn runs first; the pre-arc atomic spin
+deadlocks on the same source (the inline spin never yields, so the
+emitter never runs at all). The new tests order the emitter before
+the waiter at the emit cycle, like the entry-27 tests already do.
+(3) An earlier sed-based field rename was replaced with editor
+edits per the repository's tooling rules; no content difference.
+
+Honest v1 limits that remain (documented in ARCHITECTURE): call
+depth stays atomic as above; a `for` body assigning its own loop
+variable diverges from the fresh run on resume (the continuation
+reads the counter from the path, not the frame slot — the temporary
+is owned by the loop); the temporal engine's last-point success
+semantics are unchanged (a same-cycle emission is observed only
+when the emitter is scheduled first); one global timeline.
+
+Corpus state (absolute paths, release build of this branch,
+`run --seed 1`): `B:/e1647-rs/local/corpora/etl-simple-examples.e`
+4, `cover-edges.e` 4, `B:/e1647-rs/local/sn-cpu-tutorial/
+golden-combined-imports.e` 3, `golden-combined.e`/`igen-dist.e`/
+`type-min-max-usage.e`/`save-restart-test1.e`/`d6w/testbench.e` 0 —
+unchanged. All eight files' stdout and stderr are byte-identical to
+a main-branch release build (b956c24, built in a separate detached
+worktree), exit codes equal; the d6w run still ends with the
+reference line and exit 0, golden-combined keeps exit 0 with only
+the pre-existing implicit-gen E0407.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(241 passed: 20 elab, 1 fixtures, 121 interp, 24 lexer, 58 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 8 interpreter tests — the marquee generalization (a wait
+inside an `if` then-branch suspends and resumes after another TCM's
+emission, branch statement after the wait included); the else
+branch (re-enters without re-evaluating the condition); a `for`
+body (three suspensions resume mid-iteration with the counter
+never reset and the bounds never re-evaluated: `1\n2\n3`); a
+`case` arm (re-enters without re-matching the scrutinee); a
+`repeat until` body (mid-iteration re-entry, the condition only
+evaluated when the iteration completes); a `for each` body (the
+element and index bindings persist across the suspension); a
+multi-level path (`while` > `if` > `wait`, two iterations, the
+loop's mid-iteration semantics surviving the nesting); and the
+sync consumed by a branch's last statement (the skip position
+falls out of the body, the statement after the compound runs).
+

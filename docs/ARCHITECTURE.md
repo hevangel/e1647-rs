@@ -354,9 +354,13 @@ conjunctive linear constraints and constant ranges over bounded
 integers), per-instance temporal timelines (the run log stays one
 global timeline; the simulator-side `@sim`/event-port triggers fire
 per instance at the scheduler's cycle boundaries), and suspension
-re-entry beyond `while` chains
-(waits inside `if`/`case`/`for` bodies, inline calls, `compute` and
-`on` blocks spin inline instead of interleaving), the remaining
+re-entry into inline method calls and `compute` (waits inside
+compound statements — `if`/`case`/`for`/`for each`/`repeat until` —
+suspend and resume through the statement-path cursor, the
+generalization of the earlier while-chain skip-cursor; a called
+method keeps 13.1.1's return-delimited atomic region, which needs a
+per-coroutine call-stack continuation, and `on` bodies stay atomic —
+11.3 bans time-consuming actions in them anyway), the remaining
 clause 14 coverage model (basic and derived items collect and grade;
 per_instance items grade per bucket with holes and the weighted
 group grade; the group/item `no_collect`/`instance_no_collect`
