@@ -2767,3 +2767,104 @@ against a per-cycle watcher); the already-emitted-this-tick entry
 TCM holding the run to the E0409 budget; a bound event port firing
 its `on p$` blocks on the bound object's change edge; and the
 `edge() == rise` attribute restricting the port's edges.
+
+## 2026-11-04 (44) — offline arc: clause 28.9 coverage configuration and remaining option tables
+
+Branch `agent/coverage-config` (off main after #31 merged). The 28.9
+configuration and the option entries whose semantics the extractable
+prose defines land.
+
+Prose findings that constrained the design (clause references only,
+local copy under `local/`; the option tables 40/41 are images in the
+redline PDF):
+
+- 28.9 is the `set_config()` routine: "This routine sets the
+  configuration options to the specified values" — the syntax
+  example's `set_config(memory, gc_threshold, 100M)` gives the
+  category, option, value shape, and 7.6.1's `set_config_max()`
+  variant "sets the numeric options of a particular category to the
+  specified maximum values". No option catalog is extractable.
+- 14.2: "If ranges is not specified, the default number of buckets is
+  16 [set by the max_int_buckets coverage configuration option (see
+  28.9)]", and both 14.1 and 14.2 carry the NOTE "Unless coverage mode
+  is turned on first (see 28.9), no coverage results are collected,
+  even if cover groups and cover items are defined" — these two are
+  the extractable coverage configuration.
+- 14.1.1/14.2.3: "if one or both of no_collect and
+  instance_no_collect options of the group [item] are evaluated to
+  TRUE, the group [item] shall not be presented under that instance"
+  — the OR relation is extractable prose; the option definitions and
+  the `per_unit_instance` setting itself live in Table 40 (an image),
+  and the bool-exp form's implicit `inst` variable needs the
+  per-unit-instance model this repo does not have.
+- 14.3/14.4: a cross or transition "creates a new item with a name
+  specified using a name option or by using the default name" — the
+  `name` option is extractable prose for both derived kinds.
+- 14.8.2/14.8.3: weights and the at_least minimum "can be specified
+  in the coverage group or item definitions" — the group-level
+  spellings of the two options already applied at item level.
+- Not extractable: `radix` appears only in a 14.6 syntax example
+  (`using also radix = HEX`); `when`/`never`/`ignore`/`illegal` have
+  no extractable semantics — documented gaps, not implemented.
+
+Implementation (all in `src/coverage.rs`; the interpreter's call site
+is untouched):
+
+- `CoverageConfig` (28.9): `mode` (14.1's NOTE — with the mode off
+  nothing is built, so the interpreter finds no groups to sample and
+  the report presents none) and `max_int_buckets` (14.2's bracket —
+  the integer items' default bucket count; 0 leaves the item
+  ungradeable with a note). `build()` keeps the default
+  configuration; `build_with_config` is the documented API. The
+  default keeps collection ON — a documented deviation: the
+  standard's mode starts off until `set_config` turns it on, and
+  that routine is not wired yet.
+- `no_collect`/`instance_no_collect` (group option entries and item
+  `using` spellings): the constant TRUE spelling drops the group/item
+  from the collected model — not sampled, not graded, not presented;
+  the OR relation reads every declaration of the group.
+- The cross/transition `name = "..."` option replaces the default
+  `cross_a__b`/`transition__base` names.
+- Group-level `at_least`/`weight` option entries apply to every item
+  of the group that does not set its own; the item-level spelling
+  wins (the v1 reading of "set in the coverage group or item
+  definitions" — the procedural `covers.set_*()` overrides of 14.8
+  are not wired).
+
+Honest v1 limits: the `set_config()`/`set_config_max()` routines are
+not wired (the routine library owns the interpreter's routine table);
+the bool-exp option forms, the implicit `inst` variable and the
+`per_unit_instance` scoping are not modeled; `instance_ignore`/
+`instance_illegal`, the `radix`/`when`/`never` options and item
+`using also` extension overrides (14.6) remain unmodeled; a
+group-level `weight` has no level above the group to scale (no
+type-level grade exists in the model).
+
+Corpus state (absolute paths, run --seed 1): etl 4, cover-edges 4,
+golden-imports 3, golden-combined/igen-dist/type-min-max/
+save-restart/d6w 0 — unchanged; golden-combined and igen-dist keep
+exit 0, and the `--coverage` reports of cover-edges, golden-combined
+and igen-dist are byte-identical to the pre-change main build.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(220 passed: 16 elab, 1 fixtures, 104 interp, 24 lexer, 58 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 7 interpreter tests — the coverage mode off building
+nothing (and the default keeping collection on, per the documented
+deviation); `max_int_buckets` at 4 and at 0 (no default buckets, the
+honest note); group-level `no_collect = TRUE` and the OR relation's
+`instance_no_collect = TRUE` suppressing the group; the item-level
+`no_collect` dropping the item while a sibling collects; the
+cross/transition `name` option; and the group-level
+`at_least`/`weight` applying where the item sets none (the item-level
+`at_least` winning).

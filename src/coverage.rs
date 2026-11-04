@@ -6,19 +6,36 @@
 //! (14.5), and each item's `using ranges` clause — recorded as raw
 //! tokens in the shape `ranges = { range([lo..hi], "label"); ... }` —
 //! is parsed into explicit buckets. Items without a `ranges` clause
-//! get the clause
-//! 14.2 defaults: 16 buckets for integers ("buckets are created by
-//! default for only the first 16 possible values (0 through 15)") and
-//! the two values for booleans. Values falling outside every bucket
-//! are ungradeable ("those values are given goals of 0 and do not
-//! affect the grade for the item").
+//! get the clause 14.2 defaults: 16 buckets for integers ("buckets are
+//! created by default for only the first 16 possible values (0 through
+//! 15)" — the count is the `max_int_buckets` coverage configuration
+//! option, 28.9) and the two values for booleans. Values falling
+//! outside every bucket are ungradeable ("those values are given goals
+//! of 0 and do not affect the grade for the item").
 //!
-//! Not modeled yet: `cross`/`transition` items (recorded, not
-//! collected), per-instance coverage (14.2.1), the coverage
-//! configuration options of 28.9, and the numeric parameters of
-//! `range(...)` beyond the bounds and label (their semantics live in
-//! Table 41, an image in the local redline copy — they are recorded
-//! and counted but not applied).
+//! The 28.9 coverage configuration ([`CoverageConfig`]) carries the
+//! coverage mode (14.1's NOTE: "Unless coverage mode is turned on
+//! first (see 28.9), no coverage results are collected") and
+//! `max_int_buckets`. The setting routine the prose names,
+//! `set_config(<category>, <option>, <value>)` (28.9), is not wired
+//! into the interpreter yet, so the options are reachable through
+//! [`build_with_config`] only. The option entries whose semantics the
+//! extractable prose defines apply from the recorded tokens:
+//! `no_collect`/`instance_no_collect` on the group (14.1.1) or the
+//! item (14.2.3) — when TRUE the group/item "shall not be presented" —
+//! the cross and transition `name` option (14.3/14.4), and the
+//! group-level `at_least`/`weight` spellings (14.8.2/14.8.3: both "can
+//! be set in the coverage group or item definitions").
+//!
+//! Not modeled yet: the `set_config()` routine itself, the bool-exp
+//! option forms (including the implicit `inst` variable and the
+//! `per_unit_instance` scoping of 14.1.1/14.2.3),
+//! `instance_ignore`/`instance_illegal`, the `radix`/`when`/`never`
+//! option semantics (Tables 40/41 are images in the local redline
+//! copy), item `using also` extension overrides (14.6), and the
+//! numeric parameters of `range(...)` beyond the bounds and label
+//! (their semantics live in Table 41, an image in the local redline
+//! copy — they are recorded and counted but not applied).
 
 use crate::ast::{CoverGroupDecl, CoverItemDecl, CoverItemKind, Expr, ScalarBase, TypeExpr};
 use crate::lexer::{Token, TokenKind};
@@ -376,11 +393,59 @@ impl TypeCoverage {
     }
 }
 
+/// The coverage configuration options (28.9). The prose names the
+/// setting mechanism — the `set_config()` predefined routine, "sets
+/// the configuration options to the specified values" (the category,
+/// option, value shape of its syntax example; 7.6.1's `set_config_max`
+/// variant sets "the numeric options of a particular category to the
+/// specified maximum values") — and two coverage options by name: the
+/// coverage mode (14.1's NOTE) and `max_int_buckets` (14.2). The
+/// routine itself is not wired into the interpreter yet, so the
+/// options are reachable through [`build_with_config`] only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageConfig {
+    /// 14.1's NOTE: "Unless coverage mode is turned on first (see
+    /// 28.9), no coverage results are collected, even if cover groups
+    /// and cover items are defined." With the mode off nothing is
+    /// built, so the interpreter finds no groups to sample and the
+    /// report presents none. The default keeps collection on — a
+    /// documented deviation: the standard's mode starts off until
+    /// `set_config` turns it on, and the routine is not wired yet.
+    pub mode: bool,
+    /// 14.2: "If ranges is not specified, the default number of
+    /// buckets is 16 [set by the max_int_buckets coverage
+    /// configuration option (see 28.9)]." The integer items' default
+    /// bucket count; 0 leaves the item without default buckets
+    /// (ungradeable).
+    pub max_int_buckets: u64,
+}
+
+impl Default for CoverageConfig {
+    fn default() -> Self {
+        Self {
+            mode: true,
+            max_int_buckets: 16,
+        }
+    }
+}
+
 /// Build the coverage data model from the elaborated types' recorded
 /// cover groups: one [`TypeCoverage`] per type that declares (or
 /// extends) groups, extensions merged into their base by name (14.5),
-/// in any declaration order.
+/// in any declaration order. Uses the default [`CoverageConfig`].
 pub fn build(elaborated: &crate::elab::Elaborated) -> Vec<TypeCoverage> {
+    build_with_config(elaborated, &CoverageConfig::default())
+}
+
+/// [`build`] with explicit 28.9 coverage configuration options.
+pub fn build_with_config(
+    elaborated: &crate::elab::Elaborated,
+    config: &CoverageConfig,
+) -> Vec<TypeCoverage> {
+    // 14.1's NOTE (see [`CoverageConfig::mode`]).
+    if !config.mode {
+        return Vec::new();
+    }
     let mut result: Vec<TypeCoverage> = Vec::new();
     for ty in &elaborated.types {
         if ty.covers.is_empty() {
@@ -392,7 +457,11 @@ pub fn build(elaborated: &crate::elab::Elaborated) -> Vec<TypeCoverage> {
             if decl.is_also {
                 continue;
             }
-            let items: Vec<CoverItemData> = decl.items.iter().filter_map(build_item).collect();
+            let items: Vec<CoverItemData> = decl
+                .items
+                .iter()
+                .filter_map(|item| build_item(item, config))
+                .collect();
             let derived = build_derived(decl, &items);
             groups.push(CoverGroupData {
                 name: decl.name.clone(),
@@ -413,7 +482,11 @@ pub fn build(elaborated: &crate::elab::Elaborated) -> Vec<TypeCoverage> {
                 .iter_mut()
                 .find(|group| group.name == decl.name && group.event_path == group_event_path(decl))
             {
-                base.items.extend(decl.items.iter().filter_map(build_item));
+                base.items.extend(
+                    decl.items
+                        .iter()
+                        .filter_map(|item| build_item(item, config)),
+                );
                 base.derived.extend(build_derived(decl, &base.items));
             }
         }
@@ -434,6 +507,79 @@ pub fn build(elaborated: &crate::elab::Elaborated) -> Vec<TypeCoverage> {
             {
                 for item in &mut group.items {
                     item.per_instance = true;
+                }
+            }
+        }
+        // 14.1.1: "if one or both of no_collect and instance_no_collect
+        // options of the group are evaluated to TRUE, the group shall
+        // not be presented under that instance." The OR relation of the
+        // prose, over every declaration of the group; the constant TRUE
+        // spelling drops the group from the collected model (not
+        // sampled, not graded, not presented in the report). The
+        // bool-exp form and the per-unit-instance scoping are not
+        // modeled.
+        groups.retain(|group| {
+            !ty.covers.iter().any(|decl| {
+                decl.name == group.name
+                    && group.event_path == group_event_path(decl)
+                    && decl.options.iter().any(|entry| {
+                        scan_bool_option(entry, "no_collect") == Some(true)
+                            || scan_bool_option(entry, "instance_no_collect") == Some(true)
+                    })
+            })
+        });
+        // Group-level `at_least`/`weight` (14.8.2/14.8.3: both "can be
+        // set in the coverage group or item definitions"): the group
+        // option applies to every item of the group that does not set
+        // its own; a later declaration's reading overrides an earlier
+        // one (14.5's override reading). The item-level spellings win
+        // where present.
+        for group in groups.iter_mut() {
+            let matching: Vec<&CoverGroupDecl> = ty
+                .covers
+                .iter()
+                .filter(|decl| {
+                    decl.name == group.name && group.event_path == group_event_path(decl)
+                })
+                .collect();
+            let mut group_at_least: Option<u64> = None;
+            let mut group_weight: Option<u64> = None;
+            for decl in &matching {
+                for entry in &decl.options {
+                    if let Some(Some(value)) = scan_uint_option(entry, "at_least") {
+                        group_at_least = Some(value);
+                    }
+                    if let Some(Some(value)) = scan_uint_option(entry, "weight") {
+                        group_weight = Some(value);
+                    }
+                }
+            }
+            if group_at_least.is_none() && group_weight.is_none() {
+                continue;
+            }
+            for decl in &matching {
+                for entry in &decl.items {
+                    if entry.kind != CoverItemKind::Item {
+                        continue;
+                    }
+                    let Some(name) = entry.names.first().map(|(name, _)| name.clone()) else {
+                        continue;
+                    };
+                    let Some(item) = group.items.iter_mut().find(|item| item.name == name) else {
+                        continue;
+                    };
+                    if let Some(goal) = group_at_least
+                        && scan_uint_option(&entry.using, "at_least").is_none()
+                    {
+                        for bucket in &mut item.buckets {
+                            bucket.goal = goal;
+                        }
+                    }
+                    if let Some(weight) = group_weight
+                        && scan_uint_option(&entry.using, "weight").is_none()
+                    {
+                        item.weight = weight;
+                    }
                 }
             }
         }
@@ -460,8 +606,13 @@ fn build_derived(decl: &CoverGroupDecl, items: &[CoverItemData]) -> Vec<CoverDer
                     .find(|item| &item.name == base)
                     .filter(|item| !item.buckets.is_empty())
                     .map(|item| (item.buckets.len() * item.buckets.len()) as u64);
+                // 14.4: "If no name is specified for the transition item
+                // with the name option, it gets a default name of
+                // transition item-name" (two underscores).
+                let name = scan_string_option(&entry.using, "name")
+                    .unwrap_or_else(|| format!("transition__{base}"));
                 derived.push(CoverDerivedData {
-                    name: format!("transition__{base}"),
+                    name,
                     sources: vec![base.clone()],
                     samples: 0,
                     combos: Vec::new(),
@@ -487,8 +638,13 @@ fn build_derived(decl: &CoverGroupDecl, items: &[CoverItemData]) -> Vec<CoverDer
                         }
                     })
                 });
+                // 14.3: "It creates a new item with a name specified
+                // using a name option or by using the default name of
+                // cross item-name-1 item-name-2" (two underscores).
+                let name = scan_string_option(&entry.using, "name")
+                    .unwrap_or_else(|| format!("cross_{}", sources.join("__")));
                 derived.push(CoverDerivedData {
-                    name: format!("cross_{}", sources.join("__")),
+                    name,
                     sources,
                     samples: 0,
                     combos: Vec::new(),
@@ -530,9 +686,20 @@ fn group_event_path(decl: &CoverGroupDecl) -> Option<String> {
 
 /// Build one item's data: explicit `ranges` buckets when the recorded
 /// `using` tokens carry them, the 14.2 defaults otherwise.
-fn build_item(item: &CoverItemDecl) -> Option<CoverItemData> {
+fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItemData> {
     if item.kind != CoverItemKind::Item {
         // cross/transition items are recorded, not collected yet.
+        return None;
+    }
+    // 14.2.3: "if one or both of no_collect and instance_no_collect
+    // options of the item are evaluated to TRUE, the item shall not be
+    // presented under that instance." The constant TRUE spelling (the
+    // OR relation of the prose) drops the item from the collected
+    // model; the bool-exp form and the per-unit-instance scoping are
+    // not modeled.
+    if scan_bool_option(&item.using, "no_collect") == Some(true)
+        || scan_bool_option(&item.using, "instance_no_collect") == Some(true)
+    {
         return None;
     }
     let name = item
@@ -564,12 +731,21 @@ fn build_item(item: &CoverItemDecl) -> Option<CoverItemData> {
         });
     }
     let (mut buckets, note) = if ranges.is_empty() {
-        // 14.2 defaults: integers grade over the first 16 values;
-        // booleans over their two values; anything else has no default
-        // bucket set and is ungradeable.
+        // 14.2 defaults: integers grade over the first `max_int_buckets`
+        // values (16 unless the 28.9 configuration option says
+        // otherwise); booleans over their two values; anything else has
+        // no default bucket set and is ungradeable.
         match &item.ty {
             Some(ty) if type_is_bool(ty) => (bool_buckets(), None),
-            Some(ty) if type_is_int(ty) => (default_int_buckets(), None),
+            Some(ty) if type_is_int(ty) => {
+                let buckets = default_int_buckets(config.max_int_buckets);
+                let note = if buckets.is_empty() {
+                    Some("max_int_buckets is 0: no default buckets")
+                } else {
+                    None
+                };
+                (buckets, note)
+            }
             _ => (
                 Vec::new(),
                 Some("no ranges clause: values are recorded, not graded"),
@@ -626,6 +802,20 @@ fn scan_bool_option(tokens: &[Token], name: &str) -> Option<bool> {
     None
 }
 
+/// Scan `name = "text"` in recorded option tokens; `None` when the
+/// option is absent or its value is not a string literal.
+fn scan_string_option(tokens: &[Token], name: &str) -> Option<String> {
+    for index in 0..tokens.len() {
+        if token_word(&tokens[index]) == Some(name) && token_kind_is(tokens.get(index + 1)?, "=") {
+            return match tokens.get(index + 2).map(|token| &token.kind) {
+                Some(TokenKind::StringLiteral(text)) => Some(text.clone()),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
 fn bool_buckets() -> Vec<CoverBucket> {
     vec![
         CoverBucket {
@@ -645,12 +835,15 @@ fn bool_buckets() -> Vec<CoverBucket> {
     ]
 }
 
-fn default_int_buckets() -> Vec<CoverBucket> {
-    (0..16)
+/// The 14.2 default integer buckets: one bucket per value, "for only
+/// the first 16 possible values (0 through 15)" — the count being the
+/// `max_int_buckets` coverage configuration option's default (28.9).
+fn default_int_buckets(max: u64) -> Vec<CoverBucket> {
+    (0..max)
         .map(|value| CoverBucket {
             label: format!("{value}"),
-            lo: value,
-            hi: value,
+            lo: value as i128,
+            hi: value as i128,
             goal: 1,
             hits: 0,
         })
