@@ -3046,7 +3046,7 @@ impl<'a> Interp<'a> {
                         span,
                     ));
                 };
-                match crate::hdl::HdlSession::load(file, top) {
+                match crate::hdl::load(file, top) {
                     Ok(session) => {
                         self.hdl = Some(crate::hdl::SignalSource::Real(session));
                         Ok(Value::Void)
