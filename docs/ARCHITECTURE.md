@@ -303,7 +303,18 @@ multi-simulator HDL API, and wasm32.
   `min`/`uint_min`/`int_min` and the `max`/`uint_max`/`int_max`
   mirrors, the `_is_uint` guards, `union`/`intersect`/`diff`) run on
   set values; `to_string()` renders scalars and sets, and `as_a` to
-  an enumeral type maps the integer index to the enumerand.
+  an enumeral type maps the integer index to the enumerand. The clause
+  26 list pseudo-methods dispatch on `Value::List` receivers: the 26.3
+  modifiers (`push`/`push0`/`add`/`add0`/`pop`/`pop0`/`insert`/
+  `delete`/`fast_delete`/`clear`, a list argument extends per the list
+  forms 26.3.2/26.3.4/26.3.14/26.3.15), the no-argument general forms
+  (`size`, `is_empty`, `exists`, `copy`, `reverse`, `top`/`top0`), the
+  no-argument extremes (`min`/`max`/`min_index`/`max_index` — ties go
+  to the latest item, empty is an error) and aggregates (`sum`,
+  `product`, `and_all`, `or_all` — with their stated empty-list
+  results), and `is_a_permutation`; the expression-taking pseudo-methods
+  (26.1 makes them macros) report `E0405` and are listed as documented
+  gaps in the module docs.
 - `src/solve.rs` — constraint IR and the pluggable solver seam: the
   top-level `keep` constraints of one type translate (conservatively) into
   bounded-integer variables plus a conjunction of linear comparisons;
