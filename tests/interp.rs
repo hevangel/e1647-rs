@@ -1221,6 +1221,75 @@ fn macro_body_invoking_another_macro_expands() {
 }
 
 #[test]
+fn computed_macro_builds_its_expansion_from_the_parameter() {
+    // 15.3: the computed body executes at match time and its returned
+    // string is the expansion. The computed definition is later than the
+    // simple one of the same pattern, so per 15.5.1 it takes priority and
+    // its successful evaluation wins; the string it returns is built by
+    // concatenating the parameter's text (available as a string, 15.6).
+    let output = clean_output(
+        "define <csay_low'exp> \"CSAY[ ]\\(<type>\\)\" as {\n    \
+         out(\"SIMPLE RAN\");\n};\n\
+         define <csay_dac'exp> \"CSAY[ ]\\(<type>\\)\" as computed {\n    \
+         return \"out(\" + <type> + \")\";\n};\n\
+         extend sys {\n    run() is also {\n            CSAY(\"COMPUTED ONE\");\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("COMPUTED ONE"), "output: {output}");
+    assert!(!output.contains("SIMPLE RAN"), "output: {output}");
+}
+
+#[test]
+fn computed_macro_reject_match_declines_to_the_simple_definition() {
+    // The type-min-max define-as-computed/define-as shape: the later
+    // computed definition matches, but its body executes reject_match(),
+    // so the definition declines and the matcher continues to the next
+    // lower-priority definition (15.5.1's order) — the file's simple
+    // define-as of the same pattern applies.
+    let output = clean_output(
+        "define <dpick_low'exp> \"DPICK[ ]\\(\\)\" as {\n    \
+         out(\"SIMPLE APPLIED\");\n};\n\
+         define <dpick_dac'exp> \"DPICK[ ]\\(\\)\" as computed {\n    \
+         reject_match();\n};\n\
+         extend sys {\n    run() is also {\n            DPICK();\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("SIMPLE APPLIED"), "output: {output}");
+}
+
+#[test]
+fn computed_macro_with_unknown_routine_declines_to_the_simple_definition() {
+    // 15.3: parsing precedes semantic analysis, so the computation
+    // cannot presuppose module definitions — an unknown routine fails
+    // the evaluation and the definition declines to the simple one
+    // (rather than silently producing a wrong expansion).
+    let output = clean_output(
+        "define <upick_low'exp> \"UPICK[ ]\\(\\)\" as {\n    \
+         out(\"SIMPLE UPICK\");\n};\n\
+         define <upick_dac'exp> \"UPICK[ ]\\(\\)\" as computed {\n    \
+         var the_type := get_type_by_name(\"addr_t\");\n    \
+         return \"out(\\\"DAC RAN\\\")\";\n};\n\
+         extend sys {\n    run() is also {\n            UPICK();\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("SIMPLE UPICK"), "output: {output}");
+}
+
+#[test]
+fn computed_macro_result_variable_is_the_return_value() {
+    // 15.3: either the result variable or the return action is used —
+    // here the implicit `result` variable holds the expansion string and
+    // the body falls off its end.
+    let output = clean_output(
+        "define <rres'exp> \"RRES[ ]\\(\\)\" as computed {\n    \
+         result = \"out(\\\"RESULT RAN\\\")\";\n};\n\
+         extend sys {\n    run() is also {\n            RRES();\n        };\n};\n",
+        1,
+    );
+    assert!(output.contains("RESULT RAN"), "output: {output}");
+}
+
+#[test]
 fn set_of_values_builds_the_legal_value_set() {
     // 5.8.4: the set of all legal values of a numeric or enumeral
     // type — scalars from their width and signedness, enumerals as

@@ -2396,3 +2396,85 @@ do-while order (an already-TRUE condition still runs the body once);
 `break` exiting a repeat loop; the one-statement `if cond do
 <statement>;` form (true and false branches); and the `while cond do
 { .. };` sugar.
+
+## 2026-11-03 (41) — offline arc: clause 15.3 computed macros (parse-time evaluation, reject_match decline)
+
+Branch `agent/computed-macros` (off main after #28 merged). Define-
+as-computed bodies now expand instead of being skipped: 15.3 treats
+the body as a method returning a string, so `src/macros.rs` gained a
+restricted parse-time interpreter.
+
+- Evaluation happens at match time (15.3: the body executes whenever
+  the match expression matched), in the same later-first priority
+  order as simple definitions (15.5.1) — a computed definition LATER
+  than a simple one of the same pattern takes priority, and on
+  decline the matcher continues to the next lower-priority
+  definition (15.5.2's backtracking), so the type-min-max corpus's
+  define-as-computed/define-as pair resolves to the simple
+  expansion.
+- The interpreter reads a restricted statement subset over the
+  recorded body tokens: `var name := expr;` (also `=` and
+  `var name: type = expr;` forms), plain assignments, braced
+  `if cond { .. } [else { .. }]`, `return expr;`, and expression
+  statements. Expressions: string parameters (their matched text as
+  a string, 15.3/15.6 — by tag, else by unique kind, both as the
+  `<...>` reference spelling and as bare variable names), string
+  literals (escape sequences interpreted), the implicit
+  TRUE/FALSE booleans, `+` concatenation, `==`/`!=` comparisons,
+  parenthesized expressions, and calls — of which only
+  `reject_match()` is known.
+- Decline paths (all fall through to the next lower-priority
+  definition, documented in code): a `reject_match()` action
+  executing (the standard's decline mechanism — as a statement or
+  inside an evaluated call); any unevaluable construct — unknown
+  routines (`rf_manager` first among them: 15.3 says parsing
+  precedes semantic analysis, so module definitions cannot be
+  presupposed), method-style calls, `is a` checks, `else if`
+  chains, list/number expressions, non-string results; a
+  non-lexing or empty result (15.3: the returned string must be a
+  legal e construct of the category). The body's `result` variable
+  or `return` action supplies the expansion string; the expansion
+  pass's iteration cap and definitions-never-rewritten rule are
+  untouched.
+- Honest v1 limits (documented): a computed body that branches on
+  reflection cannot succeed at parse time (there are no type
+  objects), so the corpus's DAC bodies always decline to their
+  simple twins; parameter text is the raw matched source text (a
+  quoted-string actual carries its quotes); expansion token spans
+  are relative to the returned string, not the original source.
+
+Debugging notes for the record: the definition scanner consumes the
+body segment's trailing `;` (15.4.5), so the computed-body parser
+lets the last statement end at end-of-tokens (the first cut required
+a terminator that had already been consumed — caught by the
+parameter-concatenation test); and a body string literal's stored
+value keeps escape sequences raw, so `return "out(\"x\")";` emitted
+backslashes into the result and broke re-tokenization — string
+literal values now interpret escapes (the interp's `unescape`,
+shared via `pub(crate)`), while parameter text stays the raw source
+form (15.6's string part of the input text).
+
+Corpus state (absolute paths): etl 4, cover-edges 4, golden-imports
+3, golden-combined/igen-dist/type-min-max/save-restart/d6w 0 —
+unchanged; type-min-max only defines macros and must stay 0.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(201 passed: 14 elab, 1 fixtures, 93 interp, 24 lexer, 52 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 4 interpreter tests — a computed macro building its
+expansion string from the parameter (later than a same-pattern
+simple definition, so the computed one wins per 15.5.1); the
+type-min-max DAC shape where the computed body executes
+`reject_match()` and the simple definition applies; a computed body
+calling an unknown routine declining to the simple definition; and
+the implicit `result` variable as the return value.

@@ -94,10 +94,19 @@
       over the token stream expands every invocation site with
       backtracking matching (15.5.2) and parameter substitution
       (15.6), later definitions taking priority (15.5.1); bodies may
-      invoke other macros. The v1 approximations: literals match one
-      token each (whitespace literals vanish), the repetition form
-      matches as one non-terminal, categories are not validated, and
-      computed macros (15.3) stay recorded, not computed.
+      invoke other macros, and computed bodies (15.3) evaluate at
+      match time over a restricted statement subset (`var`/
+      assignments, braced `if`/`else`, `return`, the implicit
+      `result`; string parameters (their matched text), string
+      literals, `+`, `==`/`!=`, calls) — `reject_match()` and any
+      unevaluable construct decline the definition so the next
+      lower-priority definition applies, and the returned string
+      tokenizes into the expansion. The v1 approximations: literals
+      match one token each (whitespace literals vanish), the
+      repetition form matches as one non-terminal, categories are
+      not validated, and computed bodies beyond the subset (method
+      calls, `is a` checks, `else if` chains, list/number
+      expressions) decline.
       `expect`/`assume` members (clause 11.4) parse their
       temporal expressions into the clause 12 grammar
       (`TemporalExpr`: `@event` atoms, `cycle`, `true(exp)`,
@@ -133,9 +142,9 @@
       diagnostics and declaration/member/statement-level recovery. The
       CLI resolves `import a.b` to `a/b.e` or `a.b.e` beside the source
       and checks the merged declarations (not yet: template `extend` (clause 8.2) and body-level instance substitution,
-      computed macros and the full match-expression grammar (clause
-      15.4's repetition and the 15.3 computed bodies — simple
-      define-as macros expand, see M1), the remaining clause 14
+      the full match-expression grammar (clause 15.4's repetition and
+      category validation — computed macros evaluate their restricted
+      body subset, see M1), the remaining clause 14
       coverage model —
       the option tables beyond per_instance/at_least/weight, coverage
       configuration (28.9) and per-unit-instance options (14.1.1) —

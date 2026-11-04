@@ -4415,7 +4415,7 @@ fn parse_character_literal(text: &str) -> Option<i128> {
 }
 
 /// Interpret the escape sequences the lexer preserved as raw text.
-fn unescape(value: &str) -> String {
+pub(crate) fn unescape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars();
     while let Some(c) = chars.next() {
