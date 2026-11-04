@@ -1520,6 +1520,181 @@ fn group_level_per_instance_marks_all_items() {
 }
 
 #[test]
+fn coverage_mode_off_collects_nothing() {
+    // 14.1's NOTE: "Unless coverage mode is turned on first (see 28.9),
+    // no coverage results are collected, even if cover groups and cover
+    // items are defined." With the mode off (28.9's set_config() is not
+    // wired, so the configuration is the builder API) nothing is built.
+    let parsed = parse(
+        "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
+         item cur: uint;\n        };\n};\n",
+    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let elaborated = elaborate(&parsed.declarations);
+    assert!(
+        elaborated.diagnostics.is_empty(),
+        "{:?}",
+        elaborated.diagnostics
+    );
+    let config = e1647::coverage::CoverageConfig {
+        mode: false,
+        ..e1647::coverage::CoverageConfig::default()
+    };
+    assert!(e1647::coverage::build_with_config(&elaborated, &config).is_empty());
+    // The default configuration keeps collection on (the documented v1
+    // deviation: the standard's mode starts off until set_config turns
+    // it on, and the routine is not wired yet).
+    assert!(
+        !e1647::coverage::build_with_config(
+            &elaborated,
+            &e1647::coverage::CoverageConfig::default()
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn max_int_buckets_configuration_sets_the_default_bucket_count() {
+    // 14.2: "If ranges is not specified, the default number of buckets
+    // is 16 [set by the max_int_buckets coverage configuration option
+    // (see 28.9)]."
+    let parsed = parse(
+        "extend sys {\n    event cov_e;\n    n: uint;\n    cover cov_e is {\n        item n: uint;\n    };\n};\n",
+    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let elaborated = elaborate(&parsed.declarations);
+    assert!(
+        elaborated.diagnostics.is_empty(),
+        "{:?}",
+        elaborated.diagnostics
+    );
+    let config = e1647::coverage::CoverageConfig {
+        max_int_buckets: 4,
+        ..e1647::coverage::CoverageConfig::default()
+    };
+    let coverage = e1647::coverage::build_with_config(&elaborated, &config);
+    let item = &coverage[0].groups[0].items[0];
+    assert_eq!(item.buckets.len(), 4);
+    assert_eq!(item.buckets[0].label, "0");
+    assert_eq!(item.buckets[3].lo, 3);
+    // 0 leaves the item without default buckets (ungradeable, noted).
+    let config = e1647::coverage::CoverageConfig {
+        max_int_buckets: 0,
+        ..e1647::coverage::CoverageConfig::default()
+    };
+    let coverage = e1647::coverage::build_with_config(&elaborated, &config);
+    let item = &coverage[0].groups[0].items[0];
+    assert!(item.buckets.is_empty());
+    assert_eq!(item.grade(), None);
+    assert!(item.note.is_some(), "the honest note is recorded");
+}
+
+#[test]
+fn no_collect_group_option_suppresses_the_group() {
+    // 14.1.1: "if one or both of no_collect and instance_no_collect
+    // options of the group are evaluated to TRUE, the group shall not
+    // be presented under that instance." The constant TRUE spelling is
+    // not presented at all — not sampled, not graded, not reported.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
+         no_collect = TRUE;\n        item cur: uint using ranges = {\n            \
+         range([0..1], \"low\");\n        };\n    };\n    run() is also {\n        \
+         cur = 0; emit cov_e;\n    };\n};\n",
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(result.coverage.len(), 1);
+    assert!(result.coverage[0].groups.is_empty());
+}
+
+#[test]
+fn instance_no_collect_groups_are_not_presented_either() {
+    // 14.1.1's OR relation: instance_no_collect = TRUE alone (no
+    // no_collect on the group) suppresses presentation the same way.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
+         instance_no_collect = TRUE;\n        item cur: uint;\n    };\n    run() is also {\n        \
+         cur = 0; emit cov_e;\n    };\n};\n",
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert!(result.coverage[0].groups.is_empty());
+}
+
+#[test]
+fn no_collect_item_option_suppresses_the_item() {
+    // 14.2.3: "if one or both of no_collect and instance_no_collect
+    // options of the item are evaluated to TRUE, the item shall not be
+    // presented under that instance" — the item drops from the group;
+    // its siblings still collect.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    a: uint;\n    b: bool;\n    cover cov_e is {\n        \
+         item a: uint using no_collect = TRUE, ranges = {\n            range([0..1], \"low\");\n        };\n        \
+         item b: bool;\n    };\n    run() is also {\n            a = 0; b = TRUE; emit cov_e;\n        };\n};\n",
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let group = &result.coverage[0].groups[0];
+    assert_eq!(group.items.len(), 1);
+    assert_eq!(group.items[0].name, "b");
+    assert_eq!(group.items[0].buckets[1].hits, 1);
+}
+
+#[test]
+fn name_option_renames_cross_and_transition_items() {
+    // 14.3/14.4: a cross or transition "creates a new item with a name
+    // specified using a name option" instead of the default
+    // cross_a__b / transition__base names.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    op: uint;\n    carry: bool;\n    cover cov_e is {\n        \
+         item op: uint using ranges = { range([0..1], \"low\"); };\n        \
+         item carry: bool;\n        cross op, carry using name = \"op_by_carry\";\n        \
+         transition op using name = \"op_seq\";\n    };\n    run() is also {\n            \
+         op = 0; carry = TRUE; emit cov_e;\n            op = 1; carry = FALSE; emit cov_e;\n        };\n};\n",
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let group = &result.coverage[0].groups[0];
+    assert_eq!(group.derived.len(), 2);
+    assert_eq!(group.derived[0].name, "op_by_carry");
+    assert_eq!(
+        group.derived[0].sources,
+        vec!["op".to_owned(), "carry".to_owned()]
+    );
+    assert_eq!(group.derived[0].combos.len(), 2);
+    assert_eq!(group.derived[1].name, "op_seq");
+    assert_eq!(group.derived[1].sources, vec!["op".to_owned()]);
+    assert_eq!(group.derived[1].samples, 1);
+}
+
+#[test]
+fn group_level_at_least_and_weight_apply_to_items_without_their_own() {
+    // 14.8.2/14.8.3: weights and the at_least minimum "can be specified
+    // in the coverage group or item definitions" — the group option
+    // applies to every item that does not set its own; the item-level
+    // spelling wins where present.
+    let result = run_source(
+        "extend sys {\n    event cov_e;\n    a: uint;\n    b: bool;\n    c: bool;\n    cover cov_e is {\n        \
+         at_least = 2;\n        weight = 3;\n        item a: uint using ranges = {\n            \
+         range([0..1], \"low\");\n        };\n        item b: bool using at_least = 4;\n        \
+         item c: bool;\n    };\n    run() is also {\n            a = 0; emit cov_e;\n        };\n};\n",
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let group = &result.coverage[0].groups[0];
+    // `a` and `c` take the group's readings.
+    let a_item = &group.items[0];
+    assert_eq!(a_item.buckets[0].goal, 2);
+    assert_eq!(a_item.weight, 3);
+    assert_eq!(group.items[2].buckets[0].goal, 2);
+    assert_eq!(group.items[2].weight, 3);
+    // `b`'s own at_least wins; its weight still comes from the group.
+    let b_item = &group.items[1];
+    assert_eq!(b_item.buckets[0].goal, 4);
+    assert_eq!(b_item.weight, 3);
+}
+
+#[test]
 fn repeat_until_executes_at_least_once() {
     // 20.2.2: the body executes at least once, then repeatedly until
     // the condition is TRUE. (Locals, not fields — the implicit gen
