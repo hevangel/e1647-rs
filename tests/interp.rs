@@ -1069,6 +1069,29 @@ fn template_typed_fields_instantiate_their_monomorphized_view() {
 }
 
 #[test]
+fn method_body_new_returns_a_usable_template_instance() {
+    // 8.3 with 8.2: a template body's method containing `new iterator
+    // of <type>` substitutes the formal in the body's type position,
+    // the referenced instance materializes (its only reference is the
+    // body — no field or signature names it), and `new` instantiates
+    // it: the returned object carries the substituted instance's
+    // fields and dispatches its methods across the chain
+    // sys → container of (int) → iterator of (int).
+    let output = clean_output(
+        "struct base_struct {\n    id: int;\n};\n\
+         template struct container of <type> like base_struct {\n    \
+         make(): base_struct is {\n        return new iterator of <type> with { idx = 41; };\n    };\n};\n\
+         template struct iterator of <type> like base_struct {\n    idx: int;\n    \
+         bump(): uint is {\n        return idx + 1;\n    };\n};\n\
+         extend sys {\n    c: container of (int);\n    run() is also {\n        \
+         var it: base_struct;\n        it = c.make();\n        print it.idx;\n        print it.bump();\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("41"), "output: {output}");
+    assert!(output.contains("42"), "output: {output}");
+}
+
+#[test]
 fn enclosing_when_constraints_gate_gen_of_the_field() {
     // 10.2.7's connected field sets, v1: `gen p` inside a when-view
     // instance is gated by the when block's constraints, rebased from

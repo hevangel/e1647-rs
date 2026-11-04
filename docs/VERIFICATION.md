@@ -2755,3 +2755,131 @@ honest note); group-level `no_collect = TRUE` and the OR relation's
 cross/transition `name` option; and the group-level
 `at_least`/`weight` applying where the item sets none (the item-level
 `at_least` winning).
+
+## 2026-11-04 (43) — offline arc: clause 8.2 template extensions and method-body instance substitution
+
+Branch `agent/template-extend` (off main after #32 merged). Template
+extensions stop being unparsed, and the substitution reaches into
+method bodies.
+
+Prose findings that constrained the design (clause references only,
+local copy under `local/`; the 8.1.2 category table, the 8.2 syntax
+examples and the 8.2.1 example bodies are images in the redline PDF):
+
+- 8.2: "The number of parameters in param-list must be equal to the
+  number of parameters in the original template declaration. Tags may
+  be different from the original template declaration" — an
+  extension's formals bind positionally under its OWN tags; a count
+  mismatch is a definition error.
+- 8.2: "A template extension applies to a given template instance if
+  and only if all type parameters comply with these specifications:
+  Category compliance where type-category is specified, or the
+  specific type where type-name is specified" — the parameter
+  specification is either a category or a concrete type name.
+- 8.3's NOTE 3: "each one of them applies to this template instance
+  only if all actual parameters comply with types or type categories
+  specified for the corresponding parameters in that extension", and
+  8.2's example prose (the extension "applies only to those instances
+  ... whose first parameter is an enumerated type ... It does not
+  apply to instances whose first parameter is a different type") —
+  non-compliance means the extension does not apply at all.
+- 8.3's prose names the `scalar` category (a struct actual "does not
+  comply with the category specified for the first parameter--scalar")
+  and 5.1's prose reads scalar types as "numeric, Boolean, or
+  enumerated" (so an enumerated type complies with `scalar`); 8.2.1's
+  prose gives the `enumerated` reading. The full category table of
+  8.1.2 is an image, so only `type` (no constraint), `scalar` and
+  `enumerated` are honored — any other spelling reads as the
+  specific-type form, which can only ever mismatch (never a false
+  application).
+- 8.3: "substituting an actual parameter for the corresponding
+  template parameter within the template body, including within the
+  bodies of any applicable template extensions" — the substitution
+  covers method bodies, both for the template's own body and for a
+  complying extension's members.
+
+Implementation:
+
+- Parser (`src/parser.rs`, `src/ast.rs`): `template extend name of
+  <params> { .. };` parses as a `Declaration` with kind `Extend` and
+  the new `template_extend` flag, carrying the extension's own
+  `TemplateParam` list (tags and categories recorded); the
+  `like` clause stays a template-definition form and is not parsed on
+  extensions (8.2's syntax image).
+- Elaboration (`src/elab.rs`): template extensions are indexed
+  separately from plain extends — a template's own composed members
+  stay extension-free. The monomorphization worklist applies, per
+  materialized instance: the 8.2 arity check (`E0304`, once per
+  extension, the extension skipped); 8.3-NOTE-3 compliance (each
+  actual against its position's specification — `type`/bare tag: no
+  constraint, `scalar`/`enumerated` shape checks over the elaborated
+  types, any other spelling: the actual must render to exactly that
+  name); then a complying extension's fields, constraints, methods
+  and `on` blocks substitute the extension's formals with the
+  instance's actuals (defaults filled, positional) and append. The
+  original template's own parameter categories stay unvalidated
+  (8.3's NOTE 2), consistent with their treatment before extensions
+  landed.
+- Method-body instance substitution (8.3): a small walker
+  substitutes the formals in every type position inside method
+  bodies — local-variable types, `new <type>`, `as_a(<type>)`,
+  `is [not] a <type>`, `set_of_values(<type>)` — recursively through
+  statements and expressions, in both template bodies and extension
+  members; every template reference the substitution uncovers joins
+  the worklist, so a body's `new iterator of <type>` materializes
+  that instance even when no field or signature names it (the
+  worklist's initial seeding walks bodies too, for non-template
+  types' bodies).
+- Interpreter (`src/interp.rs`, minimal — the evaluator's `Expr::New`
+  arm only): typed `new <named-or-template-instance> [with { .. }]`
+  (6.2) instantiates the named type (the monomorphized instance's
+  canonical name for a template reference) and runs the `with`
+  assignments against the fresh instance; untyped `new` and other
+  type spellings keep the explicit `E0402` not-supported diagnostic.
+
+Honest v1 limits (documented in code and the docs): 8.4's template
+when-subtype instances do not compose; extension members beyond
+fields/constraints/methods/`on` blocks (whens, covers, expects,
+ports, events) do not compose; the 8.2 subtype propagation of applied
+extensions ("as well as to all subtypes of those instances") has no
+surface yet (template instances do not synthesize when views); an
+extension method overriding a template method without `is also` is
+not an elaboration error (E0303 runs per declaration, not per
+instance — both method blocks would run); untyped `new` stays
+unsupported.
+
+Corpus state (absolute paths, run --seed 1): etl 4, cover-edges 4,
+golden-imports 3, golden-combined/igen-dist/type-min-max/
+save-restart/d6w 0 — unchanged. Run outputs of all eight corpus
+files are byte-identical to a main-branch build (`git stash`
+rebuild), as is the etl `elab` diagnostic set (35 pre-existing
+E0303s); golden-combined keeps exit 0 with the pre-existing
+implicit-gen E0407.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(225 passed: 20 elab, 1 fixtures, 105 interp, 24 lexer, 58 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 4 elaboration tests — the enumerated-category extension
+applying to `packet of (color_e, int)` (its field and method on the
+view, the actual substituted through the extension's own tags) and
+not applying to `packet of (int, int)`; the specific-type parameter
+form applying only to the exactly-named actual; the 8.2 arity
+mismatch reporting `E0304` once while the instance still
+materializes; and a body-only `new iterator of <type>` reference
+materializing `iterator of (int)` with the body's `new` substituted.
+1 interpreter test — a template method whose body does
+`new iterator of <type> with { idx = 41; }` returning a usable
+instance across the chain sys → `container of (int)` →
+`iterator of (int)` (the instance referenced only in the body; field
+read and method dispatch on the returned object).
+

@@ -36,8 +36,11 @@
 > (weights/min/max/edges/others/normal). `when` subtypes (clause 6.6)
 > resolve: when-qualified field types instantiate synthesized subtype
 > views whose when members apply. Template instances (clause 8.3)
-> monomorphize: actuals substitute for formals and template-typed
-> fields carry the instance. Simple macros (clause 15) expand before
+> monomorphize: actuals substitute for formals (method bodies
+> included) and template-typed fields carry the instance; clause 8.2
+> template extensions apply to the instances whose actuals comply
+> with the extension's parameter categories. Simple macros (clause 15)
+> expand before
 > parsing, and the reflection set (`set_of_values` with the 27.4 set
 > pseudo-methods) evaluates. Clause 20's `repeat until` loops and the
 > `do` sugar run. It does **not** yet do

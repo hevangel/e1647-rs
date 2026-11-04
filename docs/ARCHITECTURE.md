@@ -94,21 +94,34 @@ multi-simulator HDL API, and wasm32.
   the body's trailing `;` belongs to the body segment, not the
   expansion. Clause 5 scalar type declarations (`type name: <type>;`)
   record the underlying representation. Clause 8 template declarations
-  (`template [package] struct|unit name of <params> [like base] { .. }`)
-  record their `<tag'category>` parameters and defaults; formals
+  (`template [package] struct|unit|extend name of <params> [like base]
+  { .. }`) record their `<tag'category>` parameters and defaults; a
+  `template extend` (8.2) is flagged `template_extend` with its own
+  parameter list instead of being folded by name; formals
   (`<type>`), template references (`deque of int`) and keyed lists
-  (`list (key:it) of t`) are TypeExpr variants, and `new [<type>]
-  [with { .. }]` parses to an explicit not-supported runtime
-  diagnostic. Template instances monomorphize (8.3): a worklist
-  seeded from every type's member types materializes one struct per
+  (`list (key:it) of t`) are TypeExpr variants. Template instances
+  monomorphize (8.3): a worklist
+  seeded from every type's member types and method bodies
+  materializes one struct per
   distinct instance under its canonical name (`name of (actuals)`,
   `TypeExpr::render`), substituting actuals for formals in field
-  types and method signatures, filling trailing parameters from
+  types, method signatures and method bodies (the type positions
+  inside actions — `new <template> of <type>`, casts, `is a` checks,
+  local types — substitute, and every instance a body names joins the
+  worklist), filling trailing parameters from
   defaults (defaults referencing earlier formals substitute through),
   and substituting the parameterized base to the view's base chain —
   template-typed fields then generate and dispatch through the view.
-  Method-body references to other instances and category-compliance
-  checks substitute/verify in a later milestone.
+  Each extension applies per instance when every actual complies with
+  the extension's parameter specifications (8.3's NOTE 3): the
+  prose-named `scalar`/`enumerated` categories check the actual's
+  shape (8.1.2's category table is an image, so any other spelling is
+  read as 8.2's specific-type form and can only ever mismatch), the
+  original template's own categories stay unvalidated (8.3's NOTE 2),
+  and an arity mismatch reports `E0304` once and skips the extension.
+  Typed `new <named-or-template-instance> [with { .. }]` instantiates
+  and runs the `with` assignments (clause 6.2); untyped `new` parses
+  to an explicit not-supported runtime diagnostic.
   Clause 14 coverage groups (`cover <event> is [also] { .. };`, `is
   empty;`) record their item/cross/transition entries structurally and
   every option clause verbatim; the derived entries synthesize
@@ -331,8 +344,10 @@ selects), HDL-edge- and bind()-driven event-port triggering (the
 the `@sim` gap), the preprocessor's rescanned/repeated substitution
 and backtick preprocessor names (replacement rules apply in one
 pass, per file — B.5's include-order visibility through `import` is
-not modeled), `template extend` (8.2) and method-body instance
-substitution, template category-compliance checks (8.3's notes),
+not modeled), clause 8.4's template when-subtype instances, extension
+members beyond fields/constraints/methods/`on` blocks and the 8.2
+subtype propagation of applied extensions (the 8.3 NOTE 2
+actual-category validation stays out with the original template's),
 computed macros beyond the evaluated body subset (method calls,
 `is a` checks, `else if` chains, list/number expressions — such
 bodies decline, clause 15.3) and the match-expression grammar's

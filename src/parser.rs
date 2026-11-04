@@ -498,6 +498,7 @@ impl Parser {
                             name_span: (gstart, gstart),
                             underlying: None,
                             template_params: Vec::new(),
+                            template_extend: false,
                             packaged: false,
                             like: None,
                             like_span: None,
@@ -532,6 +533,7 @@ impl Parser {
                             name_span: (gstart, gstart),
                             underlying: None,
                             template_params: Vec::new(),
+                            template_extend: false,
                             packaged: false,
                             like: None,
                             like_span: None,
@@ -702,6 +704,7 @@ impl Parser {
                 name_span: (start, start),
                 underlying: None,
                 template_params: Vec::new(),
+                template_extend: false,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -716,6 +719,7 @@ impl Parser {
                 name_span: (start, start),
                 underlying: None,
                 template_params: Vec::new(),
+                template_extend: false,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -750,6 +754,7 @@ impl Parser {
                 name_span,
                 underlying: None,
                 template_params: Vec::new(),
+                template_extend: false,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -761,28 +766,35 @@ impl Parser {
         ])
     }
 
-    /// `template (struct|unit) name of <params> [like base] { members };`
-    /// (clause 8.1). The parameters are recorded; instantiation
-    /// (monomorphization) is a later milestone. A parameterized base
-    /// type (`like container of <type>`) lands in `like` (the base
-    /// name) and `like_type` (the full expression). Template `extend`
-    /// (clause 8.2) is not parsed yet.
+    /// `template (struct|unit|extend) name of <params> [like base] {
+    /// members };` (clause 8.1/8.2). The parameters are recorded; a
+    /// template extension (8.2) records its own formal parameters and is
+    /// flagged `template_extend` — the elaborator applies it to the
+    /// instances whose actuals comply (8.3's NOTE 3), not by name
+    /// composition. A parameterized base type (`like container of
+    /// <type>`) lands in `like` (the base name) and `like_type` (the
+    /// full expression); the `like` clause is a template-definition
+    /// form and is not parsed on extensions (the 8.2 syntax example is
+    /// an image in the local redline copy, so only the prose is
+    /// implemented).
     fn parse_template_declaration(&mut self) -> Option<Declaration> {
         let start = self.current_span().0;
         self.bump(); // 'template'
-        let kind = match self.peek_kind() {
-            Some(TokenKind::Keyword(k)) if k == "struct" => DeclarationKind::Struct,
-            Some(TokenKind::Keyword(k)) if k == "unit" => DeclarationKind::Unit,
+        let (kind, template_extend) = match self.peek_kind() {
+            Some(TokenKind::Keyword(k)) if k == "struct" => (DeclarationKind::Struct, false),
+            Some(TokenKind::Keyword(k)) if k == "unit" => (DeclarationKind::Unit, false),
+            // `template extend name of <params> { .. };` (clause 8.2).
+            Some(TokenKind::Keyword(k)) if k == "extend" => (DeclarationKind::Extend, true),
             _ => {
                 self.error_here(
                     "E0101",
-                    "expected 'struct' or 'unit' after 'template' (template extend is not supported yet)",
+                    "expected 'struct', 'unit' or 'extend' after 'template'",
                 );
                 self.recover_to_declaration_boundary();
                 return None;
             }
         };
-        self.bump();
+        self.bump(); // 'struct' | 'unit' | 'extend'
         let (name, name_span) = self.expect_identifier("E0102", "expected the template name")?;
         self.expect_keyword_word("of")?;
         let mut template_params = Vec::new();
@@ -804,7 +816,7 @@ impl Parser {
         let mut like = None;
         let mut like_span = None;
         let mut like_type = None;
-        if self.eat_keyword("like") {
+        if !template_extend && self.eat_keyword("like") {
             let base = self.parse_type()?;
             like_span = Some(base.span());
             like = match &base {
@@ -826,6 +838,7 @@ impl Parser {
                 name_span,
                 underlying: None,
                 template_params,
+                template_extend,
                 packaged: false,
                 like,
                 like_span,
@@ -844,6 +857,7 @@ impl Parser {
             name_span,
             underlying: None,
             template_params,
+            template_extend,
             packaged: false,
             like,
             like_span,
@@ -897,6 +911,7 @@ impl Parser {
                 name_span,
                 underlying: Some(underlying),
                 template_params: Vec::new(),
+                template_extend: false,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -917,6 +932,7 @@ impl Parser {
                 name_span,
                 underlying: None,
                 template_params: Vec::new(),
+                template_extend: false,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -961,6 +977,7 @@ impl Parser {
                 name_span,
                 underlying: None,
                 template_params: Vec::new(),
+                template_extend: false,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -990,6 +1007,7 @@ impl Parser {
                 name_span,
                 underlying: None,
                 template_params: Vec::new(),
+                template_extend: false,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -1006,6 +1024,7 @@ impl Parser {
             name_span,
             underlying: None,
             template_params: Vec::new(),
+            template_extend: false,
             packaged: false,
             like: None,
             like_span: None,
@@ -1110,6 +1129,7 @@ impl Parser {
                 name_span,
                 underlying: None,
                 template_params: Vec::new(),
+                template_extend: false,
                 packaged: false,
                 like_type,
                 like,
@@ -1130,6 +1150,7 @@ impl Parser {
             name_span,
             underlying: None,
             template_params: Vec::new(),
+            template_extend: false,
             packaged: false,
             like_type,
             like,
