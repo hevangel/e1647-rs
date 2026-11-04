@@ -1025,6 +1025,30 @@ fn when_views_carry_methods_and_base_membership() {
 }
 
 #[test]
+fn chained_when_views_compose_both_levels_constraints() {
+    // 6.6 chained: a chained-qualified field (`LO HI pkt`) carries the
+    // combined view — the outer when's constraint and the when-in-when
+    // member's constraint both gate its gen (here two select policies:
+    // one field biased to min, the other to max) — and `is a` walks
+    // the combined view's containment chain to the base type.
+    let output = clean_output(
+        "type mode_t : [LO, HI];\n\
+         type dir_t : [UP, DOWN];\n\
+         struct pkt {\n    kind: mode_t;\n    dir: dir_t;\n    v: uint (bits: 8);\n    w: uint (bits: 8);\n    \
+         when LO kind is {\n            keep soft v == select { 1000 : min; };\n        \
+         when HI dir is {\n                keep soft w == select { 1000 : max; };\n            };\n        };\n};\n\
+         extend sys {\n    p: LO HI pkt;\n    run() is also {\n        gen p;\n        print p.v;\n        print p.w;\n        \
+         if p is a pkt {\n            out(\"IS A PKT\");\n        };\n        \
+         if p is a LO pkt {\n            out(\"IS A LO PKT\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("0"), "output: {output}");
+    assert!(output.contains("255"), "output: {output}");
+    assert!(output.contains("IS A PKT"), "output: {output}");
+    assert!(output.contains("IS A LO PKT"), "output: {output}");
+}
+
+#[test]
 fn template_typed_fields_instantiate_their_monomorphized_view() {
     // 8.3: a field of template-instance type carries the
     // monomorphized struct — its fields generate, its methods resolve,
@@ -1554,4 +1578,49 @@ fn while_do_sugar_parses_and_runs() {
         1,
     );
     assert!(output.contains("3"), "output: {output}");
+}
+
+#[test]
+fn define_replacement_substitutes_before_running() {
+    // Clause 21.3's replacement rules: the token pre-pass
+    // (src/preproc.rs) rewrites the defined name in subsequent code, so
+    // the interpreter sees the literal 3.
+    let output = clean_output(
+        "#define N 3\nextend sys {\n    run() is also {\n        var x: uint = N * 2;\n        \
+         out(\"x=\", x, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("x=6"), "output: {output}");
+}
+
+#[test]
+fn define_replacement_leaves_string_literals_alone() {
+    // The substitution stops at string literals (21.3's "except inside
+    // string literals").
+    let output = clean_output(
+        "#define N 3\nextend sys {\n    run() is also {\n        out(\"N=\", \"N\", \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("N=N"), "output: {output}");
+}
+
+#[test]
+fn hash_else_branches_run() {
+    // 21.2's `#else`: the alternative group runs when the condition
+    // fails, and the primary group runs (the alternative skipped
+    // without parsing) when it holds.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        #ifdef MISSING {\n            \
+         out(\"no\\n\");\n        } #else {\n            out(\"yes\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("yes"), "output: {output}");
+    assert!(!output.contains("no"), "output: {output}");
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        #define MISSING\n        #ifdef MISSING {\n            \
+         out(\"flag\\n\");\n        } #else {\n            out(\"other\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert!(output.contains("flag"), "output: {output}");
+    assert!(!output.contains("other"), "output: {output}");
 }

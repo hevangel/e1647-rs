@@ -1126,6 +1126,149 @@ fn conditional_directive_at_file_level_is_rejected() {
 }
 
 #[test]
+fn define_replacement_substitutes_subsequent_code() {
+    // Clause 21.3: "the given text is substituted for every occurrence
+    // of the name in subsequent code" — the token pre-pass in
+    // src/preproc.rs rewrites the name before the parser runs, so the
+    // initializer below is the literal 8.
+    let declarations = expect_clean(
+        "#define WIDTH 8\nextend sys {\n    run() is also {\n        var x: uint = WIDTH;\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    let Stmt::VarDecl {
+        init: Some(init), ..
+    } = &run.body[0]
+    else {
+        panic!("expected a var declaration");
+    };
+    let Expr::IntLiteral { text, .. } = init else {
+        panic!("expected the substituted literal, got {init:?}");
+    };
+    assert_eq!(text, "8");
+}
+
+#[test]
+fn define_replacement_is_single_pass() {
+    // The spliced replacement tokens are not rescanned (documented v1
+    // approximation in src/preproc.rs): `A` becomes `B` even though `B`
+    // is itself defined.
+    let declarations = expect_clean(
+        "#define A B\n#define B 2\nextend sys {\n    run() is also {\n        var x: uint = A;\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    let Stmt::VarDecl {
+        init: Some(init), ..
+    } = &run.body[0]
+    else {
+        panic!("expected a var declaration");
+    };
+    let Expr::Ident { name, .. } = init else {
+        panic!("expected the unsubstituted identifier, got {init:?}");
+    };
+    assert_eq!(name, "B");
+}
+
+#[test]
+fn define_replacement_skips_directives_and_strings() {
+    // The pre-pass must not rewrite the directives that define or test
+    // the name (the `#ifdef`/`#undef` spellings stay readable — had the
+    // name been substituted there, `f` would be excluded and `g` never
+    // defined) nor occurrences inside string literals (21.3's "except
+    // inside string literals").
+    let declarations = expect_clean(
+        "struct s {\n    \
+         #define X uint\n    \
+         #ifdef X {\n        f: X;\n    };\n    \
+         #undef X\n    \
+         #ifndef X {\n        g: uint;\n    };\n};\n",
+    );
+    assert_eq!(declarations[0].members.len(), 2);
+    let declarations = expect_clean(
+        "#define NAME 5\nextend sys {\n    run() is also {\n        out(\"NAME\");\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    let Stmt::ExprStmt { expr, .. } = &run.body[0] else {
+        panic!("expected an expression statement");
+    };
+    let Expr::Call { args, .. } = expr else {
+        panic!("expected a call, got {expr:?}");
+    };
+    let Expr::StringLiteral { value, .. } = &args[0] else {
+        panic!("expected a string literal, got {:?}", args[0]);
+    };
+    assert_eq!(value, "NAME");
+}
+
+#[test]
+fn hash_else_takes_the_alternative_branch() {
+    // 21.2: for `#ifdef` of an undefined name the `#else` code is
+    // included; after `#define` the first branch wins and the
+    // `#else` group is skipped. Both `} #else {` and `}; #else {`
+    // spellings parse (the extractable prose does not fix the
+    // terminator's position).
+    let declarations = expect_clean(
+        "struct s {\n    \
+         #ifdef MISSING {\n        this is not e at all !!!\n    } #else {\n        there: bool;\n    };\n    \
+         #define MISSING\n    \
+         #ifdef MISSING {\n        flagged: bool;\n    }; #else {\n        not e either !!!\n    };\n};\n",
+    );
+    assert_eq!(declarations[0].members.len(), 2);
+    let Member::Field(there) = &declarations[0].members[0] else {
+        panic!(
+            "expected the #else member, got {:?}",
+            declarations[0].members[0]
+        );
+    };
+    assert_eq!(there.name, "there");
+    let Member::Field(flagged) = &declarations[0].members[1] else {
+        panic!(
+            "expected the primary member, got {:?}",
+            declarations[0].members[1]
+        );
+    };
+    assert_eq!(flagged.name, "flagged");
+}
+
+#[test]
+fn hash_else_at_action_level() {
+    // The `#else` group of an `#ifdef` in an action block parses when
+    // the primary group was excluded (clause 21.2).
+    let declarations = expect_clean(
+        "extend sys {\n    run() is also {\n        #ifdef MISSING {\n            \
+         out(\"no\");\n        } #else {\n            out(\"yes\");\n        };\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    assert_eq!(run.body.len(), 1);
+    let Stmt::ExprStmt { .. } = &run.body[0] else {
+        panic!("expected the #else branch's statement");
+    };
+}
+
+#[test]
+fn define_in_excluded_branch_registers_nothing() {
+    // 21.2 ignores excluded code: a `#define` inside an excluded
+    // `#ifdef` branch defines no flag (the `#ifndef NEVER` below must
+    // still include) and no replacement rule (the width expression
+    // below stays the identifier `N`, which the well-formedness pass
+    // does not flag — unlike the substituted literal 0, which reports
+    // `E0205`).
+    let declarations = expect_clean(
+        "struct s {\n    \
+         #ifdef FLAG {\n        #define NEVER\n        #define N 0\n    };\n    \
+         #ifndef NEVER {\n        f: uint(bits: N);\n    };\n};\n",
+    );
+    assert_eq!(declarations[0].members.len(), 1);
+}
+
+#[test]
 fn macro_definitions_record_header_pattern_and_body() {
     // Clause 15.2/15.3 definitions are recorded uninterpreted: the
     // match-expression grammar and the expansion engine are later

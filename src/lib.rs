@@ -11,8 +11,10 @@
 //! over explicit finite paths ([`temporal`]), and the run loop drives
 //! it: an event log fed by `emit`, a clause 13.1.1 scheduler running
 //! started TCMs concurrently (round-robin turns suspending at
-//! `wait`/`sync`), and quit-time `expect`/`assume` monitoring. See
-//! docs/ROADMAP.md for what is deliberately not implemented yet.
+//! `wait`/`sync`), and quit-time `expect`/`assume` monitoring. The
+//! clause 21 preprocessor applies `#define` replacement rules as a
+//! token pre-pass ([`preproc`]). See docs/ROADMAP.md for what is
+//! deliberately not implemented yet.
 
 pub mod ast;
 pub mod builtins;
@@ -25,5 +27,6 @@ pub mod interp;
 pub mod lexer;
 pub mod macros;
 pub mod parser;
+pub mod preproc;
 pub mod solve;
 pub mod temporal;

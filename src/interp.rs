@@ -691,17 +691,15 @@ impl<'a> Interp<'a> {
             TypeExpr::WhenQualified { value, base, .. } => {
                 // A when-qualified field carries the synthesized subtype
                 // view (6.6): its when members apply for the instance.
-                let TypeExpr::Named {
-                    name: base_name, ..
-                } = base.as_ref()
-                else {
+                // Chained qualifiers resolve to the combined view name.
+                let Some(view_name) = when_view_name(value, base) else {
                     return Value::Void;
                 };
                 if self.depth > 100 {
                     return Value::Void;
                 }
                 self.depth += 1;
-                let index = self.instantiate(&when_view_name(value, base_name));
+                let index = self.instantiate(&view_name);
                 self.depth -= 1;
                 Value::Object(index)
             }
@@ -1967,18 +1965,16 @@ impl<'a> Interp<'a> {
             TypeExpr::WhenQualified { value, base, .. } => {
                 // A when-qualified field generates an instance of the
                 // synthesized subtype view, whose when members (fields,
-                // constraints) apply for it (6.6).
-                let TypeExpr::Named {
-                    name: base_name, ..
-                } = base.as_ref()
-                else {
+                // constraints) apply for it (6.6). Chained qualifiers
+                // resolve to the combined view name.
+                let Some(view_name) = when_view_name(value, base) else {
                     return Ok(Value::Void);
                 };
                 if self.depth > 50 {
                     return Err(self.error("E0406", "recursion too deep", origin_span()));
                 }
                 self.depth += 1;
-                let index = self.instantiate(&when_view_name(value, base_name));
+                let index = self.instantiate(&view_name);
                 let result = self.gen_object(index, &[]);
                 self.depth -= 1;
                 result?;
@@ -3344,19 +3340,16 @@ impl<'a> Interp<'a> {
                 ..
             } => {
                 // The instance must carry the synthesized subtype view
-                // (or a like-descendant of it — the view's base chain
-                // reaches the base type).
-                let TypeExpr::Named {
-                    name: base_name, ..
-                } = base.as_ref()
-                else {
+                // (or a descendant of it — the view's base chain reaches
+                // the base type, and a nested view's chain walks through
+                // the outer view it was applied on top of).
+                let Some(view_name) = when_view_name(modifier, base) else {
                     return Ok(false);
                 };
                 Ok(match value {
-                    Value::Object(index) => self.type_is_a(
-                        &self.instances[*index].type_name,
-                        &when_view_name(modifier, base_name),
-                    ),
+                    Value::Object(index) => {
+                        self.type_is_a(&self.instances[*index].type_name, &view_name)
+                    }
                     _ => false,
                 })
             }
@@ -3817,11 +3810,36 @@ fn as_i64(value: &Value) -> Option<i64> {
     }
 }
 
-/// The synthesized when-subtype view's name (6.6): `VALUE base`, the
-/// spelling the when-qualified field type uses — matches the
-/// elaborator's synthesized [`crate::elab::ElaboratedType`] entry.
-fn when_view_name(value: &str, base_name: &str) -> String {
-    format!("{value} {base_name}")
+/// The synthesized when-subtype view's name for a when-qualified type
+/// (6.6): the qualifying values join space-separated in written order
+/// before the base type's name — `LO HI pkt` for the chained spelling
+/// `LO HI pkt`, matching the elaborator's synthesized
+/// [`crate::elab::ElaboratedType`] entry. `None` when the chain does
+/// not bottom out in a named base type.
+fn when_view_name(value: &str, base: &TypeExpr) -> Option<String> {
+    let mut name = String::from(value);
+    let mut base = base;
+    loop {
+        match base {
+            TypeExpr::WhenQualified {
+                value: inner_value,
+                base: inner_base,
+                ..
+            } => {
+                name.push(' ');
+                name.push_str(inner_value);
+                base = inner_base;
+            }
+            TypeExpr::Named {
+                name: base_name, ..
+            } => {
+                name.push(' ');
+                name.push_str(base_name);
+                return Some(name);
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// The MAX_UINT predefined constant (the 27.4 guards' bound).

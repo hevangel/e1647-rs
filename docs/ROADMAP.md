@@ -136,9 +136,16 @@
       the field unwidened. In action position (`var x = select ...`)
       the select still reports the honest not-evaluated diagnostic.
       Preprocessor directives (clause 21): `#ifdef` / `#ifndef` /
-      `#define` / `#undef` in statement, struct-member and action
-      positions with flag semantics — `#define` records the flag but
-      applies no text substitution, and `#else` is not parsed. Spanned
+      `#define` / `#undef` / `#else` in statement, struct-member and
+      action positions — `#define` records the flag and applies the
+      21.3 replacement rules as a token pre-pass (the replacement
+      text substitutes for every occurrence of the name in subsequent
+      code, except inside string literals and the directives
+      themselves; single-pass, per-file), `#else` flips the included
+      side of a conditional (both `} #else { .. };` and `}; #else {
+      .. };` spellings; the 21.2 syntax examples are images in the
+      local redline copy, so only the prose is implemented), and
+      excluded branches are skipped without parsing. Spanned
       diagnostics and declaration/member/statement-level recovery. The
       CLI resolves `import a.b` to `a/b.e` or `a.b.e` beside the source
       and checks the merged declarations (not yet: template `extend` (clause 8.2) and body-level instance substitution,
@@ -157,7 +164,10 @@
       choice policies beyond the constant-expression subset (the
       full choice-expression grammar and soft-order interactions),
       `$1`-`$27` match captures,
-      `#define` replacement rules, `#else`)
+      the preprocessor's rescanned/repeated substitution (replacement
+      rules apply in one pass; the backtick Verilog-style names of
+      4.1.5.4 and the cross-file include-order visibility of B.5 are
+      not modeled)
 - [~] Add symbol resolution, types, diagnostics — minimal well-formedness
       checks only (duplicate declaration/field names, duplicate
       parameters/local variables/enumerals, unknown named/`like`/`extend`
@@ -184,16 +194,19 @@
       event (9.4.1), `emit p$;` triggers the port, and the 11.3
       restriction holds — wait/sync/start/compute inside an `on`
       action block report `E0210`. `when` subtypes (6.6) resolve:
-      each single-modifier block (`when BUSY'kind` or the corpus's
-      `when NO_CONSTRAINT env` space form) synthesizes a subtype view
-      named `VALUE base` — the base's composed members with the when
-      block's appended, marked with its discriminator — and
-      when-qualified field types (`f: LO pkt`) instantiate that view,
-      so the when members (fields, constraints including select
-      distributions, methods, on blocks) apply for those instances;
-      `is a` checks walk the view's base chain. Chained modifiers and
-      nested when-in-when blocks compose later; base-typed instances
-      do not dynamically match subtypes yet; there is no type checking
+      each block (`when BUSY'kind`, the corpus's `when NO_CONSTRAINT
+      env` space form, or a chained `when LO'kind HI'sel`) synthesizes
+      a subtype view named with its values space-joined before the
+      base (`LO HI pkt`) — the base's composed members with the when
+      block's appended, marked with every (field, value) pair — and
+      when-qualified field types (`f: LO pkt`, chained
+      `f: LO HI pkt`) instantiate that view, so the when members
+      (fields, constraints including select distributions, methods, on
+      blocks) apply for those instances; a `when` member nested inside
+      a when block applies on top of the enclosing view (a further
+      combined view, budget-capped); `is a` checks walk the view's
+      base chain. Base-typed instances do not dynamically match
+      subtypes yet; there is no type checking
 - [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer
       fields into a solver problem; range membership (`x in [lo..hi]`)

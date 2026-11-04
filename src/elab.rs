@@ -48,10 +48,12 @@ pub struct ElaboratedType {
     /// extends in declaration order — monitored over the run log by the
     /// interpreter.
     pub expects: Vec<crate::ast::ExpectDecl>,
-    /// For a synthesized when-subtype view (6.6): the discriminating
-    /// field id and the modifier value (`("kind", "BUSY")` for
-    /// `when BUSY'kind`). `None` for regular types.
-    pub when_of: Option<(String, String)>,
+    /// For a synthesized when-subtype view (6.6): every discriminating
+    /// (field id, modifier value) pair — `[("kind", "BUSY")]` for
+    /// `when BUSY'kind`, `[("kind", "LO"), ("sel", "HI")]` for the
+    /// chained `when LO'kind HI'sel` or the equivalent two-level
+    /// when-in-when composition. Empty for regular types.
+    pub when_of: Vec<(String, String)>,
     /// `type name: <type>;` — the underlying representation, recorded
     /// only (clause 5); distinct-type semantics are a later milestone.
     pub underlying: Option<crate::ast::TypeExpr>,
@@ -170,7 +172,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                     ons: composed.ons.into_iter().cloned().collect(),
                     covers: composed.covers.into_iter().cloned().collect(),
                     expects: composed.expects.into_iter().cloned().collect(),
-                    when_of: None,
+                    when_of: Vec::new(),
                     underlying: None,
                     enumerals: Vec::new(),
                     ports: composed
@@ -195,7 +197,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 ons: Vec::new(),
                 covers: Vec::new(),
                 expects: Vec::new(),
-                when_of: None,
+                when_of: Vec::new(),
                 underlying: declaration.underlying.clone(),
                 ports: Vec::new(),
                 enumerals: declaration
@@ -212,38 +214,64 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         }
     }
     elaborator.compose_builtin_units(&mut types);
-    // 6.6: synthesize one subtype view per single-modifier `when` block
-    // (`when BUSY'kind { .. }` on type `kind`'s owner): the base's
-    // composed members with the when block's members appended, under
-    // the `VALUE base` name the field-type spelling uses. Instances
-    // typed `VALUE base` (TypeExpr::WhenQualified) carry this view, so
-    // the when block's fields, constraints, methods, on blocks and
-    // cover groups apply for them. Chained modifiers and nested
-    // when-in-when blocks compose in a later milestone.
+    // 6.6: synthesize one subtype view per `when` block (`when
+    // BUSY'kind { .. }` on type `kind`'s owner): the base's composed
+    // members with the when block's members appended, under the
+    // `VALUE base` name the field-type spelling uses. Instances typed
+    // `VALUE base` (TypeExpr::WhenQualified) carry this view, so the
+    // when block's fields, constraints, methods, on blocks and cover
+    // groups apply for them.
+    //
+    // Chained modifiers compose conjunctively (6.6.1: subtypes can be
+    // combinations of fields): every modifier names its determinant
+    // field, and the view carries all the (field, value) pairs under a
+    // name that space-joins the values in modifier order (`V1 V2
+    // base`). A `when` member nested inside a when block applies on
+    // top of the enclosing view: the outer view is synthesized first
+    // and the inner when's modifiers run against the synthesized
+    // view's fields, producing a further view named with the combined
+    // values. Both levels share one worklist: each synthesized view is
+    // queued back, and its own nested whens synthesize on top of it
+    // until no new views appear (budget-capped — 200 synthesized
+    // views — against pathological nesting).
     let base_count = types.len();
-    for base_index in 0..base_count {
-        let whens: Vec<crate::ast::WhenDecl> = types[base_index].whens.clone();
+    let mut worklist: Vec<usize> = (0..base_count).collect();
+    let mut budget = 200usize;
+    while let Some(index) = worklist.pop() {
+        let whens: Vec<crate::ast::WhenDecl> = types[index].whens.clone();
         for when in whens {
-            // Two modifier spellings carry the discriminator: the
-            // conventional `when BUSY'kind` and the corpus's space form
-            // `when NO_CONSTRAINT env` (two bare modifiers — value
-            // first, field id second).
-            let Some((field_id, value)) = (match when.modifiers.as_slice() {
-                [one] => one
-                    .id
-                    .as_ref()
-                    .map(|(id, _)| (id.clone(), one.value.clone())),
-                [first, second] if first.id.is_none() && second.id.is_none() => {
-                    Some((second.value.clone(), first.value.clone()))
-                }
-                _ => None,
-            }) else {
+            let Some(pairs) = when_modifier_pairs(&when) else {
                 continue;
             };
-            let mut view = types[base_index].clone();
-            view.name = format!("{value} {}", view.name);
-            view.base = Some(types[base_index].name.clone());
-            view.when_of = Some((field_id, value));
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            // The enclosing view's own values (none for a base type)
+            // come first, the inner when's values follow, and the
+            // root base type's name closes — the reading order the
+            // chained field-type spelling uses (`f: LO HI pkt`).
+            let mut values: Vec<String> = types[index]
+                .when_of
+                .iter()
+                .map(|(_, value)| value.clone())
+                .collect();
+            values.extend(pairs.iter().map(|(_, value)| value.clone()));
+            let base_name = when_root_base_name(&types, index);
+            let enclosing_name = types[index].name.clone();
+            let mut view = types[index].clone();
+            view.name = format!("{} {}", values.join(" "), base_name);
+            // The combined view's direct base is the view it applies on
+            // top of (`LO HI pkt` → `LO pkt` → `pkt`), so `is a` walks
+            // the containment chain.
+            view.base = Some(enclosing_name);
+            let mut all_pairs = types[index].when_of.clone();
+            all_pairs.extend(pairs);
+            view.when_of = all_pairs;
+            // The base's other when blocks are alternative subtypes,
+            // not refinements of this one — the view composes only the
+            // when-in-when members of the block it came from.
+            view.whens = Vec::new();
             for member in &when.members {
                 match member {
                     crate::ast::Member::Field(field) => view.fields.push(field.clone()),
@@ -254,12 +282,15 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                     crate::ast::Member::On(on) => view.ons.push(on.clone()),
                     crate::ast::Member::Cover(cover) => view.covers.push(cover.clone()),
                     crate::ast::Member::Expect(expect) => view.expects.push(expect.clone()),
-                    // Nested when-in-when chains and the other member
-                    // kinds compose in a later milestone.
+                    // A when-in-when member rides on the synthesized
+                    // view: carry it in the view's whens so the worklist
+                    // applies it on top.
+                    crate::ast::Member::When(inner_when) => view.whens.push(inner_when.clone()),
                     _ => {}
                 }
             }
             types.push(view);
+            worklist.push(types.len() - 1);
         }
     }
     // 8.3: monomorphize the template instances the code uses. "A
@@ -361,7 +392,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             ons: composed.ons.into_iter().cloned().collect(),
             covers: composed.covers.into_iter().cloned().collect(),
             expects: composed.expects.into_iter().cloned().collect(),
-            when_of: None,
+            when_of: Vec::new(),
             underlying: None,
             enumerals: Vec::new(),
             ports: Vec::new(),
@@ -461,7 +492,7 @@ impl<'a> Elaborator<'a> {
                 ons: composed.ons.into_iter().cloned().collect(),
                 covers: composed.covers.into_iter().cloned().collect(),
                 expects: composed.expects.into_iter().cloned().collect(),
-                when_of: None,
+                when_of: Vec::new(),
                 underlying: None,
                 enumerals: Vec::new(),
                 ports: composed
@@ -644,6 +675,52 @@ impl<'a> Elaborator<'a> {
                 ));
             }
         }
+    }
+}
+
+/// The unmarked base type a synthesized when view (or chain of views)
+/// was built from: the enclosing view's own name for a base type, the
+/// innermost `base` otherwise — every when view's base chain ends at a
+/// type whose [`ElaboratedType::when_of`] is empty.
+fn when_root_base_name(types: &[ElaboratedType], index: usize) -> String {
+    let mut cursor = index;
+    while !types[cursor].when_of.is_empty() {
+        let base = types[cursor]
+            .base
+            .as_deref()
+            .expect("a synthesized when view always carries a base");
+        cursor = types
+            .iter()
+            .position(|ty| ty.name == base)
+            .expect("the view's base type is elaborated");
+    }
+    types[cursor].name.clone()
+}
+
+/// The (field id, value) pairs a when block's modifiers declare, or
+/// `None` when the modifier spelling does not identify its determinant
+/// fields. Two spellings carry the discriminators (6.6.1 — subtypes can
+/// be combinations of fields): the conventional `value'id` modifiers,
+/// any number of them (`when BUSY'kind`, `when LO'kind HI'dir`), and
+/// the corpus's space form `when NO_CONSTRAINT env` (two bare modifiers
+/// — value first, field id second). A lone bare modifier names no
+/// field and synthesizes nothing.
+fn when_modifier_pairs(when: &WhenDecl) -> Option<Vec<(String, String)>> {
+    match when.modifiers.as_slice() {
+        [] => None,
+        modifiers if modifiers.iter().all(|modifier| modifier.id.is_some()) => Some(
+            modifiers
+                .iter()
+                .map(|modifier| {
+                    let (id, _) = modifier.id.as_ref().expect("checked above");
+                    (id.clone(), modifier.value.clone())
+                })
+                .collect(),
+        ),
+        [first, second] if first.id.is_none() && second.id.is_none() => {
+            Some(vec![(second.value.clone(), first.value.clone())])
+        }
+        _ => None,
     }
 }
 

@@ -61,6 +61,7 @@ use crate::ast::{
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Position, Token, TokenKind};
 use crate::macros;
+use crate::preproc;
 use std::collections::BTreeSet;
 
 /// Predefined e names that lex as keywords but appear as bare values or
@@ -170,7 +171,10 @@ pub struct ParseResult {
 pub fn parse(source: &str) -> ParseResult {
     let mut diagnostics = Vec::new();
     let tokens = match lexer::tokenize(source) {
-        Ok(tokens) => macros::expand_macros(tokens),
+        // The clause 21 preprocessor (replacement rules) runs before the
+        // clause 15 macro expansion: preprocessor directives execute in
+        // a separate, earlier phase (Annex B.5.1's include order).
+        Ok(tokens) => macros::expand_macros(preproc::substitute_defines(tokens)),
         Err(err) => {
             let end = Position {
                 byte: err.position.byte + 1,
@@ -204,7 +208,7 @@ pub fn parse(source: &str) -> ParseResult {
 pub fn parse_unchecked(source: &str) -> ParseResult {
     let mut diagnostics = Vec::new();
     let tokens = match lexer::tokenize(source) {
-        Ok(tokens) => macros::expand_macros(tokens),
+        Ok(tokens) => macros::expand_macros(preproc::substitute_defines(tokens)),
         Err(err) => {
             let end = Position {
                 byte: err.position.byte + 1,
@@ -251,7 +255,10 @@ struct Parser {
     diagnostics: Vec<Diagnostic>,
     /// Names currently defined by `#define` preprocessor directives,
     /// consulted by `#ifdef` / `#ifndef` (clause 21). Directive state
-    /// follows source order.
+    /// follows source order. The replacement-rule half of `#define`
+    /// (21.3) lives in the [`crate::preproc`] token pre-pass; this set
+    /// is the flag half. Both update on the same directives in the
+    /// same source order.
     defined: BTreeSet<String>,
     /// `package` / `private` visibility prefix of the member being
     /// parsed (clause 22), recorded on the field, not enforced.
@@ -260,7 +267,8 @@ struct Parser {
 
 /// The included body of one preprocessor directive: members in member
 /// position, statements in action position, or nothing (`#define`,
-/// `#undef`, and excluded `#ifdef` / `#ifndef` branches).
+/// `#undef`, and a conditional whose primary group was excluded with
+/// no `#else` following).
 enum HashBody {
     Members(Vec<Member>),
     Statements(Vec<Stmt>),
@@ -1800,12 +1808,16 @@ impl Parser {
     }
 
     /// Consume one `#` directive. `#define NAME <replacement>;` records
-    /// the flag only — the replacement-rule half of clause 21.3 (text
-    /// substitution into later code) is a later milestone. An
+    /// the flag; the replacement-rule half of clause 21.3 has already
+    /// been applied by the token pre-pass in [`crate::preproc`], which
+    /// substitutes defined names before the parser runs. An
     /// `#ifdef`/`#ifndef` body is parsed only when included; excluded
     /// code is skipped without parsing ("ignore it", clause 21.2). The
-    /// body grammar follows the position: members in a struct body,
-    /// statements in an action block.
+    /// optional `#else` (21.2: "an alternative statement when the
+    /// condition does not hold") flips the sides — its group parses
+    /// when the first was skipped and is skipped when the first
+    /// parsed. The body grammar follows the position: members in a
+    /// struct body, statements in an action block.
     fn parse_hash_directive(&mut self, member_position: bool) -> Option<HashBody> {
         self.bump(); // '#'
         let directive = match self.peek_kind() {
@@ -1852,32 +1864,85 @@ impl Parser {
                     !self.defined.contains(&name)
                 };
                 self.expect_punct("{", "E0106", "expected '{' to open the directive body")?;
-                if !included {
-                    self.skip_balanced_braces();
+                // 21.2 puts the primary code "inside the (first)
+                // braces"; the `#else` group follows the first `}`,
+                // either directly (`} #else { .. };`) or after the
+                // group's `;` (`}; #else { .. };`). The extractable
+                // prose does not fix the terminator's position (the
+                // syntax example is an image in the local redline copy),
+                // so both spellings are accepted here and in the
+                // pre-pass.
+                if included {
+                    let body = self.parse_hash_group(member_position)?;
                     self.eat_punct(";");
-                    return Some(HashBody::Skipped);
+                    if self.at_hash_else() {
+                        self.skip_hash_else_group()?;
+                    }
+                    return Some(body);
                 }
-                if member_position {
-                    // parse_member_list consumes the closing `}`; the e
-                    // convention writes `};`, so eat the semicolon too.
-                    let members = self.parse_member_list();
+                self.skip_balanced_braces();
+                self.eat_punct(";");
+                if self.at_hash_else() {
+                    // The alternative group is the included one now.
+                    self.bump(); // '#'
+                    self.bump(); // 'else'
+                    self.expect_punct("{", "E0106", "expected '{' to open the '#else' body")?;
+                    let body = self.parse_hash_group(member_position)?;
                     self.eat_punct(";");
-                    Some(HashBody::Members(members))
-                } else {
-                    let body = self.parse_statements();
-                    self.expect_punct("}", "E0107", "expected '}' to close the directive body")?;
-                    self.eat_punct(";");
-                    Some(HashBody::Statements(body))
+                    return Some(body);
                 }
+                Some(HashBody::Skipped)
             }
         }
     }
 
-    /// Consume the `#define` replacement text without recording it
-    /// (replacement rules are a later milestone). A replacement ends at
-    /// `;` or at the end of the name's line — clause 21.3 allows line
-    /// breaks in a replacement only behind a backslash, which the
-    /// lexer does not produce.
+    /// Parse one included directive group's body and consume the
+    /// closing `}`. Members in a struct body, statements in an action
+    /// block (21.2's position rule). The trailing `;` is the caller's.
+    fn parse_hash_group(&mut self, member_position: bool) -> Option<HashBody> {
+        if member_position {
+            // parse_member_list consumes the closing `}`; the e
+            // convention writes `};`.
+            Some(HashBody::Members(self.parse_member_list()))
+        } else {
+            let body = self.parse_statements();
+            self.expect_punct("}", "E0107", "expected '}' to close the directive body")?;
+            Some(HashBody::Statements(body))
+        }
+    }
+
+    /// Whether an `#else` directive starts here. `else` lexes as a
+    /// keyword (unlike the other directive words); the identifier form
+    /// is tolerated for symmetry with the pre-pass.
+    fn at_hash_else(&self) -> bool {
+        matches!(
+            (self.peek_kind(), self.peek_second_kind()),
+            (
+                Some(TokenKind::Punctuation(p)),
+                Some(TokenKind::Keyword(k) | TokenKind::Identifier(k))
+            ) if p == "#" && k == "else"
+        )
+    }
+
+    /// Consume an `#else` group that is excluded (the first branch was
+    /// included): the `#else` header, its brace group (skipped without
+    /// parsing, 21.2) and the group's `;`.
+    fn skip_hash_else_group(&mut self) -> Option<()> {
+        self.bump(); // '#'
+        self.bump(); // 'else'
+        self.expect_punct("{", "E0106", "expected '{' to open the '#else' body")?;
+        self.skip_balanced_braces();
+        self.eat_punct(";");
+        Some(())
+    }
+
+    /// Consume the `#define` replacement text without recording it —
+    /// the clause 21.3 replacement rules are applied by the token
+    /// pre-pass in [`crate::preproc`]; this consumption keeps the
+    /// directive's replacement line out of the parsed stream. A
+    /// replacement ends at `;` or at the end of the name's line —
+    /// clause 21.3 allows line breaks in a replacement only behind a
+    /// backslash, which the lexer does not produce.
     fn consume_hash_replacement(&mut self, name_line: usize) {
         while let Some(token) = self.peek() {
             match &token.kind {
@@ -2666,18 +2731,30 @@ impl Parser {
             let (name, span) = self.take_identifier();
             // A when-qualified type (`NO_CONSTRAINT env` — the subtype
             // modifier naming the variant of the base type, 6.6): the
-            // qualifier and the base are both recorded.
+            // qualifier and the base are both recorded. Chained
+            // qualifiers (`LO HI pkt` — 6.6.1's subtype combinations,
+            // one value per determinant field) nest: the last
+            // identifier is the base, the preceding ones qualify it
+            // right-to-left, so the rendered name joins the values in
+            // written order (`LO HI pkt`).
             if self.at_identifier() {
-                let (base, base_span) = self.take_identifier();
-                let end = self.last_end();
-                return Some(TypeExpr::WhenQualified {
-                    value: name,
-                    base: Box::new(TypeExpr::Named {
-                        name: base,
-                        span: base_span,
-                    }),
-                    span: (start, end),
-                });
+                let mut identifiers = vec![(name, span)];
+                while self.at_identifier() {
+                    identifiers.push(self.take_identifier());
+                }
+                let (base, base_span) = identifiers.pop().expect("at least two identifiers");
+                let mut base = TypeExpr::Named {
+                    name: base,
+                    span: base_span,
+                };
+                while let Some((value, _)) = identifiers.pop() {
+                    base = TypeExpr::WhenQualified {
+                        value,
+                        base: Box::new(base),
+                        span: (start, self.last_end()),
+                    };
+                }
+                return Some(base);
             }
             // `deque of int` — a template instantiation in a type
             // position (clause 8.3). `list of` never reaches here: the

@@ -200,18 +200,79 @@ fn when_blocks_synthesize_subtype_views() {
          when HI kind is {\n            keep soft v == select { 100 : max; };\n        };\n};\n",
     );
     let view = find(&result, "LO pkt");
-    assert_eq!(view.when_of, Some(("kind".to_owned(), "LO".to_owned())));
+    assert_eq!(view.when_of, vec![("kind".to_owned(), "LO".to_owned())]);
     assert_eq!(view.base, Some("pkt".to_owned()));
     // The view carries the base's fields plus the when constraint.
     assert_eq!(view.fields.len(), 2);
     assert_eq!(view.constraints.len(), 1);
     let hi = find(&result, "HI pkt");
-    assert_eq!(hi.when_of, Some(("kind".to_owned(), "HI".to_owned())));
+    assert_eq!(hi.when_of, vec![("kind".to_owned(), "HI".to_owned())]);
     assert_eq!(hi.constraints.len(), 1);
     // The base itself stays unmarked and without the when constraints.
     let base = find(&result, "pkt");
-    assert_eq!(base.when_of, None);
+    assert_eq!(base.when_of, Vec::<(String, String)>::new());
     assert_eq!(base.constraints.len(), 0);
+}
+
+#[test]
+fn chained_modifiers_synthesize_a_combined_view() {
+    // 6.6.1: subtypes can be combinations of fields — a when block
+    // whose `value'id` modifiers each name their determinant field
+    // synthesizes ONE conjunctive view named with all the values
+    // space-joined in modifier order, carrying every (field, value)
+    // pair.
+    let result = elaborated(
+        "type mode_t : [LO, HI];\n\
+         type dir_t : [UP, DOWN];\n\
+         struct pkt {\n    kind: mode_t;\n    sel: dir_t;\n    v: uint (bits: 8);\n    \
+         when LO'kind HI'sel is {\n            keep soft v == select { 100 : min; };\n        };\n};\n",
+    );
+    let view = find(&result, "LO HI pkt");
+    assert_eq!(
+        view.when_of,
+        vec![
+            ("kind".to_owned(), "LO".to_owned()),
+            ("sel".to_owned(), "HI".to_owned())
+        ]
+    );
+    assert_eq!(view.base, Some("pkt".to_owned()));
+    assert_eq!(view.fields.len(), 3);
+    assert_eq!(view.constraints.len(), 1);
+    // The base itself stays unmarked.
+    assert_eq!(find(&result, "pkt").when_of, Vec::<(String, String)>::new());
+}
+
+#[test]
+fn nested_when_blocks_compose_two_level_views() {
+    // A `when` member inside a when block applies ON TOP of the
+    // enclosing view: the outer view is synthesized first, then the
+    // inner when's modifiers run against the synthesized view's fields,
+    // producing a further view named with the combined values and
+    // carrying BOTH levels' members. The combined view's base chain
+    // walks the outer view to the base type.
+    let result = elaborated(
+        "type mode_t : [LO, HI];\n\
+         type dir_t : [UP, DOWN];\n\
+         struct pkt {\n    kind: mode_t;\n    dir: dir_t;\n    v: uint (bits: 8);\n    w: uint (bits: 8);\n    \
+         when LO kind is {\n            keep soft v == select { 100 : min; };\n        \
+         when HI dir is {\n                keep soft w == select { 100 : max; };\n            };\n        };\n};\n",
+    );
+    // The outer view exists on its own.
+    let outer = find(&result, "LO pkt");
+    assert_eq!(outer.when_of, vec![("kind".to_owned(), "LO".to_owned())]);
+    assert_eq!(outer.constraints.len(), 1);
+    // The combined view carries both levels' pairs and constraints.
+    let combined = find(&result, "LO HI pkt");
+    assert_eq!(
+        combined.when_of,
+        vec![
+            ("kind".to_owned(), "LO".to_owned()),
+            ("dir".to_owned(), "HI".to_owned())
+        ]
+    );
+    assert_eq!(combined.base, Some("LO pkt".to_owned()));
+    assert_eq!(combined.constraints.len(), 2);
+    assert_eq!(combined.fields.len(), 4);
 }
 
 #[test]
