@@ -54,6 +54,11 @@ pub struct ElaboratedType {
     /// chained `when LO'kind HI'sel` or the equivalent two-level
     /// when-in-when composition. Empty for regular types.
     pub when_of: Vec<(String, String)>,
+    /// `event` members (11.1.3) with their triggers as written — the
+    /// simulator-side triggers (`rise/fall/change(HDL expression) @sim`,
+    /// 11.1.4.2) drive the interpreter's sampling. Every instance owns
+    /// its events (11.1.2); the interpreter instantiates per instance.
+    pub events: Vec<crate::ast::EventDecl>,
     /// `type name: <type>;` — the underlying representation, recorded
     /// only (clause 5); distinct-type semantics are a later milestone.
     pub underlying: Option<crate::ast::TypeExpr>,
@@ -70,6 +75,10 @@ pub struct ElaboratedType {
 pub struct PortInfo {
     pub name: String,
     pub hdl_path: Option<String>,
+    /// An event port (9.4): carries events, not data — its `$` event is
+    /// triggerable by sampling the bound HDL object per its `edge()`
+    /// attribute (9.7.2.8), not only by `emit port$`.
+    pub is_event: bool,
 }
 
 /// One `sequence NAME using item = T, created_driver = D, created_kind
@@ -107,6 +116,7 @@ struct Composed<'a> {
     ons: Vec<&'a crate::ast::OnDecl>,
     covers: Vec<&'a crate::ast::CoverGroupDecl>,
     expects: Vec<&'a crate::ast::ExpectDecl>,
+    events: Vec<&'a crate::ast::EventDecl>,
     ports: Vec<(&'a crate::ast::PortDecl, usize)>,
 }
 
@@ -173,6 +183,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                     covers: composed.covers.into_iter().cloned().collect(),
                     expects: composed.expects.into_iter().cloned().collect(),
                     when_of: Vec::new(),
+                    events: composed.events.into_iter().cloned().collect(),
                     underlying: None,
                     enumerals: Vec::new(),
                     ports: composed
@@ -181,6 +192,10 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                         .map(|(port, _)| PortInfo {
                             name: port.name.clone(),
                             hdl_path: port_paths.get(port.name.as_str()).cloned(),
+                            is_event: matches!(
+                                &port.element,
+                                crate::ast::TypeExpr::Named { name, .. } if name == "event"
+                            ),
                         })
                         .collect(),
                     span: declaration.span,
@@ -198,6 +213,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 covers: Vec::new(),
                 expects: Vec::new(),
                 when_of: Vec::new(),
+                events: Vec::new(),
                 underlying: declaration.underlying.clone(),
                 ports: Vec::new(),
                 enumerals: declaration
@@ -393,6 +409,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             covers: composed.covers.into_iter().cloned().collect(),
             expects: composed.expects.into_iter().cloned().collect(),
             when_of: Vec::new(),
+            events: Vec::new(),
             underlying: None,
             enumerals: Vec::new(),
             ports: Vec::new(),
@@ -493,6 +510,7 @@ impl<'a> Elaborator<'a> {
                 covers: composed.covers.into_iter().cloned().collect(),
                 expects: composed.expects.into_iter().cloned().collect(),
                 when_of: Vec::new(),
+                events: composed.events.into_iter().cloned().collect(),
                 underlying: None,
                 enumerals: Vec::new(),
                 ports: composed
@@ -501,6 +519,10 @@ impl<'a> Elaborator<'a> {
                     .map(|(port, _)| PortInfo {
                         name: port.name.clone(),
                         hdl_path: port_paths.get(port.name.as_str()).cloned(),
+                        is_event: matches!(
+                            &port.element,
+                            crate::ast::TypeExpr::Named { name, .. } if name == "event"
+                        ),
                     })
                     .collect(),
                 span: self.declarations[extend_indices[0]].span,
@@ -621,8 +643,9 @@ impl<'a> Elaborator<'a> {
                 Member::Cover(cover) => composed.covers.push(cover),
                 Member::Expect(expect) => composed.expects.push(expect),
                 Member::Port(port) => composed.ports.push((port, block)),
+                Member::Event(event) => composed.events.push(event),
                 Member::Import { .. } | Member::Define { .. } | Member::Macro(_) => {}
-                Member::Event(_) | Member::Enumeral(_) => {}
+                Member::Enumeral(_) => {}
             }
         }
     }

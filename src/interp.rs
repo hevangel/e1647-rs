@@ -39,7 +39,15 @@
 //!
 //! `emit` records the firing and immediately executes the event's `on`
 //! action blocks (clause 11.2), in composition order, on the instance
-//! the event path resolves to; `@sim`-attached events never fire.
+//! the event path resolves to. The simulator-side triggers fire through
+//! the same machinery: `rise/fall/change(HDL expression) @sim` events
+//! (11.1.4.2) and bound event ports (9.4, 9.7.2.8) are sampled every
+//! virtual cycle while an HDL source is available — a live session or
+//! the injected per-cycle test seam ([`crate::hdl::SignalSource`]);
+//! without one they never fire (HDL signals without a simulator). A TCM
+//! declared `@event` commences when that event occurs (17.1.2's implicit
+//! entry sync); every-cycle sampling events (`@sys.any`, `@sim`) keep
+//! the one-cycle implicit sync of the stand-alone model.
 
 use crate::ast::{
     BinaryOp, DeclarationKind, Expr, MethodDecl, ScalarBase, Stmt, TypeExpr, UnaryOp,
@@ -178,6 +186,11 @@ struct Coroutine<'a> {
     frame: Frame,
     me: Option<usize>,
     eligible_at_cycle: u64,
+    /// Set while the coroutine is parked for the occurrence of its TCM
+    /// sampling event — the implicit entry sync of a `@event` TCM
+    /// (17.1.2: "as if the action sync @event was added at the top").
+    /// Cleared when the event fires.
+    wake_event: Option<String>,
     /// Whether the coroutine is suspended at a temporal wait (drives
     /// the per-wait runaway guard).
     suspended_temporal: bool,
@@ -238,6 +251,22 @@ impl Rng {
     }
 }
 
+/// One `rise/fall/change(HDL expression) @sim` event trigger (11.1.4.2),
+/// collected from the elaborated types for the per-cycle sampling.
+#[derive(Clone)]
+struct SimTrigger {
+    /// The type that declares the event; every instance of it owns the
+    /// event (11.1.2).
+    type_name: String,
+    event_name: String,
+    /// `rise` / `fall` / `change` as written.
+    routine: String,
+    /// The monitored HDL expression inside the edge routine's
+    /// parentheses.
+    condition: Expr,
+    span: crate::ast::Span,
+}
+
 struct Interp<'a> {
     types: &'a [crate::elab::ElaboratedType],
     instances: Vec<ObjectInstance>,
@@ -248,14 +277,25 @@ struct Interp<'a> {
     seed: u64,
     output: String,
     depth: usize,
-    /// Live simulator session for the `hdl_*` builtins.
-    hdl: Option<crate::hdl::HdlSession>,
+    /// Where signal values come from: a live simulator session (spawned
+    /// by `hdl_load`) or the injected per-cycle test seam.
+    hdl: Option<crate::hdl::SignalSource>,
     /// Virtual simulation time in cycles, advanced by `wait` statements.
     cycle: u64,
     /// Remaining `wait` statements before a runaway TCM is stopped.
     wait_budget: u64,
     /// Events fired by `emit`, keyed by their path as written.
     emitted: std::collections::BTreeSet<String>,
+    /// The `rise/fall/change(HDL expression) @sim` event triggers
+    /// (11.1.4.2) collected from the elaborated types.
+    sim_triggers: Vec<SimTrigger>,
+    /// The last sampled value per monitored trigger, keyed by (instance,
+    /// event-or-port path) — the edge detection's baseline. `None` marks
+    /// a trigger whose expression has not been sampleable yet.
+    sim_prev: BTreeMap<(usize, String), Option<i128>>,
+    /// The `keep <port>.edge() == <value>` attribute values (9.7.2.8)
+    /// per (type name, port name); the sampling default is `change`.
+    port_edges: BTreeMap<(String, String), String>,
     /// The run's temporal log (clause 12): one state per virtual cycle,
     /// recording which events occurred in it. `emit` writes here and
     /// temporal `wait`s and `expect` rules read it. One global
@@ -302,6 +342,32 @@ const TEMPORAL_WAIT_CYCLES: u64 = 1_000;
 
 /// Instantiate the built-in `sys` unit and execute its `run()` methods.
 pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
+    run_inner(elaborated, seed, None)
+}
+
+/// [`run`] with an injected signal history standing in for the external
+/// simulator: the `hdl_*` routines and the `@sim`/event-port sampling
+/// read `signals` instead of a spawned `xezim` session (the simulator
+/// binary is only provided in the container — tests and offline runs use
+/// this seam). A `hdl_load` in the source replaces the injected source
+/// with a real session.
+pub fn run_with_signals(
+    elaborated: &Elaborated,
+    seed: u64,
+    signals: crate::hdl::InjectedSignals,
+) -> RunResult {
+    run_inner(
+        elaborated,
+        seed,
+        Some(crate::hdl::SignalSource::Injected(signals)),
+    )
+}
+
+fn run_inner(
+    elaborated: &Elaborated,
+    seed: u64,
+    hdl: Option<crate::hdl::SignalSource>,
+) -> RunResult {
     // Resolve `define` constants (literal values only; non-literals are
     // skipped — they need the elaboration-time substitution that a macro
     // pass would provide).
@@ -319,6 +385,42 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
             Some((name.clone(), value))
         })
         .collect();
+    // The simulator-side event triggers: the `rise/fall/change(HDL
+    // expression) @sim` shapes (11.1.4.2) that the run loop samples each
+    // virtual cycle.
+    let sim_triggers: Vec<SimTrigger> = elaborated
+        .types
+        .iter()
+        .flat_map(|ty| {
+            ty.events.iter().filter_map(|event| {
+                let trigger = event.trigger.as_ref()?;
+                // Only the single-item edge shapes are wired: multi-item
+                // triggers, `cycle`, grouped guards and `true(exp)`
+                // samples would need the temporal engine at the sampling
+                // point (documented v1 limit).
+                if trigger.cycle || trigger.group_op.is_some() || trigger.items.len() != 1 {
+                    return None;
+                }
+                let item = &trigger.items[0];
+                // `@sim` is the simulation tick the virtual cycles stand
+                // in for; other sampling events are not wired here.
+                if item.path.as_slice() != ["sim"] {
+                    return None;
+                }
+                let routine = item.routine.as_deref()?;
+                if !matches!(routine, "rise" | "fall" | "change") {
+                    return None;
+                }
+                Some(SimTrigger {
+                    type_name: ty.name.clone(),
+                    event_name: event.name.clone(),
+                    routine: routine.to_owned(),
+                    condition: item.condition.clone()?,
+                    span: event.span,
+                })
+            })
+        })
+        .collect();
     let mut interp = Interp {
         types: elaborated.types.as_slice(),
         instances: Vec::new(),
@@ -326,10 +428,13 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
         seed,
         output: String::new(),
         depth: 0,
-        hdl: None,
+        hdl,
         cycle: 0,
         wait_budget: WAIT_BUDGET,
         emitted: std::collections::BTreeSet::new(),
+        sim_triggers,
+        sim_prev: BTreeMap::new(),
+        port_edges: collect_port_edge_attributes(elaborated),
         temporal_log: Vec::new(),
         coroutines: Vec::new(),
         tracing: false,
@@ -406,7 +511,9 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
     }
     // Clause 13.1.1 scheduler: the run() bodies run as the main
     // coroutine; every `start`ed TCM joins the queue with an implicit
-    // sync cycle before it commences. Round-robin turns run atomically
+    // sync cycle before it commences (a TCM declared `@event` with a
+    // declared sampling event waits for that event's occurrence instead
+    // — 17.1.2). Round-robin turns run atomically
     // from one synchronization action to the next; when no coroutine is
     // eligible, one cycle passes.
     interp.coroutines.push(Coroutine {
@@ -418,17 +525,21 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
         frame: Frame::default(),
         me: Some(sys_index),
         eligible_at_cycle: 0,
+        wake_event: None,
         suspended_temporal: false,
         temporal_waited: 0,
         span: origin_span(),
         wait_start: None,
     });
     let mut diagnostics = Vec::new();
+    // Cycle 0's sample only establishes the monitored values' baseline —
+    // no previous value, so no edge can fire on it.
+    interp.sample_sim_events();
     while !interp.coroutines.is_empty() && !interp.stop_requested {
         let Some(index) = interp
             .coroutines
             .iter()
-            .position(|c| c.eligible_at_cycle <= interp.cycle)
+            .position(|c| c.eligible_at_cycle <= interp.cycle && c.wake_event.is_none())
         else {
             // Nobody eligible: suspended coroutines wait for the next
             // occurrence of their sampling event — one cycle passes.
@@ -443,6 +554,10 @@ pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
             interp.wait_budget -= 1;
             interp.cycle += 1;
             interp.pad_log();
+            // The virtual cycle advanced: sample the simulator-side
+            // triggers (11.1.4.2). A fire feeds the temporal log, runs
+            // the event's `on` blocks and wakes TCMs parked on it.
+            interp.sample_sim_events();
             let mut expired = Vec::new();
             for (position, co) in interp.coroutines.iter_mut().enumerate() {
                 if co.suspended_temporal {
@@ -880,8 +995,8 @@ impl<'a> Interp<'a> {
                                 *span,
                             ));
                         };
-                        let session = self.hdl.as_mut().unwrap();
-                        match session.set(path, int_value) {
+                        let cycle = self.cycle;
+                        match self.hdl.as_mut().unwrap().set(path, int_value, cycle) {
                             Ok(()) => Ok(Flow::Normal),
                             Err(msg) => Err(self.error("E0408", msg, *span)),
                         }
@@ -1180,23 +1295,11 @@ impl<'a> Interp<'a> {
                 }
             },
             Stmt::Emit { target, span } => {
+                // 11.1.3.2: emit causes the event to occur; the action
+                // itself does not consume time.
                 let path = self.event_path(target)?;
-                self.emitted.insert(path.clone());
-                // The occurrence feeds the temporal log: this cycle's
-                // state records the event for `wait`s and `expect`
-                // rules (clause 12).
-                self.pad_log();
-                self.temporal_log[self.cycle as usize].record(&path);
-                // `emit` executes the event's `on` action blocks
-                // immediately, in declaration order (clause 11.2). No
-                // TCMs wait in this milestone, so "before waiting TCMs"
-                // is trivially satisfied; `@sim`-attached events never
-                // fire here.
                 let owner = self.resolve_event_owner(target, frame, me);
-                self.run_on_blocks(&path, owner, *span)?;
-                // 14.1: a coverage group samples when its sampling event
-                // fires — record the items' values into the buckets.
-                self.sample_cover_groups(&path, owner, frame);
+                self.fire_event(&path, owner, *span, frame)?;
                 Ok(Flow::Normal)
             }
             Stmt::Start { call, span } => {
@@ -1245,6 +1348,32 @@ impl<'a> Interp<'a> {
                         *span,
                     ));
                 }
+                // 17.1.2: the TCM implicitly synchronizes on its
+                // designated sampling event upon entry, as if the action
+                // `sync @event` were added at the top of its code. The
+                // every-cycle events keep the implicit sync cycle of the
+                // stand-alone model (`sys.any` occurs automatically —
+                // 11.1.4.1.1; `sim` is the tick the virtual cycles stand
+                // in for); any other declared event parks the TCM until
+                // its occurrence — unless it already occurred this tick,
+                // when the entry sync succeeds immediately and the TCM
+                // is scheduled for the current cycle (17.2.1: "begins
+                // execution when its sampling event is emitted or
+                // immediately if the sampling event has already been
+                // emitted for the current tick" — it still runs only
+                // after the starter's turn yields, 17.2.2).
+                let tcm_event = blocks.first().and_then(|block| block.tcm_event.clone());
+                let (wake_event, eligible_at_cycle) =
+                    match tcm_event.map(|event| self.event_path(&event)) {
+                        Some(Ok(path)) if !is_every_cycle_event(&path) => {
+                            if self.event_occurred_this_cycle(&path) {
+                                (None, self.cycle)
+                            } else {
+                                (Some(path), self.cycle + 1)
+                            }
+                        }
+                        _ => (None, self.cycle + 1),
+                    };
                 self.coroutines.push(Coroutine {
                     kind: CoroutineKind::Tcm {
                         instance,
@@ -1255,8 +1384,11 @@ impl<'a> Interp<'a> {
                     cursor: Vec::new(),
                     frame: Frame::default(),
                     me: Some(instance),
-                    // The implicit "sync cycle" before it commences.
-                    eligible_at_cycle: self.cycle + 1,
+                    // The implicit "sync cycle" before it commences; a
+                    // parked TCM (wake_event set) starts when its event
+                    // fires instead.
+                    eligible_at_cycle,
+                    wake_event,
                     suspended_temporal: false,
                     temporal_waited: 0,
                     span: *span,
@@ -1651,9 +1783,14 @@ impl<'a> Interp<'a> {
             let mut pass = true;
             for constraint in &constraints {
                 // HDL-binding constraints (`keep x.hdl_path() == "…"`,
-                // `keep x.delayed() == FALSE`) record simulator-side
-                // facts, not data constraints; they never gate gen.
-                if expr_calls_any(constraint, &["hdl_path", "delayed", "soft", "select"]) {
+                // `keep x.delayed() == FALSE`, the event-port
+                // `keep x.edge() == …` attribute of 9.7.2.8) record
+                // simulator-side facts, not data constraints; they never
+                // gate gen.
+                if expr_calls_any(
+                    constraint,
+                    &["hdl_path", "delayed", "soft", "select", "edge"],
+                ) {
                     continue;
                 }
                 match self.eval(constraint, &mut Frame::default(), Some(index))? {
@@ -2250,6 +2387,184 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Fire one event occurrence — the shared path of `emit` (11.2) and
+    /// the simulator-side triggers: record it in the current cycle's
+    /// state of the temporal log (clause 12), wake TCMs parked for the
+    /// event (13.1.1's implicit entry sync — 17.1.2), execute the
+    /// event's `on` action blocks immediately and in composition order
+    /// (11.2 — an on action block runs before TCMs waiting for the same
+    /// event), and sample the coverage groups (14.1).
+    fn fire_event(
+        &mut self,
+        path: &str,
+        owner: Option<usize>,
+        span: crate::ast::Span,
+        frame: &mut Frame,
+    ) -> Result<(), Diagnostic> {
+        self.emitted.insert(path.to_owned());
+        self.pad_log();
+        self.temporal_log[self.cycle as usize].record(path);
+        self.wake_tcm_listeners(path);
+        self.run_on_blocks(path, owner, span)?;
+        self.sample_cover_groups(path, owner, frame);
+        Ok(())
+    }
+
+    /// Wake every coroutine parked for `path`'s occurrence: a TCM
+    /// declared `@path` implicitly synchronizes on its sampling event
+    /// upon entry (17.1.2), so it commences when the event occurs
+    /// (17.2.1). The woken TCM becomes eligible for the current cycle —
+    /// it still only runs once the current turn yields, since a started
+    /// TCM is scheduled only after its starter has been suspended
+    /// (17.2.2).
+    fn wake_tcm_listeners(&mut self, path: &str) {
+        let cycle = self.cycle;
+        for co in &mut self.coroutines {
+            if co.wake_event.as_deref() == Some(path) {
+                co.wake_event = None;
+                co.eligible_at_cycle = cycle;
+            }
+        }
+    }
+
+    /// Whether `path` occurred in the current cycle's state of the
+    /// temporal log (17.2.1's "already been emitted for the current
+    /// tick").
+    fn event_occurred_this_cycle(&self, path: &str) -> bool {
+        self.temporal_log
+            .get(self.cycle as usize)
+            .is_some_and(|state| {
+                state.occurs(&path.split('.').map(str::to_owned).collect::<Vec<_>>())
+            })
+    }
+
+    /// The simulator-side sampling point (11.1.4.2): every virtual
+    /// cycle, sample each `rise/fall/change(HDL expression) @sim` event
+    /// trigger and each bound event port's HDL object, and fire the ones
+    /// whose monitored value crossed their edge. A fire uses the same
+    /// machinery as `emit` — the temporal log, the `on` blocks, coverage,
+    /// and the wake of TCMs parked on the event.
+    ///
+    /// Approximations, documented: without an HDL source there is nothing
+    /// to sample (the events never fire — HDL signals without a
+    /// simulator); the first sample only establishes the baseline (no X
+    /// initial state, so no edge on it); values are plain integers (the
+    /// MVL transitions of 9.7.2.8 are not modeled — `any_change`
+    /// degrades to `change`); sampling happens at the scheduler's cycle
+    /// boundaries only (the inline spins of atomic contexts do not
+    /// advance the HDL, the existing v1 limitation); a firing's on-block
+    /// errors surface in the output like a TCM's, since no turn owns the
+    /// firing.
+    fn sample_sim_events(&mut self) {
+        if self.hdl.is_none() {
+            return;
+        }
+        let cycle = self.cycle;
+        let triggers = self.sim_triggers.clone();
+        for trigger in &triggers {
+            // Every instance of the declaring type owns the event
+            // (11.1.2), and each samples the monitored expression in its
+            // own context (a port read resolves through that instance's
+            // binding).
+            let owners: Vec<usize> = self
+                .instances
+                .iter()
+                .enumerate()
+                .filter(|(_, instance)| instance.type_name == trigger.type_name)
+                .map(|(index, _)| index)
+                .collect();
+            for owner in owners {
+                let sampled = self
+                    .eval(&trigger.condition, &mut Frame::default(), Some(owner))
+                    .ok()
+                    .and_then(|value| match value {
+                        Value::Int(value) => Some(value),
+                        Value::Bool(value) => Some(i128::from(value)),
+                        _ => None,
+                    });
+                // An unsampleable expression never produces an edge.
+                let Some(value) = sampled else {
+                    continue;
+                };
+                let key = (owner, trigger.event_name.clone());
+                let previous = self.sim_prev.insert(key, Some(value)).flatten();
+                if edge_fires(&trigger.routine, previous, value)
+                    && let Err(diagnostic) = self.fire_event(
+                        &trigger.event_name,
+                        Some(owner),
+                        trigger.span,
+                        &mut Frame::default(),
+                    )
+                {
+                    self.output.push_str(&format!(
+                        "@sim event {}: {}\n",
+                        trigger.event_name,
+                        diagnostic.render()
+                    ));
+                }
+            }
+        }
+        // Bound event ports (9.4): an external event port's `hdl_path()`
+        // attribute names the simulated object it is connected to, and
+        // its `edge()` attribute (9.7.2.8, default `change`) specifies
+        // the edge on which the port's event is generated. The port's
+        // name already carries the `$` access operator (the lexer folds
+        // `p$` into one identifier), which is the event path `emit p$`
+        // and `on p$` use.
+        let port_samples = self.collect_bound_event_ports();
+        for (owner, port_name, path, edge) in port_samples {
+            let value = match self.hdl.as_mut().unwrap().get(&path, cycle) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let key = (owner, port_name.clone());
+            let previous = self.sim_prev.insert(key, Some(value)).flatten();
+            if edge_fires(&edge, previous, value)
+                && let Err(diagnostic) = self.fire_event(
+                    &port_name,
+                    Some(owner),
+                    origin_span(),
+                    &mut Frame::default(),
+                )
+            {
+                self.output.push_str(&format!(
+                    "event port {port_name}: {}\n",
+                    diagnostic.render()
+                ));
+            }
+        }
+    }
+
+    /// The (instance, port, bound HDL path, edge) tuples of every event
+    /// port with an `hdl_path()` binding — the sampling worklist of
+    /// [`Interp::sample_sim_events`]. The edge attribute comes from the
+    /// type's `keep <port>.edge() == <value>` constraint (9.7.2.8) and
+    /// defaults to `change`.
+    fn collect_bound_event_ports(&self) -> Vec<(usize, String, String, String)> {
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let mut samples = Vec::new();
+        for (index, instance) in self.instances.iter().enumerate() {
+            let Some(declared) = types.iter().find(|t| t.name == instance.type_name) else {
+                continue;
+            };
+            for (name, path) in &instance.ports {
+                let Some(info) = declared.ports.iter().find(|p| &p.name == name) else {
+                    continue;
+                };
+                if !info.is_event || path.is_empty() {
+                    continue;
+                }
+                let edge = self
+                    .port_edges
+                    .get(&(instance.type_name.clone(), name.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| "change".to_owned());
+                samples.push((index, name.clone(), path.clone(), edge));
+            }
+        }
+        samples
+    }
+
     /// The statement index of the leaf currently being executed (the
     /// context stack's top entry, pushed by the enclosing walk).
     fn current_ctx_index(&self) -> usize {
@@ -2733,7 +3048,7 @@ impl<'a> Interp<'a> {
                 };
                 match crate::hdl::HdlSession::load(file, top) {
                     Ok(session) => {
-                        self.hdl = Some(session);
+                        self.hdl = Some(crate::hdl::SignalSource::Real(session));
                         Ok(Value::Void)
                     }
                     Err(msg) => Err(self.error("E0408", msg, span)),
@@ -2763,7 +3078,8 @@ impl<'a> Interp<'a> {
                 if self.hdl.is_none() {
                     return Err(not_loaded());
                 }
-                match self.hdl.as_mut().unwrap().set(path, value) {
+                let cycle = self.cycle;
+                match self.hdl.as_mut().unwrap().set(path, value, cycle) {
                     Ok(()) => Ok(Value::Void),
                     Err(msg) => Err(self.error("E0408", msg, span)),
                 }
@@ -2785,7 +3101,8 @@ impl<'a> Interp<'a> {
                 if self.hdl.is_none() {
                     return Err(not_loaded());
                 }
-                match self.hdl.as_mut().unwrap().get(path) {
+                let cycle = self.cycle;
+                match self.hdl.as_mut().unwrap().get(path, cycle) {
                     Ok(value) => Ok(Value::Int(value)),
                     Err(msg) => Err(self.error("E0408", msg, span)),
                 }
@@ -3293,8 +3610,8 @@ impl<'a> Interp<'a> {
                         *span,
                     ));
                 }
-                let session = self.hdl.as_mut().unwrap();
-                match session.get(path) {
+                let cycle = self.cycle;
+                match self.hdl.as_mut().unwrap().get(path, cycle) {
                     Ok(value) => Ok(Value::Int(value)),
                     Err(msg) => Err(self.error("E0408", msg, *span)),
                 }
@@ -3677,8 +3994,8 @@ impl<'a> Interp<'a> {
         if self.hdl.is_none() {
             return Err(self.error("E0408", "no simulator loaded — call hdl_load first", span));
         }
-        let session = self.hdl.as_mut().unwrap();
-        match session.get(&path) {
+        let cycle = self.cycle;
+        match self.hdl.as_mut().unwrap().get(&path, cycle) {
             Ok(value) => Ok(Value::Int(value)),
             Err(msg) => Err(self.error("E0408", msg, span)),
         }
@@ -3708,8 +4025,8 @@ impl<'a> Interp<'a> {
         if self.hdl.is_none() {
             return Err(self.error("E0408", "no simulator loaded — call hdl_load first", span));
         }
-        let session = self.hdl.as_mut().unwrap();
-        match session.set(&path, int_value) {
+        let cycle = self.cycle;
+        match self.hdl.as_mut().unwrap().set(&path, int_value, cycle) {
             Ok(()) => Ok(()),
             Err(msg) => Err(self.error("E0408", msg, span)),
         }
@@ -4246,6 +4563,87 @@ fn eval_choice_atom(tokens: &[Token]) -> Option<i128> {
 
 fn token_kind_is_punct(token: Option<&Token>, symbol: &str) -> bool {
     token.is_some_and(|token| matches!(&token.kind, TokenKind::Punctuation(p) if p == symbol))
+}
+
+/// Whether one monitored sample crosses the edge. `rise`/`fall`/`change`
+/// follow the 9.7.2.8 reading — "equivalent to the behavior of @sim
+/// TEs", transitions detected between defined values only. There is no
+/// X/Z value model here, so `any_change` degrades to `change`, and the
+/// first sample (no previous value) only establishes the baseline.
+fn edge_fires(edge: &str, previous: Option<i128>, value: i128) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    match edge {
+        "rise" => previous != 1 && value == 1,
+        "fall" => previous != 0 && value == 0,
+        // `change` and (without MVL values) `any_change`.
+        _ => previous != value,
+    }
+}
+
+/// The sampling events that occur every virtual cycle in this model:
+/// `sys.any` — in stand-alone operation the only event that occurs
+/// automatically, the stand-alone clock (11.1.4.1.1); `sys.new_time` —
+/// emitted on every sys.any in stand-alone operation (11.1.4.1.7); and
+/// `sim` — the simulation tick the virtual cycles stand in for
+/// (11.1.4.2). A TCM sampled by one of these keeps the every-cycle
+/// implicit sync; any other declared sampling event gates the entry on
+/// the event's occurrence.
+fn is_every_cycle_event(path: &str) -> bool {
+    matches!(
+        path,
+        "sys.any" | "any" | "sys.new_time" | "new_time" | "sim"
+    )
+}
+
+/// The `keep <port>.edge() == <value>` attribute values (9.7.2.8) per
+/// (type name, port name), read structurally from the composed
+/// constraints (either orientation, call on either side). Values outside
+/// the modeled subset (`change`/`rise`/`fall`/`any_change` — the MVL
+/// transitions need an MVL value model) fall back to the `change`
+/// default at the sampling point.
+fn collect_port_edge_attributes(elaborated: &Elaborated) -> BTreeMap<(String, String), String> {
+    let mut edges = BTreeMap::new();
+    for ty in &elaborated.types {
+        for constraint in &ty.constraints {
+            let Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs,
+                rhs,
+                ..
+            } = &constraint.expr
+            else {
+                continue;
+            };
+            for (call, value) in [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())] {
+                let Expr::Call { callee, args, .. } = call else {
+                    continue;
+                };
+                if !args.is_empty() {
+                    continue;
+                }
+                let Expr::MemberAccess {
+                    object,
+                    name: method,
+                    ..
+                } = callee.as_ref()
+                else {
+                    continue;
+                };
+                if method != "edge" {
+                    continue;
+                }
+                let (Expr::Ident { name: port, .. }, Expr::Ident { name: edge, .. }) =
+                    (object.as_ref(), value)
+                else {
+                    continue;
+                };
+                edges.insert((ty.name.clone(), port.clone()), edge.clone());
+            }
+        }
+    }
+    edges
 }
 
 /// Whether the expression calls any of the named routines anywhere in its

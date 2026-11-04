@@ -2655,6 +2655,119 @@ type-min-max DAC shape where the computed body executes
 calling an unknown routine declining to the simple definition; and
 the implicit `result` variable as the return value.
 
+## 2026-11-04 (42) — offline arc: simulator-side temporal integration (@sim sampling, event-driven TCM wake, port triggering)
+
+Branch `agent/sim-integration` (off main after #31 merged). The three
+M1/M3 "not wired" gaps around the simulator side are closed: `@sim`
+edge sampling, `@`-triggered TCM invocation, and event-port
+triggering on the bound HDL object's edges.
+
+Prose readings this is built on (the redline copy's syntax figures
+for 11.3/9.4 stay images; everything below is extractable prose):
+
+- 11.1.4.2: `rise | fall | change (HDL expression) @sim` "causes the
+  DUT to be monitored for a change in that expression", and control
+  passes to the e program for each delta cycle where a monitored
+  expression changes. In the virtual-cycle model every scheduler
+  cycle boundary is a sampling point: each instance of the declaring
+  type samples its trigger's expression in its own context (11.1.2 —
+  every instance owns its event instances), edge-detects against the
+  previous sample, and fires through the `emit` machinery (temporal
+  log, on blocks, coverage, TCM wake).
+- 17.1.2 + 13.1.1 + 13.1.2: a TCM "implicitly synchronize[s] on the
+  designated sampling event upon entry, as if the action sync @event
+  was added at the top of the TCM code". So a started `tcm() @ev`
+  commences when `ev` occurs (17.2.1: "when its sampling event is
+  emitted"), not one cycle after `start` — unless `ev` already
+  occurred this tick ("or immediately if the sampling event has
+  already been emitted for the current tick"), when the entry sync
+  succeeds in the current cycle. `@sys.any` — the stand-alone clock
+  that "is the only one that occurs automatically" (11.1.4.1.1) — and
+  `@sim`/`@sys.new_time` keep the every-cycle implicit sync cycle.
+- 9.4 + 9.7.2.9: "An external port needs to have an hdl_path()
+  attribute to specify the name of the object to which it is
+  connected" — the existing `keep p.hdl_path() == "…"` resolution is
+  the binding, and the port's event fires on the bound object's edge
+  per 9.7.2.8's `edge()` attribute (prose-extractable: values
+  change/rise/fall — "equivalent to the behavior of @sim TEs" — and
+  any_change, default change), read from `keep p.edge() == <value>`
+  constraints.
+
+Implementation shape:
+
+- `hdl::SignalSource` (`Real(HdlSession)` or
+  `Injected(InjectedSignals)`): the interpreter's signal seam. The
+  injected form is a sparse per-virtual-cycle history
+  (`interp::run_with_signals`) so tests and offline runs drive `@sim`
+  edges deterministically without the container-only xezim binary;
+  `hdl_load` replaces it with a real session. The `hdl_*` builtins
+  and the quoted-path/port accesses all route through it.
+- One firing path (`Interp::fire_event`) shared by `emit` and the
+  simulator-side triggers: record in the current cycle's log state,
+  wake TCMs parked on the event, run the `on` blocks (11.2 — on
+  blocks execute before TCMs waiting for the same event), sample the
+  cover groups. The scheduler's nobody-eligible branch samples after
+  each cycle advance; cycle 0's sample only establishes the baseline.
+- The scheduler's eligibility scan skips coroutines parked on their
+  TCM sampling event; a fire wakes them into the current cycle (they
+  still only run once the running turn yields — 17.2.2). The
+  5,000-cycle budget semantics are unchanged: a parked TCM keeps the
+  run alive until its event occurs, and a never-occurring event runs
+  to the budget guard (E0409).
+
+Honest v1 limits (documented in the code and ARCHITECTURE): only
+single-item `rise/fall/change(HDL expression) @sim` triggers fire
+(multi-item triggers, `cycle`, grouped guards and `true(exp)` samples
+would need the temporal engine at the sampling point); the first
+sample establishes the baseline (no X initial state, so no edge on
+it); values are plain integers, so 9.7.2.8's MVL edge spellings fall
+back to the `change` default and `any_change` degrades to `change`;
+sampling happens at the scheduler's cycle boundaries only (inline
+spins do not advance the HDL — the existing limitation); body-level
+bare `wait`/`sync` still synchronize on the stand-alone sys.any clock
+(the default-sampling-event reading of 13.1.2/13.1.3 is applied to
+the entry sync only); the run log stays one global timeline
+(occurrences are per-cycle states, not per-instance schedules); the
+predefined events still do not occur in the log (sys.any-based
+expect rules stay vacuous); `edge()` constraints inside `when` blocks
+are not seen (top-level keeps only, like the hdl_path() extraction).
+
+One additive elaboration change rides along: `Member::Event` (dropped
+until now) and an event-port flag flow into `ElaboratedType`
+(`events`, `PortInfo::is_event`) — the interpreter needs the recorded
+triggers; nothing else consumes them.
+
+Corpus state (absolute paths, release build of this branch):
+`B:/e1647-rs/local/corpora/etl-simple-examples.e` 4,
+`cover-edges.e` 4, `B:/e1647-rs/local/sn-cpu-tutorial/
+golden-combined-imports.e` 3, `golden-combined.e`/`igen-dist.e`/
+`type-min-max-usage.e`/`save-restart-test1.e`/`d6w/testbench.e` 0 —
+unchanged; the d6w `run --seed 1` still ends with the reference
+line and exit 0.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(221 passed: 16 elab, 1 fixtures, 105 interp, 24 lexer, 58 parser,
+ 9 solve, 8 temporal)
+```
+
+New tests: 8 interpreter tests — a rise trigger firing exactly on the
+rising edges of an injected history; a change trigger firing on every
+change (the flat cycle silent); no fire without any HDL source; a
+`tcm() @ev` TCM commencing only when ev occurs (output ordering
+against a per-cycle watcher); the already-emitted-this-tick entry
+(17.2.1 — the TCM runs before the watcher's first cycle); a parked
+TCM holding the run to the E0409 budget; a bound event port firing
+its `on p$` blocks on the bound object's change edge; and the
+`edge() == rise` attribute restricting the port's edges.
+
 ## 2026-11-04 (44) — offline arc: clause 28.9 coverage configuration and remaining option tables
 
 Branch `agent/coverage-config` (off main after #31 merged). The 28.9
