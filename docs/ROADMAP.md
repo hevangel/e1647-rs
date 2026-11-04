@@ -372,12 +372,27 @@
       (`SET`/`GET`/`RUN`/`FINISH`). The interpreter exposes `hdl_load` /
       `hdl_set` / `hdl_get` / `hdl_run` / `hdl_finish` and routes quoted
       HDL paths (`'top.count'`) through that session (`E0408` when no
-      simulator is loaded). This is one simulator binding, not a
-      multi-backend abstract API, and there is no VHPI
+      simulator is loaded). The binding sits behind a `Simulator` seam
+      (`load`/`name`/`set`/`get`/`run`/`finish`): the xezim VPI bridge is
+      the `XezimSimulator` backend (native targets — under wasm32 it is
+      not compiled), the `NullSimulator` is the no-op backend where no
+      simulator exists (its operations report the honest no-simulator
+      error, and it is the tests' dispatch double), and a third backend
+      (VHPI — not implemented) plugs in with one `Simulator` impl and one
+      registry arm. Still one real simulator binding, and no backend
+      selection knob yet (`hdl_load` resolves through the default
+      backend)
 - [~] SystemVerilog integration tests and event ordering — started: the
       compose `mixed` service runs `examples/mixed_counter.e` against
       `examples/mixed/counter.sv`. Event ordering between e and the HDL
       simulator is not implemented
-- [ ] WASM build and browser sandbox API
+- [~] WASM build and browser sandbox API — started: the core library
+      (lexer/parser/elaborator/interpreter) compiles for
+      `wasm32-unknown-unknown` (CI runs `cargo check --target
+      wasm32-unknown-unknown`); nothing had to be excluded from the
+      build, and the process-spawning xezim backend is native-only by
+      cfg there (`hdl_load` under wasm32 fails with the honest
+      no-simulator error). No browser sandbox API and no wasm runtime
+      test yet
 
 All stages require standards-aware conformance testing; compatibility with commercial products is not assumed.

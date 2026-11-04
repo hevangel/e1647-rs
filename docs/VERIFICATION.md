@@ -2996,6 +2996,107 @@ instance across the chain sys → `container of (int)` →
 `iterator of (int)` (the instance referenced only in the body; field
 read and method dispatch on the returned object).
 
+## 2026-11-05 (47) — offline arc: multi-simulator HDL abstraction and the wasm32 target
+
+Branch `agent/hdl-abstraction` (off main after #34 merged). Two M4 items
+in one arc: the simulator backend seam (hdl.rs is no longer "one
+simulator binding" structurally) and the wasm32 compilation check.
+
+No standard-text findings constrained this arc — it is structural work
+on the bridge side; no clause of IEEE 1647 names a simulator API (the
+standard's procedural interface concerns are the e side's
+`hdl_path()`/port bindings already covered by earlier entries). The
+VHPI shape is named only as the documented example of a future third
+backend; it is not implemented.
+
+Implementation:
+
+- `src/hdl.rs` — the seam. `Simulator` is the backend contract:
+  `load(design_file, top)` (sized-only — it constructs the session),
+  `name()`, `set`, `get`, `run`, `finish` (the object methods dispatch
+  through `dyn Simulator`). Registered explicitly:
+  `registered_backends()` / `default_backend()` / `load_backend(name,
+  ..)` / `load(design_file, top)` — the last is the constructor the
+  interpreter's `hdl_load` resolves through. Two backends:
+  `XezimSimulator` (native targets; delegates 1:1 to the unchanged
+  `HdlSession`, which keeps its public surface and its allowlist/argv
+  security posture) and `NullSimulator` (every operation reports the
+  honest no-simulator error, `load` fails up front, `finish` is a
+  no-op). `SignalSource::Real` now holds `Box<dyn Simulator>` — the
+  interpreter's other call sites and the injected seam are untouched
+  (semantics unchanged; interp.rs changed by one hunk, the `hdl_load`
+  constructor call).
+- wasm32 posture: the whole toolchain probe showed **nothing blocks
+  wasm32 compilation** — `std::process` types compile for
+  `wasm32-unknown-unknown` (a spawn would only fail at runtime), and
+  `cargo check --target wasm32-unknown-unknown` passed on the
+  pre-change branch already. The cfg gate (`not(target_arch =
+  "wasm32")` around `valid_location`/`HdlSession`/`XezimSimulator`) is
+  therefore the honest *runtime* posture, not a compile fix: under
+  wasm32 the spawning backend is not compiled at all, the null backend
+  is the only registered one, and `hdl_load` there fails up front with
+  the no-simulator error instead of a misleading PATH/container spawn
+  message. Native defaults are unchanged (default backend is still
+  xezim; identical error strings through the delegation).
+- `.github/workflows/ci.yml` — `check-wasm` job on ubuntu:
+  `rust-toolchain` with `targets: wasm32-unknown-unknown` (the rustup
+  target add) and `cargo check --target wasm32-unknown-unknown` plus
+  the `--all-targets` form. Compilation check only — no wasm runtime
+  test, no browser sandbox API.
+- Docs: ROADMAP M4 (the "one simulator binding, not a multi-backend
+  abstract API" wording replaced by the seam description; the WASM item
+  moved from `[ ]` to `[~]` with what actually lands) and ARCHITECTURE
+  (the hdl.rs bullet, the sketch line, the still-ahead list and the
+  not-implemented list shrunk to what remains: bindings beyond xezim,
+  a backend selection knob, a browser sandbox API).
+
+Honest v1 limits: no VHPI (the registry's `vhpi` arm is deliberately
+absent — the unknown-name test exercises exactly that answer); no
+backend selection knob (`hdl_load` always resolves the default backend;
+`load_backend` is the explicit form for tests and future
+configuration); the `XezimSimulator` delegation is name-and-registration
+asserted only — spawning is exercised solely by the container's
+`compose mixed` service (unchanged), since `xezim` is unavailable
+outside it; the wasm check is compile-only.
+
+Corpus state (absolute paths, release build of this branch, parse
+diagnostic counts): `B:/e1647-rs/local/corpora/etl-simple-examples.e` 4,
+`B:/e1647-rs/local/corpora/cover-edges.e` 4, `B:/e1647-rs/local/
+sn-cpu-tutorial/golden-combined-imports.e` 3, `golden-combined.e`
+/ `igen-dist.e` / `type-min-max-usage.e` / `save-restart-test1.e` /
+`d6w/testbench.e` 0 — unchanged; the d6w `run --seed 1` still ends with
+the reference line and exit 0.
+
+Commands and results (toolchain `1.99.1-x86_64-pc-windows-gnu`,
+Windows; no solver-touching changes, CI verifies the feature build):
+
+```
+$ cargo fmt --all -- --check
+(pass)
+$ cargo clippy --all-targets -- -D warnings
+(pass, no warnings)
+$ cargo test --all-targets
+(240 passed: 7 hdl (lib unittests), 20 elab, 1 fixtures, 113 interp,
+ 24 lexer, 58 parser, 9 solve, 8 temporal)
+$ rustup target add wasm32-unknown-unknown
+(done locally; the target was not installed before this arc)
+$ cargo check --target wasm32-unknown-unknown
+(pass)
+$ cargo check --target wasm32-unknown-unknown --all-targets
+(pass)
+```
+
+New tests: 7 hdl tests (in `src/hdl.rs`, no simulator binary needed) —
+the null backend reporting the no-simulator error from every operation
+under its registry name with a no-op finish; its up-front load failure;
+the registry answering the null backend the same way; unknown backend
+names answering with the registered list (the `vhpi` spelling — the
+documented future third backend, deliberately not registered);
+`SignalSource::Real` dispatching to whatever backend is in the box
+(verbatim error surfacing, the path the interpreter's `E0408` rides);
+the default backend being one of the registered ones (xezim native /
+null wasm, cfg-split); and the xezim backend keeping its registry name
+and registration on native targets.
 
 ## 2026-11-04 (45) — offline arc: clause 26 list pseudo-methods
 
