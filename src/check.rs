@@ -19,6 +19,11 @@
 //! - `E0207` a subtype derived from `longint`/`longuint` — a
 //!   `(bits: N)` width specification on either long base, or a range
 //!   qualification (`type t: longint [0..5]`) over it (clause 5.2.3.1)
+//! - `E0208` a `typeof()`/`typeof_item()` type position (clause 5.9)
+//!   whose argument's static type cannot be determined against the
+//!   current minimal type information (a field path, a local `var`, a
+//!   method parameter or a literal)
+//! - `E0209` `typeof_item()` of a type that is not a list (clause 5.9)
 //!
 //! Fields, methods and constraints are collected through `when` subtype
 //! members as well. A `keep` constraint sees every field of the enclosing
@@ -26,9 +31,11 @@
 //! scoping is elaboration and a later milestone.
 
 use crate::ast::{
-    Declaration, DeclarationKind, Expr, Field, KeepConstraint, Member, MethodDecl, Stmt, TypeExpr,
+    Declaration, DeclarationKind, Expr, Field, KeepConstraint, Member, MethodDecl, ScalarBase,
+    Stmt, TypeExpr,
 };
 use crate::diagnostic::Diagnostic;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
@@ -71,6 +78,19 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             }
         });
     }
+    // The `typeof()` resolution scope (5.9): every declaration's fields
+    // by name, so a member path (`typeof(x.n)`) resolves through the
+    // named type's field table. `when`-declared fields contribute too.
+    let struct_fields: BTreeMap<&str, Vec<(&str, &TypeExpr)>> = declarations
+        .iter()
+        .map(|declaration| {
+            let mut fields = Vec::new();
+            for_each_field(&declaration.members, &mut |field| {
+                fields.push((field.name.as_str(), &field.ty));
+            });
+            (declaration.name.as_str(), fields)
+        })
+        .collect();
     for declaration in declarations {
         check_extend_target(declaration, &declared, &mut diagnostics);
         check_like_target(declaration, &declared, &mut diagnostics);
@@ -82,15 +102,26 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
                 &mut diagnostics,
             );
         }
-        check_fields(declaration, &declared, &mut diagnostics);
+        check_fields(declaration, &declared, &struct_fields, &mut diagnostics);
         check_enumerals(declaration, &mut diagnostics);
-        check_methods(declaration, &declared, &mut diagnostics);
+        check_methods(declaration, &declared, &struct_fields, &mut diagnostics);
         for_each_on(&declaration.members, &mut |on| {
             let mut seen: BTreeSet<&str> = BTreeSet::new();
+            let mut own_fields: BTreeMap<&str, &TypeExpr> = BTreeMap::new();
+            for_each_field(&declaration.members, &mut |field| {
+                own_fields.insert(field.name.as_str(), &field.ty);
+            });
+            let mut locals: BTreeMap<&str, &TypeExpr> = own_fields.clone();
+            let scope = StatementScope {
+                declared: &declared,
+                struct_fields: &struct_fields,
+                own_fields: &own_fields,
+            };
             check_statements(
                 &on.body,
                 &mut seen,
-                &declared,
+                &scope,
+                &mut locals,
                 &on.path.join("."),
                 &mut diagnostics,
             );
@@ -162,6 +193,7 @@ fn check_like_target(
 fn check_fields(
     declaration: &Declaration,
     declared: &BTreeSet<&str>,
+    struct_fields: &BTreeMap<&str, Vec<(&str, &TypeExpr)>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     // Field names may repeat across `when` branches (each subtype variant
@@ -181,9 +213,22 @@ fn check_fields(
             ));
         }
     }
+    // The declaration's own fields are the `typeof()` scope of its field
+    // types (5.9): a field type may name any sibling field, `when`
+    // branches included.
+    let mut own_fields: BTreeMap<&str, &TypeExpr> = BTreeMap::new();
+    for_each_field(&declaration.members, &mut |field| {
+        own_fields.insert(field.name.as_str(), &field.ty);
+    });
     for_each_field(&declaration.members, &mut |field| {
         check_named_type(&field.ty, declared, diagnostics);
         check_long_subtype(&field.ty, false, diagnostics);
+        let scope = TypeScope {
+            locals: &own_fields,
+            own_fields: &own_fields,
+            struct_fields,
+        };
+        check_type_static_types(&field.ty, &scope, diagnostics);
         if let TypeExpr::Scalar {
             base: crate::ast::ScalarBase::Uint | crate::ast::ScalarBase::Int,
             width: Some(width),
@@ -222,12 +267,20 @@ fn check_enumerals(declaration: &Declaration, diagnostics: &mut Vec<Diagnostic>)
 fn check_methods(
     declaration: &Declaration,
     declared: &BTreeSet<&str>,
+    struct_fields: &BTreeMap<&str, Vec<(&str, &TypeExpr)>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // The declaration's own fields join every method's `typeof()` scope
+    // (5.9); the method's parameters shadow them.
+    let mut own_fields: BTreeMap<&str, &TypeExpr> = BTreeMap::new();
+    for_each_field(&declaration.members, &mut |field| {
+        own_fields.insert(field.name.as_str(), &field.ty);
+    });
     for_each_method(&declaration.members, &mut |method| {
         // Parameters and local variables share one namespace in this subset;
         // block scoping is a later milestone.
         let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut locals: BTreeMap<&str, &TypeExpr> = own_fields.clone();
         for param in &method.params {
             if !seen.insert(param.name.as_str()) {
                 diagnostics.push(Diagnostic::new(
@@ -243,13 +296,31 @@ fn check_methods(
             if let Some(ty) = &param.ty {
                 check_named_type(ty, declared, diagnostics);
                 check_long_subtype(ty, false, diagnostics);
+                locals.insert(param.name.as_str(), ty);
             }
         }
         if let Some(return_type) = &method.return_type {
             check_named_type(return_type, declared, diagnostics);
             check_long_subtype(return_type, false, diagnostics);
+            let scope = TypeScope {
+                locals: &locals,
+                own_fields: &own_fields,
+                struct_fields,
+            };
+            check_type_static_types(return_type, &scope, diagnostics);
         }
-        check_statements(&method.body, &mut seen, declared, &method.name, diagnostics);
+        check_statements(
+            &method.body,
+            &mut seen,
+            &StatementScope {
+                declared,
+                struct_fields,
+                own_fields: &own_fields,
+            },
+            &mut locals,
+            &method.name,
+            diagnostics,
+        );
     });
 }
 
@@ -309,10 +380,21 @@ fn check_on_body_time_consumption(
     }
 }
 
+/// The scope tables a statement walk checks against: the file's declared
+/// type names, the per-declaration field tables (`typeof()` member-path
+/// resolution, 5.9) and the enclosing declaration's own fields
+/// (`me.field`).
+struct StatementScope<'a> {
+    declared: &'a BTreeSet<&'a str>,
+    struct_fields: &'a BTreeMap<&'a str, Vec<(&'a str, &'a TypeExpr)>>,
+    own_fields: &'a BTreeMap<&'a str, &'a TypeExpr>,
+}
+
 fn check_statements<'a>(
     statements: &'a [Stmt],
     seen: &mut BTreeSet<&'a str>,
-    declared: &BTreeSet<&str>,
+    scope: &StatementScope<'a>,
+    locals: &mut BTreeMap<&'a str, &'a TypeExpr>,
     method_name: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -333,8 +415,19 @@ fn check_statements<'a>(
                     ));
                 }
                 if let Some(ty) = ty {
-                    check_named_type(ty, declared, diagnostics);
+                    check_named_type(ty, scope.declared, diagnostics);
                     check_long_subtype(ty, false, diagnostics);
+                    let type_scope = TypeScope {
+                        locals,
+                        own_fields: scope.own_fields,
+                        struct_fields: scope.struct_fields,
+                    };
+                    check_type_static_types(ty, &type_scope, diagnostics);
+                    // A later `typeof(x)` sees this variable's declared
+                    // type; an inferred type (`var x := e`) contributes
+                    // nothing and its typeofs stay undetermined (5.9's
+                    // static-type reading).
+                    locals.insert(name.as_str(), ty);
                 }
             }
             Stmt::If {
@@ -342,13 +435,13 @@ fn check_statements<'a>(
                 else_body,
                 ..
             } => {
-                check_statements(then_body, seen, declared, method_name, diagnostics);
+                check_statements(then_body, seen, scope, locals, method_name, diagnostics);
                 if let Some(else_body) = else_body {
-                    check_statements(else_body, seen, declared, method_name, diagnostics);
+                    check_statements(else_body, seen, scope, locals, method_name, diagnostics);
                 }
             }
             Stmt::Check { else_body, .. } => {
-                check_statements(else_body, seen, declared, method_name, diagnostics);
+                check_statements(else_body, seen, scope, locals, method_name, diagnostics);
             }
             Stmt::SeqDo { item, .. } => {
                 // The item field must exist in the enclosing scope.
@@ -381,6 +474,127 @@ fn check_statements<'a>(
             | Stmt::Print { .. }
             | Stmt::Gen { .. } => {}
         }
+    }
+}
+
+/// The static-type scope a `typeof()`/`typeof_item()` argument (5.9)
+/// resolves against: the names visible at the type position (the
+/// declaration's fields, the method's parameters and the locals declared
+/// so far), the enclosing declaration's own fields (`me.field`), and the
+/// file's per-declaration field tables (a member path resolves through
+/// the named type's fields).
+struct TypeScope<'a> {
+    locals: &'a BTreeMap<&'a str, &'a TypeExpr>,
+    own_fields: &'a BTreeMap<&'a str, &'a TypeExpr>,
+    struct_fields: &'a BTreeMap<&'a str, Vec<(&'a str, &'a TypeExpr)>>,
+}
+
+/// The static type of a `typeof()`/`typeof_item()` argument against the
+/// current minimal type information (5.9): a field path, a local `var`,
+/// a method parameter, or a literal. The expression is only inspected,
+/// never evaluated. `None` — the static type cannot be determined here
+/// (`E0208` at the call site).
+fn static_type_of(expr: &Expr, scope: &TypeScope) -> Option<TypeExpr> {
+    match expr {
+        Expr::Ident { name, .. } => scope.locals.get(name.as_str()).map(|ty| (*ty).clone()),
+        Expr::Paren { expr, .. } => static_type_of(expr, scope),
+        Expr::MemberAccess { object, name, .. } => {
+            // `me.field` / `self.field` — the enclosing declaration's
+            // own fields.
+            if let Expr::Ident { name: root, .. } = object.as_ref()
+                && (root == "me" || root == "self")
+            {
+                return scope.own_fields.get(name.as_str()).map(|ty| (*ty).clone());
+            }
+            // A member path resolves through a struct-like type's field
+            // table; the chain recurses (`a.b.c`).
+            let base = static_type_of(object, scope)?;
+            let type_name = struct_like_name(&base)?;
+            let fields = scope.struct_fields.get(type_name.as_str())?;
+            fields
+                .iter()
+                .find(|(field, _)| *field == name.as_str())
+                .map(|(_, ty)| (*ty).clone())
+        }
+        // A literal's static type is its predefined scalar base; the
+        // unsized and sized numeric literals are `int` at this stage.
+        Expr::IntLiteral { .. } | Expr::BitLiteral { .. } => Some(scalar_type(ScalarBase::Int)),
+        Expr::RealLiteral { .. } => Some(scalar_type(ScalarBase::Real)),
+        Expr::BoolLiteral { .. } => Some(scalar_type(ScalarBase::Bool)),
+        Expr::StringLiteral { .. } => Some(scalar_type(ScalarBase::String)),
+        _ => None,
+    }
+}
+
+/// The name of the struct-like type a type expression denotes, for the
+/// member-path resolution (`s` in `typeof(x.n)` where `x: s`).
+fn struct_like_name(ty: &TypeExpr) -> Option<String> {
+    match ty {
+        TypeExpr::Named { name, .. } => Some(name.clone()),
+        TypeExpr::WhenQualified { base, .. } => struct_like_name(base),
+        _ => None,
+    }
+}
+
+fn scalar_type(base: ScalarBase) -> TypeExpr {
+    TypeExpr::Scalar {
+        base,
+        width: None,
+        span: (
+            crate::lexer::Position {
+                byte: 0,
+                line: 0,
+                column: 0,
+            },
+            crate::lexer::Position {
+                byte: 0,
+                line: 0,
+                column: 0,
+            },
+        ),
+    }
+}
+
+/// Check the `typeof()`/`typeof_item()` leaves of a type position (5.9):
+/// the argument's static type must be determinable (`E0208`), and
+/// `typeof_item()`'s argument must be a list (`E0209`).
+fn check_type_static_types(ty: &TypeExpr, scope: &TypeScope, diagnostics: &mut Vec<Diagnostic>) {
+    match ty {
+        TypeExpr::TypeOf { expr, span } => {
+            if static_type_of(expr, scope).is_none() {
+                diagnostics.push(Diagnostic::new(
+                    "E0208",
+                    "typeof(): cannot determine the static type of this expression",
+                    span.0,
+                    span.1,
+                ));
+            }
+        }
+        TypeExpr::TypeOfItem { expr, span } => match static_type_of(expr, scope) {
+            None => diagnostics.push(Diagnostic::new(
+                "E0208",
+                "typeof_item(): cannot determine the static type of this expression",
+                span.0,
+                span.1,
+            )),
+            Some(resolved) if !matches!(resolved, TypeExpr::List { .. }) => {
+                diagnostics.push(Diagnostic::new(
+                    "E0209",
+                    "typeof_item(): the static type of this expression is not a list",
+                    span.0,
+                    span.1,
+                ));
+            }
+            Some(_) => {}
+        },
+        TypeExpr::List { element, .. } => check_type_static_types(element, scope, diagnostics),
+        TypeExpr::WhenQualified { base, .. } => check_type_static_types(base, scope, diagnostics),
+        TypeExpr::TemplateRef { args, .. } => {
+            for arg in args {
+                check_type_static_types(arg, scope, diagnostics);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -418,6 +632,11 @@ fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut 
             }
         }
         TypeExpr::Formal { .. } => {}
+        // A `typeof()`/`typeof_item()` placeholder's argument is an
+        // expression, not a type; its resolution is 5.9's
+        // `check_type_static_types`, and the resolved type's own name is
+        // validated after elaboration rewrites it.
+        TypeExpr::TypeOf { .. } | TypeExpr::TypeOfItem { .. } => {}
         TypeExpr::Scalar { .. } | TypeExpr::InlineEnum { .. } => {}
     }
 }
@@ -589,6 +808,9 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
             let var_name = var.as_deref().unwrap_or("value");
             roots.extend(inner_roots.into_iter().filter(|(name, _)| name != var_name));
         }
+        // A subtype-qualified access's roots are its base's; the
+        // qualifier words are subtype values, not references.
+        Expr::QualifiedField { base, .. } => collect_root_identifiers(base, roots),
         // A select distribution's weights are the only AST side; the
         // choices are recorded as raw tokens.
         Expr::Select { arms, .. } => {

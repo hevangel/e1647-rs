@@ -232,6 +232,14 @@ fn render_type(ty: &e1647::ast::TypeExpr) -> String {
             let args = args.iter().map(render_type).collect::<Vec<_>>().join(", ");
             format!("{name} of {args}")
         }
+        // The `typeof()` placeholders render compactly (5.9); the
+        // elaborated view shows the resolved type instead.
+        TypeExpr::TypeOf { expr, .. } => {
+            format!("typeof({})", e1647::ast::render_expr_compact(expr))
+        }
+        TypeExpr::TypeOfItem { expr, .. } => {
+            format!("typeof_item({})", e1647::ast::render_expr_compact(expr))
+        }
     }
 }
 

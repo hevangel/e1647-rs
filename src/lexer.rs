@@ -718,17 +718,32 @@ impl<'a> Cursor<'a> {
             TokenKind::StringLiteral(value)
         } else if first == '\'' {
             // Either a based literal (`'hFF`, including MVL digits), the
-            // subtype modifier quote (`read'kind`), or the opening or
-            // closing quote of a quoted hierarchical path
-            // (`'memory_tb.address'`). Non-literal quotes become standalone
-            // punctuation tokens (like the reference grammar's `SNG_QUOTE`);
-            // the parser decides what they delimit.
+            // subtype modifier quote (`read'kind`, and 4.17.3's subtype
+            // qualifiers `p.red'good'x`), or the opening or closing
+            // quote of a quoted hierarchical path
+            // (`'memory_tb.address'`). A based literal commits only when
+            // a digit of its base follows the base letter — `'x` in a
+            // qualifier run (`red'x`) is the qualifier quote, not the
+            // start of a hex literal. Non-literal quotes become
+            // standalone punctuation tokens (like the reference grammar's
+            // `SNG_QUOTE`); the parser decides what they delimit.
             match self.peek_second() {
                 Some(base) if Self::based_base_letter(base) => {
-                    self.bump();
-                    self.bump();
-                    self.read_based_digits(base, start, true)?;
-                    self.finish_number(start)
+                    let third = {
+                        let mut chars = self.source[self.byte..].chars();
+                        chars.next();
+                        chars.next();
+                        chars.next()
+                    };
+                    if third.is_some_and(|c| based_digit_ok(base, c, true)) {
+                        self.bump();
+                        self.bump();
+                        self.read_based_digits(base, start, true)?;
+                        self.finish_number(start)
+                    } else {
+                        self.bump();
+                        TokenKind::Punctuation("'".to_owned())
+                    }
                 }
                 _ => {
                     self.bump();

@@ -136,6 +136,14 @@ pub struct SubtypeModifier {
     pub id: Option<(String, Span)>,
 }
 
+/// A subtype qualifier of a dot access (`p.red'good'x`, clause 4.17.3).
+/// The same shape as a `when` block's [`SubtypeModifier`]: the resolution
+/// matches a qualifier word against a synthesized when view's
+/// discriminating (field id, value) pairs — a short word (`red`) may name
+/// the pair's value (`red'color`) or, for a Boolean determinant, the pair's
+/// field id (`good` for `TRUE'good`).
+pub type WhenQualifier = SubtypeModifier;
+
 /// Port direction of a [`PortDecl`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortDirection {
@@ -655,6 +663,16 @@ pub enum TypeExpr {
         args: Vec<TypeExpr>,
         span: Span,
     },
+    /// `typeof(exp)` in a type position (clause 5.9): the static type of
+    /// `exp` — the expression is never evaluated (purely compile-time;
+    /// typical use is inside macros). Resolution against the current
+    /// minimal type information happens during elaboration: a field path,
+    /// a local `var`, a method parameter or a literal resolves; anything
+    /// else is reported (`E0208`) and the placeholder stays.
+    TypeOf { expr: Box<Expr>, span: Span },
+    /// `typeof_item(exp)` in a type position (clause 5.9): the element
+    /// type of a list-typed `exp`. A non-list argument is `E0209`.
+    TypeOfItem { expr: Box<Expr>, span: Span },
 }
 
 impl TypeExpr {
@@ -666,7 +684,9 @@ impl TypeExpr {
             | TypeExpr::WhenQualified { span, .. }
             | TypeExpr::InlineEnum { span, .. }
             | TypeExpr::Formal { span, .. }
-            | TypeExpr::TemplateRef { span, .. } => *span,
+            | TypeExpr::TemplateRef { span, .. }
+            | TypeExpr::TypeOf { span, .. }
+            | TypeExpr::TypeOfItem { span, .. } => *span,
         }
     }
 
@@ -690,7 +710,35 @@ impl TypeExpr {
             TypeExpr::InlineEnum { names, .. } => format!("[{}]", names.join(", ")),
             TypeExpr::Formal { name, .. } => format!("<{name}>"),
             TypeExpr::TemplateRef { name, args, .. } => template_instance_name(name, args),
+            TypeExpr::TypeOf { expr, .. } => format!("typeof({})", render_expr_compact(expr)),
+            TypeExpr::TypeOfItem { expr, .. } => {
+                format!("typeof_item({})", render_expr_compact(expr))
+            }
         }
+    }
+}
+
+/// A compact source-like rendering of an expression, used only for
+/// diagnostics and canonical type names (there is no general expression
+/// printer in this milestone). Shapes beyond these render as `...`.
+pub fn render_expr_compact(expr: &Expr) -> String {
+    match expr {
+        Expr::IntLiteral { text, .. } | Expr::RealLiteral { text, .. } => text.clone(),
+        Expr::BitLiteral { text, .. } => text.clone(),
+        Expr::BoolLiteral { value, .. } => {
+            if *value {
+                "TRUE".to_owned()
+            } else {
+                "FALSE".to_owned()
+            }
+        }
+        Expr::StringLiteral { value, .. } => format!("\"{value}\""),
+        Expr::Ident { name, .. } => name.clone(),
+        Expr::MemberAccess { object, name, .. } => {
+            format!("{}.{}", render_expr_compact(object), name)
+        }
+        Expr::Paren { expr, .. } => format!("({})", render_expr_compact(expr)),
+        _ => "...".to_owned(),
     }
 }
 
@@ -914,20 +962,23 @@ pub enum Expr {
         body: Vec<Stmt>,
         span: Span,
     },
-}
-
-/// One element of an `in_table` row (clause 4.11.8): a scalar expression
-/// (matched against the tuple element by `==`) or a set (matched by
-/// `in` — a set literal for enum/bool elements, any set expression for
-/// numeric elements).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TableElem {
-    /// A scalar row element.
-    Scalar(Expr),
-    /// A set literal `[a, b]` / `[lo..hi]`.
-    Set(InSetExpr),
-    /// `set_of_values(T)` / `full_set_of_values(T)` (5.10.5/5.10.6).
-    TypeSet { ty: TypeExpr, full: bool },
+    /// `struct-exp.qual'qual'...'field` — a field access qualified by
+    /// when-subtype words (clause 4.17.3). The qualifier sequence is
+    /// legal iff the same words separated by spaces would form a legal
+    /// when-subtype name; qualifiers already implied by the static type
+    /// of the base expression may be omitted. Each qualifier is a value
+    /// word (`red`) or a full `value'id` pair (`red'color`) — both
+    /// spellings lex identically after the dot here, so every qualifier
+    /// is recorded value-only and resolution matches a word against the
+    /// synthesized when view's (field id, value) pairs, by value or (for
+    /// a Boolean determinant's short form) by field id.
+    QualifiedField {
+        base: Box<Expr>,
+        qualifiers: Vec<WhenQualifier>,
+        field: String,
+        field_span: Span,
+        span: Span,
+    },
 }
 
 /// The right-hand side of an `in` membership expression.
@@ -1038,6 +1089,7 @@ impl Expr {
             | Expr::IsA { span, .. }
             | Expr::InTable { span, .. }
             | Expr::Evaluate { span, .. }
+            | Expr::QualifiedField { span, .. }
             | Expr::New { span, .. }
             | Expr::Select { span, .. }
             | Expr::HdlPath { span, .. } => *span,
