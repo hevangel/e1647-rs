@@ -1555,8 +1555,7 @@ impl<'a> Interp<'a> {
                         // The declared type is the inference context for an
                         // untyped `evaluate { ... }` in the initializer
                         // (4.17.7); the `var x := e` form declares none.
-                        let value = self.eval_with_hint(ty.clone(), expr, frame, me)?;
-                        value
+                        self.eval_with_hint(ty.clone(), expr, frame, me)?
                     }
                     // A declared type without an initializer takes the
                     // type's default; the type-inferring `:=` form
@@ -6088,20 +6087,6 @@ fn when_view_base(base: &TypeExpr) -> Option<String> {
     match base {
         TypeExpr::Named { name, .. } => Some(name.clone()),
         TypeExpr::WhenQualified { base, .. } => when_view_base(base),
-        _ => None,
-    }
-}
-
-/// The instance type name a declared type expression creates with: the
-/// named type, a when-qualified spelling's combined view name, or a
-/// template reference's canonical instance name.
-fn declared_type_name(ty: &TypeExpr) -> Option<String> {
-    match ty {
-        TypeExpr::Named { name, .. } => Some(name.clone()),
-        TypeExpr::WhenQualified { value, base, .. } => when_view_name(value, base),
-        TypeExpr::TemplateRef { name, args, .. } => {
-            Some(crate::ast::template_instance_name(name, args))
-        }
         _ => None,
     }
 }
