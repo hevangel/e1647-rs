@@ -990,6 +990,20 @@ pub enum InSetExpr {
     Range(Box<Expr>, Box<Expr>),
 }
 
+/// One element of an `in_table` row (clause 4.11.8): a scalar expression
+/// (matched against the tuple element by `==`) or a set (matched by
+/// `in` — a set literal for enum/bool elements, any set expression for
+/// numeric elements).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableElem {
+    /// A scalar row element.
+    Scalar(Expr),
+    /// A set literal `[a, b]` / `[lo..hi]`.
+    Set(InSetExpr),
+    /// `set_of_values(T)` / `full_set_of_values(T)` (5.10.5/5.10.6).
+    TypeSet { ty: TypeExpr, full: bool },
+}
+
 /// One weighted arm of a [`Expr::Select`] distribution: the weight
 /// expression and the choice's raw tokens (clause 10).
 #[derive(Debug, Clone, PartialEq, Eq)]

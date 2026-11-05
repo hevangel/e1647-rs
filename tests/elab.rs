@@ -536,7 +536,6 @@ fn typeof_type_positions_resolve_in_elaboration() {
         );
     }
 }
-}
 
 #[test]
 fn typeof_resolves_method_signature_and_local_var_positions() {

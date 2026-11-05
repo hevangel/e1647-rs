@@ -1518,7 +1518,6 @@ impl<'a> Interp<'a> {
                         self.new_type_hint = None;
                         value
                     }
-                }
                     // A declared type without an initializer takes the
                     // type's default; the type-inferring `:=` form
                     // always carries an initializer.
