@@ -4,7 +4,11 @@
 //! fields (single names and name groups), `like` inheritance clauses, `keep`
 //! constraint expressions, enumeral type declarations, `when` subtype
 //! members, and methods with parameter lists and statement bodies (including
-//! `while`/`break`/`continue`). Temporal expressions, events and coverage
+//! `while`/`break`/`continue`). The 2019 `interface` declaration (clause
+//! 6.13) is represented with kind [`DeclarationKind::Interface`]: its
+//! members are method *signatures* (body-less [`MethodDecl`]s), and the
+//! `implementing` clause of structs, units and extends is recorded on
+//! [`Declaration::implements`]. Temporal expressions, events and coverage
 //! are later milestones and not representable here.
 
 use crate::lexer::Position;
@@ -18,6 +22,11 @@ pub enum DeclarationKind {
     Extend,
     /// `type name: [A, B, C];` — its members are [`Member::Enumeral`].
     Type,
+    /// `[package] interface name [like base, ...] { signature; ... }`
+    /// (clause 6.13): a named collection of method signatures. No object
+    /// is *of* an interface type; a value of interface type points at an
+    /// instance whose type implements the interface, or is NULL.
+    Interface,
 }
 
 /// One formal type parameter of a template declaration (clause 8.2):
@@ -60,9 +69,22 @@ pub struct Declaration {
     pub packaged: bool,
     /// `struct derived like base { .. }` inheritance clause. For
     /// template declarations the base name; the full parameterized base
-    /// type is in [`Declaration::like_type`].
+    /// type is in [`Declaration::like_type`]. Interfaces record their
+    /// (possibly several) bases in [`Declaration::bases`] and leave this
+    /// empty.
     pub like: Option<String>,
     pub like_span: Option<Span>,
+    /// `interface name like base1, base2, ... { .. }` (clause 6.13): the
+    /// inherited interfaces, in written order. An interface includes all
+    /// of their members. Only interfaces may appear here (checked in
+    /// `check.rs`); the spans point at each base name for diagnostics.
+    pub bases: Vec<(String, Span)>,
+    /// `struct S [like B] implementing I1, I2, ... { .. }` and
+    /// `extend S implementing I { .. }` (clause 6.3, 31.4): the
+    /// implemented interfaces, in written order. Elaboration composes
+    /// the per-type set (like-chain bases and extend blocks add to it);
+    /// subtypes implement their base's interfaces.
+    pub implements: Vec<String>,
     /// `template struct t of <type> like container of <type> { .. }` —
     /// the parameterized base type, recorded (clause 8.5.2).
     pub like_type: Option<TypeExpr>,

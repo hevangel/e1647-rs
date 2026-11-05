@@ -1030,14 +1030,21 @@ impl<'a> Interp<'a> {
             }
             TypeExpr::Named { name, .. } => {
                 let types: &[crate::elab::ElaboratedType] = self.types;
-                if let Some(t) = types.iter().find(|t| t.name == name.as_str())
-                    && t.kind == DeclarationKind::Type
-                    && let Some(first) = t.enumerals.first()
-                {
-                    return Value::Enum {
-                        type_name: name.clone(),
-                        name: first.name.clone(),
-                    };
+                if let Some(t) = types.iter().find(|t| t.name == name.as_str()) {
+                    // Clause 5.2.9/5.4.4.4: an interface-typed value is a
+                    // pointer to an instance that implements the
+                    // interface, or NULL — the default.
+                    if t.kind == DeclarationKind::Interface {
+                        return Value::Void;
+                    }
+                    if t.kind == DeclarationKind::Type
+                        && let Some(first) = t.enumerals.first()
+                    {
+                        return Value::Enum {
+                            type_name: name.clone(),
+                            name: first.name.clone(),
+                        };
+                    }
                 }
                 if self.depth > 100 {
                     return Value::Void;
@@ -2813,18 +2820,24 @@ impl<'a> Interp<'a> {
             }
             TypeExpr::Named { name, .. } => {
                 let types: &[crate::elab::ElaboratedType] = self.types;
-                if let Some(t) = types.iter().find(|t| t.name == name.as_str())
-                    && t.kind == DeclarationKind::Type
-                {
-                    let names: Vec<&str> = t.enumerals.iter().map(|e| e.name.as_str()).collect();
-                    if names.is_empty() {
+                if let Some(t) = types.iter().find(|t| t.name == name.as_str()) {
+                    // Clause 5.2.9: no object is of an interface type — a
+                    // generated interface-typed field stays NULL.
+                    if t.kind == DeclarationKind::Interface {
                         return Ok(Value::Void);
                     }
-                    let pick = names[self.rng.below(names.len() as u128) as usize];
-                    return Ok(Value::Enum {
-                        type_name: name.clone(),
-                        name: pick.to_owned(),
-                    });
+                    if t.kind == DeclarationKind::Type {
+                        let names: Vec<&str> =
+                            t.enumerals.iter().map(|e| e.name.as_str()).collect();
+                        if names.is_empty() {
+                            return Ok(Value::Void);
+                        }
+                        let pick = names[self.rng.below(names.len() as u128) as usize];
+                        return Ok(Value::Enum {
+                            type_name: name.clone(),
+                            name: pick.to_owned(),
+                        });
+                    }
                 }
                 if self.depth > 50 {
                     return Err(self.error("E0406", "recursion too deep", origin_span()));
@@ -4531,7 +4544,55 @@ impl<'a> Interp<'a> {
                         }
                         let object_value = self.eval(object, frame, me)?;
                         match object_value {
-                            Value::Object(index) => self.call_method(index, name, values, *span),
+                            Value::Object(index) => {
+                                // Clause 6.13 dynamic dispatch: a call
+                                // through an interface-typed expression
+                                // invokes the object's actual type's
+                                // method (call_method resolves on the
+                                // instance). When the interface declares
+                                // the method but the actual type does
+                                // not provide it, the missing
+                                // implementation is the error (E0414) —
+                                // not the plain not-found one.
+                                let interface_name = self
+                                    .static_type_of(object, frame, me)
+                                    .and_then(|declared| match declared {
+                                        TypeExpr::Named { name: ty_name, .. }
+                                            if self.is_interface(&ty_name) =>
+                                        {
+                                            Some(ty_name)
+                                        }
+                                        _ => None,
+                                    });
+                                if let Some(interface_name) = interface_name {
+                                    let declares = self
+                                        .types
+                                        .iter()
+                                        .find(|t| {
+                                            t.name == interface_name
+                                                && t.kind == DeclarationKind::Interface
+                                        })
+                                        .is_some_and(|t| t.methods.iter().any(|m| m.name == *name));
+                                    if declares {
+                                        let type_name = self.instances[index].type_name.clone();
+                                        let types: &[crate::elab::ElaboratedType] = self.types;
+                                        let provides =
+                                            types.iter().find(|t| t.name == type_name).is_some_and(
+                                                |t| t.methods.iter().any(|m| m.name == *name),
+                                            );
+                                        if !provides {
+                                            return Err(self.error(
+                                                "E0414",
+                                                format!(
+                                                    "struct '{type_name}' does not implement interface method '{name}'"
+                                                ),
+                                                *span,
+                                            ));
+                                        }
+                                    }
+                                }
+                                self.call_method(index, name, values, *span)
+                            }
                             Value::List(list) => {
                                 // The modifying pseudo-methods mutate the
                                 // shared storage through the handle; the
@@ -4735,6 +4796,51 @@ impl<'a> Interp<'a> {
                         type_name: inline_enum_key(names),
                         name: names[*index as usize].clone(),
                     });
+                }
+                // Interface casts (5.10.2.4): no object is of an
+                // interface type, so an `as_a` to an interface is a
+                // checked reference cast — the same pointer when the
+                // object's type implements the interface, NULL
+                // otherwise. The same NULL-on-mismatch applies when an
+                // INTERFACE-typed expression casts to a struct or
+                // another interface: the pointer is kept when the object
+                // satisfies the target, and NULL when it does not (a
+                // subtype might implement the target later, so the cast
+                // itself is legal). Struct-to-struct casts keep their
+                // value-preserving behavior below.
+                if let TypeExpr::Named { name, .. } = ty {
+                    if self.is_interface(name) {
+                        return Ok(match value {
+                            Value::Object(index)
+                                if self.implements_interface(
+                                    &self.instances[index].type_name.clone(),
+                                    name,
+                                ) =>
+                            {
+                                Value::Object(index)
+                            }
+                            _ => Value::Void,
+                        });
+                    }
+                    if let Value::Object(index) = value {
+                        let operand_is_interface = self
+                            .static_type_of(expr, frame, me)
+                            .is_some_and(|operand| match &operand {
+                                TypeExpr::Named {
+                                    name: operand_name, ..
+                                } => self.is_interface(operand_name),
+                                _ => false,
+                            });
+                        if operand_is_interface {
+                            return Ok(
+                                if self.type_is_a(&self.instances[index].type_name.clone(), name) {
+                                    Value::Object(index)
+                                } else {
+                                    Value::Void
+                                },
+                            );
+                        }
+                    }
                 }
                 Ok(value)
             }
@@ -4968,6 +5074,17 @@ impl<'a> Interp<'a> {
                 if self.depth > 100 {
                     return Ok(Value::Void);
                 }
+                // Clause 5.2.9: no object is *of* an interface type — an
+                // interface-typed value points at an instance of a
+                // struct that implements it, so `new <interface>` has no
+                // instance to create.
+                if self.is_interface(&new_name) {
+                    return Err(self.error(
+                        "E0402",
+                        format!("cannot instantiate interface '{new_name}' (clause 5.2.9)"),
+                        *span,
+                    ));
+                }
                 self.depth += 1;
                 let index = self.instantiate(&new_name);
                 let mut frame = Frame::default();
@@ -5027,7 +5144,17 @@ impl<'a> Interp<'a> {
             )),
             TypeExpr::List { .. } => Ok(matches!(value, Value::List(_))),
             TypeExpr::Named { name, .. } => Ok(match value {
-                Value::Object(index) => self.type_is_a(&self.instances[*index].type_name, name),
+                Value::Object(index) => {
+                    // Clause 5.7.1: `is a <interface>` holds for an
+                    // instance whose type implements the interface
+                    // (directly or through inheritance); for a struct
+                    // type name the `like` walk decides.
+                    if self.is_interface(name) {
+                        self.implements_interface(&self.instances[*index].type_name.clone(), name)
+                    } else {
+                        self.type_is_a(&self.instances[*index].type_name, name)
+                    }
+                }
                 Value::Enum { type_name, .. } => self.type_is_a(type_name, name),
                 _ => false,
             }),
@@ -5092,6 +5219,53 @@ impl<'a> Interp<'a> {
             }
         }
         false
+    }
+
+    /// Whether `name` declares an interface (clause 6.13).
+    fn is_interface(&self, name: &str) -> bool {
+        self.types
+            .iter()
+            .any(|t| t.name == name && t.kind == DeclarationKind::Interface)
+    }
+
+    /// Whether interface `name` is `target` or inherits from it (clause
+    /// 6.13: an interface includes all of its `like` bases' members).
+    fn interface_is_a(&self, name: &str, target: &str) -> bool {
+        let mut stack = vec![name.to_owned()];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if current == target {
+                return true;
+            }
+            if let Some(declared) = self
+                .types
+                .iter()
+                .find(|t| t.name == current && t.kind == DeclarationKind::Interface)
+            {
+                for base in &declared.interface_bases {
+                    stack.push(base.clone());
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the struct type `type_name` implements interface `iface`
+    /// (clause 6.3): its composed `implementing` set contains the
+    /// interface, or an interface that inherits it. The composed set
+    /// carries the like-chain bases' and the extend blocks' interfaces,
+    /// so subtypes implement their base's interfaces.
+    fn implements_interface(&self, type_name: &str, iface: &str) -> bool {
+        let Some(declared) = self.types.iter().find(|t| t.name == type_name) else {
+            return false;
+        };
+        declared
+            .implements
+            .iter()
+            .any(|implemented| *implemented == iface || self.interface_is_a(implemented, iface))
     }
 
     /// Evaluate `expr` with `hint` as the declared type expected of it —
@@ -5340,6 +5514,12 @@ impl<'a> Interp<'a> {
                         },
                     ) => ta == tb && na == nb,
                     (Value::Object(a), Value::Object(b)) => a == b,
+                    // NULL comparisons (5.4.4.4): two null references are
+                    // equal; an object never equals NULL. The regular
+                    // value-vs-NULL comparison stays the type error it
+                    // was.
+                    (Value::Void, Value::Void) => true,
+                    (Value::Object(_), Value::Void) | (Value::Void, Value::Object(_)) => false,
                     // The regular `==` on lists is item-by-item (4.11.4's
                     // contrast with `list_ptr==`).
                     (Value::List(a), Value::List(b)) => lists_equal(a, b, 0),
@@ -5965,7 +6145,11 @@ impl<'a> Interp<'a> {
                     .collect();
                 format!("{}{{{}}}", instance.type_name, parts.join(", "))
             }
-            Value::Void => "void".to_owned(),
+            // Clause 5.4.4.4: `Value::Void` doubles as the null
+            // reference — an interface-typed variable with no instance
+            // prints NULL (T3.5). A struct-typed interface value prints
+            // the underlying instance, as any object does above.
+            Value::Void => "NULL".to_owned(),
         }
     }
 

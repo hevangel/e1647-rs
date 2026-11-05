@@ -12,11 +12,15 @@
 //! parameter lists and statement bodies (local `var` declarations,
 //! assignments, expression statements including calls and indexing,
 //! `return`, braced `if`/`else`, `while` with `break`/`continue`, `print`
-//! and `gen`). Brace grouping is pure syntax (clause 4.3.2 module level,
-//! 4.3.3 member lists): a bare `{ ... }` splices its contents into the
-//! enclosing list, and groups nest. A statement (or member) may also span
-//! code segments (clause 4.2.3): the lexer skips prose between `'>` and
-//! `<'`, so the parser sees one continuous token stream.
+//! and `gen`). The 2019 additions: `interface` declarations (clause 6.13)
+//! whose members are body-less method signatures, and the `implementing
+//! I1, I2, ...` clause on structs, units and extends (clause 6.3) — both
+//! recorded on the AST; the interface well-formedness rules are checked
+//! in [`crate::check`]. Brace grouping is pure syntax (clause 4.3.2 module
+//! level, 4.3.3 member lists): a bare `{ ... }` splices its contents into
+//! the enclosing list, and groups nest. A statement (or member) may also
+//! span code segments (clause 4.2.3): the lexer skips prose between `'>`
+//! and `<'`, so the parser sees one continuous token stream.
 //!
 //! Everything else (events, temporal expressions, coverage, the
 //! single-statement `if ... do` form, `for`/`repeat` loops) is a later
@@ -308,6 +312,12 @@ struct Parser {
     /// matching `}` of nested groups. A `}` at depth 0 is still the
     /// stray-brace diagnostic it was before the migration.
     module_group_depth: usize,
+    /// Set while an interface body's members parse (clause 6.13): a
+    /// method member is a SIGNATURE — `name(params)[: ret-type];` with no
+    /// `is` body — and parses into a body-less [`MethodDecl`]. The flag
+    /// scopes to the interface body only; elsewhere a body-less method
+    /// stays the `E0115` error it always was.
+    interface_body: bool,
 }
 
 /// The included body of one preprocessor directive: members in member
@@ -330,6 +340,7 @@ impl Parser {
             defined: BTreeSet::new(),
             member_visibility: None,
             module_group_depth: 0,
+            interface_body: false,
         }
     }
 
@@ -522,7 +533,10 @@ impl Parser {
         while self.peek().is_some() {
             let keyword = match self.peek_kind() {
                 Some(TokenKind::Keyword(k))
-                    if matches!(k.as_str(), "struct" | "unit" | "extend" | "type") =>
+                    if matches!(
+                        k.as_str(),
+                        "struct" | "unit" | "extend" | "type" | "interface"
+                    ) =>
                 {
                     k.clone()
                 }
@@ -554,6 +568,8 @@ impl Parser {
                             like: None,
                             like_span: None,
                             like_type: None,
+                            bases: Vec::new(),
+                            implements: Vec::new(),
                             modifiers: Vec::new(),
                             members,
                             span: (gstart, gend),
@@ -590,6 +606,8 @@ impl Parser {
                             like: None,
                             like_span: None,
                             like_type: None,
+                            bases: Vec::new(),
+                            implements: Vec::new(),
                             modifiers: Vec::new(),
                             members,
                             span: (gstart, gend),
@@ -629,6 +647,7 @@ impl Parser {
                                 if matches!(
                                     k.as_str(),
                                     "template" | "struct" | "unit" | "extend" | "type"
+                                        | "interface"
                                 )
                         ) =>
                 {
@@ -686,6 +705,13 @@ impl Parser {
             };
             let declaration = if keyword == "type" {
                 let mut declaration = self.parse_type_declaration();
+                if let Some(d) = declaration.as_mut() {
+                    d.packaged = packaged;
+                }
+                packaged = false;
+                declaration
+            } else if keyword == "interface" {
+                let mut declaration = self.parse_interface_declaration();
                 if let Some(d) = declaration.as_mut() {
                     d.packaged = packaged;
                 }
@@ -779,6 +805,8 @@ impl Parser {
                 like: None,
                 like_span: None,
                 like_type: None,
+                bases: Vec::new(),
+                implements: Vec::new(),
                 modifiers: Vec::new(),
                 members: vec![members.pop().expect("MAIN enumeral")],
                 span: (start, end),
@@ -795,6 +823,8 @@ impl Parser {
                 like: None,
                 like_span: None,
                 like_type: None,
+                bases: Vec::new(),
+                implements: Vec::new(),
                 modifiers: Vec::new(),
                 members: vec![
                     Member::Event(crate::ast::EventDecl {
@@ -831,6 +861,8 @@ impl Parser {
                 like: None,
                 like_span: None,
                 like_type: None,
+                bases: Vec::new(),
+                implements: Vec::new(),
                 modifiers: Vec::new(),
                 members,
                 span: (start, end),
@@ -916,6 +948,8 @@ impl Parser {
                 like,
                 like_span,
                 like_type,
+                bases: Vec::new(),
+                implements: Vec::new(),
                 modifiers: Vec::new(),
                 members: Vec::new(),
                 span: (start, self.eof),
@@ -936,6 +970,8 @@ impl Parser {
             like,
             like_span,
             like_type,
+            bases: Vec::new(),
+            implements: Vec::new(),
             modifiers: Vec::new(),
             members,
             span: (start, end),
@@ -1000,6 +1036,8 @@ impl Parser {
                 like: None,
                 like_span: None,
                 like_type: None,
+                bases: Vec::new(),
+                implements: Vec::new(),
                 modifiers: Vec::new(),
                 members: Vec::new(),
                 span: (start, end),
@@ -1022,6 +1060,8 @@ impl Parser {
                 like: None,
                 like_span: None,
                 like_type: None,
+                bases: Vec::new(),
+                implements: Vec::new(),
                 modifiers: Vec::new(),
                 members: Vec::new(),
                 span: (start, self.eof),
@@ -1068,6 +1108,8 @@ impl Parser {
                 like: None,
                 like_span: None,
                 like_type: None,
+                bases: Vec::new(),
+                implements: Vec::new(),
                 modifiers: Vec::new(),
                 members,
                 span: (start, self.last_end()),
@@ -1099,6 +1141,8 @@ impl Parser {
                 like: None,
                 like_span: None,
                 like_type: None,
+                bases: Vec::new(),
+                implements: Vec::new(),
                 modifiers: Vec::new(),
                 members,
                 span: (start, self.last_end()),
@@ -1117,6 +1161,8 @@ impl Parser {
             like: None,
             like_span: None,
             like_type: None,
+            bases: Vec::new(),
+            implements: Vec::new(),
             modifiers: Vec::new(),
             members,
             span: (start, end),
@@ -1153,6 +1199,83 @@ impl Parser {
         let expr = self.parse_expr()?;
         self.expect_punct(")", "E0110", "expected ')' after width specification")?;
         Some(Box::new(expr))
+    }
+
+    /// `[package] interface name [like base1, base2, ...] { signature; ... };`
+    /// (clause 6.13). An interface declares a named collection of method
+    /// signatures — no bodies (the `interface_body` parser mode lets
+    /// `parse_method` accept the body-less `name(params): ret;` shape) —
+    /// and may inherit several interfaces, whose members it includes.
+    /// Non-signature members parse structurally and are rejected by
+    /// `check.rs` (E0125); extending an interface is rejected there too
+    /// (E0124). The bases are recorded in `Declaration::bases`.
+    fn parse_interface_declaration(&mut self) -> Option<Declaration> {
+        let start = self.current_span().0;
+        self.bump(); // 'interface'
+        let (name, name_span) = self.expect_type_name("expected the interface name")?;
+        let mut bases = Vec::new();
+        if self.eat_keyword("like") {
+            loop {
+                let (base, base_span) =
+                    self.expect_type_name("expected an interface name after 'like'")?;
+                bases.push((base, base_span));
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+        }
+        if self
+            .expect_punct("{", "E0106", "expected '{' to open the interface body")
+            .is_none()
+        {
+            self.recover_to_declaration_boundary();
+            return Some(Declaration {
+                kind: DeclarationKind::Interface,
+                name,
+                name_span,
+                underlying: None,
+                subtype_range: None,
+                template_params: Vec::new(),
+                template_extend: false,
+                packaged: false,
+                like: None,
+                like_span: None,
+                like_type: None,
+                bases,
+                implements: Vec::new(),
+                modifiers: Vec::new(),
+                members: Vec::new(),
+                span: (start, self.eof),
+            });
+        }
+        // Interface bodies hold method signatures: `parse_method` accepts
+        // the body-less form while the flag is set.
+        let saved_interface_body = self.interface_body;
+        self.interface_body = true;
+        let members = self.parse_member_list();
+        self.interface_body = saved_interface_body;
+        // e convention writes the closing brace as `};`; the semicolon is
+        // accepted but not required.
+        self.eat_punct(";");
+        let end = self.last_end();
+        Some(Declaration {
+            kind: DeclarationKind::Interface,
+            name,
+            name_span,
+            underlying: None,
+            subtype_range: None,
+            template_params: Vec::new(),
+            template_extend: false,
+            packaged: false,
+            like: None,
+            like_span: None,
+            like_type: None,
+            bases,
+            implements: Vec::new(),
+            modifiers: Vec::new(),
+            members,
+            span: (start, end),
+        })
     }
 
     fn parse_declaration(&mut self, keyword: &str) -> Option<Declaration> {
@@ -1241,6 +1364,21 @@ impl Parser {
             };
             like_type = Some(base);
         }
+        // `implementing I1, I2, ...` (clause 6.3, 31.4): the interfaces
+        // this struct/unit (or extend target) implements, in written
+        // order. Elaboration composes them per type; the conformance and
+        // conflict checks live in `check.rs`.
+        let mut implements = Vec::new();
+        if self.eat_keyword("implementing") {
+            loop {
+                let (interface_name, _) =
+                    self.expect_type_name("expected an interface name after 'implementing'")?;
+                implements.push(interface_name);
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+        }
         if self
             .expect_punct("{", "E0106", "expected '{' to open the declaration body")
             .is_none()
@@ -1258,6 +1396,8 @@ impl Parser {
                 like_type,
                 like,
                 like_span,
+                bases: Vec::new(),
+                implements,
                 modifiers,
                 members: Vec::new(),
                 span: (start, self.eof),
@@ -1280,6 +1420,8 @@ impl Parser {
             like_type,
             like,
             like_span,
+            bases: Vec::new(),
+            implements,
             modifiers,
             members,
             span: (start, end),
@@ -2428,6 +2570,25 @@ impl Parser {
         } else {
             None
         };
+        // Clause 6.13: inside an interface body a method member is a
+        // SIGNATURE — `name(params): ret-type;` with no body. It records
+        // as a body-less method; the interpreter never runs it (dispatch
+        // goes through the implementing struct's method, E0414 when
+        // absent).
+        if self.interface_body && (self.at_punct(";") || self.at_punct("}")) {
+            self.eat_punct(";");
+            let end = self.last_end();
+            return Some(Member::Method(MethodDecl {
+                name,
+                name_span,
+                params,
+                return_type,
+                tcm_event,
+                modifier: None,
+                body: Vec::new(),
+                span: (start, end),
+            }));
+        }
         if !self.eat_keyword("is") {
             self.error_here("E0115", "expected 'is' to start the method body");
             self.recover_to_member_boundary();

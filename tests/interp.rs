@@ -2928,3 +2928,109 @@ fn qualified_field_access_writes_and_checks_presence() {
     );
     assert_eq!(output, "42\nIS A PACKET\n");
 }
+
+#[test]
+fn interface_dispatch_casts_and_is_a_compose() {
+    // 5.2.9/5.4.4.4/5.7.1/5.10.2.4 (the migration's T3.3): an
+    // interface-typed variable holds the implementing instance; a call
+    // through it dispatches on the object's actual type; `is a` holds
+    // for implementors; an `as_a` between an interface and an unrelated
+    // struct is legal and yields NULL on mismatch.
+    let output = clean_output(
+        "interface shape { area(): uint; };\n\
+         struct square implementing shape { side: uint; area(): uint is { return side * side; }; };\n\
+         struct rect implementing shape { w: uint; h: uint; area(): uint is { return w * h; }; };\n\
+         struct blob { };\n\
+         extend sys {\n    run() is also {\n        var sq: square = new; sq.side = 3;\n        \
+         var rc: rect = new; rc.w = 2; rc.h = 5;\n        \
+         var shapes: list of shape = {sq; rc};\n        \
+         var total: uint = 0;\n        \
+         for each (s) in shapes { total = total + s.area(); };\n        \
+         out(total, \"\n\");\n        \
+         var sh: shape = sq;\n        \
+         out(sh is a square, \"\n\");\n        \
+         out(sh.as_a(rect) == NULL, \"\n\");\n        \
+         var b: blob = new;\n        \
+         out(b is a shape, \"\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "19\nTRUE\nTRUE\nFALSE\n");
+}
+
+#[test]
+fn interface_base_assignment_and_casts_follow_inheritance() {
+    // 6.13 + 5.4.4.4: implementing an interface implies implementing its
+    // `like` bases — a struct→base-interface assignment is the automatic
+    // cast, an interface→base-interface cast keeps the pointer, and a
+    // base→unrelated-interface cast is legal but NULL.
+    let output = clean_output(
+        "interface base_i { m(): uint; };\n\
+         interface derived_i like base_i { n(): uint; };\n\
+         interface unrelated { m(): uint; };\n\
+         struct s implementing derived_i {\n    m(): uint is { return 7; };\n    n(): uint is { return 8; };\n};\n\
+         extend sys {\n    run() is also {\n        var d: derived_i = new s;\n        \
+         out(d.n(), \"\n\");\n        \
+         var b: base_i = d;\n        \
+         out(b.m(), \"\n\");\n        \
+         out(b.as_a(derived_i).n(), \"\n\");\n        \
+         var u: unrelated = b.as_a(unrelated);\n        \
+         out(u == NULL, \"\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "8\n7\n8\nTRUE\n");
+}
+
+#[test]
+fn interface_call_without_implementation_reports_e0414() {
+    // 6.13 (the migration's T3.4): the interface method resolves through
+    // the object's actual struct type; a type that implements the
+    // interface without providing the method is a run-time error at the
+    // call — E0414 names the struct and the method.
+    let result = run_source(
+        "interface shape { area(): uint; };\n\
+         struct lazy implementing shape { };\n\
+         extend sys {\n    run() is also {\n        var s: shape = new lazy;\n        \
+         s.area();\n    };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0414");
+    assert!(
+        diagnostic
+            .render()
+            .contains("struct 'lazy' does not implement interface method 'area'"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn interface_typed_values_print_the_underlying_struct_or_null() {
+    // T3.5: printing an interface-typed value renders the underlying
+    // instance exactly as a struct-typed one does; a NULL interface
+    // value (the default) prints NULL.
+    let output = clean_output(
+        "interface shape { area(): uint; };\n\
+         struct square implementing shape { side: uint; area(): uint is { return side * side; }; };\n\
+         extend sys {\n    run() is also {\n        var filled: shape = new square;\n        \
+         out(filled, \"\\n\");\n        \
+         var nothing: shape;\n        \
+         out(nothing, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "square{side: 0}\nNULL\n");
+}
+
+#[test]
+fn interface_default_and_generated_fields_are_null() {
+    // 5.2.9: an interface-typed field's default is NULL, and `gen` does
+    // not invent an instance for it — the field stays NULL.
+    let output = clean_output(
+        "interface shape { area(): uint; };\n\
+         struct holder {\n    sh: shape;\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         gen h;\n        out(h.sh == NULL, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUE\n");
+}
