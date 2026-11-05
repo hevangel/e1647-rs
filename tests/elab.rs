@@ -190,7 +190,7 @@ fn on_members_compose_through_extends_in_order() {
 
 #[test]
 fn when_blocks_synthesize_subtype_views() {
-    // 6.6: a single-modifier `when VALUE'id` block synthesizes a
+    // 6.7: a single-modifier `when VALUE'id` block synthesizes a
     // subtype view named `VALUE base` — the base's composed members
     // with the when block's appended — marked with its discriminator.
     let result = elaborated(
@@ -216,7 +216,7 @@ fn when_blocks_synthesize_subtype_views() {
 
 #[test]
 fn chained_modifiers_synthesize_a_combined_view() {
-    // 6.6.1: subtypes can be combinations of fields — a when block
+    // 6.7.1: subtypes can be combinations of fields — a when block
     // whose `value'id` modifiers each name their determinant field
     // synthesizes ONE conjunctive view named with all the values
     // space-joined in modifier order, carrying every (field, value)

@@ -10,6 +10,12 @@ material.
 - **Designation:** IEEE 1647-2019 — *IEEE Standard for the Functional
   Verification Language e* (revisions 1647-2006/2008/2011/2016 exist; 2019 is
   current).
+- **Implementation target:** this repository implements **IEEE 1647-2019**;
+  behaviour notes, diagnostic messages and docs cite **2019 clause numbers**.
+  The migration from the 2016 numbering is tracked in
+  [e1647-rs_IEEE1647-2019_migration_plan.md](e1647-rs_IEEE1647-2019_migration_plan.md);
+  historical log entries in `docs/VERIFICATION.md` written before that
+  migration cite 2016 numbers.
 - **Official page:** <https://standards.ieee.org/ieee/1647/7193/>
 - **Access:** The standard is copyrighted by IEEE. It is available through
   IEEE Xplore and the [IEEE GET Program](https://standards.ieee.org/products-programs/ieee-get-program/)

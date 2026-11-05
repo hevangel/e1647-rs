@@ -168,7 +168,7 @@ fn run_error(source: &str) -> Vec<String> {
 
 #[test]
 fn list_pop_pop0_remove_and_return_the_ends() {
-    // 26.3.10 pop(): removes and returns the last item. 26.3.11 pop0():
+    // 27.3.10 pop(): removes and returns the last item. 27.3.11 pop0():
     // removes and returns the first item, renumbering the rest.
     let output = clean_output(
         "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
@@ -181,8 +181,8 @@ fn list_pop_pop0_remove_and_return_the_ends() {
 
 #[test]
 fn list_top_top0_read_without_removing() {
-    // 26.4.26 top(): the last item, not removed (pairs with pop).
-    // 26.4.27 top0(): the first item, not removed (pairs with pop0 for
+    // 27.4.26 top(): the last item, not removed (pairs with pop).
+    // 27.4.27 top0(): the first item, not removed (pairs with pop0 for
     // queues, per the prose's note).
     let output = clean_output(
         "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
@@ -195,7 +195,7 @@ fn list_top_top0_read_without_removing() {
 
 #[test]
 fn list_push0_insert_place_items_by_position() {
-    // 26.3.13 push0(item): the item becomes index 0. 26.3.8
+    // 27.3.13 push0(item): the item becomes index 0. 27.3.8
     // insert(index, item): index == size appends (the prose's stated
     // case), earlier positions shift the rest back.
     let output = clean_output(
@@ -214,8 +214,8 @@ fn list_push0_insert_place_items_by_position() {
 
 #[test]
 fn list_delete_fast_delete_remove_items() {
-    // 26.3.6 delete(index): removes the item at the index, renumbering
-    // sequentially. 26.3.7 fast_delete(index): the last item's value
+    // 27.3.6 delete(index): removes the item at the index, renumbering
+    // sequentially. 27.3.7 fast_delete(index): the last item's value
     // moves into the deleted slot, so the other indexes stay.
     let output = clean_output(
         "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
@@ -229,7 +229,7 @@ fn list_delete_fast_delete_remove_items() {
 
 #[test]
 fn list_clear_and_is_empty() {
-    // 26.3.5 clear(): deletes all items. 26.4.12 is_empty(): TRUE only
+    // 27.3.5 clear(): deletes all items. 27.4.12 is_empty(): TRUE only
     // when the list has no items.
     let output = clean_output(
         "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
@@ -243,9 +243,9 @@ fn list_clear_and_is_empty() {
 
 #[test]
 fn list_push_push0_add_add0_of_a_list_extend() {
-    // 26.3.2 add(list) / 26.3.14 push(list): a copy of the argument list
-    // is appended. 26.3.4 add0(list) / 26.3.15 push0(list): it is placed
-    // at the head. e declares no lists of lists (26.4.25), so a
+    // 27.3.2 add(list) / 27.3.14 push(list): a copy of the argument list
+    // is appended. 27.3.4 add0(list) / 27.3.15 push0(list): it is placed
+    // at the head. e declares no lists of lists (27.4.25), so a
     // list-valued argument is unambiguously the list form.
     let output = clean_output(
         "extend sys {\n    run() is also {\n        var a: list of int;\n        \
@@ -259,9 +259,9 @@ fn list_push_push0_add_add0_of_a_list_extend() {
 
 #[test]
 fn list_reverse_copy_and_exists() {
-    // 26.4.21 reverse(): a new list in reverse order, receiver unchanged.
-    // 26.4.3 copy(): a new list; modifying the copy leaves the original.
-    // 26.4.5 exists(): TRUE only for an index number that exists.
+    // 27.4.21 reverse(): a new list in reverse order, receiver unchanged.
+    // 27.4.3 copy(): a new list; modifying the copy leaves the original.
+    // 27.4.5 exists(): TRUE only for an index number that exists.
     let output = clean_output(
         "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
          xs.push(1); xs.push(2); xs.push(3);\n        \
@@ -276,8 +276,8 @@ fn list_reverse_copy_and_exists() {
 
 #[test]
 fn list_min_max_prefer_the_latest_on_ties() {
-    // 26.4.15 max()/26.4.18 min(): the item with the largest/smallest
-    // value. 26.4.16 max_index()/26.4.19 min_index(): the same scan as an
+    // 27.4.15 max()/27.4.18 min(): the item with the largest/smallest
+    // value. 27.4.16 max_index()/27.4.19 min_index(): the same scan as an
     // index — and on ties the latest item wins, which the index forms
     // make observable.
     let output = clean_output(
@@ -295,9 +295,9 @@ fn list_min_max_prefer_the_latest_on_ties() {
 
 #[test]
 fn list_sum_product_and_all_or_all_with_empty_results() {
-    // 26.5.5 sum(): the integer sum, 0 when empty. 26.5.4 product(): the
-    // integer product, 1 when empty. 26.5.1 and_all(): TRUE when empty.
-    // 26.5.2 or_all(): FALSE when empty. The no-argument forms read the
+    // 27.5.5 sum(): the integer sum, 0 when empty. 27.5.4 product(): the
+    // integer product, 1 when empty. 27.5.1 and_all(): TRUE when empty.
+    // 27.5.2 or_all(): FALSE when empty. The no-argument forms read the
     // items themselves; the exp-parameter forms are a documented gap.
     let output = clean_output(
         "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
@@ -314,7 +314,7 @@ fn list_sum_product_and_all_or_all_with_empty_results() {
 
 #[test]
 fn list_is_a_permutation_ignores_order() {
-    // 26.4.11 is_a_permutation(): TRUE when the argument holds the same
+    // 27.4.11 is_a_permutation(): TRUE when the argument holds the same
     // items with the same multiplicities, in any order.
     let output = clean_output(
         "extend sys {\n    run() is also {\n        var a: list of int;\n        \
@@ -332,7 +332,7 @@ fn list_is_a_permutation_ignores_order() {
 
 #[test]
 fn list_modifiers_work_through_struct_fields() {
-    // The pseudo-methods attach to any list expression (26.2) — a struct
+    // The pseudo-methods attach to any list expression (27.2) — a struct
     // field receiver writes back through the field.
     let output = clean_output(
         "struct queue_s {\n    items: list of int;\n};\n\
@@ -347,8 +347,8 @@ fn list_modifiers_work_through_struct_fields() {
 
 #[test]
 fn empty_list_accessors_report_e0402() {
-    // 26.3.10/26.3.11 and 26.4.26/26.4.27: "If the list is empty, an
-    // error shall be issued." 26.4.15/26.4.18: "If the list is empty, an
+    // 27.3.10/27.3.11 and 27.4.26/27.4.27: "If the list is empty, an
+    // error shall be issued." 27.4.15/27.4.18: "If the list is empty, an
     // error shall be issued." Reported like the set pseudo-methods'
     // empty-set errors (E0402).
     for (call, name) in [
@@ -373,8 +373,8 @@ fn empty_list_accessors_report_e0402() {
 
 #[test]
 fn list_index_pseudo_methods_report_e0404() {
-    // 26.3.6/26.3.7: an index that does not exist in the list issues an
-    // error; 26.3.8: a size smaller than index issues an error. E0404 is
+    // 27.3.6/27.3.7: an index that does not exist in the list issues an
+    // error; 27.3.8: a size smaller than index issues an error. E0404 is
     // the list index out-of-range code (the same one the [i] expression
     // reports).
     let cases = [
@@ -399,8 +399,8 @@ fn list_index_pseudo_methods_report_e0404() {
 
 #[test]
 fn list_aggregates_reject_wrong_item_types() {
-    // 26.5.4/26.5.5 define integer results; 26.5.1/26.5.2 read boolean
-    // items; the 26.4.15-26.4.19 extremes order items the way the
+    // 27.5.4/27.5.5 define integer results; 27.5.1/27.5.2 read boolean
+    // items; the 27.4.15-27.4.19 extremes order items the way the
     // relational operators do. Anything else is a type error.
     let cases = [
         (
@@ -435,7 +435,7 @@ fn list_aggregates_reject_wrong_item_types() {
 
 #[test]
 fn unsupported_list_methods_report_e0405() {
-    // The expression-taking pseudo-methods (apply 26.4.2, sort 26.4.23 —
+    // The expression-taking pseudo-methods (apply 27.4.2, sort 27.4.23 —
     // documented gaps) and unknown names stay E0405.
     for call in ["xs.apply(1);", "xs.sort();", "xs.foo();"] {
         let source = format!(
@@ -575,7 +575,7 @@ fn compute_calls_tcm_inline_and_waits_advance() {
 
 #[test]
 fn start_schedules_the_tcm_and_the_starter_continues() {
-    // 13.1.1: `start` enqueues the TCM with an implicit sync cycle and
+    // 13.2.2: `start` enqueues the TCM with an implicit sync cycle and
     // the starter continues; the TCM's first statement runs after the
     // starter's turn.
     let output = clean_output(
@@ -590,7 +590,7 @@ fn start_schedules_the_tcm_and_the_starter_continues() {
 
 #[test]
 fn temporal_wait_in_a_tcm_observes_emissions_made_while_suspended() {
-    // The marquee clause 13.1.1 behavior: the waiter suspends at
+    // The marquee clause 13.2.2 behavior: the waiter suspends at
     // `wait @ev`; the emitter's TCM advances two cycles and emits; the
     // waiter resumes and completes.
     let output = clean_output(
@@ -637,7 +637,7 @@ fn tcm_locals_persist_across_suspensions_in_a_while_loop() {
 
 #[test]
 fn bare_sync_suspends_for_one_cycle() {
-    // 13.1.2: `sync;` suspends for one occurrence of the default
+    // 13.2.3: `sync;` suspends for one occurrence of the default
     // sampling event. The TCM syncs away cycle 0 and its wait starts
     // at cycle 1; the starter's emission lands in cycle 2 and the
     // post-sync wait observes it from the log.
@@ -653,7 +653,7 @@ fn bare_sync_suspends_for_one_cycle() {
 #[test]
 fn wait_inside_an_if_body_suspends_and_resumes() {
     // The marquee generalization: the wait inside the `then` branch
-    // suspends the TCM (13.1.1) while the emitter advances; the resume
+    // suspends the TCM (13.2.2) while the emitter advances; the resume
     // path re-enters the branch without re-evaluating the condition or
     // replaying the branch's executed statements.
     let output = clean_output(
@@ -723,7 +723,7 @@ fn wait_inside_a_case_arm_suspends_and_resumes() {
 #[test]
 fn wait_inside_a_repeat_until_body_suspends_and_resumes() {
     // A repeat-until body re-enters mid-iteration (the condition is
-    // only evaluated when the iteration completes, 20.2.2): the first
+    // only evaluated when the iteration completes, 20.2.3): the first
     // wait resumes on the emission and the second succeeds in the same
     // cycle's log (the occurrence is behind the fresh wait's start).
     let output = clean_output(
@@ -856,7 +856,7 @@ fn is_a_checks_enumeral_types_by_name() {
 
 #[test]
 fn string_match_evaluates_case_insensitive_full_string_literals() {
-    // Native string matching (clause 4.11.1) is case insensitive and
+    // Native string matching (clause 4.12.1) is case insensitive and
     // always matches the full string; the literal subset compares
     // equal-ignoring-case.
     let output = clean_output(
@@ -870,7 +870,7 @@ fn string_match_evaluates_case_insensitive_full_string_literals() {
 
 #[test]
 fn string_match_reports_unsupported_pattern_shapes() {
-    // `/.../` selects AWK-style regular expressions (clause 4.11.2) and
+    // `/.../` selects AWK-style regular expressions (clause 4.12.2) and
     // native meta-characters are unimplemented; both report E0410.
     let result = run(
         &elaborate(
@@ -1089,7 +1089,7 @@ fn select_expressions_report_an_honest_eval_diagnostic() {
 #[test]
 fn emit_feeds_the_temporal_log_and_wait_sees_it() {
     // `emit` records the occurrence in this cycle's state; a temporal
-    // wait started in the same cycle succeeds immediately (12.3.1's
+    // wait started in the same cycle succeeds immediately (12.3.2's
     // sub-path over the recorded state).
     let output = clean_output(
         "extend sys {\n    ev: event;\n    run() is also {\n        emit ev;\n        \
@@ -1103,7 +1103,7 @@ fn emit_feeds_the_temporal_log_and_wait_sees_it() {
 fn temporal_wait_sees_events_recorded_by_a_tcm() {
     // A started TCM's numeric wait advanced the cycle and the emission
     // landed in the new cycle's state; the temporal wait `until @ev`
-    // (13.1.3's readability-only `until`) succeeds against the log.
+    // (13.2.4's readability-only `until`) succeeds against the log.
     // (An `on` block cannot carry the wait: 11.3 forbids
     // time-consuming actions in on action blocks.)
     let output = clean_output(
@@ -1163,7 +1163,7 @@ fn failed_expect_rule_runs_the_else_body() {
 #[test]
 fn satisfied_and_vacuous_expect_rules_stay_silent() {
     // The satisfied rule: start then done one cycle later. The vacuous
-    // rule: its lhs never occurs, so nothing is obligated (12.2.13).
+    // rule: its lhs never occurs, so nothing is obligated (12.2.14).
     let output = clean_output(
         "extend sys {\n    start_ev: event;\n    done_ev: event;\n    other_ev: event;\n    \
          expect @start_ev => eventually @done_ev else dut_error(\"SATISFIABLE\");\n    \
@@ -1222,7 +1222,7 @@ fn eventually_rule_requires_the_event_before_quit() {
 
 #[test]
 fn temporal_wait_spins_until_a_later_cycle_satisfies_the_sequence() {
-    // `wait {@a; cycle}` (12.2.8): a occurs in the start cycle; the
+    // `wait {@a; cycle}` (12.2.9): a occurs in the start cycle; the
     // tail `cycle` holds on the next cycle, so the wait spins once —
     // the padded empty state — and succeeds.
     let output = clean_output(
@@ -1248,7 +1248,7 @@ fn proposition_wait_evaluates_with_current_field_values() {
 
 #[test]
 fn cover_group_samples_explicit_buckets_on_emit() {
-    // 14.1/14.2: the group samples when its event fires; each item
+    // 14.2/14.3: the group samples when its event fires; each item
     // value lands in the bucket whose range contains it, and values
     // outside every bucket are ungradeable.
     let result = run_source(
@@ -1280,7 +1280,7 @@ fn cover_group_samples_explicit_buckets_on_emit() {
 
 #[test]
 fn cover_items_without_ranges_use_the_clause_defaults() {
-    // 14.2: integers default to 16 buckets (0 through 15), booleans to
+    // 14.3: integers default to 16 buckets (0 through 15), booleans to
     // their two values; out-of-range values do not affect the grade.
     let result = run_source(
         "extend sys {\n    event cov_e;\n    n: uint;\n    flag: bool;\n    cover cov_e is {\n        \
@@ -1306,7 +1306,7 @@ fn cover_items_without_ranges_use_the_clause_defaults() {
 
 #[test]
 fn cover_is_also_merges_items_into_the_base_group() {
-    // 14.5: `is also` extensions add items to the base group; an
+    // 14.6: `is also` extensions add items to the base group; an
     // `empty` placeholder receives them too.
     let result = run_source(
         "extend sys {\n    event cov_e;\n    ok: bool;\n    cover cov_e is empty;\n    \
@@ -1325,7 +1325,7 @@ fn cover_is_also_merges_items_into_the_base_group() {
 #[test]
 fn untyped_unranged_cover_items_record_without_grading() {
     // An item with no ranges clause and no typed expression is
-    // recorded but ungradeable (14.2: goals of 0).
+    // recorded but ungradeable (14.3: goals of 0).
     let result = run_source(
         "extend sys {\n    event cov_e;\n    tag: string;\n    cover cov_e is {\n        \
          item tag;\n        };\n    run() is also {\n        tag = \"a\"; emit cov_e;\n        \
@@ -1344,7 +1344,7 @@ fn untyped_unranged_cover_items_record_without_grading() {
 
 #[test]
 fn select_weights_bias_the_sampler_to_min_and_max() {
-    // 10.2.12.2: an arm is chosen with probability weight/(sum of all
+    // 10.3.12.3: an arm is chosen with probability weight/(sum of all
     // weights) over the current range; `min`/`max` take the extremes.
     let dominated = |arm_a: &str, arm_b: &str| {
         clean_output(
@@ -1454,7 +1454,7 @@ fn select_with_an_unevaluable_choice_keeps_the_field_free() {
 
 #[test]
 fn when_subtyped_fields_generate_under_their_when_constraints() {
-    // 6.6 + 10.2.12.2 together: a when-qualified field (`LO pkt`)
+    // 6.7 + 10.3.12.3 together: a when-qualified field (`LO pkt`)
     // generates an instance of the synthesized subtype view, whose
     // when-block constraints — here a select distribution — apply.
     let output = clean_output(
@@ -1491,7 +1491,7 @@ fn when_views_carry_methods_and_base_membership() {
 
 #[test]
 fn chained_when_views_compose_both_levels_constraints() {
-    // 6.6 chained: a chained-qualified field (`LO HI pkt`) carries the
+    // 6.7 chained: a chained-qualified field (`LO HI pkt`) carries the
     // combined view — the outer when's constraint and the when-in-when
     // member's constraint both gate its gen (here two select policies:
     // one field biased to min, the other to max) — and `is a` walks
@@ -1558,7 +1558,7 @@ fn method_body_new_returns_a_usable_template_instance() {
 
 #[test]
 fn enclosing_when_constraints_gate_gen_of_the_field() {
-    // 10.2.7's connected field sets, v1: `gen p` inside a when-view
+    // 10.3.6-10.3.7's connected field sets, v1: `gen p` inside a when-view
     // instance is gated by the when block's constraints, rebased from
     // `p.v` to `v` — two sibling instances with different policies
     // produce opposite extremes, like igen-dist's env policies.
@@ -1580,7 +1580,7 @@ fn enclosing_when_constraints_gate_gen_of_the_field() {
 
 #[test]
 fn transition_items_collect_value_pairs_from_the_base() {
-    // 14.4: the transition derives previous-value/value samples from
+    // 14.5: the transition derives previous-value/value samples from
     // the base item's consecutive samples; gradeable over the base's
     // bucket pairs.
     let result = run_source(
@@ -1595,7 +1595,7 @@ fn transition_items_collect_value_pairs_from_the_base() {
     assert_eq!(group.derived.len(), 1);
     let transition = &group.derived[0];
     assert_eq!(transition.name, "transition__cur");
-    // n=3 base samples → n-1=2 transition samples (14.4).
+    // n=3 base samples → n-1=2 transition samples (14.5).
     assert_eq!(transition.samples, 2);
     // low→high and high→low observed of the 4 ordered bucket pairs.
     assert_eq!(transition.combos.len(), 2);
@@ -1606,7 +1606,7 @@ fn transition_items_collect_value_pairs_from_the_base() {
 
 #[test]
 fn cross_items_collect_combinations_of_their_sources() {
-    // 14.3: the cross shows every combination of the crossed items'
+    // 14.4: the cross shows every combination of the crossed items'
     // values; gradeable over the cross product of the bucket counts.
     let result = run_source(
         "extend sys {\n    event cov_e;\n    a: uint;\n    b: bool;\n    cover cov_e is {\n        \
@@ -1803,7 +1803,7 @@ fn computed_macro_result_variable_is_the_return_value() {
 
 #[test]
 fn set_of_values_builds_the_legal_value_set() {
-    // 5.8.4: the set of all legal values of a numeric or enumeral
+    // 5.10.5: the set of all legal values of a numeric or enumeral
     // type — scalars from their width and signedness, enumerals as
     // their indices.
     let output = clean_output(
@@ -1820,7 +1820,7 @@ fn set_of_values_builds_the_legal_value_set() {
 
 #[test]
 fn set_pseudo_methods_query_and_combine() {
-    // 27.4: size/uint_size/min/uint_min/max/uint_max on sets, and the
+    // 28.5: size/uint_size/min/uint_min/max/uint_max on sets, and the
     // union/intersect/diff algebra.
     let output = clean_output(
         "type addr_t : int (bits : 8);\n\
@@ -1836,7 +1836,7 @@ fn set_pseudo_methods_query_and_combine() {
 
 #[test]
 fn set_union_intersect_diff_canonicalize() {
-    // 27.4.1-27.4.3: the algebra results are canonical (5.1.10:
+    // 28.5.1-28.5.3: the algebra results are canonical (5.2.12:
     // sorted, merged, non-neighboring).
     let output = clean_output(
         "extend sys {\n    run() is also {\n            var a: set = set_of_values(bit);\n            \
@@ -1868,7 +1868,7 @@ fn min_max_to_string_and_macro_shapes_compose() {
 
 #[test]
 fn cast_of_int_to_enumeral_maps_the_index() {
-    // 5.8.1: as_a to an enumeral type maps the integer value to the
+    // 5.10.2: as_a to an enumeral type maps the integer value to the
     // enumerand at that index.
     let output = clean_output(
         "type color_t : [WHITE, BLACK, RED];\n\
@@ -1881,7 +1881,7 @@ fn cast_of_int_to_enumeral_maps_the_index() {
 
 #[test]
 fn on_event_port_runs_when_the_port_event_is_emitted() {
-    // 11.3 + 9.4.1: `on p$` runs its block when the event port's event
+    // 11.3 + 9.5.2: `on p$` runs its block when the event port's event
     // occurs — here triggered by `emit p$` (the T1 emit trigger; HDL
     // edge/bind-driven triggering stays with the @sim gap). Repeated
     // declarations extend the block (11.3's is-also equivalent).
@@ -1916,7 +1916,7 @@ fn on_event_port_rejects_time_consuming_actions() {
 
 #[test]
 fn per_instance_items_grade_per_bucket_with_holes() {
-    // 14.2.1: each bucket of a per_instance item is its own graded
+    // 14.4.2: each bucket of a per_instance item is its own graded
     // instance (`item==bucket`); unsampled instances are holes; the
     // group grade is the weighted grades of the instances plus the
     // per_type bucket.
@@ -1944,7 +1944,7 @@ fn per_instance_items_grade_per_bucket_with_holes() {
 
 #[test]
 fn unsampled_per_instance_buckets_are_holes() {
-    // 14.2.1: "any instance that is not sampled is marked as a hole" —
+    // 14.4.2: "any instance that is not sampled is marked as a hole" —
     // a hole grades 0 and pulls the group grade down.
     let result = run_source(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
@@ -2009,9 +2009,9 @@ fn group_level_per_instance_marks_all_items() {
 
 #[test]
 fn coverage_mode_off_collects_nothing() {
-    // 14.1's NOTE: "Unless coverage mode is turned on first (see 28.9),
+    // 14.2's NOTE: "Unless coverage mode is turned on first (see 14.9),
     // no coverage results are collected, even if cover groups and cover
-    // items are defined." With the mode off (28.9's set_config() is not
+    // items are defined." With the mode off (14.9's set_config() is not
     // wired, so the configuration is the builder API) nothing is built.
     let parsed = parse(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
@@ -2043,9 +2043,9 @@ fn coverage_mode_off_collects_nothing() {
 
 #[test]
 fn max_int_buckets_configuration_sets_the_default_bucket_count() {
-    // 14.2: "If ranges is not specified, the default number of buckets
+    // 14.3: "If ranges is not specified, the default number of buckets
     // is 16 [set by the max_int_buckets coverage configuration option
-    // (see 28.9)]."
+    // (see 14.9)]."
     let parsed = parse(
         "extend sys {\n    event cov_e;\n    n: uint;\n    cover cov_e is {\n        item n: uint;\n    };\n};\n",
     );
@@ -2079,7 +2079,7 @@ fn max_int_buckets_configuration_sets_the_default_bucket_count() {
 
 #[test]
 fn no_collect_group_option_suppresses_the_group() {
-    // 14.1.1: "if one or both of no_collect and instance_no_collect
+    // 14.3.2: "if one or both of no_collect and instance_no_collect
     // options of the group are evaluated to TRUE, the group shall not
     // be presented under that instance." The constant TRUE spelling is
     // not presented at all — not sampled, not graded, not reported.
@@ -2097,7 +2097,7 @@ fn no_collect_group_option_suppresses_the_group() {
 
 #[test]
 fn instance_no_collect_groups_are_not_presented_either() {
-    // 14.1.1's OR relation: instance_no_collect = TRUE alone (no
+    // 14.3.2's OR relation: instance_no_collect = TRUE alone (no
     // no_collect on the group) suppresses presentation the same way.
     let result = run_source(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
@@ -2111,7 +2111,7 @@ fn instance_no_collect_groups_are_not_presented_either() {
 
 #[test]
 fn no_collect_item_option_suppresses_the_item() {
-    // 14.2.3: "if one or both of no_collect and instance_no_collect
+    // 14.4.4: "if one or both of no_collect and instance_no_collect
     // options of the item are evaluated to TRUE, the item shall not be
     // presented under that instance" — the item drops from the group;
     // its siblings still collect.
@@ -2130,7 +2130,7 @@ fn no_collect_item_option_suppresses_the_item() {
 
 #[test]
 fn name_option_renames_cross_and_transition_items() {
-    // 14.3/14.4: a cross or transition "creates a new item with a name
+    // 14.4/14.5: a cross or transition "creates a new item with a name
     // specified using a name option" instead of the default
     // cross_a__b / transition__base names.
     let result = run_source(
@@ -2157,7 +2157,7 @@ fn name_option_renames_cross_and_transition_items() {
 
 #[test]
 fn group_level_at_least_and_weight_apply_to_items_without_their_own() {
-    // 14.8.2/14.8.3: weights and the at_least minimum "can be specified
+    // 14.9.3/14.9.5: weights and the at_least minimum "can be specified
     // in the coverage group or item definitions" — the group option
     // applies to every item that does not set its own; the item-level
     // spelling wins where present.
@@ -2184,7 +2184,7 @@ fn group_level_at_least_and_weight_apply_to_items_without_their_own() {
 
 #[test]
 fn repeat_until_executes_at_least_once() {
-    // 20.2.2: the body executes at least once, then repeatedly until
+    // 20.2.3: the body executes at least once, then repeatedly until
     // the condition is TRUE. (Locals, not fields — the implicit gen
     // randomizes uint fields before run().)
     let output = clean_output(
@@ -2269,7 +2269,7 @@ fn define_replacement_leaves_string_literals_alone() {
 
 #[test]
 fn hash_else_branches_run() {
-    // 21.2's `#else`: the alternative group runs when the condition
+    // 21.3's `#else`: the alternative group runs when the condition
     // fails, and the primary group runs (the alternative skipped
     // without parsing) when it holds.
     let output = clean_output(
@@ -2397,7 +2397,7 @@ fn tcm_with_already_emitted_sampling_event_starts_this_tick() {
 
 #[test]
 fn tcm_parked_on_a_never_firing_event_holds_the_run_to_the_budget() {
-    // The parked TCM keeps the run alive (13.1.1: it stays idle until
+    // The parked TCM keeps the run alive (13.2.2: it stays idle until
     // the next occurrence of its sampling event); with the event never
     // occurring, the shared cycle budget is what stops the run (E0409).
     let result = run_source(
@@ -2422,9 +2422,9 @@ fn tcm_parked_on_a_never_firing_event_holds_the_run_to_the_budget() {
 
 #[test]
 fn bound_event_port_fires_on_its_hdl_object_edge() {
-    // 9.4 + 9.7.2.9: the external event port's hdl_path() attribute
+    // 9.5 + 9.7.2.9: the external event port's hdl_path() attribute
     // names the simulated object; the port's event fires on the bound
-    // object's edge (the default `change` of 9.7.2.8) and runs the `on
+    // object's edge (the default `change` of 9.7.3) and runs the `on
     // rst$` blocks (11.3) — here driven by the injected history instead
     // of a simulator.
     let mut signals = e1647::hdl::InjectedSignals::new();
@@ -2445,7 +2445,7 @@ fn bound_event_port_fires_on_its_hdl_object_edge() {
 
 #[test]
 fn event_port_edge_attribute_selects_the_edge() {
-    // 9.7.2.8: `keep p.edge() == rise` restricts the port's event to
+    // 9.7.3: `keep p.edge() == rise` restricts the port's event to
     // rising edges. The injected history 0,1,0,1 crosses two rises (a
     // plain change edge would fire three times).
     let mut signals = e1647::hdl::InjectedSignals::new();

@@ -6,15 +6,15 @@
 //! `external/` (see docs/REFERENCES.md). A bare `'` followed by an
 //! identifier is the subtype modifier quote (`read'kind`), tokenized as a
 //! standalone punctuation token like the reference grammar's `SNG_QUOTE`.
-//! Code-segment markers `<'` and `'>` (clause 4.1.2) count only when they
+//! Code-segment markers `<'` and `'>` (clause 4.2.3) count only when they
 //! occupy the first column and the rest of that line is whitespace. A file
 //! that contains such a begin marker is a comment until the first one, and
 //! again between segments. A file with no begin marker is tokenized as code
 //! throughout, so snippet tests need not wrap a segment. Decimal integers
 //! may end in a `K`/`k` (×1024) or `M`/`m` (×1024×1024) multiplier
-//! (clause 4.1.4.1). `0c"..."` is a one-character literal (clause 4.1.4.6).
+//! (clause 4.2.5.2). `0c"..."` is a one-character literal (clause 4.2.5.7).
 //! Based literals may include the MVL digits `x z u l h w n`
-//! (clause 4.1.4.3); evaluating those literals is a later stage.
+//! (clause 4.2.5.4); evaluating those literals is a later stage.
 
 use std::fmt;
 
@@ -71,15 +71,30 @@ impl std::error::Error for LexError {}
 /// `tests/lexer.rs::keywords_match_reference_grammar_set`. Deviations:
 /// the IEEE 1647 predefined type spellings `real` and `string` are keywords
 /// here (the reference grammar leaves them as identifiers), the clause 8
-/// keyword `template` (Table 8 of the 2016 standard) is a keyword here —
-/// the reference grammar predates it — multi-word
-/// reference keywords (`is a`, `state machine`, `C export`, `C routine`)
-/// are not single-token keywords, and their operator spellings are handled
-/// by later stages.
+/// keyword `template` (Table 8) is a keyword here — the reference grammar
+/// predates it — multi-word reference keywords (`is a`, `state machine`,
+/// `C export`, `C routine`) are not single-token keywords, and their
+/// operator spellings are handled by later stages.
+///
+/// Aligned with Table 8 of the 2019 standard (4.2.6.4): the words 2019 added
+/// to the table — `annotation`, `chosen_from`, `conditions`, `implementing`,
+/// `in_table`, `interface`, `numeric_type`, `repeatable` — are keywords here.
+/// Other 2019 Table 8 words this lexer keeps contextual (`abort`, `const`,
+/// `edges`, `exclusive_start`, `export`, `external`, `final`, `in_set`,
+/// `inout`, `interface_port`, `method_port`, `method_type`, `buffer_port`,
+/// `tlm_initiator_socket`, `tlm_target_socket`, `attribute`, `ifdef`,
+/// `ifndef`, `none`, `out`, `pass`, `prefix`, `suffix`, `ranges`, `set`,
+/// `simple_port`, `stop`, `suffix`, `computed`, `context`): each is
+/// recognized by position in `src/parser.rs` instead, because promoting it
+/// could break existing sources that use the spelling as an identifier (for
+/// example `out` as a routine name and `set` as a type name). `static`,
+/// `evaluate`, `typeof`, `typeof_item`, `table`, `rgf`, `list_ptr` are not
+/// in Table 8 and stay contextual too.
 pub const KEYWORDS: &[&str] = &[
     "all",
     "also",
     "and",
+    "annotation",
     "as",
     "as_a",
     "as_computed",
@@ -100,7 +115,9 @@ pub const KEYWORDS: &[&str] = &[
     "case",
     "change",
     "check",
+    "chosen_from",
     "compute",
+    "conditions",
     "consume",
     "continue",
     "cover",
@@ -138,11 +155,14 @@ pub const KEYWORDS: &[&str] = &[
     "if",
     "ignore",
     "illegal",
+    "implementing",
     "import",
     "in",
+    "in_table",
     "index",
     "instance",
     "int",
+    "interface",
     "is",
     "item",
     "it",
@@ -164,6 +184,7 @@ pub const KEYWORDS: &[&str] = &[
     "not",
     "now",
     "num_of_buckets",
+    "numeric_type",
     "nxor",
     "of",
     "on",
@@ -182,6 +203,7 @@ pub const KEYWORDS: &[&str] = &[
     "real",
     "release",
     "repeat",
+    "repeatable",
     "reverse",
     "return",
     "rise",
@@ -246,7 +268,7 @@ struct Cursor<'a> {
     byte: usize,
     line: usize,
     column: usize,
-    /// Whether this file has a column-0 `<'` marker line (clause 4.1.2).
+    /// Whether this file has a column-0 `<'` marker line (clause 4.2.3).
     /// Without one, the whole source is code.
     segments: bool,
     /// Whether the cursor is inside a code segment. Prose outside segments
@@ -365,7 +387,7 @@ impl<'a> Cursor<'a> {
     }
 
     /// A begin-code (`<'`) or end-code (`'>`) marker: first column, and
-    /// only whitespace after it on that line (clause 4.1.2). `Some(true)`
+    /// only whitespace after it on that line (clause 4.2.3). `Some(true)`
     /// is a begin marker.
     fn line_is_code_marker(&self) -> Option<bool> {
         if !self.segments || self.column != 1 {
@@ -416,10 +438,10 @@ impl<'a> Cursor<'a> {
 
     /// Digits legal for a based literal, validated per base. Hexadecimal
     /// spellings: `x`/`X` per the reference grammar, `h`/`H` per clause
-    /// 4.1.4.2 and common Specman usage, `f`/`F` per the reference grammar.
+    /// 4.2.5.3 and common Specman usage, `f`/`F` per the reference grammar.
     /// Non-decimal bases also accept MVL digits `x z u l h w n`
-    /// (clause 4.1.4.3). Decimal bases do not. `0x`/`0b`/`0o` prefixes are
-    /// unsized numbers (clause 4.1.4.1) and do not take MVL digits.
+    /// (clause 4.2.5.4). Decimal bases do not. `0x`/`0b`/`0o` prefixes are
+    /// unsized numbers (clause 4.2.5.2) and do not take MVL digits.
     fn read_based_digits(
         &mut self,
         base: char,
@@ -453,7 +475,7 @@ impl<'a> Cursor<'a> {
     }
 
     /// `0c"..."` / `0C"..."`: one ASCII character, or one string-style
-    /// escape, between the quotes (clause 4.1.4.6).
+    /// escape, between the quotes (clause 4.2.5.7).
     fn read_character_literal(&mut self, start: Position) -> Result<TokenKind, LexError> {
         self.bump();
         self.bump();
@@ -677,7 +699,7 @@ impl<'a> Cursor<'a> {
 }
 
 /// Whether `c` is legal in a based literal of `base`. `mvl` allows the
-/// clause 4.1.4.3 digits on binary, octal, and hexadecimal values.
+/// clause 4.2.5.4 digits on binary, octal, and hexadecimal values.
 fn based_digit_ok(base: char, c: char, mvl: bool) -> bool {
     let mvl_letter = mvl
         && matches!(
@@ -693,7 +715,7 @@ fn based_digit_ok(base: char, c: char, mvl: bool) -> bool {
     }
 }
 
-/// Clause 4.1.2: a begin-code marker is `<'` at the first column with only
+/// Clause 4.2.3: a begin-code marker is `<'` at the first column with only
 /// whitespace after it on that line.
 fn has_begin_code_marker(source: &str) -> bool {
     let mut at_line_start = true;

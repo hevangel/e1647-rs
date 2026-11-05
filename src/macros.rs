@@ -44,14 +44,14 @@ use crate::lexer::{Token, TokenKind};
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MatchTerm {
     /// A literal terminal: matches one token whose whole text equals
-    /// it (15.4.1; whitespace-only literals are dropped at compile
+    /// it (15.4.2; whitespace-only literals are dropped at compile
     /// time).
     Literal(String),
-    /// `<[tag']kind>` — a syntactic argument (15.4.1) that consumes a
+    /// `<[tag']kind>` — a syntactic argument (15.4.2) that consumes a
     /// subsequence of tokens by backtracking.
     NonTerminal { tag: Option<String>, kind: String },
     /// `[ ... ]` (optional) or `( ... )` (grouping) with `|`
-    /// alternatives (15.4.2); an option succeeds even when nothing
+    /// alternatives (15.4.3); an option succeeds even when nothing
     /// matches.
     Alternatives {
         optional: bool,
@@ -562,7 +562,7 @@ fn scan_one_definition(tokens: &[Token], start: usize) -> Option<ScannedDefiniti
         return None;
     }
     // The body's trailing `;` terminates the body segment itself
-    // (15.4.5: the semicolon's function is fixed to sequencing inside
+    // (15.4.6: the semicolon's function is fixed to sequencing inside
     // braces) — it is not part of the expansion; the invocation site
     // carries its own.
     let body_end = cursor - 1;
@@ -974,7 +974,7 @@ impl<'a> CompParser<'a> {
     }
 
     /// The `;` terminating a simple statement. The body segment's
-    /// trailing `;` is consumed by the definition scanner (15.4.5 — it
+    /// trailing `;` is consumed by the definition scanner (15.4.6 — it
     /// terminates the body segment, not the expansion), so the last
     /// statement of the body may end without one.
     fn expect_statement_end(&mut self) -> Result<(), ()> {

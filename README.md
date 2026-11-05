@@ -10,7 +10,11 @@
   <em>Slopman (present) &#8594; Rustman (pending sufficient token expenditure).</em>
 </p>
 
-> **Status: pre-alpha.** Implements a source tokenizer and a parser for a
+> **Status: pre-alpha.** The implementation target is **IEEE 1647-2019**
+> (clause citations in code comments, diagnostics and docs use the 2019
+> numbering; historical entries in the verification log predate the
+> migration and cite 2016 — see [docs/REFERENCES.md](docs/REFERENCES.md)).
+> Implements a source tokenizer and a parser for a
 > declared subset of the language: struct/unit/extend/type declarations,
 > fields, scalar/list/named and enumeral types, `keep`/`keep soft`
 > constraints, `when` subtype members, ports, events and sequences, and
@@ -26,22 +30,22 @@
 > example. The clause 12 temporal-engine core (`src/temporal.rs`)
 > propagates sampling events to sampled normal form and evaluates
 > temporal expressions over explicit finite paths; the run loop drives
-> it: `emit` feeds an event log, the clause 13.1.1 scheduler runs
+> it: `emit` feeds an event log, the clause 13.2.2 scheduler runs
 > `start`ed TCMs concurrently (round-robin turns suspending at
 > `wait`/`sync`), temporal waits re-evaluate against the log, and
 > `expect`/`assume` rules are checked at quit. Coverage groups
 > (clause 14) collect basic-item buckets and grades on their sampling
 > event (`run --coverage` reports them), and `select` distributions
 > (clause 10) bias the seeded rejection sampler
-> (weights/min/max/edges/others/normal). `when` subtypes (clause 6.6)
+> (weights/min/max/edges/others/normal). `when` subtypes (clause 6.7)
 > resolve: when-qualified field types instantiate synthesized subtype
-> views whose when members apply. Template instances (clause 8.3)
+> views whose when members apply. Template instances (clause 8.7)
 > monomorphize: actuals substitute for formals (method bodies
-> included) and template-typed fields carry the instance; clause 8.2
+> included) and template-typed fields carry the instance; clause 8.6
 > template extensions apply to the instances whose actuals comply
 > with the extension's parameter categories. Simple macros (clause 15)
 > expand before
-> parsing, and the reflection set (`set_of_values` with the 27.4 set
+> parsing, and the reflection set (`set_of_values` with the 28.5 set
 > pseudo-methods) evaluates. Clause 20's `repeat until` loops and the
 > `do` sugar run. The simulator-side temporal integration samples
 > `rise/fall/change(HDL expression) @sim` events and `hdl_path()`-bound

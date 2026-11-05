@@ -37,7 +37,7 @@
 //! - `E0114` reserved (formerly "unsupported construct"; every construct it
 //!   covered is now either supported or has its own code)
 //! - `E0115` expected `is` in a method declaration
-//! - `E0116` user-written `extend global` (clause 4.3.1.1)
+//! - `E0116` user-written `extend global` (clause 4.4.2.2)
 //! - `E0117` unsupported or misplaced preprocessor directive (clause 21)
 //! - `E0118` expected the match expression string of a macro definition
 //!   (clause 15)
@@ -99,7 +99,7 @@ fn is_predefined_name(word: &str) -> bool {
     PREDEFINED_NAMES.contains(&word)
 }
 
-/// Binary operator rows from loosest to tightest binding (clause 4.5,
+/// Binary operator rows from loosest to tightest binding (clause 4.6,
 /// Table 12). Arithmetic, shifts, relational operators, and `&&` / `||`
 /// follow C. `^` is looser than `|`, `===` / `!==` are looser than
 /// `==` / `!=`. The word spellings (`and`, `or`, `xor`) share the level of
@@ -132,16 +132,16 @@ const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
 ];
 
 /// `in` membership is not a [`BINARY_LEVELS`] row. It binds looser than
-/// the string-match operators and tighter than `&` (clause 4.5).
+/// the string-match operators and tighter than `&` (clause 4.6).
 const IN_LEVEL: usize = 6;
 
 /// `~` / `!~` string match is not a [`BINARY_LEVELS`] row. It binds looser
-/// than `===` / `!==` and tighter than `in` (clause 4.5, Table 12).
+/// than `===` / `!==` and tighter than `in` (clause 4.6, Table 12).
 const MATCH_LEVEL: usize = 7;
 
 /// `is [not] a <type>` is not a [`BINARY_LEVELS`] row: its right operand
 /// is a type, not an expression. It binds tighter than `==` / `!=` and
-/// looser than the comparisons (clause 4.5, Table 12).
+/// looser than the comparisons (clause 4.6, Table 12).
 const ISA_LEVEL: usize = 10;
 
 /// The [`BINARY_LEVELS`] row for a parse level, if the level is a plain
@@ -428,7 +428,7 @@ impl Parser {
 
     /// A word in identifier position that may also be a keyword spelling
     /// — template formals are conventionally named `<type>`, and `type`
-    /// is a keyword (clause 8.1).
+    /// is a keyword (clause 8.2).
     fn expect_word(
         &mut self,
         code: &'static str,
@@ -585,7 +585,7 @@ impl Parser {
                     continue;
                 }
                 // File-level preprocessor directives: only `#define` /
-                // `#undef` (clause 21.2 lists the conditional forms as
+                // `#undef` (clause 21.3 lists the conditional forms as
                 // statement, struct-member and action positions, not
                 // module level).
                 Some(TokenKind::Punctuation(p)) if p == "#" => {
@@ -767,7 +767,7 @@ impl Parser {
     }
 
     /// `template (struct|unit|extend) name of <params> [like base] {
-    /// members };` (clause 8.1/8.2). The parameters are recorded; a
+    /// members };` (clause 8.2/8.6). The parameters are recorded; a
     /// template extension (8.2) records its own formal parameters and is
     /// flagged `template_extend` — the elaborator applies it to the
     /// instances whose actuals comply (8.3's NOTE 3), not by name
@@ -783,7 +783,7 @@ impl Parser {
         let (kind, template_extend) = match self.peek_kind() {
             Some(TokenKind::Keyword(k)) if k == "struct" => (DeclarationKind::Struct, false),
             Some(TokenKind::Keyword(k)) if k == "unit" => (DeclarationKind::Unit, false),
-            // `template extend name of <params> { .. };` (clause 8.2).
+            // `template extend name of <params> { .. };` (clause 8.6).
             Some(TokenKind::Keyword(k)) if k == "extend" => (DeclarationKind::Extend, true),
             _ => {
                 self.error_here(
@@ -1086,7 +1086,7 @@ impl Parser {
         } else {
             self.expect_type_name("expected declaration name")?
         };
-        // Clause 4.3.1.1: extensions of the root `global` type are reserved
+        // Clause 4.4.2.2: extensions of the root `global` type are reserved
         // for the runtime; user code shall not write `extend global`. The
         // parser's own `extend global` pseudo-declaration (the holder of
         // file-level `define`/`import` members) is built in
@@ -1106,7 +1106,7 @@ impl Parser {
         let mut like_type = None;
         if self.eat_keyword("like") {
             // The base may be a template instance (`like linked_list of
-            // packet`, clause 8.3); the full type is recorded alongside
+            // packet`, clause 8.7); the full type is recorded alongside
             // the base name.
             let base = self.parse_type()?;
             like_span = Some(base.span());
@@ -1393,7 +1393,7 @@ impl Parser {
     }
 
     /// `cover <event> is { [items, crosses, transitions, option
-    /// entries] };` (clause 14.1) or `cover <event> is empty;`. Items
+    /// entries] };` (clause 14.2) or `cover <event> is empty;`. Items
     /// parse structurally (`item name [: type] [= expr] [using …];`);
     /// every `using` option clause and non-item body entry is recorded
     /// as raw tokens — the option semantics belong to the coverage data
@@ -1406,7 +1406,7 @@ impl Parser {
         let name = render_expr_path(&event).unwrap_or_default();
         let name_span = event.span();
         self.expect_keyword_word("is")?;
-        // `cover ... is also { .. }` extends the group (clause 14.5).
+        // `cover ... is also { .. }` extends the group (clause 14.6).
         let is_also = self.eat_keyword("also");
         if self.eat_keyword("empty") {
             self.expect_stmt_semi("expected ';' after the cover group")?;
@@ -1571,8 +1571,8 @@ impl Parser {
     }
 
     /// The clause 12 temporal-expression grammar. Precedence, loosest to
-    /// tightest: `=>` (12.2.13), `or` (12.2.7), `and` (12.2.6), the
-    /// binary sampling `@` (12.2.5), repeats and prefix operators, then
+    /// tightest: `=>` (12.2.14), `or` (12.2.8), `and` (12.2.7), the
+    /// binary sampling `@` (12.2.6), repeats and prefix operators, then
     /// the atoms — Table 37 is an image in the local copy, so this order
     /// follows the prose conventions (`or` looser than `and`, sampling
     /// binds over both, yield loosest as the expect shape requires).
@@ -1607,9 +1607,9 @@ impl Parser {
         Some(lhs)
     }
 
-    /// The suffix sampling operator: `te @event` (12.2.5) — the operand
+    /// The suffix sampling operator: `te @event` (12.2.6) — the operand
     /// is a bare dotted event path (`@clk`-style atoms are the unary
-    /// operator, 12.2.4).
+    /// operator, 12.2.5).
     fn parse_te_sample(&mut self) -> Option<crate::ast::TemporalExpr> {
         let mut te = self.parse_te_prefix()?;
         while self.at_punct("@") {
@@ -1625,7 +1625,7 @@ impl Parser {
     }
 
     /// Repeats and the prefix operators `not`, `fail`, `eventually`.
-    /// Three repeat spellings (12.2.9–12.2.11): the fixed repeat
+    /// Three repeat spellings (12.2.10–12.2.12): the fixed repeat
     /// `[n]*te` (a single bound, no `..`), the true-match repeat
     /// `~[l..h]*te` (`~`; a single bound is the exact count) and the
     /// first-match repeat `[l..h]*te` (a range without `~`, valid only
@@ -1655,7 +1655,7 @@ impl Parser {
             }
             self.bump(); // '['
             // `~[..]*te` / `[..]*te` — an empty low bound is the
-            // unbounded form (12.2.10, 12.2.11).
+            // unbounded form (12.2.11, 12.2.12).
             let low = if self.at_punct("..") {
                 None
             } else {
@@ -1671,10 +1671,10 @@ impl Parser {
             } else {
                 None
             };
-            // A range without `~` is the first-match repeat (12.2.11);
-            // a single bound is the fixed repeat (12.2.9) — or, under
+            // A range without `~` is the first-match repeat (12.2.12);
+            // a single bound is the fixed repeat (12.2.10) — or, under
             // `~`, the exact-count form of the true-match repeat
-            // (12.2.10).
+            // (12.2.11).
             let kind = match (true_match, ranged) {
                 (true, _) => crate::ast::RepeatKind::TrueMatch,
                 (false, true) => crate::ast::RepeatKind::FirstMatch,
@@ -1699,8 +1699,8 @@ impl Parser {
     }
 
     /// The temporal atoms: `cycle`, `true(exp)`, `change/rise/fall(exp)`,
-    /// `@event`, `{ sequences }`, `( te )` (12.2.2–12.2.4, 12.2.8,
-    /// 12.2.17).
+    /// `@event`, `{ sequences }`, `( te )` (12.2.3–12.2.5, 12.2.9,
+    /// 12.2.18).
     fn parse_te_atom(&mut self) -> Option<crate::ast::TemporalExpr> {
         if self.eat_keyword("cycle") {
             return Some(crate::ast::TemporalExpr::Cycle);
@@ -1809,7 +1809,7 @@ impl Parser {
     }
 
     /// One `#define` / `#undef` / `#ifdef` / `#ifndef` preprocessor
-    /// directive in member position (clause 21.2).
+    /// directive in member position (clause 21.3).
     fn parse_hash_members(&mut self) -> Option<Vec<Member>> {
         match self.parse_hash_directive(true)? {
             HashBody::Members(members) => Some(members),
@@ -1833,8 +1833,8 @@ impl Parser {
     /// been applied by the token pre-pass in [`crate::preproc`], which
     /// substitutes defined names before the parser runs. An
     /// `#ifdef`/`#ifndef` body is parsed only when included; excluded
-    /// code is skipped without parsing ("ignore it", clause 21.2). The
-    /// optional `#else` (21.2: "an alternative statement when the
+    /// code is skipped without parsing ("ignore it", clause 21.3). The
+    /// optional `#else` (21.3: "an alternative statement when the
     /// condition does not hold") flips the sides — its group parses
     /// when the first was skipped and is skipped when the first
     /// parsed. The body grammar follows the position: members in a
@@ -1885,7 +1885,7 @@ impl Parser {
                     !self.defined.contains(&name)
                 };
                 self.expect_punct("{", "E0106", "expected '{' to open the directive body")?;
-                // 21.2 puts the primary code "inside the (first)
+                // 21.3 puts the primary code "inside the (first)
                 // braces"; the `#else` group follows the first `}`,
                 // either directly (`} #else { .. };`) or after the
                 // group's `;` (`}; #else { .. };`). The extractable
@@ -1919,7 +1919,7 @@ impl Parser {
 
     /// Parse one included directive group's body and consume the
     /// closing `}`. Members in a struct body, statements in an action
-    /// block (21.2's position rule). The trailing `;` is the caller's.
+    /// block (21.3's position rule). The trailing `;` is the caller's.
     fn parse_hash_group(&mut self, member_position: bool) -> Option<HashBody> {
         if member_position {
             // parse_member_list consumes the closing `}`; the e
@@ -1947,7 +1947,7 @@ impl Parser {
 
     /// Consume an `#else` group that is excluded (the first branch was
     /// included): the `#else` header, its brace group (skipped without
-    /// parsing, 21.2) and the group's `;`.
+    /// parsing, 21.3) and the group's `;`.
     fn skip_hash_else_group(&mut self) -> Option<()> {
         self.bump(); // '#'
         self.bump(); // 'else'
@@ -1981,7 +1981,7 @@ impl Parser {
 
     /// Skip tokens after a directive's `{` with brace-depth counting, up
     /// to and including the matching `}`. Skipped code is ignored, not
-    /// parsed (clause 21.2).
+    /// parsed (clause 21.3).
     fn skip_balanced_braces(&mut self) {
         let mut depth = 1usize;
         while let Some(token) = self.peek() {
@@ -2036,7 +2036,7 @@ impl Parser {
             self.recover_to_member_boundary();
             return None;
         }
-        // The optional `is` before the body (6.6.1's `when v't is { .. }`).
+        // The optional `is` before the body (6.7.1's `when v't is { .. }`).
         self.eat_keyword("is");
         if self
             .expect_punct("{", "E0106", "expected '{' to open the 'when' body")
@@ -2315,7 +2315,7 @@ impl Parser {
             Some(TokenKind::Identifier(id)) if id == "simple_port" => {
                 self.bump();
             }
-            // An event port (9.4): carries events, not data — no `of`
+            // An event port (9.5): carries events, not data — no `of`
             // element type.
             Some(TokenKind::Identifier(id)) if id == "event_port" => {
                 self.bump();
@@ -2731,7 +2731,7 @@ impl Parser {
         }
         if self.at_punct("<") {
             // A template's formal parameter in a type position
-            // (`<type>`, `<key'type>` — clause 8.1): recorded as the raw
+            // (`<type>`, `<key'type>` — clause 8.2): recorded as the raw
             // text between the brackets.
             self.bump();
             let (name, _) = self.expect_word("E0102", "expected the formal parameter name")?;
@@ -2751,9 +2751,9 @@ impl Parser {
         if self.at_identifier() {
             let (name, span) = self.take_identifier();
             // A when-qualified type (`NO_CONSTRAINT env` — the subtype
-            // modifier naming the variant of the base type, 6.6): the
+            // modifier naming the variant of the base type, 6.7): the
             // qualifier and the base are both recorded. Chained
-            // qualifiers (`LO HI pkt` — 6.6.1's subtype combinations,
+            // qualifiers (`LO HI pkt` — 6.7.1's subtype combinations,
             // one value per determinant field) nest: the last
             // identifier is the base, the preceding ones qualify it
             // right-to-left, so the rendered name joins the values in
@@ -2778,7 +2778,7 @@ impl Parser {
                 return Some(base);
             }
             // `deque of int` — a template instantiation in a type
-            // position (clause 8.3). `list of` never reaches here: the
+            // position (clause 8.7). `list of` never reaches here: the
             // keyword branch handles it first.
             if self.at_keyword("of") {
                 self.bump();
@@ -2813,7 +2813,7 @@ impl Parser {
         if keyword == "list" {
             self.bump();
             // Keyed list: `list (key:it) of <type>` — the key expression
-            // is recorded (clause 5.1.8's keyed lists).
+            // is recorded (clause 5.2.11's keyed lists).
             let key = if self.at_punct("(") && self.peek_second_is_word("key") {
                 self.bump();
                 self.expect_keyword_word("key")?;
@@ -2879,7 +2879,7 @@ impl Parser {
     fn parse_statements(&mut self) -> Vec<Stmt> {
         let mut statements = Vec::new();
         while self.peek().is_some() && !self.at_punct("}") {
-            // `#` directives are actions too (clause 21.2); an excluded
+            // `#` directives are actions too (clause 21.3); an excluded
             // branch contributes no statements and the loop continues.
             if self.at_punct("#") {
                 if let Some(hash_statements) = self.parse_hash_statements() {
@@ -3292,7 +3292,7 @@ impl Parser {
     }
 
     /// `repeat [do] { body } until cond;` — the do-while loop (clause
-    /// 20.2.2): the body executes at least once.
+    /// 20.2.3): the body executes at least once.
     fn parse_repeat_statement(&mut self) -> Option<Stmt> {
         let start = self.current_span().0;
         self.bump(); // 'repeat'
@@ -3381,15 +3381,15 @@ impl Parser {
 
     /// `wait cycle;` / `wait [n];` / `wait [n] * cycle;` — normalized to
     /// a cycle-count expression — and the temporal forms `wait <te>;`
-    /// (clause 13.1.3: `@event`, sequences, proposition waits, repeats
+    /// (clause 13.2.4: `@event`, sequences, proposition waits, repeats
     /// over non-cycle TEs; the optional `until` word is readability
-    /// only, 13.1.3's NOTE). In this v1 kernel time units and cycles
+    /// only, 13.2.4's NOTE). In this v1 kernel time units and cycles
     /// advance the same counter (documented in the interpreter).
     fn parse_wait_statement(&mut self) -> Option<Stmt> {
         let start = self.current_span().0;
         self.bump(); // 'wait'
         if self.eat_keyword("until") {
-            // `until` is readability-only (13.1.3's NOTE): a temporal
+            // `until` is readability-only (13.2.4's NOTE): a temporal
             // expression after it is the wait's TE; a plain expression
             // keeps the v1 check-syntax-and-advance-one behavior.
             if self.at_temporal_wait_start() {
@@ -3415,7 +3415,7 @@ impl Parser {
         if self.at_punct("[") {
             // `wait [n];` / `wait [n]*cycle;` stay the plain numeric
             // wait; a `..` range or a multiplier over a non-cycle TE is
-            // a temporal wait (12.2.9–12.2.11).
+            // a temporal wait (12.2.10–12.2.12).
             let ranged =
                 matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == ".");
             if !ranged {
@@ -3450,7 +3450,7 @@ impl Parser {
     }
 
     /// `sync;` / `sync cycle;` — the bare synchronization action
-    /// (13.1.2) — and `sync <te>;` with a temporal expression, which
+    /// (13.2.3) — and `sync <te>;` with a temporal expression, which
     /// behaves like the temporal wait.
     fn parse_sync_statement(&mut self) -> Option<Stmt> {
         let start = self.current_span().0;
@@ -3473,7 +3473,7 @@ impl Parser {
     }
 
     /// Whether the next token can begin a temporal expression in wait
-    /// position (13.1.3): an event atom, a brace sequence, a tilde
+    /// position (13.2.4): an event atom, a brace sequence, a tilde
     /// repeat, a prefixed operator or a temporal routine.
     fn at_temporal_wait_start(&self) -> bool {
         if self.at_punct("@") || self.at_punct("{") || self.at_punct("~") {
@@ -3693,7 +3693,7 @@ impl Parser {
         Some(lhs)
     }
 
-    /// `lhs ~ pattern` / `lhs !~ pattern` string match (clause 4.11),
+    /// `lhs ~ pattern` / `lhs !~ pattern` string match (clause 4.12),
     /// left-associative, at [`MATCH_LEVEL`].
     fn parse_match_level(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_binary_level(MATCH_LEVEL + 1)?;
@@ -3717,7 +3717,7 @@ impl Parser {
         Some(lhs)
     }
 
-    /// `expr is [not] a <type> [(name)]` type check (clause 4.5),
+    /// `expr is [not] a <type> [(name)]` type check (clause 4.17.1),
     /// left-associative, at [`ISA_LEVEL`]. The optional `(name)` binds a
     /// true match to a local. A bare `is` that does not start this shape
     /// is left for the caller — `is` also appears in member and trigger
@@ -3852,7 +3852,7 @@ impl Parser {
     fn parse_primary(&mut self) -> Option<Expr> {
         let (start, end) = self.current_span();
         // `new [<type>] [with { assignments }]` — instance creation
-        // (clause 6.2). The type is optional (`var p: packet = new;`).
+        // (clause 6.3). The type is optional (`var p: packet = new;`).
         // Evaluation is staged: instances come from declared fields and
         // typed locals today.
         if self.at_keyword("new") {
@@ -3994,7 +3994,7 @@ impl Parser {
             Some(TokenKind::Identifier(name))
                 if name == "set_of_values" || name == "full_set_of_values" =>
             {
-                // 5.8.4/5.8.5: the argument is a TYPE (a numeric or
+                // 5.10.5/5.10.6: the argument is a TYPE (a numeric or
                 // enumeral type), not an expression.
                 let (name, _) = self.take_identifier();
                 let full = name == "full_set_of_values";

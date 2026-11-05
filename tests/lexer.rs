@@ -4,9 +4,11 @@ use std::collections::BTreeSet;
 /// The single-token keyword spellings of the reference grammar
 /// (`external/specman-e-parser/specman.flex`, MIT licensed), transcribed for
 /// this cross-check. Deviations in `KEYWORDS`, as documented there: the
-/// IEEE 1647 predefined types `real` and `string` are added; the 2016
+/// IEEE 1647 predefined types `real` and `string` are added; the clause 8
 /// keyword `template` (Table 8) is added — the reference grammar predates
-/// it; the multi-word
+/// it; the words 2019's Table 8 added (`annotation`, `chosen_from`,
+/// `conditions`, `implementing`, `in_table`, `interface`, `numeric_type`,
+/// `repeatable`) are added; the multi-word
 /// reference keywords (`is a`, `is not a`, `state machine`, `C export`,
 /// `C routine`) are not single-token keywords.
 const REFERENCE_KEYWORDS: &[&str] = &[
@@ -155,6 +157,15 @@ const REFERENCE_KEYWORDS: &[&str] = &[
     "real",
     "string",
     "template",
+    // Table 8 of the 2019 standard (4.2.6.4) — new in 2019.
+    "annotation",
+    "chosen_from",
+    "conditions",
+    "implementing",
+    "in_table",
+    "interface",
+    "numeric_type",
+    "repeatable",
 ];
 
 fn kinds(source: &str) -> Vec<TokenKind> {
@@ -163,6 +174,35 @@ fn kinds(source: &str) -> Vec<TokenKind> {
         .into_iter()
         .map(|token| token.kind)
         .collect()
+}
+
+/// The single-word keyword entries Table 8 of the 2019 standard added.
+const KEYWORDS_2019: &[&str] = &[
+    "annotation",
+    "chosen_from",
+    "conditions",
+    "implementing",
+    "in_table",
+    "interface",
+    "numeric_type",
+    "repeatable",
+];
+
+#[test]
+fn tokenizes_2019_keywords() {
+    for keyword in KEYWORDS_2019 {
+        let tokens = tokenize(keyword).expect("keyword is valid source");
+        assert_eq!(
+            tokens.len(),
+            1,
+            "'{keyword}' must be one token, got {tokens:?}"
+        );
+        assert_eq!(
+            tokens[0].kind,
+            TokenKind::Keyword((*keyword).to_owned()),
+            "'{keyword}' did not lex as a keyword"
+        );
+    }
 }
 
 #[test]
@@ -249,7 +289,7 @@ fn operators_longest_match() {
 
 #[test]
 fn negative_string_match_is_one_token() {
-    // `!~` is the negative string-match operator (clause 4.11); the
+    // `!~` is the negative string-match operator (clause 4.12); the
     // spaced form stays a logical not followed by a bitwise not.
     assert_eq!(
         kinds("a!~b"),
@@ -311,7 +351,7 @@ fn reals_and_ranges() {
 fn rejects_bad_based_literals() {
     let error = tokenize("8'b2").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
-    // `Z` is an MVL digit on a hex value (clause 4.1.4.3), so this is one
+    // `Z` is an MVL digit on a hex value (clause 4.2.5.4), so this is one
     // literal rather than a bad hex digit.
     assert_eq!(kinds("8'xZZ"), vec![TokenKind::Number("8'xZZ".into())]);
     let error = tokenize("'d").unwrap_err();
@@ -349,7 +389,7 @@ fn subtype_modifier_quote_tokenizes_standalone() {
 
 #[test]
 fn code_segment_markers_must_own_their_line() {
-    // Clause 4.1.2: the marker is the whole line, at the first column.
+    // Clause 4.2.3: the marker is the whole line, at the first column.
     assert_eq!(
         kinds("<\'\nextend foo\n\'>\n"),
         vec![

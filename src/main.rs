@@ -450,7 +450,7 @@ fn print_coverage(coverage: &[e1647::coverage::TypeCoverage]) {
                     item.samples,
                     item.ungradeable_hits
                 );
-                // 14.2.1: per_instance items list their instances
+                // 14.4.2: per_instance items list their instances
                 // (name = item==bucket); unsampled ones are holes.
                 for instance in group
                     .instances()
@@ -483,7 +483,7 @@ fn print_coverage(coverage: &[e1647::coverage::TypeCoverage]) {
                     );
                 }
             }
-            // Derived items (14.3/14.4): crosses and transitions.
+            // Derived items (14.4/14.5): crosses and transitions.
             for derived in &group.derived {
                 let grade = match derived.grade() {
                     Some(grade) => format!("{:.0}%", grade * 100.0),

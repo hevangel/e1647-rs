@@ -4,6 +4,11 @@ Append-only log of verification work: exact commands, results, scope and
 known limitations. A successful build alone does not verify acceptance; every
 claim here must name the command that backs it.
 
+> **Clause numbering note:** entries dated before 2026-11-04 cite **2016**
+> clause numbers; from 2026-11-04 onward the implementation target is
+> **IEEE 1647-2019** and new entries cite 2019 numbers (see
+> [REFERENCES.md](REFERENCES.md) and the migration plan).
+
 ## 2026-10-25 — issue #1 staged front-end work (branch `agent/issue-1-foundation`)
 
 Scope claimed for this change (nothing broader):
@@ -3341,4 +3346,73 @@ multi-level path (`while` > `if` > `wait`, two iterations, the
 loop's mid-iteration semantics surviving the nesting); and the
 sync consumed by a branch's last statement (the skip position
 falls out of the body, the statement after the compound runs).
+
+## 2026-11-05 (48) — Phase 0 of the IEEE 1647-2019 migration (branch `agent/2019-phase0`)
+
+Scope claimed for this change (nothing broader):
+
+- **T0.1 clause-number sweep.** Every 2016 clause citation in `src/`,
+  `tests/`, `README.md`, `docs/ROADMAP.md`, `docs/ARCHITECTURE.md`
+  renumbered per the migration plan's §1.4 map (mechanical single-pass
+  substitution for the docs; sequential ordered replacements for the
+  source comments). Three `is [not] a` sites re-cited 4.17.1 (not the
+  precedence clause 4.6); the template shorthand 8.1.3 → 8.5.2; the
+  template-declaration/extend compound → 8.2/8.6; CFS 10.2.7 →
+  10.3.6–10.3.7; the 12.2.x operator family shifted +1 through its full
+  cited range (12.2.2–12.2.17 → 12.2.3–12.2.18); 12.3.1/12.3.2 →
+  12.3.2/12.3.3; the 13.1.x scheduler → 13.2.2–13.2.4; clause 14
+  renumbered (explicit 14.2.1 → 14.3.2; the remaining sub-levels by the
+  same inserted-Introduction mechanism — 14.1.1 → 14.2.2, 14.2.3 →
+  14.3.4, 14.8.2/14.8.3 → 14.9.3/14.9.4 — these are inferred, the plan
+  marks them †); coverage configuration 28.9 → 14.9; list
+  pseudo-methods clause 26 → clause 27 (pure first-number bump,
+  verified against the plan's own 27.4.17/27.4.20 citations); set
+  pseudo-methods 27.4 → 28.5; preprocessor directives 21.2 → 21.3 (the
+  plan maps both cited preprocessor numbers to the 21.3 umbrella, so
+  the `#undef` 21.4 citations are left unchanged); macro sub-clauses
+  15.4.1/.2/.5 → 15.4.2/.3/.6. `docs/VERIFICATION.md` gains a header
+  note instead of rewriting historical entries.
+- **T0.2 keywords.** The eight words 2019's Table 8 added —
+  `annotation`, `chosen_from`, `conditions`, `implementing`,
+  `in_table`, `interface`, `numeric_type`, `repeatable` — are keywords
+  (`src/lexer.rs::KEYWORDS`); none appears as an identifier in
+  `tests/` or `examples/` (checked before promoting). The other 2019
+  Table 8 words stay contextual, each named in the `KEYWORDS` doc
+  comment with the reason (`out`, `set`, `const`, `final`, … —
+  identifier-collision risk; the parser recognizes them by position).
+  `static`/`evaluate`/`typeof`/`typeof_item`/`table`/`rgf`/`list_ptr`
+  are not in Table 8 and stay contextual.
+- **T0.3 designation.** `README.md`'s status paragraph and
+  `docs/REFERENCES.md` name IEEE 1647-2019 as the implementation
+  target with the migration-plan pointer; `AGENTS.md` gains the
+  standard-revision paragraph.
+- The migration plan itself is committed
+  (`docs/e1647-rs_IEEE1647-2019_migration_plan.md`) — it is the task
+  list for the remaining phases and cites the plan's own paraphrased
+  specs (no standard text).
+- `docs/ROADMAP.md` gains the "Migration to IEEE 1647-2019" checklist
+  section with Phase 0 checked.
+
+Verification:
+
+- `cargo fmt --all -- --check` — pass
+- `cargo clippy --all-targets -- -D warnings` — pass, no warnings
+- `cargo test --all-targets` — **264 passed** (was 263; +1
+  `tokenizes_2019_keywords`)
+- Corpus (absolute paths): etl 4, cover-edges 4, golden-imports 3,
+  golden-combined 0, igen-dist 0, type-min-max 0, save-restart 0, d6w
+  0 — unchanged from the baseline. `local/concat-etl.e` reports 1
+  error (`E0001` code segment opened inside a code segment at 131:1);
+  verified identical against the `main` binary in a scratch worktree —
+  pre-existing, not a sweep regression.
+- Diagnostic message texts are unchanged (no message cites a clause
+  number), so no fixture `.expected` changed: `grep -rn "2016" src
+  tests README.md docs` now returns only the historical
+  `docs/VERIFICATION.md` entries and the `docs/REFERENCES.md`
+  revision list.
+- Honest limits recorded: sub-clause numbers the plan marks † (inferred
+  from the 2019 TOC) were applied mechanically and are listed above;
+  the local redline PDF is the 2016 copy, so a future spot-check
+  against the 2019 text may adjust individual leaf numbers by one.
+
 
