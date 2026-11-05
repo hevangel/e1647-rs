@@ -354,10 +354,25 @@ fn rejects_bad_based_literals() {
     // `Z` is an MVL digit on a hex value (clause 4.2.5.4), so this is one
     // literal rather than a bad hex digit.
     assert_eq!(kinds("8'xZZ"), vec![TokenKind::Number("8'xZZ".into())]);
-    let error = tokenize("'d").unwrap_err();
-    assert_eq!(error.message, "invalid based literal");
     let error = tokenize("8'").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
+}
+
+#[test]
+fn unsized_base_letter_without_digits_is_a_quote_not_a_literal() {
+    // 4.17.3's subtype qualifiers (`p.red'x`, `p.big'd`) lex `'` plus a
+    // base-letter word as the standalone quote and an identifier: a
+    // based literal commits only when a digit of its base follows the
+    // base letter. The sized form (`8'` above) keeps its error.
+    assert_eq!(
+        kinds("'d"),
+        vec![
+            TokenKind::Punctuation("'".into()),
+            TokenKind::Identifier("d".into()),
+        ]
+    );
+    assert_eq!(kinds("'hFF"), vec![TokenKind::Number("'hFF".into())]);
+    assert_eq!(kinds("'bX"), vec![TokenKind::Number("'bX".into())]);
 }
 
 #[test]

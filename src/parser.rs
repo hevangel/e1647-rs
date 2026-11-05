@@ -56,7 +56,7 @@
 use crate::ast::{
     BinaryOp, Declaration, DeclarationKind, Enumeral, Expr, Field, KeepConstraint, Member,
     MethodDecl, MethodModifier, OnDecl, Param, ScalarBase, Stmt, SubtypeModifier, TypeExpr,
-    UnaryOp, WhenDecl,
+    UnaryOp, WhenDecl, WhenQualifier,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Position, Token, TokenKind};
@@ -2559,6 +2559,49 @@ impl Parser {
                     };
                     continue;
                 }
+                // 4.17.3: subtype qualifiers in dot access —
+                // `struct-exp.qual'qual'...'field`. After the first name,
+                // a `'`-joined run of further names makes the whole
+                // sequence a qualifier list whose last name is the
+                // accessed field (`p.red'good'x`, `p.TRUE'good'red'x`,
+                // `p.red'color'x`). The `'`-joined spellings of a full
+                // qualifier (`red'color`) and of two short qualifiers
+                // (`red`, `color`) are identical token runs, so every
+                // qualifier is recorded value-only and the resolution
+                // matches each word against the when view's (field id,
+                // value) pairs.
+                if self.at_punct("'") {
+                    let mut qualifiers = Vec::new();
+                    let mut current = (member, member_span);
+                    let mut field = current.clone();
+                    while self.at_punct("'") {
+                        qualifiers.push(WhenQualifier {
+                            value: current.0,
+                            value_span: current.1,
+                            id: None,
+                        });
+                        self.bump();
+                        let (word, word_span) = if self.at_identifier() {
+                            self.take_identifier()
+                        } else if let Some(word) = self.take_word() {
+                            let span = self.last_end();
+                            (word, (span, span))
+                        } else {
+                            self.error_here("E0102", "expected a subtype qualifier after \"'\"");
+                            return None;
+                        };
+                        current = (word, word_span);
+                        field = current.clone();
+                    }
+                    expr = Expr::QualifiedField {
+                        base: Box::new(expr),
+                        qualifiers,
+                        field: field.0,
+                        field_span: field.1,
+                        span: (start, self.last_end()),
+                    };
+                    continue;
+                }
                 expr = Expr::MemberAccess {
                     object: Box::new(expr),
                     name: member,
@@ -2750,6 +2793,28 @@ impl Parser {
         }
         if self.at_identifier() {
             let (name, span) = self.take_identifier();
+            // `typeof(exp)` / `typeof_item(exp)` in a type position
+            // (clause 5.9): the static type of the (never evaluated)
+            // expression, or its list element type. The argument is
+            // recorded as an expression; resolution against the current
+            // type information happens during elaboration.
+            if (name == "typeof" || name == "typeof_item") && self.at_punct("(") {
+                self.bump();
+                let expr = self.parse_expr()?;
+                self.expect_punct(")", "E0110", "expected ')' to close the typeof expression")?;
+                let end = self.last_end();
+                return Some(if name == "typeof" {
+                    TypeExpr::TypeOf {
+                        expr: Box::new(expr),
+                        span: (span.0, end),
+                    }
+                } else {
+                    TypeExpr::TypeOfItem {
+                        expr: Box::new(expr),
+                        span: (span.0, end),
+                    }
+                });
+            }
             // A when-qualified type (`NO_CONSTRAINT env` — the subtype
             // modifier naming the variant of the base type, 6.7): the
             // qualifier and the base are both recorded. Chained

@@ -26,8 +26,10 @@
 //! sampled inside their declared bounds, a candidate is accepted only when
 //! every top-level `keep` constraint of the enclosing type evaluates to
 //! TRUE, and after 1000 failed attempts a diagnostic is reported. Soft
-//! constraints and `when` blocks are not enforced. Every run takes an
-//! explicit seed and is fully deterministic per backend.
+//! constraints are not enforced; a `when` subtype view's determinant
+//! fields are fixed to the view's values (6.7) and never sampled, while
+//! the enclosing type's when-block constraints stay unenforced. Every
+//! run takes an explicit seed and is fully deterministic per backend.
 //!
 //! ## Diagnostic codes
 //!
@@ -42,6 +44,9 @@
 //! - `E0409` cycle budget exceeded (runaway TCM)
 //! - `E0410` unsupported string-match pattern shape (`/.../` or a
 //!   native meta-character)
+//! - `E0413` a subtype-qualified field access (4.17.3) on an instance
+//!   that does not currently match the qualifiers' subtype — the field
+//!   is not present on it
 //!
 //! ## Clause 26 list pseudo-methods — documented gaps
 //!
@@ -82,7 +87,7 @@
 //! the one-cycle implicit sync of the stand-alone model.
 
 use crate::ast::{
-    BinaryOp, DeclarationKind, Expr, MethodDecl, ScalarBase, Stmt, TypeExpr, UnaryOp,
+    BinaryOp, DeclarationKind, Expr, MethodDecl, ScalarBase, Stmt, TypeExpr, UnaryOp, WhenQualifier,
 };
 use crate::diagnostic::Diagnostic;
 use crate::elab::Elaborated;
@@ -396,6 +401,11 @@ struct Interp<'a> {
     dut_errors: usize,
     /// `define` constants resolved to values.
     defines: std::collections::BTreeMap<String, Value>,
+    /// The type name an untyped `new` creates with while the enclosing
+    /// `var x: t = new;` initializer evaluates (clause 18: the
+    /// variable's declared type is the instance's): set just before the
+    /// initializer evaluates, cleared right after.
+    new_type_hint: Option<String>,
 }
 
 /// How many `wait` statements and scheduler cycles one run may consume
@@ -514,6 +524,7 @@ fn run_inner(
         stop_requested: false,
         dut_errors: 0,
         defines,
+        new_type_hint: None,
     };
     let types: &[crate::elab::ElaboratedType] = interp.types;
     let Some(sys) = types
@@ -809,6 +820,7 @@ impl<'a> Interp<'a> {
     fn instantiate(&mut self, type_name: &str) -> usize {
         let mut fields = Vec::new();
         let mut ports = Vec::new();
+        let mut when_of: Vec<(String, String)> = Vec::new();
         let types: &[crate::elab::ElaboratedType] = self.types;
         if let Some(ty) = types.iter().find(|t| t.name == type_name) {
             for field in &ty.fields {
@@ -820,13 +832,75 @@ impl<'a> Interp<'a> {
                     ports.push((port.name.clone(), hdl_path.clone()));
                 }
             }
+            when_of = ty.when_of.clone();
+        } else if let Some(base_name) = type_name.rsplit(' ').next()
+            && let Some(base) = types.iter().find(|t| t.name == base_name)
+        {
+            // A when-qualified type spelling (`good packet`) whose exact
+            // subtype view was not synthesized (no `when good packet`
+            // block): the instance carries the base's fields under the
+            // spelling's name (6.7). Its determinants are fixed by the
+            // qualifier words at the type position that named it (see
+            // [`Interp::default_for`]).
+            for field in &base.fields {
+                let default = self.default_for(&field.ty);
+                fields.push((field.name.clone(), default));
+            }
         }
+        let index = self.instances.len();
         self.instances.push(ObjectInstance {
             type_name: type_name.to_owned(),
             fields,
             ports,
         });
-        self.instances.len() - 1
+        // A subtype view instance carries its determinant values (6.7):
+        // the view's (field id, value) pairs hold from instantiation on,
+        // and generation never samples them (they are what the view is).
+        for (id, value) in when_of {
+            if let Some(v) = self.determinant_value(index, &id, &value) {
+                self.instances[index].set(&id, v);
+            }
+        }
+        index
+    }
+
+    /// The value a determinant field of an instance takes under a
+    /// subtype view's (field id, value) pair: an enumerand of the
+    /// field's type, a Boolean, or a numeric literal.
+    fn determinant_value(&self, index: usize, id: &str, word: &str) -> Option<Value> {
+        let type_name = self.instances[index].type_name.clone();
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let ty = types.iter().find(|t| t.name == type_name)?;
+        let field = ty.fields.iter().find(|field| field.name == id)?;
+        match &field.ty {
+            TypeExpr::Scalar {
+                base: ScalarBase::Bool,
+                ..
+            } => Some(Value::Bool(word.eq_ignore_ascii_case("true"))),
+            TypeExpr::Scalar { .. } => word.parse::<i128>().ok().map(Value::Int),
+            TypeExpr::Named { name, .. } => {
+                let declared = types
+                    .iter()
+                    .find(|t| &t.name == name && t.kind == DeclarationKind::Type)?;
+                // The word must be one of the type's enumerands.
+                if !declared
+                    .enumerals
+                    .iter()
+                    .any(|enumeral| enumeral.name == word)
+                {
+                    return None;
+                }
+                Some(Value::Enum {
+                    type_name: name.clone(),
+                    name: word.to_owned(),
+                })
+            }
+            TypeExpr::InlineEnum { names, .. } => Some(Value::Enum {
+                type_name: inline_enum_key(names),
+                name: word.to_owned(),
+            }),
+            _ => None,
+        }
     }
 
     fn default_for(&mut self, ty: &TypeExpr) -> Value {
@@ -884,6 +958,19 @@ impl<'a> Interp<'a> {
                 self.depth += 1;
                 let index = self.instantiate(&view_name);
                 self.depth -= 1;
+                // A spelling whose view was not synthesized (no `when`
+                // block for it) still fixes its qualifier words as
+                // determinants on the base-carried instance: `good
+                // packet` means the instance's `good` determinant is
+                // TRUE from instantiation on (6.7).
+                if !self.types.iter().any(|t| t.name == view_name) {
+                    let words = when_spelling_words(value, base);
+                    if let Some(base_name) = when_view_base(base) {
+                        for word in words {
+                            self.set_spelled_determinant(index, &base_name, &word);
+                        }
+                    }
+                }
                 Value::Object(index)
             }
             // A template reference instantiates its monomorphized view
@@ -900,7 +987,62 @@ impl<'a> Interp<'a> {
                 self.depth -= 1;
                 Value::Object(index)
             }
+            // `typeof()`/`typeof_item()` placeholders resolve during
+            // elaboration (5.9); reaching the interpreter with one means
+            // the static type was undetermined — no value.
+            TypeExpr::TypeOf { .. } | TypeExpr::TypeOfItem { .. } => Value::Void,
             TypeExpr::Formal { .. } => Value::Void,
+        }
+    }
+
+    /// Fix one qualifier word of a when-qualified type spelling as a
+    /// determinant value on a freshly instantiated base-carried
+    /// instance: a Boolean field's own name means TRUE (`good` for
+    /// `TRUE'good`); otherwise the word is an enumerand of some field's
+    /// type (`red` of `color`).
+    fn set_spelled_determinant(&mut self, index: usize, base_name: &str, word: &str) {
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let Some(base) = types.iter().find(|t| t.name == base_name) else {
+            return;
+        };
+        // Boolean field named by the word (the bare `TRUE'good` form).
+        if let Some(field) = base.fields.iter().find(|field| field.name == word)
+            && matches!(
+                &field.ty,
+                TypeExpr::Scalar {
+                    base: ScalarBase::Bool,
+                    ..
+                }
+            )
+        {
+            self.instances[index].set(word, Value::Bool(true));
+            return;
+        }
+        // An enumerand of a field's declared or inline enumeral type.
+        for field in &base.fields {
+            let holds = match &field.ty {
+                TypeExpr::Named { name, .. } => types.iter().any(|t| {
+                    &t.name == name
+                        && t.kind == DeclarationKind::Type
+                        && t.enumerals.iter().any(|e| e.name == word)
+                }),
+                TypeExpr::InlineEnum { names, .. } => names.iter().any(|n| n == word),
+                _ => false,
+            };
+            if holds {
+                self.instances[index].set(
+                    &field.name,
+                    Value::Enum {
+                        type_name: match &field.ty {
+                            TypeExpr::Named { name, .. } => name.clone(),
+                            TypeExpr::InlineEnum { names, .. } => inline_enum_key(names),
+                            _ => unreachable!("matched above"),
+                        },
+                        name: word.to_owned(),
+                    },
+                );
+                return;
+            }
         }
     }
 
@@ -1284,7 +1426,21 @@ impl<'a> Interp<'a> {
         match statement {
             Stmt::VarDecl { name, ty, init, .. } => {
                 let value = match (ty, init) {
-                    (_, Some(expr)) => self.eval(expr, frame, me)?,
+                    (_, Some(expr)) => {
+                        // `var x: s = new;` — the declared type is the
+                        // instance the untyped `new` creates (clause 18:
+                        // the variable's declared type). The hint is
+                        // visible only while this initializer evaluates.
+                        self.new_type_hint = match (expr, ty) {
+                            (Expr::New { ty: None, .. }, Some(declared)) => {
+                                declared_type_name(declared)
+                            }
+                            _ => None,
+                        };
+                        let value = self.eval(expr, frame, me)?;
+                        self.new_type_hint = None;
+                        value
+                    }
                     // A declared type without an initializer takes the
                     // type's default; the type-inferring `:=` form
                     // always carries an initializer.
@@ -2011,11 +2167,17 @@ impl<'a> Interp<'a> {
         };
         let type_span = ty.span;
         // `!` fields keep their value; instance (unit-typed) fields are
-        // not generated — they are instantiated structurally.
+        // not generated — they are instantiated structurally. A subtype
+        // view's determinant fields are fixed by the view (6.7) and are
+        // not sampled.
         let field_types: Vec<(String, TypeExpr)> = ty
             .fields
             .iter()
-            .filter(|field| !field.no_gen && !self.is_unit_typed(&field.ty))
+            .filter(|field| {
+                !field.no_gen
+                    && !self.is_unit_typed(&field.ty)
+                    && !ty.when_of.iter().any(|(id, _)| id == &field.name)
+            })
             .map(|field| (field.name.clone(), field.ty.clone()))
             .collect();
         let mut constraints: Vec<Expr> = ty
@@ -2411,6 +2573,18 @@ impl<'a> Interp<'a> {
                 let result = self.gen_object(index, &[]);
                 self.depth -= 1;
                 result?;
+                // A spelling whose view was not synthesized still fixes
+                // its qualifier words as determinants (6.7) — but after
+                // the base fields' generation, which must not overwrite
+                // them back.
+                if !self.types.iter().any(|t| t.name == view_name) {
+                    let words = when_spelling_words(value, base);
+                    if let Some(base_name) = when_view_base(base) {
+                        for word in words {
+                            self.set_spelled_determinant(index, &base_name, &word);
+                        }
+                    }
+                }
                 Ok(Value::Object(index))
             }
             TypeExpr::InlineEnum { names, .. } => {
@@ -2439,6 +2613,10 @@ impl<'a> Interp<'a> {
                 result?;
                 Ok(Value::Object(index))
             }
+            // `typeof()`/`typeof_item()` placeholders resolve during
+            // elaboration (5.9); reaching the sampler with one means the
+            // static type was undetermined — nothing to generate.
+            TypeExpr::TypeOf { .. } | TypeExpr::TypeOfItem { .. } => Ok(Value::Void),
             TypeExpr::Formal { .. } => Ok(Value::Void),
         }
     }
@@ -3993,6 +4171,25 @@ impl<'a> Interp<'a> {
                     )),
                 }
             }
+            Expr::QualifiedField {
+                base,
+                qualifiers,
+                field,
+                field_span,
+                span,
+            } => {
+                // 4.17.3: the field is present iff the instance currently
+                // matches the qualifiers' subtype.
+                let object_value = self.eval(base, frame, me)?;
+                let Value::Object(index) = object_value else {
+                    return Err(self.error(
+                        "E0402",
+                        "subtype-qualified access requires an object",
+                        *span,
+                    ));
+                };
+                self.read_qualified_field(index, qualifiers, field, *field_span, *span)
+            }
             Expr::Call { callee, args, span } => {
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args {
@@ -4061,6 +4258,21 @@ impl<'a> Interp<'a> {
                                 *span,
                             )),
                         }
+                    }
+                    // A method named through a subtype-qualified access
+                    // (`p.red'f()`) resolves on the qualified base object
+                    // — the field dispatch is the plain one (4.17.3
+                    // qualifies field presence, not method lookup).
+                    Expr::QualifiedField { base, field, .. } => {
+                        let object_value = self.eval(base, frame, me)?;
+                        let Value::Object(index) = object_value else {
+                            return Err(self.error(
+                                "E0402",
+                                "subtype-qualified call requires an object",
+                                *span,
+                            ));
+                        };
+                        self.call_method(index, field, values, *span)
                     }
                     _ => Err(self.error("E0402", "call target not supported", *span)),
                 }
@@ -4298,34 +4510,40 @@ impl<'a> Interp<'a> {
                 // creation instantiates the named type — the
                 // monomorphized template instance's canonical name for a
                 // template reference — and runs the `with` assignments
-                // against the fresh instance. Untyped `new` and other
-                // type spellings stay the explicit not-supported
-                // diagnostic.
-                let Some(new_ty) = ty else {
-                    return Err(self.error(
-                        "E0402",
-                        "untyped 'new' instance creation is not supported yet",
-                        *span,
-                    ));
-                };
-                let name = match new_ty {
-                    TypeExpr::Named { name, .. } => name.clone(),
-                    TypeExpr::TemplateRef { name, args, .. } => {
-                        crate::ast::template_instance_name(name, args)
-                    }
-                    _ => {
-                        return Err(self.error(
-                            "E0402",
-                            "'new' supports named and template-instance types only",
-                            new_ty.span(),
-                        ));
-                    }
+                // against the fresh instance. An untyped `new` creates
+                // with the enclosing `var x: t = new;`'s declared type
+                // (clause 18) when one is evaluating; other untyped
+                // spellings stay the explicit not-supported diagnostic.
+                let new_name = match ty {
+                    None => match self.new_type_hint.clone() {
+                        Some(name) => name,
+                        None => {
+                            return Err(self.error(
+                                "E0402",
+                                "untyped 'new' instance creation is not supported yet",
+                                *span,
+                            ));
+                        }
+                    },
+                    Some(new_ty) => match new_ty {
+                        TypeExpr::Named { name, .. } => name.clone(),
+                        TypeExpr::TemplateRef { name, args, .. } => {
+                            crate::ast::template_instance_name(name, args)
+                        }
+                        _ => {
+                            return Err(self.error(
+                                "E0402",
+                                "'new' supports named and template-instance types only",
+                                new_ty.span(),
+                            ));
+                        }
+                    },
                 };
                 if self.depth > 100 {
                     return Ok(Value::Void);
                 }
                 self.depth += 1;
-                let index = self.instantiate(&name);
+                let index = self.instantiate(&new_name);
                 let mut frame = Frame::default();
                 let flow = self.exec_block(inits, &mut frame, Some(index))?;
                 self.depth -= 1;
@@ -4413,6 +4631,14 @@ impl<'a> Interp<'a> {
                 ),
                 _ => false,
             }),
+            // `typeof()`/`typeof_item()` placeholders resolve during
+            // elaboration (5.9); an `is a` against an unresolved one has
+            // no static type to check against.
+            TypeExpr::TypeOf { span, .. } | TypeExpr::TypeOfItem { span, .. } => Err(self.error(
+                "E0402",
+                "'is a' against an unresolved typeof() type is not supported",
+                *span,
+            )),
             TypeExpr::Formal { .. } => Ok(false),
             TypeExpr::InlineEnum { .. } => Err(self.error(
                 "E0402",
@@ -4605,6 +4831,208 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Read a subtype-qualified field (4.17.3): the accessed field must
+    /// be provided by a when-subtype view of the instance's type whose
+    /// when-of set contains every qualifier word, and the instance must
+    /// currently match that subtype — otherwise `E0413` ("the field is
+    /// not present").
+    fn read_qualified_field(
+        &mut self,
+        index: usize,
+        qualifiers: &[WhenQualifier],
+        field: &str,
+        field_span: crate::ast::Span,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let Some(view) = self.find_qualified_field_view(index, qualifiers, field) else {
+            return Err(self.error(
+                "E0401",
+                format!(
+                    "unknown field '{field}': no when-subtype view of the instance's type provides it under these qualifiers"
+                ),
+                span,
+            ));
+        };
+        if !self.instance_matches_view(index, view) {
+            return Err(self.error(
+                "E0413",
+                format!(
+                    "field '{}' is not present: instance is not of subtype '{}'",
+                    field, view.name
+                ),
+                span,
+            ));
+        }
+        if self.instances[index].get(field).is_none() {
+            self.materialize_qualified_field(index, view, field, field_span)?;
+        }
+        Ok(self.instances[index]
+            .get(field)
+            .cloned()
+            .unwrap_or(Value::Void))
+    }
+
+    /// The elaborated subtype view a subtype-qualified access (4.17.3)
+    /// resolves against: a view derived from the instance's root base
+    /// type whose when-of set contains every qualifier word and whose
+    /// fields include the accessed one. A qualifier word matches a
+    /// (field id, value) pair by value (`red` for `red'color`) or, for a
+    /// Boolean determinant's short form, by field id (`good` for
+    /// `TRUE'good`); the most specific matching view (the most pairs)
+    /// wins.
+    fn find_qualified_field_view(
+        &self,
+        index: usize,
+        qualifiers: &[WhenQualifier],
+        field: &str,
+    ) -> Option<&'a crate::elab::ElaboratedType> {
+        let words: Vec<&str> = qualifiers.iter().map(|q| q.value.as_str()).collect();
+        let mut best: Option<&'a crate::elab::ElaboratedType> = None;
+        for view in self.types {
+            if view.when_of.is_empty() {
+                continue;
+            }
+            if !view.fields.iter().any(|f| f.name == field) {
+                continue;
+            }
+            if !view_contains_words(view, &words) {
+                continue;
+            }
+            if !self.instance_in_view_family(index, view) {
+                continue;
+            }
+            if best.is_none_or(|best| view.when_of.len() > best.when_of.len()) {
+                best = Some(view);
+            }
+        }
+        best
+    }
+
+    /// Whether the instance belongs to the subtype family a view was
+    /// derived from: its type is the view itself, the family's root base
+    /// type, a `like` descendant of the root, or a when-qualified
+    /// spelling over the root (`good packet` — a spelling whose view was
+    /// not synthesized keeps the root's name as its last word).
+    fn instance_in_view_family(&self, index: usize, view: &crate::elab::ElaboratedType) -> bool {
+        let type_name = self.instances[index].type_name.as_str();
+        if type_name == view.name {
+            return true;
+        }
+        let Some(root) = self.when_root_base(view) else {
+            return false;
+        };
+        type_name == root
+            || self.type_is_a(type_name, &root)
+            || type_name.rsplit(' ').next() == Some(root.as_str())
+    }
+
+    /// The unmarked base type a when view was derived from (the same
+    /// walk the elaborator's view synthesis uses).
+    fn when_root_base(&self, view: &crate::elab::ElaboratedType) -> Option<String> {
+        let mut current = view;
+        for _ in 0..=self.types.len() {
+            if current.when_of.is_empty() {
+                return Some(current.name.clone());
+            }
+            let base_name = current.base.as_deref()?;
+            current = self.types.iter().find(|t| t.name == base_name)?;
+        }
+        None
+    }
+
+    /// Whether the instance currently satisfies a view's subtype
+    /// (4.17.3): every determinant pair whose field id names a field of
+    /// the instance holds on its value. Pairs whose id names no field
+    /// (the corpus's space form keeps the struct name as the pair's id)
+    /// cannot be verified and are skipped.
+    fn instance_matches_view(&self, index: usize, view: &crate::elab::ElaboratedType) -> bool {
+        view.when_of.iter().all(|(id, value)| {
+            match self.instances[index].get(id) {
+                Some(field_value) => value_holds(field_value, value),
+                // No such field on the instance: the pair is
+                // unverifiable here, not violated.
+                None => true,
+            }
+        })
+    }
+
+    /// A subtype-qualified access whose subtype matched but whose field
+    /// is not on the instance (the instance was created from a less
+    /// specific view or from the base type): the field's presence
+    /// follows from the subtype match (4.17.3 — the field is there iff
+    /// the instance is of the subtype), so it materializes from the
+    /// view's declaration and generates under the view's hard `keep`
+    /// constraints. A constraint that cannot be evaluated against the
+    /// instance (it names a field the instance does not carry) is
+    /// unverifiable and does not gate the materialization.
+    fn materialize_qualified_field(
+        &mut self,
+        index: usize,
+        view: &crate::elab::ElaboratedType,
+        field: &str,
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        let Some(declaration) = view.fields.iter().find(|f| f.name == field) else {
+            return Err(self.error("E0401", format!("unknown field '{field}'"), span));
+        };
+        let ty = declaration.ty.clone();
+        let default = self.default_for(&ty);
+        self.instances[index]
+            .fields
+            .push((field.to_owned(), default));
+        let constraints: Vec<Expr> = view
+            .constraints
+            .iter()
+            .filter(|constraint| !constraint.is_bind)
+            .map(|constraint| constraint.expr.clone())
+            .collect();
+        // The same domain narrowing gen uses: a `keep x == 5` shapes the
+        // sampling domain before the rejection loop.
+        let domains = self.constraint_domains(&constraints, &[(field.to_owned(), ty.clone())]);
+        for _ in 0..1000 {
+            let value = match domains.get(field) {
+                Some(domain) => self.sample_int_in(&ty, *domain),
+                None => self.sample_type(&ty)?,
+            };
+            self.instances[index].set(field, value);
+            let mut pass = true;
+            for constraint in &constraints {
+                // The same shapes gen skips (HDL bindings, soft and
+                // select constraints) do not gate a materialization.
+                if expr_calls_any(
+                    constraint,
+                    &["hdl_path", "delayed", "soft", "select", "edge"],
+                ) {
+                    continue;
+                }
+                match self.eval(constraint, &mut Frame::default(), Some(index)) {
+                    Ok(Value::Bool(true)) => {}
+                    Ok(Value::Bool(false)) => {
+                        pass = false;
+                        break;
+                    }
+                    Ok(_) => {
+                        return Err(self.error(
+                            "E0402",
+                            "constraint did not evaluate to a boolean",
+                            span,
+                        ));
+                    }
+                    // Unverifiable here (a missing sibling field): skip.
+                    Err(_) => {}
+                }
+            }
+            if pass {
+                return Ok(());
+            }
+        }
+        Err(self.error(
+            "E0407",
+            format!("no solution found for the constraints of field '{field}' after 1000 attempts"),
+            span,
+        ))
+    }
+
     fn read_slot(
         &mut self,
         target: &Expr,
@@ -4653,6 +5081,23 @@ impl<'a> Interp<'a> {
                 self.instances[index].get(name).cloned().ok_or_else(|| {
                     self.error("E0401", format!("unknown field '{name}'"), target.span())
                 })
+            }
+            Expr::QualifiedField {
+                base,
+                qualifiers,
+                field,
+                field_span,
+                span,
+            } => {
+                let object_value = self.eval(base, frame, me)?;
+                let Value::Object(index) = object_value else {
+                    return Err(self.error(
+                        "E0402",
+                        "subtype-qualified access requires an object",
+                        target.span(),
+                    ));
+                };
+                self.read_qualified_field(index, qualifiers, field, *field_span, *span)
             }
             _ => Err(self.error("E0402", "unsupported assignment target", target.span())),
         }
@@ -4707,6 +5152,50 @@ impl<'a> Interp<'a> {
                 } else {
                     Err(self.error("E0401", format!("unknown field '{name}'"), span))
                 }
+            }
+            Expr::QualifiedField {
+                base,
+                qualifiers,
+                field,
+                field_span,
+                ..
+            } => {
+                // The same presence rule as the read (4.17.3): the write
+                // lands only if the instance currently matches the
+                // qualifiers' subtype.
+                let object_value = self.eval(base, frame, me)?;
+                let Value::Object(index) = object_value else {
+                    return Err(self.error(
+                        "E0402",
+                        "subtype-qualified assignment requires an object",
+                        span,
+                    ));
+                };
+                let Some(view) = self.find_qualified_field_view(index, qualifiers, field) else {
+                    return Err(self.error(
+                        "E0401",
+                        format!(
+                            "unknown field '{field}': no when-subtype view of the instance's type provides it under these qualifiers"
+                        ),
+                        span,
+                    ));
+                };
+                if !self.instance_matches_view(index, view) {
+                    return Err(self.error(
+                        "E0413",
+                        format!(
+                            "field '{}' is not present: instance is not of subtype '{}'",
+                            field, view.name
+                        ),
+                        span,
+                    ));
+                }
+                if self.instances[index].get(field).is_none() {
+                    let field_span = *field_span;
+                    self.materialize_qualified_field(index, view, field, field_span)?;
+                }
+                self.instances[index].set(field, value);
+                Ok(())
             }
             _ => Err(self.error("E0402", "unsupported assignment target", span)),
         }
@@ -4867,7 +5356,7 @@ fn as_i64(value: &Value) -> Option<i64> {
 /// `LO HI pkt`, matching the elaborator's synthesized
 /// [`crate::elab::ElaboratedType`] entry. `None` when the chain does
 /// not bottom out in a named base type.
-fn when_view_name(value: &str, base: &TypeExpr) -> Option<String> {
+pub(crate) fn when_view_name(value: &str, base: &TypeExpr) -> Option<String> {
     let mut name = String::from(value);
     let mut base = base;
     loop {
@@ -4890,6 +5379,75 @@ fn when_view_name(value: &str, base: &TypeExpr) -> Option<String> {
             }
             _ => return None,
         }
+    }
+}
+
+/// The qualifier words of a when-qualified type spelling, in written
+/// order (`["LO", "HI"]` for `LO HI pkt`).
+pub(crate) fn when_spelling_words(value: &str, base: &TypeExpr) -> Vec<String> {
+    let mut words = vec![value.to_owned()];
+    let mut base = base;
+    while let TypeExpr::WhenQualified {
+        value: inner_value,
+        base: inner_base,
+        ..
+    } = base
+    {
+        words.push(inner_value.clone());
+        base = inner_base;
+    }
+    words
+}
+
+/// The named base type a when-qualified spelling bottoms out in.
+fn when_view_base(base: &TypeExpr) -> Option<String> {
+    match base {
+        TypeExpr::Named { name, .. } => Some(name.clone()),
+        TypeExpr::WhenQualified { base, .. } => when_view_base(base),
+        _ => None,
+    }
+}
+
+/// The instance type name a declared type expression creates with: the
+/// named type, a when-qualified spelling's combined view name, or a
+/// template reference's canonical instance name.
+fn declared_type_name(ty: &TypeExpr) -> Option<String> {
+    match ty {
+        TypeExpr::Named { name, .. } => Some(name.clone()),
+        TypeExpr::WhenQualified { value, base, .. } => when_view_name(value, base),
+        TypeExpr::TemplateRef { name, args, .. } => {
+            Some(crate::ast::template_instance_name(name, args))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a view's when-of set contains every qualifier word (4.17.3's
+/// legality reading): each word denotes a (field id, value) determinant
+/// of the view — by value (`red` for `red'color`, `TRUE` for
+/// `TRUE'good`) or by field id (a determinant's full or short spelling,
+/// `color` for `red'color`, `good` for `TRUE'good`). Several words may
+/// denote the same determinant (the full `TRUE'good` spelling of the
+/// short `good`), and qualifiers already implied by the static type are
+/// simply absent — so the words only need to cover a subset of the
+/// view's determinants; the subtype check below verifies the rest.
+fn view_contains_words(view: &crate::elab::ElaboratedType, words: &[&str]) -> bool {
+    words.iter().all(|word| {
+        view.when_of
+            .iter()
+            .any(|(id, value)| value == word || id == word)
+    })
+}
+
+/// Whether a determinant value word holds on a field value: an
+/// enumerand by name, a Boolean by its TRUE/FALSE word, a number by its
+/// decimal text.
+fn value_holds(value: &Value, word: &str) -> bool {
+    match value {
+        Value::Bool(b) => word.eq_ignore_ascii_case("true") == *b,
+        Value::Enum { name, .. } => name == word,
+        Value::Int(i) => word.parse::<i128>().map(|w| w == *i).unwrap_or(false),
+        _ => false,
     }
 }
 

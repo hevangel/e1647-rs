@@ -1029,11 +1029,14 @@ fn compute_calls_inline_and_untyped_params_accept_anything() {
 
 #[test]
 fn new_reports_a_clean_runtime_diagnostic() {
+    // An untyped `new` creates with the enclosing `var x: t = new;`'s
+    // declared type (clause 18); away from such an initializer it stays
+    // unsupported and reports the clean E0402 diagnostic.
     let result = run(
         &elaborate(
             &parse(
                 "struct s {\n    v: int;\n};\n\
-             extend sys {\n    run() is also {\n        var p: s = new;\n    };\n};\n",
+             extend sys {\n    run() is also {\n        var p: s;\n        p = new;\n    };\n};\n",
             )
             .declarations,
         ),
@@ -1045,6 +1048,17 @@ fn new_reports_a_clean_runtime_diagnostic() {
         "expected E0402 for 'new': {:?}",
         result.diagnostics[0].render()
     );
+}
+
+#[test]
+fn untyped_new_creates_the_var_declared_type() {
+    // `var p: s = new;` — the declared type is the instance (clause 18).
+    let output = clean_output(
+        "struct s {\n    v: int;\n};\n\
+         extend sys {\n    run() is also {\n        var p: s = new;\n        p.v = 7;\n        out(p.v, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "7\n");
 }
 
 #[test]
@@ -2463,4 +2477,103 @@ fn event_port_edge_attribute_selects_the_edge() {
     )
     .output;
     assert_eq!(output, "EDGE\nEDGE\nDONE\n");
+}
+
+#[test]
+fn typeof_and_typeof_item_resolve_in_type_positions() {
+    // 5.9: `typeof_item(data)` is the element type of the list field
+    // (`byte`), `typeof(first_item)` chains to the same static type —
+    // the expression is never evaluated, the resolved type substitutes
+    // wherever the type position is used. `x.n` therefore behaves as a
+    // byte (200 + 55 wraps to 255) and `typeof(x.n)` types a local var.
+    let output = clean_output(
+        "struct s {\n    data: list of byte;\n    first_item: typeof_item(data);\n    n: typeof(first_item);\n};\n\
+         extend sys {\n    run() is also {\n        var x: s = new;\n        x.first_item = 200;\n        \
+         x.n = x.first_item + 55;\n        out(x.n, \"\\n\");\n        var k: typeof(x.n) = 7;\n        \
+         out(k, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "255\n7\n");
+}
+
+#[test]
+fn typeof_resolves_through_local_vars_and_literals() {
+    // 5.9: a local var's declared type and a literal's scalar base are
+    // the static types typeof() resolves against; `typeof(x.first_item)`
+    // walks a member path through a struct-typed local, and a literal
+    // argument types a list's element.
+    let output = clean_output(
+        "struct s {\n    data: list of byte;\n    first_item: typeof_item(data);\n};\n\
+         extend sys {\n    run() is also {\n        var x: s = new;\n        var k: typeof(x.first_item) = 3;\n        \
+         var l: list of typeof(k);\n        l.push(k * 2);\n        out(l[0], \"\\n\");\n        \
+         var m: typeof(5) = 9;\n        out(m + 1, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "6\n10\n");
+}
+
+#[test]
+fn qualified_field_access_reads_when_subtype_fields() {
+    // 4.17.3: a subtype-qualified access reads the field declared in the
+    // matching when subtype — with short qualifiers (`red'good`), full
+    // ones (`TRUE'good`, `red'color`), order-independent words
+    // (`green'color'big'size`), and qualifiers already implied by the
+    // static type omitted (`red'color` on a `good packet`, `big'green`).
+    // The instance must currently match the subtype; the sys keeps fix
+    // the determinants before run() reads them.
+    let output = clean_output(
+        "type color_t: [red, green, blue];\n\
+         type size_t: [big, medium, small];\n\
+         struct packet {\n    color: color_t;\n    size: size_t;\n    good: bool;\n    \
+         when red good packet { x: int; keep x == 5; };\n    \
+         when big'size green'color packet { y: uint; keep y == 9; };\n};\n\
+         extend sys {\n    p1: good packet;  keep p1.color == red;\n    \
+         p2: packet;       keep p2.color == green; keep p2.size == big;\n    \
+         run() is also {\n        out(p1.red'good'x, \"\\n\");\n        out(p1.TRUE'good'red'x, \"\\n\");\n        \
+         out(p1.red'color'x, \"\\n\");\n        out(p2.green'color'big'size'y, \"\\n\");\n        \
+         out(p2.big'green'y, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "5\n5\n5\n9\n9\n");
+}
+
+#[test]
+fn qualified_field_access_on_non_matching_subtype_reports_e0413() {
+    // 4.17.3 at run time: p2's color is green (its keep), so it is not a
+    // `red good packet` and the field x is not present — E0413 names the
+    // field and the subtype.
+    let result = run_source(
+        "type color_t: [red, green, blue];\n\
+         struct packet {\n    color: color_t;\n    good: bool;\n    \
+         when red good packet { x: int; keep x == 5; };\n};\n\
+         extend sys {\n    p2: packet; keep p2.color == green;\n    \
+         run() is also {\n        out(p2.red'good'x, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0413");
+    assert!(
+        diagnostic
+            .render()
+            .contains("field 'x' is not present: instance is not of subtype 'red good packet'"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn qualified_field_access_writes_and_checks_presence() {
+    // 4.17.3: a write through a subtype-qualified access lands only when
+    // the instance currently matches the subtype, and `is a` still
+    // dispatches on the plain base type.
+    let output = clean_output(
+        "type color_t: [red, green, blue];\n\
+         struct packet {\n    color: color_t;\n    good: bool;\n    \
+         when red good packet { x: int; keep x == 5; };\n};\n\
+         extend sys {\n    p1: good packet; keep p1.color == red;\n    \
+         run() is also {\n        p1.red'good'x = 41;\n        out(p1.red'good'x + 1, \"\\n\");\n        \
+         if p1 is a packet {\n            out(\"IS A PACKET\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "42\nIS A PACKET\n");
 }

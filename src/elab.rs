@@ -268,8 +268,10 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
     let mut budget = 200usize;
     while let Some(index) = worklist.pop() {
         let whens: Vec<crate::ast::WhenDecl> = types[index].whens.clone();
+        let root_base = when_root_base_name(&types, index);
         for when in whens {
-            let Some(pairs) = when_modifier_pairs(&when) else {
+            let Some(subtype) = when_modifier_pairs(&when, &types[index], &root_base, &types)
+            else {
                 continue;
             };
             if budget == 0 {
@@ -277,15 +279,18 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             }
             budget -= 1;
             // The enclosing view's own values (none for a base type)
-            // come first, the inner when's values follow, and the
+            // come first, the inner when's value words follow, and the
             // root base type's name closes — the reading order the
-            // chained field-type spelling uses (`f: LO HI pkt`).
+            // chained field-type spelling uses (`f: LO HI pkt`). The
+            // name words are the written subtype values (`red good` for
+            // `when red good packet`), not the resolved determinant
+            // values (`TRUE` for the `good` short form).
             let mut values: Vec<String> = types[index]
                 .when_of
                 .iter()
                 .map(|(_, value)| value.clone())
                 .collect();
-            values.extend(pairs.iter().map(|(_, value)| value.clone()));
+            values.extend(subtype.name_words);
             let base_name = when_root_base_name(&types, index);
             let enclosing_name = types[index].name.clone();
             let mut view = types[index].clone();
@@ -295,7 +300,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             // the containment chain.
             view.base = Some(enclosing_name);
             let mut all_pairs = types[index].when_of.clone();
-            all_pairs.extend(pairs);
+            all_pairs.extend(subtype.pairs);
             view.when_of = all_pairs;
             // The base's other when blocks are alternative subtypes,
             // not refinements of this one — the view composes only the
@@ -506,6 +511,15 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             span: template.span,
         });
     }
+    // 6.7 with 5.9: two final passes over the composed types.
+    // (a) every when-qualified type spelling used in a type position
+    //     names a subtype view; a spelling without a when-block view
+    //     (`good packet` — no `when good packet` block) materializes as
+    //     the root base's members under the spelling's name, with the
+    //     spelling's words resolved as the view's determinants.
+    // (b) the `typeof()`/`typeof_item()` placeholders (5.9) resolve
+    //     against the composed types and rewrite in place.
+    finalize_type_positions(&mut types);
     let mut defines = BTreeMap::new();
     for declaration in declarations {
         for member in &declaration.members {
@@ -810,31 +824,160 @@ fn when_root_base_name(types: &[ElaboratedType], index: usize) -> String {
     types[cursor].name.clone()
 }
 
-/// The (field id, value) pairs a when block's modifiers declare, or
-/// `None` when the modifier spelling does not identify its determinant
-/// fields. Two spellings carry the discriminators (6.7.1 — subtypes can
-/// be combinations of fields): the conventional `value'id` modifiers,
-/// any number of them (`when BUSY'kind`, `when LO'kind HI'dir`), and
-/// the corpus's space form `when NO_CONSTRAINT env` (two bare modifiers
-/// — value first, field id second). A lone bare modifier names no
-/// field and synthesizes nothing.
-fn when_modifier_pairs(when: &WhenDecl) -> Option<Vec<(String, String)>> {
-    match when.modifiers.as_slice() {
-        [] => None,
-        modifiers if modifiers.iter().all(|modifier| modifier.id.is_some()) => Some(
-            modifiers
+/// A when block's declared subtype: the (field id, value) determinant
+/// pairs, and the value words the synthesized view's name is built from
+/// (`red good` for `when red good packet` — the written words, not the
+/// resolved determinant values).
+struct WhenSubtype {
+    pairs: Vec<(String, String)>,
+    name_words: Vec<String>,
+}
+
+/// The subtype a when block's modifiers declare, or `None` when the
+/// modifier spelling does not identify its determinant fields. The
+/// spellings (6.7.1 — subtypes can be combinations of fields):
+///
+/// - the conventional `value'id` modifiers, any number of them (`when
+///   BUSY'kind`, `when LO'kind HI'dir`);
+/// - a trailing bare modifier equal to the enclosing (or root base)
+///   type's name is that type's name marker, not a subtype value (`when
+///   red good packet` on `packet`) — it is stripped first;
+/// - bare modifier words, each a subtype value: the Boolean field it
+///   names (`good` for `TRUE'good`) or the field whose enumeral type
+///   contains it (`red` of `color`) — `when red good packet` fixes two
+///   determinants and names the view `red good packet`;
+/// - the corpus's space form `when NO_CONSTRAINT env` (two bare
+///   modifiers — value first, field id second), and the `when <value>
+///   <struct-name>` form, as the fallback readings when the fields'
+///   types do not identify the words. There the second word is a
+///   determinant id, not a value, so it stays out of the view's name.
+fn when_modifier_pairs(
+    when: &WhenDecl,
+    view: &ElaboratedType,
+    root_base: &str,
+    types: &[ElaboratedType],
+) -> Option<WhenSubtype> {
+    if when.modifiers.is_empty() {
+        return None;
+    }
+    let mut modifiers = when.modifiers.as_slice();
+    let mut marker: Option<&str> = None;
+    if let Some(last) = modifiers.last()
+        && last.id.is_none()
+        && (last.value == view.name || last.value == root_base)
+    {
+        marker = Some(last.value.as_str());
+        modifiers = &modifiers[..modifiers.len() - 1];
+    }
+    if modifiers.is_empty() {
+        return None;
+    }
+    // The conventional form: every modifier names its determinant.
+    if modifiers.iter().all(|modifier| modifier.id.is_some()) {
+        return Some(WhenSubtype {
+            pairs: modifiers
                 .iter()
                 .map(|modifier| {
                     let (id, _) = modifier.id.as_ref().expect("checked above");
                     (id.clone(), modifier.value.clone())
                 })
                 .collect(),
-        ),
-        [first, second] if first.id.is_none() && second.id.is_none() => {
-            Some(vec![(second.value.clone(), first.value.clone())])
-        }
-        _ => None,
+            name_words: modifiers
+                .iter()
+                .map(|modifier| modifier.value.clone())
+                .collect(),
+        });
     }
+    // All-bare modifiers: subtype value words.
+    if modifiers.iter().all(|modifier| modifier.id.is_none()) {
+        let words: Vec<&str> = modifiers.iter().map(|m| m.value.as_str()).collect();
+        if let Some(pairs) = resolve_bare_words(&words, view, types) {
+            return Some(WhenSubtype {
+                pairs,
+                name_words: words.iter().map(|w| w.to_string()).collect(),
+            });
+        }
+        // The fallback readings preserve the pre-existing behavior:
+        // `when <value> <struct-name>` (the name marker is the pair's
+        // id), and the corpus's space form (value first, field id
+        // second) — the second word is an id there, not a value.
+        if let (Some(marker), [word]) = (marker, words.as_slice()) {
+            return Some(WhenSubtype {
+                pairs: vec![(marker.to_string(), word.to_string())],
+                name_words: vec![word.to_string()],
+            });
+        }
+        if let [first, second] = words.as_slice() {
+            return Some(WhenSubtype {
+                pairs: vec![(second.to_string(), first.to_string())],
+                name_words: vec![first.to_string()],
+            });
+        }
+        return None;
+    }
+    // Mixed `value'id` and bare modifiers: the bare words resolve like
+    // the all-bare form; one unresolvable word means the spelling does
+    // not identify its determinants.
+    let mut pairs = Vec::new();
+    let mut name_words = Vec::new();
+    for modifier in modifiers {
+        if let Some((id, _)) = &modifier.id {
+            pairs.push((id.clone(), modifier.value.clone()));
+        } else {
+            let word_pairs = resolve_bare_words(&[modifier.value.as_str()], view, types)?;
+            pairs.extend(word_pairs);
+        }
+        name_words.push(modifier.value.clone());
+    }
+    Some(WhenSubtype { pairs, name_words })
+}
+
+/// The (field id, value) pairs bare subtype words declare: the Boolean
+/// field a word names (`good` for `TRUE'good`) or the field whose
+/// enumeral type contains the word (`red` of `color`). One
+/// unidentifiable word fails the whole sequence.
+fn resolve_bare_words(
+    words: &[&str],
+    view: &ElaboratedType,
+    types: &[ElaboratedType],
+) -> Option<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    for word in words {
+        let word = *word;
+        // A Boolean field named by the word (the bare `TRUE'good` form).
+        if let Some(field) = view.fields.iter().find(|field| field.name == word)
+            && matches!(
+                &field.ty,
+                crate::ast::TypeExpr::Scalar {
+                    base: crate::ast::ScalarBase::Bool,
+                    ..
+                }
+            )
+        {
+            pairs.push((word.to_string(), "TRUE".to_string()));
+            continue;
+        }
+        // An enumerand of a field's declared or inline enumeral type.
+        let mut determinant = None;
+        for field in &view.fields {
+            let holds = match &field.ty {
+                crate::ast::TypeExpr::Named { name, .. } => types.iter().any(|ty| {
+                    &ty.name == name
+                        && ty.kind == DeclarationKind::Type
+                        && ty.enumerals.iter().any(|enumeral| enumeral.name == word)
+                }),
+                crate::ast::TypeExpr::InlineEnum { names, .. } => names.iter().any(|n| n == word),
+                _ => false,
+            };
+            if holds {
+                determinant = Some(field.name.clone());
+                break;
+            }
+        }
+        let field_name = determinant?;
+        pairs.push((field_name, word.to_string()));
+    }
+    Some(pairs)
 }
 
 /// Substitute the bound actuals for the formals of a type position
@@ -864,6 +1007,25 @@ fn substitute_type(
             crate::ast::TypeExpr::WhenQualified {
                 value: value.clone(),
                 base: Box::new(substitute_type(base, bindings, queue)),
+                span: *span,
+            }
+        }
+        // A `typeof()` placeholder's argument is an expression whose
+        // type positions substitute too (8.3 covers the whole body);
+        // the placeholder itself resolves after instantiation.
+        crate::ast::TypeExpr::TypeOf { expr, span } => {
+            let mut expr = (**expr).clone();
+            substitute_expr(&mut expr, bindings, queue);
+            crate::ast::TypeExpr::TypeOf {
+                expr: Box::new(expr),
+                span: *span,
+            }
+        }
+        crate::ast::TypeExpr::TypeOfItem { expr, span } => {
+            let mut expr = (**expr).clone();
+            substitute_expr(&mut expr, bindings, queue);
+            crate::ast::TypeExpr::TypeOfItem {
+                expr: Box::new(expr),
                 span: *span,
             }
         }
@@ -1039,6 +1201,8 @@ fn substitute_expr(
         Expr::SetOfValues { ty, .. } => {
             *ty = substitute_type(ty, bindings, queue);
         }
+        // A subtype-qualified access's base carries the type positions.
+        Expr::QualifiedField { base, .. } => substitute_expr(base, bindings, queue),
         Expr::MemberAccess { object, .. } => substitute_expr(object, bindings, queue),
         Expr::Call { callee, args, .. } => {
             substitute_expr(callee, bindings, queue);
@@ -1200,6 +1364,10 @@ fn collect_template_refs(
         }
         crate::ast::TypeExpr::List { element, .. } => collect_template_refs(element, queue),
         crate::ast::TypeExpr::WhenQualified { base, .. } => collect_template_refs(base, queue),
+        // A `typeof()` placeholder's argument may reference a template
+        // instance in a type position inside an expression.
+        crate::ast::TypeExpr::TypeOf { expr, .. }
+        | crate::ast::TypeExpr::TypeOfItem { expr, .. } => collect_expression_refs(expr, queue),
         _ => {}
     }
 }
@@ -1379,6 +1547,429 @@ fn collect_expression_refs(
                 }
             }
         }
+        // A subtype-qualified access's type positions live in its base.
+        crate::ast::Expr::QualifiedField { base, .. } => collect_expression_refs(base, queue),
         _ => {}
+    }
+}
+
+/// The two final passes over the composed types (see the call site in
+/// [`elaborate`]): when-qualified spelling views, then `typeof()`
+/// resolution.
+fn finalize_type_positions(types: &mut Vec<ElaboratedType>) {
+    // (a) Spelled when-qualified views. Bounded passes: a synthesized
+    // view's own field types may name further spellings.
+    for _ in 0..3 {
+        let mut spellings: Vec<(String, Vec<String>)> = Vec::new();
+        for entry in types.iter() {
+            collect_spelled_views(entry, &mut spellings);
+        }
+        spellings.dedup_by(|a, b| a.0 == b.0);
+        if spellings.is_empty() {
+            break;
+        }
+        let mut added = 0usize;
+        for (name, words) in spellings {
+            if types.iter().any(|ty| ty.name == name) {
+                continue;
+            }
+            if synthesize_spelled_view(&name, &words, types).is_some() {
+                added += 1;
+            }
+        }
+        if added == 0 {
+            break;
+        }
+    }
+    // (b) `typeof()`/`typeof_item()` resolution (5.9), in type order so
+    // a field's resolved type feeds later resolutions.
+    for index in 0..types.len() {
+        resolve_type_typeof(types, index);
+    }
+}
+
+/// The when-qualified type spellings (6.7) one composed type's type
+/// positions use, as (view name, qualifier words) candidates.
+fn collect_spelled_views(entry: &ElaboratedType, out: &mut Vec<(String, Vec<String>)>) {
+    let mut spellings: Vec<(String, Vec<String>)> = Vec::new();
+    for field in &entry.fields {
+        collect_type_spellings(&field.ty, &mut spellings);
+    }
+    for method in &entry.methods {
+        for param in &method.params {
+            if let Some(ty) = &param.ty {
+                collect_type_spellings(ty, &mut spellings);
+            }
+        }
+        if let Some(return_type) = &method.return_type {
+            collect_type_spellings(return_type, &mut spellings);
+        }
+        for statement in &method.body {
+            collect_statement_spellings(statement, &mut spellings);
+        }
+    }
+    out.append(&mut spellings);
+}
+
+fn collect_type_spellings(ty: &crate::ast::TypeExpr, out: &mut Vec<(String, Vec<String>)>) {
+    match ty {
+        crate::ast::TypeExpr::WhenQualified { value, base, .. } => {
+            if let Some(view_name) = crate::interp::when_view_name(value, base) {
+                out.push((view_name, crate::interp::when_spelling_words(value, base)));
+            }
+            collect_type_spellings(base, out);
+        }
+        crate::ast::TypeExpr::List { element, .. } => collect_type_spellings(element, out),
+        crate::ast::TypeExpr::TemplateRef { args, .. } => {
+            for arg in args {
+                collect_type_spellings(arg, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The type positions of one statement — the read-only walk that gathers
+/// spelled when-qualified views from method bodies.
+fn collect_statement_spellings(statement: &crate::ast::Stmt, out: &mut Vec<(String, Vec<String>)>) {
+    match statement {
+        crate::ast::Stmt::VarDecl { ty: Some(ty), .. } => collect_type_spellings(ty, out),
+        crate::ast::Stmt::Assign { target, value, .. } => {
+            collect_expression_spellings(target, out);
+            collect_expression_spellings(value, out);
+        }
+        crate::ast::Stmt::ExprStmt { expr, .. } => collect_expression_spellings(expr, out),
+        crate::ast::Stmt::Return {
+            value: Some(value), ..
+        } => collect_expression_spellings(value, out),
+        crate::ast::Stmt::If {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            collect_expression_spellings(cond, out);
+            for statement in then_body {
+                collect_statement_spellings(statement, out);
+            }
+            if let Some(else_body) = else_body {
+                for statement in else_body {
+                    collect_statement_spellings(statement, out);
+                }
+            }
+        }
+        crate::ast::Stmt::While { cond, body, .. } => {
+            collect_expression_spellings(cond, out);
+            for statement in body {
+                collect_statement_spellings(statement, out);
+            }
+        }
+        crate::ast::Stmt::Case {
+            scrutinee, arms, ..
+        } => {
+            collect_expression_spellings(scrutinee, out);
+            for (alternatives, body) in arms {
+                for expr in alternatives {
+                    collect_expression_spellings(expr, out);
+                }
+                for statement in body {
+                    collect_statement_spellings(statement, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_expression_spellings(expr: &crate::ast::Expr, out: &mut Vec<(String, Vec<String>)>) {
+    match expr {
+        crate::ast::Expr::New {
+            ty: Some(ty),
+            inits,
+            ..
+        } => {
+            collect_type_spellings(ty, out);
+            for statement in inits {
+                collect_statement_spellings(statement, out);
+            }
+        }
+        crate::ast::Expr::CastAs { expr, ty, .. } | crate::ast::Expr::IsA { expr, ty, .. } => {
+            collect_expression_spellings(expr, out);
+            collect_type_spellings(ty, out);
+        }
+        crate::ast::Expr::SetOfValues { ty, .. } => collect_type_spellings(ty, out),
+        crate::ast::Expr::MemberAccess { object, .. } => collect_expression_spellings(object, out),
+        crate::ast::Expr::QualifiedField { base, .. } => collect_expression_spellings(base, out),
+        crate::ast::Expr::Call { callee, args, .. } => {
+            collect_expression_spellings(callee, out);
+            for arg in args {
+                collect_expression_spellings(arg, out);
+            }
+        }
+        crate::ast::Expr::Index { base, index, .. } => {
+            collect_expression_spellings(base, out);
+            collect_expression_spellings(index, out);
+        }
+        crate::ast::Expr::Binary { lhs, rhs, .. } => {
+            collect_expression_spellings(lhs, out);
+            collect_expression_spellings(rhs, out);
+        }
+        crate::ast::Expr::Unary { expr, .. } | crate::ast::Expr::Paren { expr, .. } => {
+            collect_expression_spellings(expr, out)
+        }
+        _ => {}
+    }
+}
+
+/// Materialize one spelled when-qualified view: the root base's members
+/// under the spelling's name, its qualifier words resolved as the view's
+/// determinants. A spelling whose words do not resolve against the root
+/// base's fields, or whose root base is an enumeral type, synthesizes
+/// nothing — the interpreter's base-carried fallback covers the instance.
+fn synthesize_spelled_view(
+    view_name: &str,
+    words: &[String],
+    types: &mut Vec<ElaboratedType>,
+) -> Option<()> {
+    let root_name = view_name.rsplit(' ').next()?.to_owned();
+    let root_index = types
+        .iter()
+        .position(|ty| ty.name == root_name && ty.kind != DeclarationKind::Type)?;
+    let root = &types[root_index];
+    let word_refs: Vec<&str> = words.iter().map(String::as_str).collect();
+    let pairs = resolve_bare_words(&word_refs, root, types)?;
+    let mut view = root.clone();
+    view.name = view_name.to_owned();
+    view.base = Some(root_name);
+    view.when_of = pairs;
+    // The spelling's own when blocks (if any exist for the exact
+    // spelling) already synthesized a view under this name — this
+    // materialization only fills the gap, so no when composition runs
+    // on top of it.
+    view.whens = Vec::new();
+    types.push(view);
+    Some(())
+}
+
+/// Resolve the `typeof()`/`typeof_item()` placeholders (5.9) of one
+/// composed type in place: field types in declaration order (an
+/// earlier field's resolved type feeds the next: `n: typeof(first_item)`
+/// after `first_item: typeof_item(data)`), then each method's parameter,
+/// return and local-variable types. A placeholder whose argument's
+/// static type cannot be determined stays — the interpreter's value
+/// model yields nothing for it, and the checker has reported `E0208`.
+fn resolve_type_typeof(types: &mut [ElaboratedType], index: usize) {
+    // Phase 1 (read-only over `types`): the rewritten field types.
+    let mut env: BTreeMap<String, crate::ast::TypeExpr> = types[index]
+        .fields
+        .iter()
+        .map(|field| (field.name.clone(), field.ty.clone()))
+        .collect();
+    let mut new_field_types = Vec::with_capacity(types[index].fields.len());
+    for field in &types[index].fields {
+        let resolved = resolve_typeof_in_type(&field.ty, &env, types);
+        env.insert(field.name.clone(), resolved.clone());
+        new_field_types.push(resolved);
+    }
+    // Phase 2 (write-back).
+    for (position, field) in types[index].fields.iter_mut().enumerate() {
+        field.ty = new_field_types[position].clone();
+    }
+    // Methods: parameters, return type and body locals, in order.
+    let mut new_methods = Vec::with_capacity(types[index].methods.len());
+    for method in &types[index].methods {
+        let mut method_env = env.clone();
+        let mut new_method = method.clone();
+        for param in &mut new_method.params {
+            if let Some(ty) = &mut param.ty {
+                let resolved = resolve_typeof_in_type(ty, &method_env, types);
+                method_env.insert(param.name.clone(), resolved.clone());
+                *ty = resolved;
+            }
+        }
+        if let Some(return_type) = &mut new_method.return_type {
+            *return_type = resolve_typeof_in_type(return_type, &method_env, types);
+        }
+        for statement in &mut new_method.body {
+            resolve_statement_typeof(statement, &mut method_env, types);
+        }
+        new_methods.push(new_method);
+    }
+    types[index].methods = new_methods;
+}
+
+/// Resolve the placeholders inside one type position recursively.
+fn resolve_typeof_in_type(
+    ty: &crate::ast::TypeExpr,
+    env: &BTreeMap<String, crate::ast::TypeExpr>,
+    types: &[ElaboratedType],
+) -> crate::ast::TypeExpr {
+    match ty {
+        crate::ast::TypeExpr::TypeOf { expr, .. } => {
+            static_type_of_expr(expr, env, types).unwrap_or_else(|| ty.clone())
+        }
+        crate::ast::TypeExpr::TypeOfItem { expr, .. } => {
+            match static_type_of_expr(expr, env, types) {
+                Some(crate::ast::TypeExpr::List { element, .. }) => *element,
+                _ => ty.clone(),
+            }
+        }
+        crate::ast::TypeExpr::List { element, key, span } => crate::ast::TypeExpr::List {
+            element: Box::new(resolve_typeof_in_type(element, env, types)),
+            key: key.clone(),
+            span: *span,
+        },
+        crate::ast::TypeExpr::WhenQualified { value, base, span } => {
+            crate::ast::TypeExpr::WhenQualified {
+                value: value.clone(),
+                base: Box::new(resolve_typeof_in_type(base, env, types)),
+                span: *span,
+            }
+        }
+        crate::ast::TypeExpr::TemplateRef { name, args, span } => {
+            crate::ast::TypeExpr::TemplateRef {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| resolve_typeof_in_type(arg, env, types))
+                    .collect(),
+                span: *span,
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// Resolve the placeholders inside one statement's type positions
+/// (local-variable declarations), in statement order: a later `var k:
+/// typeof(x)` sees `x`'s resolved type. The locals share one flat scope,
+/// like the checker's model.
+fn resolve_statement_typeof(
+    statement: &mut crate::ast::Stmt,
+    env: &mut BTreeMap<String, crate::ast::TypeExpr>,
+    types: &[ElaboratedType],
+) {
+    match statement {
+        crate::ast::Stmt::VarDecl {
+            name, ty: Some(ty), ..
+        } => {
+            let resolved = resolve_typeof_in_type(ty, env, types);
+            env.insert(name.clone(), resolved.clone());
+            *ty = resolved;
+        }
+        crate::ast::Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for inner in then_body {
+                resolve_statement_typeof(inner, env, types);
+            }
+            if let Some(else_body) = else_body {
+                for inner in else_body {
+                    resolve_statement_typeof(inner, env, types);
+                }
+            }
+        }
+        crate::ast::Stmt::While { body, .. } => {
+            for inner in body {
+                resolve_statement_typeof(inner, env, types);
+            }
+        }
+        crate::ast::Stmt::RepeatUntil { body, .. } => {
+            for inner in body {
+                resolve_statement_typeof(inner, env, types);
+            }
+        }
+        crate::ast::Stmt::ForEach { body, .. } => {
+            for inner in body {
+                resolve_statement_typeof(inner, env, types);
+            }
+        }
+        crate::ast::Stmt::ForTo { body, .. } => {
+            for inner in body {
+                resolve_statement_typeof(inner, env, types);
+            }
+        }
+        crate::ast::Stmt::Case { arms, default, .. } => {
+            for (_, body) in arms {
+                for inner in body {
+                    resolve_statement_typeof(inner, env, types);
+                }
+            }
+            if let Some(default) = default {
+                for inner in default {
+                    resolve_statement_typeof(inner, env, types);
+                }
+            }
+        }
+        crate::ast::Stmt::Check { else_body, .. } => {
+            for inner in else_body {
+                resolve_statement_typeof(inner, env, types);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The static type of a `typeof()`/`typeof_item()` argument (5.9)
+/// against the composed types: a field of the enclosing type, a local
+/// `var`, a method parameter, a literal, or a member path through a
+/// struct-typed name. The expression is only inspected, never evaluated.
+fn static_type_of_expr(
+    expr: &crate::ast::Expr,
+    env: &BTreeMap<String, crate::ast::TypeExpr>,
+    types: &[ElaboratedType],
+) -> Option<crate::ast::TypeExpr> {
+    match expr {
+        crate::ast::Expr::Ident { name, .. } => env.get(name).cloned(),
+        crate::ast::Expr::Paren { expr, .. } => static_type_of_expr(expr, env, types),
+        crate::ast::Expr::MemberAccess { object, name, .. } => {
+            let base = static_type_of_expr(object, env, types)?;
+            let type_name = struct_like_name(&base)?;
+            let ty = types.iter().find(|ty| ty.name == type_name)?;
+            ty.fields
+                .iter()
+                .find(|field| &field.name == name)
+                .map(|field| field.ty.clone())
+        }
+        // A literal's static type is its predefined scalar base; the
+        // unsized and sized numeric literals are `int` at this stage.
+        crate::ast::Expr::IntLiteral { .. } | crate::ast::Expr::BitLiteral { .. } => {
+            Some(scalar_type_of(crate::ast::ScalarBase::Int))
+        }
+        crate::ast::Expr::RealLiteral { .. } => Some(scalar_type_of(crate::ast::ScalarBase::Real)),
+        crate::ast::Expr::BoolLiteral { .. } => Some(scalar_type_of(crate::ast::ScalarBase::Bool)),
+        crate::ast::Expr::StringLiteral { .. } => {
+            Some(scalar_type_of(crate::ast::ScalarBase::String))
+        }
+        _ => None,
+    }
+}
+
+fn struct_like_name(ty: &crate::ast::TypeExpr) -> Option<String> {
+    match ty {
+        crate::ast::TypeExpr::Named { name, .. } => Some(name.clone()),
+        crate::ast::TypeExpr::WhenQualified { base, .. } => struct_like_name(base),
+        _ => None,
+    }
+}
+
+fn scalar_type_of(base: crate::ast::ScalarBase) -> crate::ast::TypeExpr {
+    crate::ast::TypeExpr::Scalar {
+        base,
+        width: None,
+        span: (
+            crate::lexer::Position {
+                byte: 0,
+                line: 0,
+                column: 0,
+            },
+            crate::lexer::Position {
+                byte: 0,
+                line: 0,
+                column: 0,
+            },
+        ),
     }
 }
