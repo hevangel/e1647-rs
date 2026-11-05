@@ -474,3 +474,39 @@ fn method_body_instance_references_substitute_and_materialize() {
     assert_eq!(args.len(), 1);
     assert_eq!(args[0].render(), "int".to_owned());
 }
+
+#[test]
+fn statement_may_span_code_segments() {
+    // 4.2.3: a code segment may end in the middle of a statement (here,
+    // inside a struct body between two fields); the statement completes
+    // in the next code segment of the same module. The lexer skips the
+    // prose between `'>` and `<'`, so the parser sees one continuous
+    // member list.
+    let result = elaborated(include_str!("fixtures/s2019_statement_spans_segments.e"));
+    assert_eq!(field_names(find(&result, "pkt")), vec!["a", "b"]);
+}
+
+#[test]
+fn brace_groups_splice_members_and_statements() {
+    // 4.3.2 / 4.3.3: bare `{ ... }` groups at module level and in member
+    // lists are pure syntax — no scope, no semantics. Members splice
+    // into the enclosing list in source order, groups nest, and an
+    // `#ifdef` inside a group keeps its member-position meaning.
+    let result = elaborated(include_str!("fixtures/s2019_brace_groups.e"));
+    let pkt = find(&result, "pkt");
+    assert_eq!(field_names(pkt), vec!["a", "b", "c"]);
+    assert_eq!(pkt.constraints.len(), 1, "the grouped `keep` spliced in");
+    let color = find(&result, "color_t");
+    let enumeral_names: Vec<&str> = color
+        .enumerals
+        .iter()
+        .map(|enumeral| enumeral.name.as_str())
+        .collect();
+    assert_eq!(enumeral_names, vec!["RED", "GREEN"]);
+    // A nested group and an `#ifdef` whose body sits inside a group.
+    let result = elaborated(
+        "<'\n#define X\nstruct s {\n    { { x: uint; } }\n    {\n        \
+         #ifdef X { y: uint; }\n    }\n    z: uint;\n};\n'>\n",
+    );
+    assert_eq!(field_names(find(&result, "s")), vec!["x", "y", "z"]);
+}

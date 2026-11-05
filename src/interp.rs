@@ -2157,14 +2157,17 @@ impl<'a> Interp<'a> {
     }
 
     /// Per-field sampling domains implied by the constraint list's simple
-    /// shapes: `f in [lo..hi]` and `f == c` (either orientation), where
+    /// shapes: `f in [lo..hi]`, `f == c`, and a constant comparison
+    /// `f < c` / `f <= c` / `f > c` / `f >= c` (either orientation), where
     /// the bounds evaluate to integer constants without an instance
     /// context. Conjuncts contribute independently; everything else —
     /// soft shapes included, which the rejection predicate enforces
     /// as written — leaves the field's domain untouched. An empty
     /// intersection is left as-is: sampling then uses the declared
     /// bounds and the predicate fails the attempt (E0407), which is the
-    /// honest outcome for contradictory constraints.
+    /// honest outcome for contradictory constraints. A comparison against
+    /// a constant narrows only the sampling domain; the rejection
+    /// predicate still enforces the constraint as written.
     fn constraint_domains(
         &mut self,
         constraints: &[Expr],
@@ -2234,6 +2237,48 @@ impl<'a> Interp<'a> {
                         && let Some(value) = self.const_int_eval(other)
                     {
                         intersect_domain(domains, name, (value, value));
+                    }
+                }
+            }
+            // A constant comparison narrows the side that names a field:
+            // `a < 10` and its mirror `10 > a` narrow identically. Bounds
+            // saturate so extreme constants stay representable; sampling
+            // clamps the domain to the field's natural range anyway.
+            Expr::Binary { op, lhs, rhs, .. }
+                if matches!(
+                    op,
+                    BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+                ) =>
+            {
+                for (side, other, direct) in [(lhs, rhs, true), (rhs, lhs, false)] {
+                    let Some(value) = self.const_int_eval(other) else {
+                        continue;
+                    };
+                    // `a < 10` / `a <= 10` bound the field above; the
+                    // mirrored `10 > a` / `10 >= a` bound it below.
+                    let upper = if direct {
+                        matches!(op, BinaryOp::Lt | BinaryOp::Le)
+                    } else {
+                        matches!(op, BinaryOp::Gt | BinaryOp::Ge)
+                    };
+                    let strict = matches!(op, BinaryOp::Lt | BinaryOp::Gt);
+                    let (lower, high) = if upper {
+                        let bound = if strict {
+                            value.saturating_sub(1)
+                        } else {
+                            value
+                        };
+                        (i128::MIN, bound)
+                    } else {
+                        let bound = if strict {
+                            value.saturating_add(1)
+                        } else {
+                            value
+                        };
+                        (bound, i128::MAX)
+                    };
+                    if let Expr::Ident { name, .. } = side.as_ref() {
+                        intersect_domain(domains, name, (lower, high));
                     }
                 }
             }
