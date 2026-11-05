@@ -258,7 +258,7 @@ fn expression_precedence() {
 }
 
 #[test]
-fn clause_4_5_places_xor_identity_and_in() {
+fn clause_4_6_places_xor_identity_and_in() {
     let declarations = expect_clean(
         "struct s {\n    a: uint;\n    b: uint;\n    c: uint;\n    flag: bool;\n    y: bool;\n    \
          keep a === b == c;\n    keep a == b === c;\n    keep flag && a in [1, 2];\n    \
@@ -349,6 +349,93 @@ fn clause_4_5_places_xor_identity_and_in() {
         rhs.as_ref(),
         Expr::Binary {
             op: BinaryOp::BitOr,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn clause_4_6_table_12_row_order() {
+    // IEEE 1647-2019 Table 12 (clause 4.6), over the rows implemented:
+    // `in` binds tighter than the bitwise `&` / `|` / `^` rows, which in
+    // turn bind tighter than `&&`; `=>` binds looser than `||`; `? :` is
+    // the loosest construct. (`list_ptr==`/`!list_ptr=` share the
+    // equality row and `in_table` the `in` row — other tasks.)
+    let declarations = expect_clean(
+        "struct s {\n    x: uint;\n    y: uint;\n    z: uint;\n    flag: bool;\n    \
+         keep x & y in [1, 2];\n    keep x | y in [1, 2];\n    keep x ^ y in [1, 2];\n    \
+         keep x & y && flag;\n    keep x | y && flag;\n    keep x ^ y && flag;\n    \
+         keep x || y => flag;\n    keep flag || x ? y : z;\n};\n",
+    );
+    let keep = |index: usize| match &declarations[0].members[4 + index] {
+        Member::Constraint(constraint) => &constraint.expr,
+        _ => panic!("expected a keep constraint"),
+    };
+    // `in` is tighter than `&`, `|` and `^`: x op (y in [1, 2])
+    for (index, op) in [
+        (0, BinaryOp::BitAnd),
+        (1, BinaryOp::BitOr),
+        (2, BinaryOp::BitXor),
+    ] {
+        let Expr::Binary { op: top, rhs, .. } = keep(index) else {
+            panic!("expected a binary constraint at keep {index}");
+        };
+        assert_eq!(
+            *top, op,
+            "expected the bitwise operator on top of keep {index}"
+        );
+        assert!(
+            matches!(rhs.as_ref(), Expr::InSet { .. }),
+            "expected 'in' absorbed into the right operand of keep {index}"
+        );
+    }
+    // `&`, `|` and `^` are tighter than `&&`: (x op y) && flag
+    for (index, op) in [
+        (3, BinaryOp::BitAnd),
+        (4, BinaryOp::BitOr),
+        (5, BinaryOp::BitXor),
+    ] {
+        let Expr::Binary {
+            op: top, lhs, rhs, ..
+        } = keep(index)
+        else {
+            panic!("expected a binary constraint at keep {index}");
+        };
+        assert_eq!(
+            *top,
+            BinaryOp::LogicalAnd,
+            "expected && on top of keep {index}"
+        );
+        assert!(
+            matches!(lhs.as_ref(), Expr::Binary { op: lhs_op, .. } if *lhs_op == op),
+            "expected the bitwise operator under the && of keep {index}"
+        );
+        assert!(matches!(rhs.as_ref(), Expr::Ident { .. }));
+    }
+    // `=>` is looser than `||`: (x || y) => flag
+    let Expr::Binary {
+        op: BinaryOp::Imply,
+        lhs,
+        ..
+    } = keep(6)
+    else {
+        panic!("expected => at the top of x || y => flag");
+    };
+    assert!(matches!(
+        lhs.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::LogicalOr,
+            ..
+        }
+    ));
+    // `? :` is the loosest: (flag || x) ? y : z
+    let Expr::Ternary { cond, .. } = keep(7) else {
+        panic!("expected the ternary on top of flag || x ? y : z");
+    };
+    assert!(matches!(
+        cond.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::LogicalOr,
             ..
         }
     ));
@@ -864,7 +951,7 @@ fn prefixed_field_declarations_parse() {
 }
 
 #[test]
-fn clause_4_5_places_string_match_between_identity_and_in() {
+fn clause_4_6_places_string_match_between_identity_and_in() {
     let declarations = expect_clean(
         "struct s {\n    a: string;\n    b: string;\n    c: string;\n    \
          keep a ~ b;\n    keep a !~ b;\n    keep a === b ~ c;\n    \

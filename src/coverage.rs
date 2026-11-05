@@ -866,6 +866,8 @@ fn type_is_int(ty: &TypeExpr) -> bool {
         TypeExpr::Scalar {
             base: ScalarBase::Uint
                 | ScalarBase::Int
+                | ScalarBase::Longint
+                | ScalarBase::Longuint
                 | ScalarBase::Bit
                 | ScalarBase::Byte
                 | ScalarBase::Nibble,

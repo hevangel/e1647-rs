@@ -16,6 +16,9 @@
 //! - `E0205` a `uint`/`int` width literal is zero
 //! - `E0206` duplicate name in an inner scope: method parameter, local
 //!   variable, or enumeral
+//! - `E0207` a subtype derived from `longint`/`longuint` — a
+//!   `(bits: N)` width specification on either long base, or a range
+//!   qualification (`type t: longint [0..5]`) over it (clause 5.2.3.1)
 //!
 //! Fields, methods and constraints are collected through `when` subtype
 //! members as well. A `keep` constraint sees every field of the enclosing
@@ -73,6 +76,11 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
         check_like_target(declaration, &declared, &mut diagnostics);
         if let Some(underlying) = &declaration.underlying {
             check_named_type(underlying, &declared, &mut diagnostics);
+            check_long_subtype(
+                underlying,
+                declaration.subtype_range.is_some(),
+                &mut diagnostics,
+            );
         }
         check_fields(declaration, &declared, &mut diagnostics);
         check_enumerals(declaration, &mut diagnostics);
@@ -175,6 +183,7 @@ fn check_fields(
     }
     for_each_field(&declaration.members, &mut |field| {
         check_named_type(&field.ty, declared, diagnostics);
+        check_long_subtype(&field.ty, false, diagnostics);
         if let TypeExpr::Scalar {
             base: crate::ast::ScalarBase::Uint | crate::ast::ScalarBase::Int,
             width: Some(width),
@@ -233,10 +242,12 @@ fn check_methods(
             }
             if let Some(ty) = &param.ty {
                 check_named_type(ty, declared, diagnostics);
+                check_long_subtype(ty, false, diagnostics);
             }
         }
         if let Some(return_type) = &method.return_type {
             check_named_type(return_type, declared, diagnostics);
+            check_long_subtype(return_type, false, diagnostics);
         }
         check_statements(&method.body, &mut seen, declared, &method.name, diagnostics);
     });
@@ -323,6 +334,7 @@ fn check_statements<'a>(
                 }
                 if let Some(ty) = ty {
                     check_named_type(ty, declared, diagnostics);
+                    check_long_subtype(ty, false, diagnostics);
                 }
             }
             Stmt::If {
@@ -424,6 +436,30 @@ fn check_width(width: &Expr, diagnostics: &mut Vec<Diagnostic>) {
             span.1,
         ));
     }
+}
+
+/// Subtypes shall not be derived from `longint`/`longuint` (clause
+/// 5.2.3.1): a `(bits: N)` width specification on either long base, or a
+/// range qualification over a `type` declaration of one, is reported
+/// once, at the long base's own token. A bare alias
+/// (`type t: longint;`) is not a subtype and stays legal.
+fn check_long_subtype(ty: &TypeExpr, ranged: bool, diagnostics: &mut Vec<Diagnostic>) {
+    let TypeExpr::Scalar { base, width, span } = ty else {
+        return;
+    };
+    if !matches!(
+        base,
+        crate::ast::ScalarBase::Longint | crate::ast::ScalarBase::Longuint
+    ) || !(width.is_some() || ranged)
+    {
+        return;
+    }
+    diagnostics.push(Diagnostic::new(
+        "E0207",
+        format!("subtype of '{}' is not allowed", base.name()),
+        span.0,
+        span.1,
+    ));
 }
 
 /// Report root identifiers of the constraint expression that are neither

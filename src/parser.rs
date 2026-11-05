@@ -103,14 +103,27 @@ fn is_predefined_name(word: &str) -> bool {
     PREDEFINED_NAMES.contains(&word)
 }
 
-/// Binary operator rows from loosest to tightest binding (clause 4.6,
-/// Table 12). Arithmetic, shifts, relational operators, and `&&` / `||`
-/// follow C. `^` is looser than `|`, `===` / `!==` are looser than
-/// `==` / `!=`. The word spellings (`and`, `or`, `xor`) share the level of
-/// their symbol twins. All of these are left-associative. Three operators
-/// of Table 12 are not rows here: `in` and `~` / `!~` sit between these
-/// rows (see [`IN_LEVEL`], [`MATCH_LEVEL`]), and `is [not] a` has a type
-/// operand instead of an expression (see [`ISA_LEVEL`]).
+/// Binary operator rows of IEEE 1647-2019 Table 12 (clause 4.6), loosest
+/// first to match the parse order. The full table, tightest binding
+/// first: `[]`/`[..]`/`[:]` indexing, slicing and bit slicing · `f()`
+/// calls · `::` static access (Phase 2) · `.` dot · unary `~ ! not` ·
+/// `{...;...}` list concatenation · `%{...}` bit concatenation · unary
+/// `+ -` · `* / %` · binary `+ -` · `>> <<` · `< <= > >=` ·
+/// `is [not] a` · `== != list_ptr== !list_ptr=` (`list_ptr==` and
+/// `!list_ptr=` join this row in a later task) · `=== !==` · `~ !~`
+/// string match · `in not in` (and `in_table`, a later task) · `&` ·
+/// `|` · `^` · `&& and` · `|| or` · `=>` · `? :`.
+///
+/// The rows here carry the expression-binary operators of that order.
+/// Arithmetic, shifts, relations and the logical rows follow C; `&`
+/// binds tighter than `|`, which binds tighter than `^`; `==` / `!=`
+/// bind tighter than `===` / `!==`. The word spellings (`and`, `or`,
+/// `xor`) share the level of their symbol twins. All rows are
+/// left-associative. Four table entries are not rows here: `in` and
+/// `~` / `!~` sit between these rows (see [`IN_LEVEL`],
+/// [`MATCH_LEVEL`]), `is [not] a` takes a type operand instead of an
+/// expression (see [`ISA_LEVEL`]), and `? :` — the loosest construct —
+/// is parsed in [`Parser::parse_expr`].
 const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
     &[("=>", BinaryOp::Imply)],
     &[("||", BinaryOp::LogicalOr), ("or", BinaryOp::LogicalOr)],
@@ -135,24 +148,30 @@ const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
     ],
 ];
 
-/// `in` membership is not a [`BINARY_LEVELS`] row. It binds looser than
-/// the string-match operators and tighter than `&` (clause 4.6).
+/// `in` membership (Table 12's `in not in` row, which will also carry
+/// `in_table`) is not a [`BINARY_LEVELS`] row: its right operand is a
+/// set. It binds tighter than the `&` row and looser than the `~ !~`
+/// string-match row (clause 4.6).
 const IN_LEVEL: usize = 6;
 
-/// `~` / `!~` string match is not a [`BINARY_LEVELS`] row. It binds looser
-/// than `===` / `!==` and tighter than `in` (clause 4.6, Table 12).
+/// `~` / `!~` string match (Table 12's match row) is not a
+/// [`BINARY_LEVELS`] row: neither operand is restricted to a string. It
+/// binds tighter than the `in` row and looser than the `=== !==` row
+/// (clause 4.6, Table 12).
 const MATCH_LEVEL: usize = 7;
 
-/// `is [not] a <type>` is not a [`BINARY_LEVELS`] row: its right operand
-/// is a type, not an expression. It binds tighter than `==` / `!=` and
-/// looser than the comparisons (clause 4.6, Table 12).
+/// `is [not] a <type>` (Table 12's `is a / is not a` row) is not a
+/// [`BINARY_LEVELS`] row: its right operand is a type, not an
+/// expression. It binds tighter than the `== !=` row and looser than the
+/// relational row (clause 4.6, Table 12).
 const ISA_LEVEL: usize = 10;
 
 /// The [`BINARY_LEVELS`] row for a parse level, if the level is a plain
-/// binary-operator row. Two special levels (`in` at [`IN_LEVEL`] and
-/// string match at [`MATCH_LEVEL`]) sit between rows 5 and 6, and `is
-/// [not] a` ([`ISA_LEVEL`]) between rows 7 and 8, so levels above a
-/// special level shift by the number of specials passed.
+/// binary-operator row. Three special levels sit between rows: `in`
+/// ([`IN_LEVEL`]) and string match ([`MATCH_LEVEL`]) between the `===`
+/// row and the `&` row, and `is [not] a` ([`ISA_LEVEL`]) between the
+/// equality row and the relational row, so levels above a special level
+/// shift by the number of specials passed.
 fn binary_row_for(level: usize) -> Option<&'static [(&'static str, BinaryOp)]> {
     match level {
         0..=5 => BINARY_LEVELS.get(level).copied(),
@@ -513,6 +532,7 @@ impl Parser {
                             name: "global".to_owned(),
                             name_span: (gstart, gstart),
                             underlying: None,
+                            subtype_range: None,
                             template_params: Vec::new(),
                             template_extend: false,
                             packaged: false,
@@ -548,6 +568,7 @@ impl Parser {
                             name: "global".to_owned(),
                             name_span: (gstart, gstart),
                             underlying: None,
+                            subtype_range: None,
                             template_params: Vec::new(),
                             template_extend: false,
                             packaged: false,
@@ -736,6 +757,7 @@ impl Parser {
                 name: kind,
                 name_span: (start, start),
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -751,6 +773,7 @@ impl Parser {
                 name: driver,
                 name_span: (start, start),
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -786,6 +809,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -870,6 +894,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                subtype_range: None,
                 template_params,
                 template_extend,
                 packaged: false,
@@ -889,6 +914,7 @@ impl Parser {
             name,
             name_span,
             underlying: None,
+            subtype_range: None,
             template_params,
             template_extend,
             packaged: false,
@@ -925,9 +951,11 @@ impl Parser {
     }
 
     /// `type name: [ENUMERAL [= expr] , ..];` or the clause 5 scalar
-    /// form `type name: <type>;` (`type addr_t: int (bits: 8);`) — the
-    /// underlying representation is recorded; distinct-type semantics
-    /// over it are a later milestone.
+    /// form `type name: <type>;` (`type addr_t: int (bits: 8);`), with
+    /// the optional range qualification of a numeric subtype
+    /// (`type small: uint [0..7];` — clause 5.2.3.1) — the underlying
+    /// representation and the range are recorded; distinct-type
+    /// semantics and range narrowing over them are a later milestone.
     fn parse_type_declaration(&mut self) -> Option<Declaration> {
         let start = self.current_span().0;
         self.bump(); // 'type'
@@ -936,6 +964,13 @@ impl Parser {
         if !self.at_punct("[") {
             // Scalar/list type declaration: record the representation.
             let underlying = self.parse_type()?;
+            // The range qualification applies to a scalar base only; a
+            // `[` after any other underlying type stays a syntax error.
+            let subtype_range = if matches!(underlying, TypeExpr::Scalar { .. }) {
+                self.parse_subtype_range()?
+            } else {
+                None
+            };
             self.expect_punct(";", "E0105", "expected ';' after the type declaration")?;
             let end = self.last_end();
             return Some(Declaration {
@@ -943,6 +978,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: Some(underlying),
+                subtype_range,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -964,6 +1000,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -1009,6 +1046,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -1039,6 +1077,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -1056,6 +1095,7 @@ impl Parser {
             name,
             name_span,
             underlying: None,
+            subtype_range: None,
             template_params: Vec::new(),
             template_extend: false,
             packaged: false,
@@ -1066,6 +1106,38 @@ impl Parser {
             members,
             span: (start, end),
         })
+    }
+
+    /// `[low..high]` — the range qualification of a numeric subtype
+    /// declaration (clause 5.2.3.1's subtypes over scalar bases). The
+    /// qualification is recorded on the declaration; the well-formedness
+    /// check rejects the forms derived from `longint`/`longuint` (E0207).
+    /// Returns `None` when no `[` follows (the common case), so callers
+    /// can chain it with `?`.
+    fn parse_subtype_range(&mut self) -> Option<Option<(Expr, Expr)>> {
+        if !self.at_punct("[") {
+            return Some(None);
+        }
+        self.expect_punct("[", "E0106", "expected '[' to open the subtype range")?;
+        let low = self.parse_expr()?;
+        self.expect_punct("..", "E0108", "expected '..' in the subtype range")?;
+        let high = self.parse_expr()?;
+        self.expect_punct("]", "E0107", "expected ']' to close the subtype range")?;
+        Some(Some((low, high)))
+    }
+
+    /// `(bits: <expr>)` — the width specification after a scalar base
+    /// type (clause 5.2.3.2). The caller has checked the opening `(`.
+    fn parse_scalar_width(&mut self) -> Option<Box<Expr>> {
+        self.bump(); // '('
+        if !self.eat_keyword("bits") {
+            self.error_here("E0111", "expected 'bits' in width specification");
+            return None;
+        }
+        self.expect_punct(":", "E0103", "expected ':' after 'bits'")?;
+        let expr = self.parse_expr()?;
+        self.expect_punct(")", "E0110", "expected ')' after width specification")?;
+        Some(Box::new(expr))
     }
 
     fn parse_declaration(&mut self, keyword: &str) -> Option<Declaration> {
@@ -1161,6 +1233,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -1182,6 +1255,7 @@ impl Parser {
             name,
             name_span,
             underlying: None,
+            subtype_range: None,
             template_params: Vec::new(),
             template_extend: false,
             packaged: false,
@@ -2803,6 +2877,21 @@ impl Parser {
         }
         if self.at_identifier() {
             let (name, span) = self.take_identifier();
+            // Table 17's long types are predefined scalar names that lex
+            // as identifiers — `KEYWORDS` does not list them (the
+            // reference grammar treats type names as identifiers), so
+            // they are recognized here, ahead of the named-type fallback.
+            // Like `uint`/`int`, a `(bits: N)` width specification makes
+            // the type a subtype — rejected for the long bases by the
+            // well-formedness check (E0207, clause 5.2.3.1).
+            if let Some(base) = ScalarBase::from_keyword(&name) {
+                let width = if self.at_punct("(") {
+                    Some(self.parse_scalar_width()?)
+                } else {
+                    None
+                };
+                return Some(TypeExpr::Scalar { base, width, span });
+            }
             // A when-qualified type (`NO_CONSTRAINT env` — the subtype
             // modifier naming the variant of the base type, 6.7): the
             // qualifier and the base are both recorded. Chained
@@ -2891,18 +2980,12 @@ impl Parser {
         }
         if let Some(base) = ScalarBase::from_keyword(&keyword) {
             self.bump();
-            let mut width = None;
-            if (base == ScalarBase::Uint || base == ScalarBase::Int) && self.at_punct("(") {
-                self.bump();
-                if !self.eat_keyword("bits") {
-                    self.error_here("E0111", "expected 'bits' in width specification");
-                    return None;
-                }
-                self.expect_punct(":", "E0103", "expected ':' after 'bits'")?;
-                let expr = self.parse_expr()?;
-                width = Some(Box::new(expr));
-                self.expect_punct(")", "E0110", "expected ')' after width specification")?;
-            }
+            let width =
+                if (base == ScalarBase::Uint || base == ScalarBase::Int) && self.at_punct("(") {
+                    Some(self.parse_scalar_width()?)
+                } else {
+                    None
+                };
             let end = self.last_end();
             return Some(TypeExpr::Scalar {
                 base,

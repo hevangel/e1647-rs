@@ -2399,6 +2399,16 @@ impl<'a> Interp<'a> {
                     let raw = self.rng.below(1u128 << bits) as i128;
                     Value::Int(raw - ((1i128 << bits) >> 1))
                 }
+                // The long bases are 64-bit wide (Table 17, clause
+                // 5.2.3.1): an unconstrained `longuint` samples the full
+                // unsigned 64-bit range, a `longint` the full signed one.
+                // i128 storage holds both without truncation.
+                ScalarBase::Longuint => Value::Int(self.below_width(width, 64)),
+                ScalarBase::Longint => {
+                    let bits = width_bits(width, 64);
+                    let raw = self.rng.below(1u128 << bits) as i128;
+                    Value::Int(raw - ((1i128 << bits) >> 1))
+                }
                 ScalarBase::Bit => Value::Int(self.rng.below(2) as i128),
                 ScalarBase::Byte => Value::Int(self.rng.below(256) as i128),
                 ScalarBase::Nibble => Value::Int(self.rng.below(16) as i128),
@@ -4415,6 +4425,8 @@ impl<'a> Interp<'a> {
                 (
                     ScalarBase::Int
                         | ScalarBase::Uint
+                        | ScalarBase::Longint
+                        | ScalarBase::Longuint
                         | ScalarBase::Bit
                         | ScalarBase::Byte
                         | ScalarBase::Nibble
@@ -4952,6 +4964,9 @@ fn scalar_range(base: ScalarBase, width: &Option<Box<Expr>>) -> Option<(i128, i1
             let bits = width_bits(width, 32);
             Some((-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1))
         }
+        // The long bases are 64-bit wide (Table 17, clause 5.2.3.1).
+        ScalarBase::Longuint => Some((0, (1i128 << 64) - 1)),
+        ScalarBase::Longint => Some((-(1i128 << 63), (1i128 << 63) - 1)),
         ScalarBase::Bit => Some((0, 1)),
         ScalarBase::Byte => Some((0, 255)),
         ScalarBase::Nibble => Some((0, 15)),
@@ -5118,6 +5133,9 @@ fn natural_range(ty: &TypeExpr) -> Option<(i128, i128)> {
             let bits = width_bits(width, 32);
             Some((-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1))
         }
+        // The long bases are 64-bit wide (Table 17, clause 5.2.3.1).
+        ScalarBase::Longuint => Some((0, (1i128 << 64) - 1)),
+        ScalarBase::Longint => Some((-(1i128 << 63), (1i128 << 63) - 1)),
         ScalarBase::Bit => Some((0, 1)),
         ScalarBase::Byte => Some((0, 255)),
         ScalarBase::Nibble => Some((0, 15)),
@@ -5536,13 +5554,17 @@ fn list_element_type(ty: &TypeExpr) -> TypeExpr {
 }
 
 /// The bit width of a scalar type declaration (`uint(bits: 3)` → 3);
-/// unsized scalars count as one bit for packing.
+/// unsized scalars count as one bit for packing — except the long bases,
+/// whose default packing width is 64 bits (Table 17, clause 5.2.3.1).
 fn field_width_bits(ty: &TypeExpr) -> Option<i128> {
-    let TypeExpr::Scalar {
-        width: Some(width), ..
-    } = ty
-    else {
+    let TypeExpr::Scalar { base, width, .. } = ty else {
         return None;
+    };
+    let Some(width) = width else {
+        return match base {
+            ScalarBase::Longint | ScalarBase::Longuint => Some(64),
+            _ => None,
+        };
     };
     match width.as_ref() {
         Expr::IntLiteral { text, .. } => parse_int_literal(text),
