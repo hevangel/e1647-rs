@@ -81,14 +81,14 @@ pub enum EvalError {
 
 /// Sampling propagation (12.1.4): return the sampled normal form
 /// `S(t, q)` — every temporal atom under `t` carries the sampling event
-/// `q` unless it carries its own. Per 12.2.5 the sampling event
+/// `q` unless it carries its own. Per 12.2.6 the sampling event
 /// "applies to all sub-expressions" and can be "overridden for a
 /// sub-expression by attaching a different sampling event". The clause's
 /// worked example `{@a; ~[..]*cycle; @b} @q` becomes
 /// `{@a @q; ~[..]*cycle @q; @b @q} @q`: each direct sub-expression
 /// carries the event attached to it as a unit, the braces themselves
 /// keep `@q`, and the interior of a repeat is left alone (`cycle`
-/// already denotes one cycle of the context event, 12.2.2).
+/// already denotes one cycle of the context event, 12.2.3).
 pub fn sampled_normal_form(te: &TemporalExpr, sampling: &TemporalExpr) -> TemporalExpr {
     normal_form(te, sampling)
 }
@@ -115,7 +115,7 @@ fn normal_form(te: &TemporalExpr, q: &TemporalExpr) -> TemporalExpr {
             })
         }
         // The sequence keeps the sampling on the braces (12.1.4's
-        // worked example) while each item carries it too (12.2.8: the
+        // worked example) while each item carries it too (12.2.9: the
         // items are evaluated over the same sampling event's periods).
         crate::ast::TemporalExpr::Sequence { items } => {
             sampled(crate::ast::TemporalExpr::Sequence {
@@ -125,7 +125,7 @@ fn normal_form(te: &TemporalExpr, q: &TemporalExpr) -> TemporalExpr {
         // The worked example shows the repeat sampled as a unit —
         // `~[..]*cycle @q` — with its interior untouched: `cycle`
         // already means one cycle of the context sampling event
-        // (12.2.2).
+        // (12.2.3).
         crate::ast::TemporalExpr::Repeat {
             kind,
             low,
@@ -137,8 +137,8 @@ fn normal_form(te: &TemporalExpr, q: &TemporalExpr) -> TemporalExpr {
             high: high.clone(),
             te: Box::new((**inner).clone()),
         }),
-        // The remaining compounds propagate into their operands (12.2.5:
-        // the sampling event "applies to all sub-expressions"); 12.2.13
+        // The remaining compounds propagate into their operands (12.2.6:
+        // the sampling event "applies to all sub-expressions"); 12.2.14
         // states the context event applies to both sides of a yield.
         crate::ast::TemporalExpr::Yield { lhs, rhs } => crate::ast::TemporalExpr::Yield {
             lhs: Box::new(sub(lhs)),
@@ -158,7 +158,7 @@ fn normal_form(te: &TemporalExpr, q: &TemporalExpr) -> TemporalExpr {
             crate::ast::TemporalExpr::Eventually(Box::new(sub(inner)))
         }
         // An explicit sub-sampling overrides the context for everything
-        // below it (12.2.5); the normal form is rebuilt under its own
+        // below it (12.2.6); the normal form is rebuilt under its own
         // event, whose wrapper is the result — no extra sampling layer.
         crate::ast::TemporalExpr::Sampled { te: inner, event } => normal_form(inner, event),
         // Groups are transparent to sampling.
@@ -167,7 +167,7 @@ fn normal_form(te: &TemporalExpr, q: &TemporalExpr) -> TemporalExpr {
 }
 
 /// A direct sub-expression of a compound: one that carries its own
-/// sampling event keeps it (12.2.5's override — the context does not
+/// sampling event keeps it (12.2.6's override — the context does not
 /// descend past it), any other carries the context event.
 fn sub_form(child: &TemporalExpr, q: &TemporalExpr) -> TemporalExpr {
     match child {
@@ -229,15 +229,15 @@ fn holds_tight(
     match te {
         // An event atom holds on a single-state path where the event
         // occurs (success is simultaneous with the occurrence,
-        // 12.2.4).
+        // 12.2.5).
         crate::ast::TemporalExpr::EventRef { path } => {
             Ok(states.len() == 1 && states[0].occurs(path))
         }
         // One cycle of the sampling event: any single sampling state
-        // (12.2.2).
+        // (12.2.3).
         crate::ast::TemporalExpr::Cycle => Ok(states.len() == 1),
         // A proposition holds at the state where it is evaluated
-        // (12.2.3).
+        // (12.2.4).
         crate::ast::TemporalExpr::True { expr } => {
             Ok(states.len() == 1 && (callbacks.boolean)(expr) == Some(true))
         }
@@ -248,43 +248,43 @@ fn holds_tight(
         // A sequence holds when its items hold over consecutive,
         // non-overlapping segments, each item starting in the sampling
         // period following the one where the previous succeeded
-        // (12.2.8). A first-match repeat item (12.2.11) tries every
+        // (12.2.9). A first-match repeat item (12.2.12) tries every
         // repetition count within its bounds.
         crate::ast::TemporalExpr::Sequence { items } => seq_holds(items, states, callbacks),
-        // Both TEs succeed in the same sampling periods (12.2.6).
+        // Both TEs succeed in the same sampling periods (12.2.7).
         crate::ast::TemporalExpr::And(a, b) => {
             Ok(holds_tight(a, states, callbacks)? && holds_tight(b, states, callbacks)?)
         }
-        // Either TE succeeds (12.2.7).
+        // Either TE succeeds (12.2.8).
         crate::ast::TemporalExpr::Or(a, b) => {
             Ok(holds_tight(a, states, callbacks)? || holds_tight(b, states, callbacks)?)
         }
         // `not te` holds when the sub-expression does not hold tightly
-        // on the slice (12.2.16).
+        // on the slice (12.2.17).
         crate::ast::TemporalExpr::Not(inner) => Ok(!holds_tight(inner, states, callbacks)?),
         // `fail te` holds when every possibility to satisfy `te` is
-        // exhausted on the slice (12.2.12).
+        // exhausted on the slice (12.2.13).
         crate::ast::TemporalExpr::Fail(inner) => Ok(!succeeds(inner, states, callbacks)?),
         // `eventually te` holds when the sub-expression succeeds at any
-        // point of the slice (12.2.14).
+        // point of the slice (12.2.15).
         crate::ast::TemporalExpr::Eventually(inner) => succeeds(inner, states, callbacks),
-        // The yield (12.2.13): "succeeds without evaluating the second
+        // The yield (12.2.14): "succeeds without evaluating the second
         // expression if the first expression fails. If the first
         // expression succeeds, then the second expression needs to also
         // succeed in sequence." The lhs's successes within the slice
         // are its tight satisfactions on prefixes; each such success
         // obligates the rhs to succeed on the states after that prefix
-        // (12.2.8: the following TE starts in the sampling period after
+        // (12.2.9: the following TE starts in the sampling period after
         // the preceding one succeeded). When the lhs cannot succeed
         // anywhere in the slice, the yield holds vacuously.
         crate::ast::TemporalExpr::Yield { lhs, rhs } => {
             // Every way the lhs holds tightly on a prefix of the slice
             // obligates the rhs to succeed on the states after that
-            // prefix (12.2.8: the following TE starts in the sampling
+            // prefix (12.2.9: the following TE starts in the sampling
             // period after the preceding one succeeded). A violated
             // obligation fails the yield; with no lhs success anywhere
             // in the slice there is no obligation and the yield holds
-            // vacuously (12.2.13).
+            // vacuously (12.2.14).
             for split in 1..=states.len() {
                 if holds_tight(lhs, &states[..split], callbacks)?
                     && !succeeds(rhs, &states[split..], callbacks)?
@@ -300,7 +300,7 @@ fn holds_tight(
             high,
             te: inner,
         } => match kind {
-            // `[n]*te` — exactly n consecutive occurrences (12.2.9):
+            // `[n]*te` — exactly n consecutive occurrences (12.2.10):
             // the unrolled sequence holds.
             RepeatKind::Fixed => {
                 let n = repeat_bound(low.as_ref(), callbacks)?;
@@ -309,7 +309,7 @@ fn holds_tight(
             }
             // `~[l..h]*te` — a true-match repeat holds when the
             // sub-expression holds over k consecutive states for some
-            // k in the bounds (12.2.10); `~[..]` is the unbounded-low
+            // k in the bounds (12.2.11); `~[..]` is the unbounded-low
             // form, so the range starts at zero.
             RepeatKind::TrueMatch => {
                 let low = match low.as_ref() {
@@ -328,7 +328,7 @@ fn holds_tight(
                 }
                 Ok(false)
             }
-            // First-match repeats are sequence items (12.2.11) and are
+            // First-match repeats are sequence items (12.2.12) and are
             // handled by `seq_holds`.
             RepeatKind::FirstMatch => Err(EvalError::Unsupported(
                 "first-match repeats are sequence constructs",
@@ -355,7 +355,7 @@ fn seq_holds(
     };
     // A first-match repeat expands to k consecutive copies of its TE
     // (k in the bounds) followed by the rest of the sequence —
-    // 12.2.11's equivalence `{[..]*TE1; @ev_a}` is
+    // 12.2.12's equivalence `{[..]*TE1; @ev_a}` is
     // `{@ev_a} or {[1]*TE1; @ev_a} or {[2]*TE1; @ev_a} ...`, so an
     // omitted lower bound starts at zero.
     if let crate::ast::TemporalExpr::Repeat {
@@ -396,7 +396,7 @@ fn seq_holds(
 }
 
 /// `te` repeated `n` times as a sequence (an empty repetition holds
-/// trivially, per 12.2.9's "evaluates to zero — the TE succeeds
+/// trivially, per 12.2.10's "evaluates to zero — the TE succeeds
 /// immediately").
 fn unroll(te: &TemporalExpr, n: usize) -> TemporalExpr {
     if n == 0 {
@@ -437,7 +437,7 @@ fn edge_routine_name(routine: EdgeRoutine) -> &'static str {
 /// Whether `te` succeeded at any point of `states`: some sub-path
 /// (12.3.3's legal starts — the path start, or just after any sampling
 /// point; the run loop's single timeline samples every cycle) over
-/// which the TE holds tightly (12.3.1 at any end point). This is the
+/// which the TE holds tightly (12.3.2 at any end point). This is the
 /// wait- and rule-side notion of "happened at some time", as opposed
 /// to [`succeeds`]'s success at the last point only.
 pub fn succeeded_somewhere(
@@ -456,16 +456,16 @@ pub fn succeeded_somewhere(
 }
 
 /// Whether an `expect`/`assume` rule (11.4) failed over a finished run
-/// log — 12.3.2: the rule fails where `fail te` succeeds, i.e. where
+/// log — 12.3.3: the rule fails where `fail te` succeeds, i.e. where
 /// all possibilities to satisfy the TE are exhausted. The per-shape
 /// readings, over the whole log:
 ///
 /// - a yield (the common `@a => eventually @b` shape) fails when the
 ///   lhs succeeded somewhere (12.3.3 legal starts) and the rhs never
-///   succeeded after that (12.2.13: "needs to also succeed in
+///   succeeded after that (12.2.14: "needs to also succeed in
 ///   sequence");
 /// - `eventually te` fails when the sub-expression never succeeded
-///   (all possibilities exhausted at quit, 12.2.14);
+///   (all possibilities exhausted at quit, 12.2.15);
 /// - `not te` / `fail te` fail when the sub-expression did hold —
 ///   `not @a` as a rule is the invariant "a never occurs";
 /// - every other top-level shape is success-required: it fails when it
@@ -506,7 +506,7 @@ pub fn rule_failed(
             Ok(!succeeded_somewhere(inner, log, callbacks)?)
         }
         // `not te` / `fail te` rules are invariants: they fail when the
-        // inner behavior did happen (12.2.16 vs 12.2.12, read over the
+        // inner behavior did happen (12.2.17 vs 12.2.13, read over the
         // whole window).
         crate::ast::TemporalExpr::Not(inner) | crate::ast::TemporalExpr::Fail(inner) => {
             succeeded_somewhere(inner, log, callbacks)

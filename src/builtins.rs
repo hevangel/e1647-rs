@@ -60,7 +60,7 @@ pub fn is_builtin_base(name: &str) -> bool {
 
 /// Predeclared value types usable in type positions without a
 /// declaration in the source file (`var f: file`, `ev: event;`,
-/// `var s: set` — the set type of 5.1.10).
+/// `var s: set` — the set type of 5.2.12).
 pub const BUILTIN_TYPES: &[&str] = &["file", "event", "set"];
 
 pub fn is_builtin_type(name: &str) -> bool {

@@ -72,7 +72,7 @@ fn propagation_matches_the_clause_worked_example() {
 
 #[test]
 fn explicit_sub_sampling_overrides_the_context() {
-    // 12.2.5: a sub-expression's own sampling event overrides the
+    // 12.2.6: a sub-expression's own sampling event overrides the
     // context for everything below it.
     let te = parse_temporal_expression("{@a @p; @b} @q").expect("parses");
     let q = event("q");
@@ -104,7 +104,7 @@ fn event_atoms_cycles_and_sequences_hold_over_paths() {
     assert!(succeeds(&te, &[State::new(&["a"])], &callbacks).unwrap());
     assert!(!succeeds(&te, &[State::new(&["b"])], &callbacks).unwrap());
     // A sequence holds over consecutive sampling periods, each item
-    // starting after the previous succeeded (12.2.8).
+    // starting after the previous succeeded (12.2.9).
     let seq = parse_temporal_expression("{@a; @b; @c}").expect("parses");
     let path = [State::new(&["a"]), State::new(&["b"]), State::new(&["c"])];
     assert!(succeeds(&seq, &path, &callbacks).unwrap());
@@ -152,12 +152,12 @@ fn yield_not_and_fail_are_distinguishable() {
     assert!(holds_tightly(&golden, &good, &callbacks).unwrap());
     let missing = [State::new(&["enter_exec_st"]), State::new(&["other"])];
     assert!(!holds_tightly(&golden, &missing, &callbacks).unwrap());
-    // A yield whose lhs never succeeds holds vacuously (12.2.13: the
+    // A yield whose lhs never succeeds holds vacuously (12.2.14: the
     // rhs is not evaluated when the lhs fails).
     let vacuous = [State::new(&["other"]), State::new(&["other"])];
     assert!(holds_tightly(&golden, &vacuous, &callbacks).unwrap());
     // `not @a` holds where a does not occur; `fail @a` holds where a
-    // can no longer occur (12.2.16 vs 12.2.12).
+    // can no longer occur (12.2.17 vs 12.2.13).
     let not_a = parse_temporal_expression("not @a").expect("parses");
     let fail_a = parse_temporal_expression("fail @a").expect("parses");
     let a_absent = [State::new(&["b"]), State::new(&["b"])];
@@ -176,23 +176,23 @@ fn repeats_props_and_eventually_evaluate() {
     numerics.insert("two".to_owned(), 2);
     let callbacks = callbacks(&booleans, &numerics);
     // `~[1..3]*true(sig_on) @q` — a true-match repeat over a
-    // proposition (12.2.10, 12.2.3).
+    // proposition (12.2.11, 12.2.4).
     let te = parse_temporal_expression("~[1..3]*true(sig_on) @q").expect("parses");
     let path = [State::new(&["q"]), State::new(&["q"]), State::new(&["q"])];
     assert!(succeeds(&te, &path, &callbacks).unwrap());
     let short = [State::new(&["q"])];
     assert!(succeeds(&te, &short, &callbacks).unwrap());
-    // `[2]*cycle @q` — a fixed repeat of two cycles (12.2.9).
+    // `[2]*cycle @q` — a fixed repeat of two cycles (12.2.10).
     let fixed = parse_temporal_expression("[2]*cycle @q").expect("parses");
     let two = [State::new(&["q"]), State::new(&["q"])];
     assert!(succeeds(&fixed, &two, &callbacks).unwrap());
     assert!(!succeeds(&fixed, &short, &callbacks).unwrap());
     // `eventually @b` holds when b occurs anywhere on the path
-    // (12.2.14).
+    // (12.2.15).
     let eventually = parse_temporal_expression("eventually @b").expect("parses");
     let late = [State::new(&["a"]), State::new(&["a"]), State::new(&["b"])];
     assert!(succeeds(&eventually, &late, &callbacks).unwrap());
-    // First-match repeats live in sequences (12.2.11's equivalence:
+    // First-match repeats live in sequences (12.2.12's equivalence:
     // {[..]*@a; @b}).
     let first_match = parse_temporal_expression("{[..]*@a; @b}").expect("parses");
     let wait_then_b = [State::new(&["a"]), State::new(&["a"]), State::new(&["b"])];

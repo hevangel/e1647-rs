@@ -14,6 +14,16 @@ of support must always match what the code and its tests actually do. The
 owning GitHub issue for the current qualification effort is
 `hevangel/e1647-rs#1`.
 
+**Standard revision.** The implementation target is **IEEE 1647-2019**. From
+2026-11-04 onward, code comments, diagnostic messages, docs and tests cite
+**2019 clause numbers**; older `docs/VERIFICATION.md` entries are historical
+and cite 2016. The active work stream is the 2019 migration
+([docs/e1647-rs_IEEE1647-2019_migration_plan.md](docs/e1647-rs_IEEE1647-2019_migration_plan.md)
+— phases, task IDs, diagnostic-code allocations and per-task test cases);
+check [docs/ROADMAP.md](docs/ROADMAP.md)'s migration section for what has
+landed and pick tasks from there, one phase (or one task for large phases)
+per pull request.
+
 ## Required reading
 
 Read the documents that cover your task before changing anything:

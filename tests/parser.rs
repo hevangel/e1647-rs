@@ -233,7 +233,7 @@ fn expression_precedence() {
     let Member::Constraint(constraint) = &declarations[0].members[4] else {
         panic!("expected a keep constraint");
     };
-    // `||` is looser than `&&`, which is looser than `==` (clause 4.5):
+    // `||` is looser than `&&`, which is looser than `==` (clause 4.6):
     // flag || ((a + b * 2 == 10) && !(x > 3))
     let Expr::Binary {
         op: BinaryOp::LogicalOr,
@@ -585,7 +585,7 @@ fn typed_for_each_and_file_types_parse() {
 
 #[test]
 fn unsupported_statements_report_explicitly() {
-    // `repeat` now parses (clause 20.2.2); a missing `until` reports
+    // `repeat` now parses (clause 20.2.3); a missing `until` reports
     // the honest E0112 at the body's close.
     let result = parse(
         "struct s {\n    run() is {\n        repeat {\n            out(1);\n        };\n    };\n};\n",
@@ -888,7 +888,7 @@ fn clause_4_5_places_string_match_between_identity_and_in() {
     else {
         panic!("expected a !~ b to parse as a negative match");
     };
-    // `===` is tighter than `~` (clause 4.5): (a === b) ~ c
+    // `===` is tighter than `~` (clause 4.6): (a === b) ~ c
     let Expr::Binary {
         op: BinaryOp::Match,
         lhs,
@@ -978,7 +978,7 @@ fn clause_4_5_places_is_a_between_equality_and_comparisons() {
         panic!("expected an is-a expression");
     };
     assert!(matches!(ty, TypeExpr::List { .. }));
-    // `is a` is tighter than `==` (clause 4.5): flag == (x is a uint)
+    // `is a` is tighter than `==` (clause 4.6): flag == (x is a uint)
     let Expr::Binary {
         op: BinaryOp::Eq,
         rhs,
@@ -1023,7 +1023,7 @@ fn bare_is_is_not_consumed_as_a_type_check() {
 
 #[test]
 fn extend_global_is_rejected() {
-    // Clause 4.3.1.1: extensions of `global` are reserved for the runtime.
+    // Clause 4.4.2.2: extensions of `global` are reserved for the runtime.
     let result = parse("extend global {\n    helper: uint;\n};\n");
     assert!(result.declarations.is_empty());
     let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
@@ -1071,7 +1071,7 @@ fn on_member_parses_with_path_and_body() {
 #[test]
 fn hash_directives_include_and_exclude_at_member_level() {
     // `#ifdef` of an undefined name is excluded ("ignore it", clause
-    // 21.2): garbage inside the braces must not produce diagnostics.
+    // 21.3): garbage inside the braces must not produce diagnostics.
     // `#define` registers the flag; the `#ifndef` then excludes and the
     // following `#ifdef` includes a real member. `#undef` clears it.
     let declarations = expect_clean(
@@ -1108,7 +1108,7 @@ fn hash_directives_include_and_exclude_at_action_level() {
 
 #[test]
 fn conditional_directive_at_file_level_is_rejected() {
-    // Clause 21.2 lists the conditional forms as statement, struct-member
+    // Clause 21.3 lists the conditional forms as statement, struct-member
     // and action positions; the module level takes `#define`/`#undef`.
     let result = parse("#ifdef FLAG {\nstruct s {\n    x: uint;\n};\n};\n");
     assert!(
@@ -1207,7 +1207,7 @@ fn define_replacement_skips_directives_and_strings() {
 
 #[test]
 fn hash_else_takes_the_alternative_branch() {
-    // 21.2: for `#ifdef` of an undefined name the `#else` code is
+    // 21.3: for `#ifdef` of an undefined name the `#else` code is
     // included; after `#define` the first branch wins and the
     // `#else` group is skipped. Both `} #else {` and `}; #else {`
     // spellings parse (the extractable prose does not fix the
@@ -1238,7 +1238,7 @@ fn hash_else_takes_the_alternative_branch() {
 #[test]
 fn hash_else_at_action_level() {
     // The `#else` group of an `#ifdef` in an action block parses when
-    // the primary group was excluded (clause 21.2).
+    // the primary group was excluded (clause 21.3).
     let declarations = expect_clean(
         "extend sys {\n    run() is also {\n        #ifdef MISSING {\n            \
          out(\"no\");\n        } #else {\n            out(\"yes\");\n        };\n    };\n};\n",
@@ -1254,7 +1254,7 @@ fn hash_else_at_action_level() {
 
 #[test]
 fn define_in_excluded_branch_registers_nothing() {
-    // 21.2 ignores excluded code: a `#define` inside an excluded
+    // 21.3 ignores excluded code: a `#define` inside an excluded
     // `#ifdef` branch defines no flag (the `#ifndef NEVER` below must
     // still include) and no replacement rule (the width expression
     // below stays the identifier `N`, which the well-formedness pass
@@ -1445,10 +1445,10 @@ fn expect_and_assume_members_record_te_and_else() {
     assert_eq!(expect.kind, e1647::ast::ExpectKind::Expect);
     // `@enter_exec_st => {@fetch1_assert} @sys.any` structures as
     // Sampled(Yield(@enter_exec_st, Sequence{@fetch1_assert}), @sys.any)
-    // (clause 12.2.13 yield, 12.2.8 sequence, 12.2.5 sampling).
+    // (clause 12.2.14 yield, 12.2.9 sequence, 12.2.6 sampling).
     let shape = match &expect.te {
         // The sampling `@sys.any` attaches lexically to the yield's rhs;
-        // the semantic propagation to both sides (12.1.4, 12.2.13) is
+        // the semantic propagation to both sides (12.1.4, 12.2.14) is
         // the temporal engine's sampled normal form, a later milestone.
         e1647::ast::TemporalExpr::Yield { lhs, rhs } => match (&**lhs, &**rhs) {
             (
@@ -1569,7 +1569,7 @@ fn temporal_grammar_covers_the_clause_12_operators() {
     };
     let cycle_shape = match &cycle_repeat.te {
         e1647::ast::TemporalExpr::Sampled { te, .. } => match &**te {
-            // `[2]*cycle` is the fixed repeat (12.2.9's syntax example).
+            // `[2]*cycle` is the fixed repeat (12.2.10's syntax example).
             e1647::ast::TemporalExpr::Repeat {
                 kind, te: inner, ..
             } => {
@@ -1696,7 +1696,7 @@ fn select_distributions_parse_weights_and_verbatim_choices() {
 
 #[test]
 fn wait_statements_split_numeric_from_temporal_forms() {
-    // 13.1.3: `cycle`, `[n]` and `[n]*cycle` stay the numeric wait;
+    // 13.2.4: `cycle`, `[n]` and `[n]*cycle` stay the numeric wait;
     // event atoms, `until` + TE, repeats over events, sequences and
     // proposition waits are temporal.
     let declarations = expect_clean(
@@ -1726,7 +1726,7 @@ fn wait_statements_split_numeric_from_temporal_forms() {
             "expected an event atom: {te:?}"
         );
     }
-    // `wait [2]*@ev` is the fixed repeat (12.2.9).
+    // `wait [2]*@ev` is the fixed repeat (12.2.10).
     let Stmt::WaitTemporal { te, .. } = &run.body[6] else {
         panic!("expected the repeat wait");
     };
@@ -1757,7 +1757,7 @@ fn wait_statements_split_numeric_from_temporal_forms() {
 
 #[test]
 fn sync_statements_parse_bare_and_temporal_forms() {
-    // 13.1.2: `sync;` / `sync cycle;` are the bare synchronization
+    // 13.2.3: `sync;` / `sync cycle;` are the bare synchronization
     // action (no TE); `sync <te>;` carries a temporal expression.
     let declarations = expect_clean(
         "struct s {\n    ev: event;\n    clk: event;\n    run() is {\n        \

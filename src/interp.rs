@@ -7,13 +7,13 @@
 //!
 //! Supported at run time: `uint`/`int`/`bit`/`byte`/`nibble`/`bool`/`real`/
 //! `string` values (integers are unbounded `i128`; declared widths are not
-//! truncated), enumerals, `list of` values with the clause 26 pseudo-method
-//! subset (26.4.22 `size`, 26.4.12 `is_empty`, 26.4.5 `exists`, 26.4.3
-//! `copy`, 26.4.21 `reverse`, 26.4.26/26.4.27 `top`/`top0`, the 26.3
+//! truncated), enumerals, `list of` values with the clause 27 pseudo-method
+//! subset (27.4.22 `size`, 27.4.12 `is_empty`, 27.4.5 `exists`, 27.4.3
+//! `copy`, 27.4.21 `reverse`, 27.4.26/27.4.27 `top`/`top0`, the 27.3
 //! modifiers `push`/`push0`/`add`/`add0`/`pop`/`pop0`/`insert`/`delete`/
-//! `fast_delete`/`clear`, the 26.4.15-26.4.19 extremes
-//! `min`/`max`/`min_index`/`max_index`, the 26.5.1/26.5.2/26.5.4/26.5.5
-//! aggregates `and_all`/`or_all`/`product`/`sum`, and 26.4.11
+//! `fast_delete`/`clear`, the 27.4.15-27.4.19 extremes
+//! `min`/`max`/`min_index`/`max_index`, the 27.5.1/27.5.2/27.5.4/27.5.5
+//! aggregates `and_all`/`or_all`/`product`/`sum`, and 27.4.11
 //! `is_a_permutation`), struct instances, method calls (every composed block with the
 //! name runs, in composition order; the last returned value wins), local
 //! variables, assignments, `if`/`else`, `while` with `break`/`continue`,
@@ -45,35 +45,35 @@
 //!
 //! ## Clause 26 list pseudo-methods — documented gaps
 //!
-//! Pseudo-methods are macros, not struct methods (26.1). The ones whose
+//! Pseudo-methods are macros, not struct methods (27.1). The ones whose
 //! semantics take a per-item expression argument cannot pass through the
 //! v1 dispatch (it evaluates arguments to values only), so they report
-//! `E0405` "list method ... is not supported": `apply` (26.4.2),
-//! `sort`/`sort_by_field` (26.4.23/26.4.24), `all`/`all_indices`
-//! (26.4.29/26.4.30), `has` (26.4.10), `count` (26.4.4), `first`/`last`
-//! (26.4.6/26.4.13), `first_index`/`last_index` (26.4.7/26.4.14),
-//! `all_different` (26.4.1), `unique` (26.4.28), `split` (26.4.25), the
+//! `E0405` "list method ... is not supported": `apply` (27.4.2),
+//! `sort`/`sort_by_field` (27.4.23/27.4.24), `all`/`all_indices`
+//! (27.4.29/27.4.30), `has` (27.4.10), `count` (27.4.4), `first`/`last`
+//! (27.4.6/27.4.13), `first_index`/`last_index` (27.4.7/27.4.14),
+//! `all_different` (27.4.1), `unique` (27.4.28), `split` (27.4.25), the
 //! `exp`-parameter forms of `min`/`max`/`min_index`/`max_index`
-//! (26.4.15-26.4.19) and of the 26.5 aggregates, and `max_value`/
-//! `min_value` (26.4.17/26.4.20 — their empty-list return is Table 54,
+//! (27.4.15-27.4.19) and of the 27.5 aggregates, and `max_value`/
+//! `min_value` (27.4.17/27.4.20 — their empty-list return is Table 54,
 //! keyed by an element type the value model does not carry). Also not
-//! modeled: `average` (26.5.3 — the empty-list result is UNDEF, which the
-//! value model has no representation for), `resize` (26.3.16 — the
+//! modeled: `average` (27.5.3 — the empty-list result is UNDEF, which the
+//! value model has no representation for), `resize` (27.3.16 — the
 //! `filler`/`keep_old` parameters are expressions and new items need the
-//! element type's default value), `get_indices` (26.4.9 — the prose does
+//! element type's default value), `get_indices` (27.4.9 — the prose does
 //! not state the out-of-range index behavior; element access is the `[i]`
-//! index expression, `E0404`), `flatten` (26.4.8 — no language surface of
+//! index expression, `E0404`), `flatten` (27.4.8 — no language surface of
 //! this subset can produce a nested list: a list argument to a modifying
-//! pseudo-method is the 26.3.2/26.3.4/26.3.14/26.3.15 list form, because e
-//! declares no lists of lists), the CRC family (26.6.1-26.6.3 — the prose
+//! pseudo-method is the 27.3.2/27.3.4/27.3.14/27.3.15 list form, because e
+//! declares no lists of lists), the CRC family (27.6.1-27.6.3 — the prose
 //! notes the polynomials but not the full algorithm parameters), and keyed
-//! lists (26.7).
+//! lists (27.7).
 //!
 //! `emit` records the firing and immediately executes the event's `on`
 //! action blocks (clause 11.2), in composition order, on the instance
 //! the event path resolves to. The simulator-side triggers fire through
 //! the same machinery: `rise/fall/change(HDL expression) @sim` events
-//! (11.1.4.2) and bound event ports (9.4, 9.7.2.8) are sampled every
+//! (11.1.4.2) and bound event ports (9.5, 9.7.3) are sampled every
 //! virtual cycle while an HDL source is available — a live session or
 //! the injected per-cycle test seam ([`crate::hdl::SignalSource`]);
 //! without one they never fire (HDL signals without a simulator). A TCM
@@ -113,7 +113,7 @@ pub enum Value {
         name: String,
     },
     List(Vec<Value>),
-    /// A set (5.1.10): inclusive intervals in canonical form — sorted,
+    /// A set (5.2.12): inclusive intervals in canonical form — sorted,
     /// non-overlapping, non-neighboring.
     Set(Vec<(i128, i128)>),
     Object(usize),
@@ -168,7 +168,7 @@ enum Flow {
     Return(Value),
     /// `stop_run()` — unwind to the top of the run.
     Stop,
-    /// A synchronization action inside a scheduled coroutine (13.1.1):
+    /// A synchronization action inside a scheduled coroutine (13.2.2):
     /// unwind to the scheduler, which queues the coroutine for a later
     /// cycle. Only raised in coroutine turns — `call_method` and
     /// `on` blocks run atomically and never produce it.
@@ -177,7 +177,7 @@ enum Flow {
 
 /// Which child of a compound statement a turn's continuation lives in.
 ///
-/// The resume-path design (13.1.1): a synchronization action delimits
+/// The resume-path design (13.2.2): a synchronization action delimits
 /// the atomic fragments of a TCM, and resumption "commences executing
 /// from the first action following the synchronization action". The
 /// suspension therefore records the full descent through the statement
@@ -197,7 +197,7 @@ enum Child {
     /// A `while` body mid-iteration — the condition is re-checked only
     /// when the iteration completes.
     WhileBody,
-    /// A `repeat until` body mid-iteration (20.2.2) — likewise, the
+    /// A `repeat until` body mid-iteration (20.2.3) — likewise, the
     /// condition is evaluated only when the iteration completes.
     RepeatBody,
     /// A numeric `for` body mid-iteration, carrying the in-flight
@@ -242,7 +242,7 @@ struct PendingSuspension {
     wait_start: Option<usize>,
 }
 
-/// One concurrently scheduled execution (clause 13.1.1): the main
+/// One concurrently scheduled execution (clause 13.2.2): the main
 /// pseudo-coroutine (the `run()` bodies, in order) and every `start`ed
 /// TCM. Suspension state is the statement path into the tree (the
 /// walk's position when the synchronization action suspended), the
@@ -360,7 +360,7 @@ struct Interp<'a> {
     /// event-or-port path) — the edge detection's baseline. `None` marks
     /// a trigger whose expression has not been sampleable yet.
     sim_prev: BTreeMap<(usize, String), Option<i128>>,
-    /// The `keep <port>.edge() == <value>` attribute values (9.7.2.8)
+    /// The `keep <port>.edge() == <value>` attribute values (9.7.3)
     /// per (type name, port name); the sampling default is `change`.
     port_edges: BTreeMap<(String, String), String>,
     /// The run's temporal log (clause 12): one state per virtual cycle,
@@ -368,7 +368,7 @@ struct Interp<'a> {
     /// temporal `wait`s and `expect` rules read it. One global
     /// timeline: all events share the per-cycle states.
     temporal_log: Vec<crate::temporal::State>,
-    /// The scheduled coroutines (13.1.1): the main `run()` chain first,
+    /// The scheduled coroutines (13.2.2): the main `run()` chain first,
     /// then every `start`ed TCM, run round-robin.
     coroutines: Vec<Coroutine<'a>>,
     /// Set while a coroutine turn executes: statement walks record
@@ -399,7 +399,7 @@ struct Interp<'a> {
 }
 
 /// How many `wait` statements and scheduler cycles one run may consume
-/// (the runaway-TCM guard; every suspension cycle in the clause 13.1.1
+/// (the runaway-TCM guard; every suspension cycle in the clause 13.2.2
 /// scheduler draws from the same budget).
 const WAIT_BUDGET: u64 = 5_000;
 
@@ -577,7 +577,7 @@ fn run_inner(
             ));
         }
     }
-    // Clause 13.1.1 scheduler: the run() bodies run as the main
+    // Clause 13.2.2 scheduler: the run() bodies run as the main
     // coroutine; every `start`ed TCM joins the queue with an implicit
     // sync cycle before it commences (a TCM declared `@event` with a
     // declared sampling event waits for that event's occurrence instead
@@ -678,7 +678,7 @@ fn run_inner(
         }
     }
     // 11.4: at quit, report the expect/assume rules that failed over
-    // the run log (12.3.2 — the rule fails where all possibilities to
+    // the run log (12.3.3 — the rule fails where all possibilities to
     // satisfy it are exhausted). The `else` body (usually a
     // `dut_error` call) runs on the sys instance; without one, the
     // failure itself is the check error. Rules whose TE cannot be
@@ -839,7 +839,7 @@ impl<'a> Interp<'a> {
             },
             TypeExpr::List { .. } => Value::List(Vec::new()),
             TypeExpr::Named { name, .. } if name == "set" => {
-                // The set type's default is the empty set (5.1.10: `[]`).
+                // The set type's default is the empty set (5.2.12: `[]`).
                 Value::Set(Vec::new())
             }
             TypeExpr::InlineEnum { names, .. } => {
@@ -873,7 +873,7 @@ impl<'a> Interp<'a> {
             }
             TypeExpr::WhenQualified { value, base, .. } => {
                 // A when-qualified field carries the synthesized subtype
-                // view (6.6): its when members apply for the instance.
+                // view (6.7): its when members apply for the instance.
                 // Chained qualifiers resolve to the combined view name.
                 let Some(view_name) = when_view_name(value, base) else {
                     return Value::Void;
@@ -923,7 +923,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Execute a statement chain resuming at the position named by
-    /// `path` (13.1.1: resumption "commences executing from the first
+    /// `path` (13.2.2: resumption "commences executing from the first
     /// action following the synchronization action"). The path's first
     /// level names the statement to continue at: an already-executed
     /// prefix is skipped (no replay), a level whose child is set
@@ -1140,7 +1140,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// The shared `repeat until` loop (20.2.2): the body executes at
+    /// The shared `repeat until` loop (20.2.3): the body executes at
     /// least once, then repeatedly until the condition is TRUE.
     /// `in_flight` is the resume path of an already-running iteration
     /// (a suspension inside the body) or `None` for a fresh entry.
@@ -1402,7 +1402,7 @@ impl<'a> Interp<'a> {
                 self.set_ctx_child(Child::WhileBody);
                 self.while_loop(cond, body, frame, me, Flow::Normal)
             }
-            // 20.2.2: the body executes at least once, then repeatedly
+            // 20.2.3: the body executes at least once, then repeatedly
             // until the condition is TRUE.
             Stmt::RepeatUntil { body, cond, .. } => {
                 self.set_ctx_child(Child::RepeatBody);
@@ -1534,7 +1534,7 @@ impl<'a> Interp<'a> {
                     return Err(self.error("E0402", "wait count must be non-negative", *span));
                 }
                 // In a coroutine turn the wait suspends for n
-                // occurrences of the sampling event (13.1.1) — the
+                // occurrences of the sampling event (13.2.2) — the
                 // scheduler advances time; resumption skips this
                 // statement.
                 if n > 0 && self.suspend_eligible() {
@@ -1563,7 +1563,7 @@ impl<'a> Interp<'a> {
             Stmt::Sync { te, span } => match te {
                 Some(te) => self.temporal_wait(te, *span, frame, me),
                 None => {
-                    // 13.1.2: the bare sync suspends for one occurrence
+                    // 13.2.3: the bare sync suspends for one occurrence
                     // of the default sampling event; in this model the
                     // default event fires every cycle.
                     if self.suspend_eligible() {
@@ -1591,7 +1591,7 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             Stmt::Start { call, span } => {
-                // 13.1.1: a started TCM joins the scheduler's queue with
+                // 13.2.2: a started TCM joins the scheduler's queue with
                 // an implicit sync cycle before it commences; it runs
                 // concurrently (round-robin turns) with the starter.
                 let Expr::Call { callee, args, .. } = call else {
@@ -1777,7 +1777,7 @@ impl<'a> Interp<'a> {
         };
         // A struct instance is randomized in place, recursively — under
         // the enclosing instance's constraints that reference it
-        // (10.2.7's connected field sets, v1: depth-2 paths).
+        // (10.3.6-10.3.7's connected field sets, v1: depth-2 paths).
         if let Value::Object(index) = current {
             let obj_type_name = self.instances[me_index].type_name.clone();
             let types: &[crate::elab::ElaboratedType] = self.types;
@@ -2080,7 +2080,7 @@ impl<'a> Interp<'a> {
             for constraint in &constraints {
                 // HDL-binding constraints (`keep x.hdl_path() == "…"`,
                 // `keep x.delayed() == FALSE`, the event-port
-                // `keep x.edge() == …` attribute of 9.7.2.8) record
+                // `keep x.edge() == …` attribute of 9.7.3) record
                 // simulator-side facts, not data constraints; they never
                 // gate gen.
                 if expr_calls_any(
@@ -2174,7 +2174,7 @@ impl<'a> Interp<'a> {
         for constraint in constraints {
             self.collect_domain_leaves(constraint, &mut domains);
         }
-        // 10.2.12.2: a `select` distribution biases the choice within
+        // 10.3.12.3: a `select` distribution biases the choice within
         // the current range of legal values — the range already
         // narrowed by the other constraints. The drawn value narrows
         // the field to a point; the rejection predicate skips
@@ -2251,7 +2251,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Draw one value from a select distribution over the given range
-    /// (10.2.12.2): an arm is chosen with probability weight/(sum of
+    /// (10.3.12.3): an arm is chosen with probability weight/(sum of
     /// all weights), weights being integers, and the arm's choice maps
     /// to a value of the range — `min`/`max` take the extremes,
     /// `edges` picks one of them, `others` draws uniformly strictly
@@ -2398,7 +2398,7 @@ impl<'a> Interp<'a> {
             TypeExpr::WhenQualified { value, base, .. } => {
                 // A when-qualified field generates an instance of the
                 // synthesized subtype view, whose when members (fields,
-                // constraints) apply for it (6.6). Chained qualifiers
+                // constraints) apply for it (6.7). Chained qualifiers
                 // resolve to the combined view name.
                 let Some(view_name) = when_view_name(value, base) else {
                     return Ok(Value::Void);
@@ -2472,7 +2472,7 @@ impl<'a> Interp<'a> {
             return Err(self.error("E0406", "recursion too deep", span));
         }
         self.depth += 1;
-        // Inline calls are atomic regions (13.1.1: a called TCM runs to
+        // Inline calls are atomic regions (13.2.2: a called TCM runs to
         // its return before the callee resumes): waits inside keep the
         // inline spin.
         self.atomic_depth += 1;
@@ -2686,10 +2686,10 @@ impl<'a> Interp<'a> {
     /// Fire one event occurrence — the shared path of `emit` (11.2) and
     /// the simulator-side triggers: record it in the current cycle's
     /// state of the temporal log (clause 12), wake TCMs parked for the
-    /// event (13.1.1's implicit entry sync — 17.1.2), execute the
+    /// event (13.2.2's implicit entry sync — 17.1.2), execute the
     /// event's `on` action blocks immediately and in composition order
     /// (11.2 — an on action block runs before TCMs waiting for the same
-    /// event), and sample the coverage groups (14.1).
+    /// event), and sample the coverage groups (14.2).
     fn fire_event(
         &mut self,
         path: &str,
@@ -2745,7 +2745,7 @@ impl<'a> Interp<'a> {
     /// to sample (the events never fire — HDL signals without a
     /// simulator); the first sample only establishes the baseline (no X
     /// initial state, so no edge on it); values are plain integers (the
-    /// MVL transitions of 9.7.2.8 are not modeled — `any_change`
+    /// MVL transitions of 9.7.3 are not modeled — `any_change`
     /// degrades to `change`); sampling happens at the scheduler's cycle
     /// boundaries only (the inline spins of atomic contexts do not
     /// advance the HDL, the existing v1 limitation); a firing's on-block
@@ -2800,9 +2800,9 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        // Bound event ports (9.4): an external event port's `hdl_path()`
+        // Bound event ports (9.5): an external event port's `hdl_path()`
         // attribute names the simulated object it is connected to, and
-        // its `edge()` attribute (9.7.2.8, default `change`) specifies
+        // its `edge()` attribute (9.7.3, default `change`) specifies
         // the edge on which the port's event is generated. The port's
         // name already carries the `$` access operator (the lexer folds
         // `p$` into one identifier), which is the event path `emit p$`
@@ -2834,7 +2834,7 @@ impl<'a> Interp<'a> {
     /// The (instance, port, bound HDL path, edge) tuples of every event
     /// port with an `hdl_path()` binding — the sampling worklist of
     /// [`Interp::sample_sim_events`]. The edge attribute comes from the
-    /// type's `keep <port>.edge() == <value>` constraint (9.7.2.8) and
+    /// type's `keep <port>.edge() == <value>` constraint (9.7.3) and
     /// defaults to `change`.
     fn collect_bound_event_ports(&self) -> Vec<(usize, String, String, String)> {
         let types: &[crate::elab::ElaboratedType] = self.types;
@@ -2871,7 +2871,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Sample the coverage groups (14.1) of the instance whose event
+    /// Sample the coverage groups (14.2) of the instance whose event
     /// fired: each item's recorded expression evaluates in the emitting
     /// frame, or the item's field is read from the owner, and the value
     /// lands in the item's buckets.
@@ -2939,14 +2939,14 @@ impl<'a> Interp<'a> {
                 }
             }
             // The cross items record after all of their sources have
-            // this round's labels (14.3).
+            // this round's labels (14.4).
             self.coverage[entry_index].groups[group_index].record_crosses();
         }
     }
 
     /// Whether the running statement may suspend to the scheduler: a
     /// coroutine turn, not inside an atomic region (inline method
-    /// calls, `compute`, `on` blocks, `check` else bodies — 13.1.1
+    /// calls, `compute`, `on` blocks, `check` else bodies — 13.2.2
     /// delimits atomic fragments at the synchronization actions, and
     /// these regions keep the conservative run-to-completion model of
     /// v1; `on` bodies may not contain time-consuming actions at all,
@@ -2957,7 +2957,7 @@ impl<'a> Interp<'a> {
         self.tracing && self.atomic_depth == 0
     }
 
-    /// Raise a suspension for the scheduler (13.1.1): the turn's walk
+    /// Raise a suspension for the scheduler (13.2.2): the turn's walk
     /// stack becomes the resume path. `skip_resume` resumes after this
     /// statement (a consumed numeric wait or bare sync — the first
     /// action following the synchronization action); otherwise the
@@ -2987,7 +2987,7 @@ impl<'a> Interp<'a> {
         Ok(Flow::Suspend)
     }
 
-    /// A temporal wait (13.1.3): in a coroutine turn, 13.1.1(b) —
+    /// A temporal wait (13.2.4): in a coroutine turn, 13.2.2(b) —
     /// evaluate the TE once; on success resume immediately, otherwise
     /// suspend until the next sampling occurrence, when the statement
     /// re-executes against the grown log. Propositions and repeat
@@ -3063,7 +3063,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Build the set of all legal values of a type (5.8.4): scalars
+    /// Build the set of all legal values of a type (5.10.5): scalars
     /// from their width and signedness, clause-5 `type` declarations
     /// from their underlying representation, enumeral types as
     /// `[0..count-1]`.
@@ -3109,7 +3109,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// The set pseudo-methods (27.4) on a set value: queries
+    /// The set pseudo-methods (28.5) on a set value: queries
     /// (`size`/`uint_size`/`min`/`uint_min`/`int_min`/`max`/`uint_max`/
     /// `int_max` and their `_is_*` guards), the algebra
     /// (`union`/`intersect`/`diff`), and `to_string`. `None` when the
@@ -3125,7 +3125,7 @@ impl<'a> Interp<'a> {
         let set = Value::Set(intervals.to_vec());
         let result = match name {
             "size" | "uint_size" => {
-                // 27.4.4/27.4.5: the number of elements in the set.
+                // 28.5.4/28.5.5: the number of elements in the set.
                 let size: i128 = intervals.iter().map(|(lo, hi)| hi - lo + 1).sum();
                 Ok(Value::Int(size))
             }
@@ -3134,7 +3134,7 @@ impl<'a> Interp<'a> {
                 Ok(Value::Bool((0..=MAX_UINT_VALUE).contains(&size)))
             }
             "min" | "uint_min" | "int_min" => {
-                // 27.4.7-27.4.10: the bottom boundary; empty is an
+                // 28.5.7-28.5.10: the bottom boundary; empty is an
                 // error (the prose's exception).
                 match intervals.first() {
                     Some((lo, _)) => Ok(Value::Int(*lo)),
@@ -3185,8 +3185,8 @@ impl<'a> Interp<'a> {
         Some(result)
     }
 
-    /// The clause 26 list pseudo-methods, dispatched on a `Value::List`
-    /// receiver. Pseudo-methods are macros, not struct methods (26.1) —
+    /// The clause 27 list pseudo-methods, dispatched on a `Value::List`
+    /// receiver. Pseudo-methods are macros, not struct methods (27.1) —
     /// they attach to any list expression, and a modifying one writes the
     /// changed list back through the receiver expression (the same slot
     /// `push` has always used). `None` when the name is not one of this
@@ -3207,11 +3207,11 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
     ) -> Option<Result<Value, Diagnostic>> {
         let result = match (name, args) {
-            // 26.4.22 size(): the number of items in the list.
+            // 27.4.22 size(): the number of items in the list.
             ("size", []) => Ok(Value::Int(items.len() as i128)),
-            // 26.4.12 is_empty(): TRUE when the list has no items.
+            // 27.4.12 is_empty(): TRUE when the list has no items.
             ("is_empty", []) => Ok(Value::Bool(items.is_empty())),
-            // 26.4.5 exists(): TRUE when an item with the given index
+            // 27.4.5 exists(): TRUE when an item with the given index
             // number exists in the list, FALSE when the index does not.
             ("exists", [Value::Int(index)]) => {
                 Ok(Value::Bool(*index >= 0 && (*index as usize) < items.len()))
@@ -3219,30 +3219,30 @@ impl<'a> Interp<'a> {
             ("exists", _) => {
                 Err(self.error("E0402", "exists() expects an integer index", span))
             }
-            // 26.4.3 copy(): a copy of the list — the list case of
-            // exp.copy() (27.4.1). Values clone; struct items stay shared
+            // 27.4.3 copy(): a copy of the list — the list case of
+            // exp.copy() (28.5.1). Values clone; struct items stay shared
             // by instance index.
             ("copy", []) => Ok(Value::List(items.to_vec())),
-            // 26.4.21 reverse(): a new list of all the items in reverse
+            // 27.4.21 reverse(): a new list of all the items in reverse
             // order (the receiver is unchanged).
             ("reverse", []) => {
                 let mut reversed = items.to_vec();
                 reversed.reverse();
                 Ok(Value::List(reversed))
             }
-            // 26.4.26 top(): the last item, not removed; empty is an
+            // 27.4.26 top(): the last item, not removed; empty is an
             // error (the prose's exception).
             ("top", []) => match items.last() {
                 Some(item) => Ok(item.clone()),
                 None => Err(self.error("E0402", "top of an empty list", span)),
             },
-            // 26.4.27 top0(): the first item, not removed; empty is an
+            // 27.4.27 top0(): the first item, not removed; empty is an
             // error (the prose's exception; pairs with pop0 for queues).
             ("top0", []) => match items.first() {
                 Some(item) => Ok(item.clone()),
                 None => Err(self.error("E0402", "top0 of an empty list", span)),
             },
-            // 26.3.10 pop(): removes and returns the last item; empty is
+            // 27.3.10 pop(): removes and returns the last item; empty is
             // an error (the prose's exception).
             ("pop", []) => match items.split_last() {
                 Some((last, rest)) => {
@@ -3253,7 +3253,7 @@ impl<'a> Interp<'a> {
                 }
                 None => Err(self.error("E0402", "pop of an empty list", span)),
             },
-            // 26.3.11 pop0(): removes and returns the first item; empty
+            // 27.3.11 pop0(): removes and returns the first item; empty
             // is an error (the prose's exception).
             ("pop0", []) => match items.split_first() {
                 Some((first, rest)) => {
@@ -3264,11 +3264,11 @@ impl<'a> Interp<'a> {
                 }
                 None => Err(self.error("E0402", "pop0 of an empty list", span)),
             },
-            // 26.3.1 add(item) / 26.3.12 push(item): the same function —
+            // 27.3.1 add(item) / 27.3.12 push(item): the same function —
             // the item goes to the end of the list.
-            // 26.3.2 add(list) / 26.3.14 push(list): a copy of the
+            // 27.3.2 add(list) / 27.3.14 push(list): a copy of the
             // argument list is appended. e declares no lists of lists
-            // (26.4.25), so a list-valued argument is unambiguously the
+            // (27.4.25), so a list-valued argument is unambiguously the
             // list form.
             ("push" | "add", [Value::List(added)]) => {
                 let mut grown = items.to_vec();
@@ -3280,9 +3280,9 @@ impl<'a> Interp<'a> {
                 grown.push(item.clone());
                 return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
             }
-            // 26.3.3 add0(item) / 26.3.13 push0(item): the item becomes
+            // 27.3.3 add0(item) / 27.3.13 push0(item): the item becomes
             // the first position (index 0); later items reindex by +1.
-            // 26.3.4 add0(list) / 26.3.15 push0(list): the argument list
+            // 27.3.4 add0(list) / 27.3.15 push0(list): the argument list
             // is placed at the head (same list-form reading as above).
             ("push0" | "add0", [Value::List(added)]) => {
                 let mut grown = added.clone();
@@ -3298,14 +3298,14 @@ impl<'a> Interp<'a> {
             ("push" | "add" | "push0" | "add0", _) => {
                 Err(self.error("E0402", "push/add expects exactly one argument", span))
             }
-            // 26.3.8 insert(index, item): the item goes at the index
+            // 27.3.8 insert(index, item): the item goes at the index
             // location; index == size appends; a size smaller than index
             // is an error (the prose's exception; indexes count from 0,
-            // 26.3.6).
-            // 26.3.9 insert(index, list): all items of the argument list
+            // 27.3.6).
+            // 27.3.9 insert(index, list): all items of the argument list
             // go in starting at index (a list-valued second argument is
             // the list form; the prose's "positive integer" index is read
-            // with the 0-based numbering of 26.3.6).
+            // with the 0-based numbering of 27.3.6).
             ("insert", [Value::Int(index), Value::List(inserted)]) => {
                 let at = match self.list_insert_position(items, *index, span) {
                     Ok(at) => at,
@@ -3331,7 +3331,7 @@ impl<'a> Interp<'a> {
                 "insert expects an integer index and an item",
                 span,
             )),
-            // 26.3.6 delete(index): removes item number index (indexes
+            // 27.3.6 delete(index): removes item number index (indexes
             // start counting from 0) and renumbers sequentially; an index
             // that does not exist is an error (the prose's exception).
             ("delete", [Value::Int(index)]) => {
@@ -3344,7 +3344,7 @@ impl<'a> Interp<'a> {
                 return Some(self.store_list(receiver, shrunk, Value::Void, frame, me, span));
             }
             ("delete", _) => Err(self.error("E0402", "delete expects an integer index", span)),
-            // 26.3.7 fast_delete(index): the last item's value moves into
+            // 27.3.7 fast_delete(index): the last item's value moves into
             // the deleted slot, so every other item keeps its index; an
             // index that does not exist is an error (the prose's
             // exception).
@@ -3363,11 +3363,11 @@ impl<'a> Interp<'a> {
             ("fast_delete", _) => {
                 Err(self.error("E0402", "fast_delete expects an integer index", span))
             }
-            // 26.3.5 clear(): deletes all items in the list.
+            // 27.3.5 clear(): deletes all items in the list.
             ("clear", []) => {
                 return Some(self.store_list(receiver, Vec::new(), Value::Void, frame, me, span));
             }
-            // 26.5.1 and_all(): TRUE when every item is TRUE; empty is
+            // 27.5.1 and_all(): TRUE when every item is TRUE; empty is
             // TRUE (the prose's stated empty result). The exp-parameter
             // form is a documented gap; the no-argument form reads the
             // items themselves.
@@ -3387,7 +3387,7 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Bool(all))
             }
-            // 26.5.2 or_all(): TRUE when any item is TRUE; empty is
+            // 27.5.2 or_all(): TRUE when any item is TRUE; empty is
             // FALSE (the prose's stated empty result).
             ("or_all", []) => {
                 let mut any = false;
@@ -3405,7 +3405,7 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Bool(any))
             }
-            // 26.5.4 product(): the integer product over the items; 1
+            // 27.5.4 product(): the integer product over the items; 1
             // when empty (the prose's stated empty result).
             ("product", []) => {
                 let mut product: i128 = 1;
@@ -3423,7 +3423,7 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Int(product))
             }
-            // 26.5.5 sum(): the integer sum over the items; 0 when empty
+            // 27.5.5 sum(): the integer sum over the items; 0 when empty
             // (the prose's stated empty result).
             ("sum", []) => {
                 let mut sum: i128 = 0;
@@ -3441,10 +3441,10 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Int(sum))
             }
-            // 26.4.15 max() / 26.4.18 min(): the item with the largest /
+            // 27.4.15 max() / 27.4.18 min(): the item with the largest /
             // smallest value — on ties the item latest in the list; empty
             // is an error (the prose's exception).
-            // 26.4.16 max_index() / 26.4.19 min_index(): the same scan,
+            // 27.4.16 max_index() / 27.4.19 min_index(): the same scan,
             // returning the winning index.
             ("max" | "min" | "max_index" | "min_index", []) => {
                 self.list_extreme(items, name, span)
@@ -3454,7 +3454,7 @@ impl<'a> Interp<'a> {
                 "the no-argument form of min/max is the supported one (the exp form is a documented gap)",
                 span,
             )),
-            // 26.4.11 is_a_permutation(): TRUE when the argument holds
+            // 27.4.11 is_a_permutation(): TRUE when the argument holds
             // the same items with the same multiplicities (order
             // irrelevant); struct items compare by instance index — the
             // prose's "compares the addresses of the struct items".
@@ -3488,7 +3488,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Write a modified list back through the receiver expression (the
-    /// pseudo-method attaches to any list expression, 26.2 — the write
+    /// pseudo-method attaches to any list expression, 27.2 — the write
     /// goes to the slot the receiver denotes) and return the
     /// pseudo-method's own result.
     fn store_list(
@@ -3504,7 +3504,7 @@ impl<'a> Interp<'a> {
         Ok(result)
     }
 
-    /// The valid index positions for the 26.3.6 `delete` / 26.3.7
+    /// The valid index positions for the 27.3.6 `delete` / 27.3.7
     /// `fast_delete` family: an index that does not exist in the list is
     /// an error (the prose's exception; `E0404` matches the `[i]` index
     /// expression's out-of-range code).
@@ -3526,7 +3526,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// The valid insertion positions for 26.3.8/26.3.9 `insert`: index ==
+    /// The valid insertion positions for 27.3.8/27.3.9 `insert`: index ==
     /// size appends (the prose's stated case), a size smaller than index
     /// is an error (the prose's exception).
     fn list_insert_position(
@@ -3547,7 +3547,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// 26.4.15/26.4.16/26.4.18/26.4.19: the extreme item or its index.
+    /// 27.4.15/27.4.16/27.4.18/27.4.19: the extreme item or its index.
     /// On ties the item latest in the list wins (the prose's rule); empty
     /// is an error (the prose's exception, reported like the set
     /// pseudo-methods' empty-set errors), and items the relational
@@ -4164,7 +4164,7 @@ impl<'a> Interp<'a> {
                 // Casts are value-preserving in this subset: integers,
                 // enumerals and booleans flow through unchanged — an
                 // integer cast to an enumeral type maps its value to
-                // the enumerand at that index (5.8.1).
+                // the enumerand at that index (5.10.2).
                 let value = self.eval(expr, frame, me)?;
                 if let (Value::Int(index), TypeExpr::Named { name, .. }) = (&value, ty) {
                     let types: &[crate::elab::ElaboratedType] = self.types;
@@ -4189,10 +4189,10 @@ impl<'a> Interp<'a> {
                 Ok(value)
             }
             Expr::SetOfValues { ty, full, .. } => {
-                // 5.8.4/5.8.5: the set of all legal (or possible)
+                // 5.10.5/5.10.6: the set of all legal (or possible)
                 // values of the type. No range restrictions are
                 // recorded on declared types yet, so both forms build
-                // the same set (the honest reading of 5.8.5's "for
+                // the same set (the honest reading of 5.10.6's "for
                 // types that have no range restrictions...").
                 let _ = full;
                 self.set_of_type(ty)
@@ -4294,7 +4294,7 @@ impl<'a> Interp<'a> {
                 *span,
             )),
             Expr::New { ty, inits, span } => {
-                // `new [<type>] [with { .. }]` (clause 6.2): a typed
+                // `new [<type>] [with { .. }]` (clause 6.3): a typed
                 // creation instantiates the named type — the
                 // monomorphized template instance's canonical name for a
                 // template reference — and runs the `with` assignments
@@ -4353,7 +4353,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// The runtime half of `expr is [not] a <type>` (clause 4.5). Scalar
+    /// The runtime half of `expr is [not] a <type>` (clause 4.17.1). Scalar
     /// kinds match by value shape (integers are one runtime value, so
     /// `is a int` and `is a uint` both accept it); named types match by
     /// declared name, walking `like` bases — subtype-aware dispatch is a
@@ -4575,7 +4575,7 @@ impl<'a> Interp<'a> {
                     return Err(err("string match"));
                 };
                 // `/.../` selects AWK-style regular expression matching
-                // (clause 4.11.2) — not implemented.
+                // (clause 4.12.3) — not implemented.
                 if pattern.len() >= 2 && pattern.starts_with('/') && pattern.ends_with('/') {
                     return Err(self.error(
                         "E0410",
@@ -4583,7 +4583,7 @@ impl<'a> Interp<'a> {
                         span,
                     ));
                 }
-                // Native matching (clause 4.11.1) is case insensitive and
+                // Native matching (clause 4.12.2) is case insensitive and
                 // always matches the full string. Only a literal pattern —
                 // letters, digits, underscore and space — is evaluated;
                 // the meta-characters of the native pattern language are
@@ -4862,7 +4862,7 @@ fn as_i64(value: &Value) -> Option<i64> {
 }
 
 /// The synthesized when-subtype view's name for a when-qualified type
-/// (6.6): the qualifying values join space-separated in written order
+/// (6.7): the qualifying values join space-separated in written order
 /// before the base type's name — `LO HI pkt` for the chained spelling
 /// `LO HI pkt`, matching the elaborator's synthesized
 /// [`crate::elab::ElaboratedType`] entry. `None` when the chain does
@@ -4893,7 +4893,7 @@ fn when_view_name(value: &str, base: &TypeExpr) -> Option<String> {
     }
 }
 
-/// The MAX_UINT predefined constant (the 27.4 guards' bound).
+/// The MAX_UINT predefined constant (the 28.5 guards' bound).
 const MAX_UINT_VALUE: i128 = (1i128 << 32) - 1;
 
 /// The inclusive value range of a scalar type from its base and width.
@@ -4915,7 +4915,7 @@ fn scalar_range(base: ScalarBase, width: &Option<Box<Expr>>) -> Option<(i128, i1
     }
 }
 
-/// Canonicalize intervals (5.1.10): sort, merge overlapping and
+/// Canonicalize intervals (5.2.12): sort, merge overlapping and
 /// neighboring ones, drop empties.
 fn canonical_set(mut intervals: Vec<(i128, i128)>) -> Vec<(i128, i128)> {
     intervals.retain(|(lo, hi)| lo <= hi);
@@ -4976,7 +4976,7 @@ fn diff_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Value {
     Value::Set(canonical_set(current))
 }
 
-/// Render a set in canonical form (5.1.10): `[1..5,10]` — single-value
+/// Render a set in canonical form (5.2.12): `[1..5,10]` — single-value
 /// intervals show the value alone.
 fn render_set(intervals: &[(i128, i128)]) -> String {
     let parts: Vec<String> = intervals
@@ -4993,7 +4993,7 @@ fn render_set(intervals: &[(i128, i128)]) -> String {
 }
 
 /// Rebase an enclosing instance's constraints onto a generated
-/// object's own field names (10.2.7's connected field sets, v1):
+/// object's own field names (10.3.6-10.3.7's connected field sets, v1):
 /// `p.v == select { .. }` gating `gen p` becomes `v == select { .. }`.
 /// A constraint rebases only when every path it references is rooted
 /// at the generated object (depth two — `prefix.field`); anything else
@@ -5300,7 +5300,7 @@ fn token_kind_is_punct(token: Option<&Token>, symbol: &str) -> bool {
 }
 
 /// Whether one monitored sample crosses the edge. `rise`/`fall`/`change`
-/// follow the 9.7.2.8 reading — "equivalent to the behavior of @sim
+/// follow the 9.7.3 reading — "equivalent to the behavior of @sim
 /// TEs", transitions detected between defined values only. There is no
 /// X/Z value model here, so `any_change` degrades to `change`, and the
 /// first sample (no previous value) only establishes the baseline.
@@ -5331,7 +5331,7 @@ fn is_every_cycle_event(path: &str) -> bool {
     )
 }
 
-/// The `keep <port>.edge() == <value>` attribute values (9.7.2.8) per
+/// The `keep <port>.edge() == <value>` attribute values (9.7.3) per
 /// (type name, port name), read structurally from the composed
 /// constraints (either orientation, call on either side). Values outside
 /// the modeled subset (`change`/`rise`/`fall`/`any_change` — the MVL
@@ -5442,7 +5442,7 @@ fn as_f64(value: &Value) -> Option<f64> {
     }
 }
 
-/// The ordering used by the list `min`/`max` family (26.4.15-26.4.19):
+/// The ordering used by the list `min`/`max` family (27.4.15-27.4.19):
 /// the operand rules of the relational operators (the `Lt`..`Ge` arms of
 /// `apply_binary`). `None` when the pair is not comparable.
 fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
@@ -5456,7 +5456,7 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     }
 }
 
-/// The equality used by `is_a_permutation()` (26.4.11): the operand rules
+/// The equality used by `is_a_permutation()` (27.4.11): the operand rules
 /// of `==` (the `Eq` arm of `apply_binary`), with struct items compared by
 /// instance index — the prose's "compares the addresses of the struct
 /// items". Pairs `==` does not accept compare unequal.
@@ -5506,7 +5506,7 @@ fn field_width_bits(ty: &TypeExpr) -> Option<i128> {
 }
 
 /// Whether the value digits of a sized or unsized based literal include an
-/// MVL letter (clause 4.1.4.3). The base character itself (`'h`, `'x`) is
+/// MVL letter (clause 4.2.5.4). The base character itself (`'h`, `'x`) is
 /// not part of the value. In an ambiguous context those letters make the
 /// literal MVL rather than a number; hex `x` is therefore not read as 15.
 pub(crate) fn based_value_is_mvl(text: &str) -> bool {
@@ -5631,7 +5631,7 @@ pub(crate) fn unescape(value: &str) -> String {
 }
 
 impl<'a> Interp<'a> {
-    /// One scheduler turn (13.1.1): execute the coroutine atomically
+    /// One scheduler turn (13.2.2): execute the coroutine atomically
     /// from its resume point until it completes, suspends at a
     /// synchronization action, or errors.
     fn run_coroutine_turn(&mut self, co: &mut Coroutine<'a>) -> TurnOutcome {

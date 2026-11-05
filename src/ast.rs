@@ -20,7 +20,7 @@ pub enum DeclarationKind {
     Type,
 }
 
-/// One formal type parameter of a template declaration (clause 8.1):
+/// One formal type parameter of a template declaration (clause 8.2):
 /// `<[tag']type-category>` with an optional default (`=<type>`), the
 /// default only for trailing parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +45,7 @@ pub struct Declaration {
     /// type parameters, recorded. Instantiation (monomorphization) is a
     /// later milestone.
     pub template_params: Vec<TemplateParam>,
-    /// `template extend name of <params> { .. };` (clause 8.2): a
+    /// `template extend name of <params> { .. };` (clause 8.6): a
     /// template extension declaration. Its members apply to the
     /// instances whose actuals comply with the parameters' types or
     /// categories (8.3's NOTE 3), substituted with the instance's
@@ -59,7 +59,7 @@ pub struct Declaration {
     pub like: Option<String>,
     pub like_span: Option<Span>,
     /// `template struct t of <type> like container of <type> { .. }` —
-    /// the parameterized base type, recorded (clause 8.1.3).
+    /// the parameterized base type, recorded (clause 8.5.2).
     pub like_type: Option<TypeExpr>,
     /// When-modifier prefixes of the declared/extended type
     /// (`extend imm cpu_instr_s`, `extend ACTIVE TX uart_agent_u`) —
@@ -85,7 +85,7 @@ pub enum Member {
     Event(EventDecl),
     /// An `on <event-path> { actions };` struct member (clause 11.2).
     On(OnDecl),
-    /// A `cover <event> is { .. };` coverage group (clause 14.1) —
+    /// A `cover <event> is { .. };` coverage group (clause 14.2) —
     /// recorded, not collected: the coverage data model is a later
     /// milestone.
     Cover(CoverGroupDecl),
@@ -285,7 +285,7 @@ pub struct OnDecl {
     pub span: Span,
 }
 
-/// A `cover <event> is { .. };` coverage group (clause 14.1). The
+/// A `cover <event> is { .. };` coverage group (clause 14.2). The
 /// sampling event is recorded; items, crosses and transitions are
 /// recorded structurally, and every option clause (`using ...`) is kept
 /// as raw tokens — the option semantics (weights, at_least, per_instance)
@@ -298,7 +298,7 @@ pub struct CoverGroupDecl {
     pub event: Expr,
     /// `cover name is empty;` — extendable empty group.
     pub empty: bool,
-    /// `cover name is also { .. };` — a clause 14.5 extension of the
+    /// `cover name is also { .. };` — a clause 14.6 extension of the
     /// group defined for the same event.
     pub is_also: bool,
     pub items: Vec<CoverItemDecl>,
@@ -402,7 +402,7 @@ pub enum Stmt {
         span: Span,
     },
     /// `repeat [do] { body } until cond;` — the do-while loop (clause
-    /// 20.2.2): the body executes at least once, then repeatedly until
+    /// 20.2.3): the body executes at least once, then repeatedly until
     /// `cond` is TRUE.
     RepeatUntil {
         body: Vec<Stmt>,
@@ -476,15 +476,15 @@ pub enum Stmt {
         span: Span,
     },
     /// `wait @event;`, `wait {..} @clk;`, `wait [n]*@event;`,
-    /// `wait until <te>;` — a temporal wait (clause 13.1.3; `until` is
+    /// `wait until <te>;` — a temporal wait (clause 13.2.4; `until` is
     /// readability-only): suspends until the temporal expression
-    /// succeeds (12.3.1) over the run's event log, under the wait
+    /// succeeds (12.3.2) over the run's event log, under the wait
     /// budget.
     WaitTemporal {
         te: TemporalExpr,
         span: Span,
     },
-    /// `sync;` / `sync <te>;` — a synchronization action (13.1.2): the
+    /// `sync;` / `sync <te>;` — a synchronization action (13.2.3): the
     /// bare form suspends for one occurrence of the default sampling
     /// event; the TE form behaves like the temporal wait.
     Sync {
@@ -611,7 +611,7 @@ pub enum TypeExpr {
     },
     /// A user-defined type name.
     Named { name: String, span: Span },
-    /// A when-qualified type (`NO_CONSTRAINT env` — clause 6.6): the
+    /// A when-qualified type (`NO_CONSTRAINT env` — clause 6.7): the
     /// subtype variant of a base type. Instances of the field carry the
     /// subtype's synthesized view (its when members composed onto the
     /// base).
@@ -694,7 +694,7 @@ pub enum BinaryOp {
     Le,
     Gt,
     Ge,
-    /// `lhs ~ pattern` — native string matching (clause 4.11), case
+    /// `lhs ~ pattern` — native string matching (clause 4.12), case
     /// insensitive over the full string.
     Match,
     /// `lhs !~ pattern` — the negation of [`BinaryOp::Match`].
@@ -792,7 +792,7 @@ pub enum Expr {
         span: Span,
     },
     /// `new [<type>] [with { <assignments> }]` — instance creation
-    /// (clause 6.2). The `with` block records field assignments for the
+    /// (clause 6.3). The `with` block records field assignments for the
     /// fresh instance.
     New {
         ty: Option<TypeExpr>,
@@ -817,7 +817,7 @@ pub enum Expr {
         span: Span,
     },
     /// `set_of_values(<type>)` / `full_set_of_values(<type>)`
-    /// (5.8.4/5.8.5) — the set of all legal (or possible) values of a
+    /// (5.10.5/5.10.6) — the set of all legal (or possible) values of a
     /// numeric or enumeral type. The argument parses as a type, not an
     /// expression.
     SetOfValues {
@@ -839,7 +839,7 @@ pub enum Expr {
         span: Span,
     },
     /// `expr is a ty` / `expr is not a ty` — the type check operator
-    /// (clause 4.5), with the optional `(name)` binding of a true match
+    /// (clause 4.17.1), with the optional `(name)` binding of a true match
     /// to a local. Runtime type dispatch is exact-name only; there is
     /// no inheritance-aware type system yet.
     IsA {
@@ -874,41 +874,41 @@ pub struct SelectArm {
 /// milestone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TemporalExpr {
-    /// `@event` — the unary event operator (12.2.4); dotted path, the
+    /// `@event` — the unary event operator (12.2.5); dotted path, the
     /// last segment may carry the HDL `$` suffix.
     EventRef { path: Vec<String> },
-    /// `cycle` (12.2.2).
+    /// `cycle` (12.2.3).
     Cycle,
-    /// `true(exp)` — a proposition (12.2.3).
+    /// `true(exp)` — a proposition (12.2.4).
     True { expr: Expr },
-    /// `change(exp)` / `rise(exp)` / `fall(exp)` edge samples (12.2.17).
+    /// `change(exp)` / `rise(exp)` / `fall(exp)` edge samples (12.2.18).
     EdgeSample { routine: EdgeRoutine, expr: Expr },
-    /// `{ a; b; .. }` sequence (12.2.8).
+    /// `{ a; b; .. }` sequence (12.2.9).
     Sequence { items: Vec<TemporalExpr> },
-    /// `lhs => rhs` yield (12.2.13) — the expect-operator shape.
+    /// `lhs => rhs` yield (12.2.14) — the expect-operator shape.
     Yield {
         lhs: Box<TemporalExpr>,
         rhs: Box<TemporalExpr>,
     },
-    /// `a and b` (12.2.6).
+    /// `a and b` (12.2.7).
     And(Box<TemporalExpr>, Box<TemporalExpr>),
-    /// `a or b` (12.2.7).
+    /// `a or b` (12.2.8).
     Or(Box<TemporalExpr>, Box<TemporalExpr>),
-    /// `not te` (12.2.16).
+    /// `not te` (12.2.17).
     Not(Box<TemporalExpr>),
-    /// `fail te` (12.2.12).
+    /// `fail te` (12.2.13).
     Fail(Box<TemporalExpr>),
-    /// `eventually te` (12.2.14).
+    /// `eventually te` (12.2.15).
     Eventually(Box<TemporalExpr>),
     /// `[n]*te`, `~[l..h]*te`, `[l..h]*te` — fixed, true-match and
-    /// first-match repeats (12.2.9–12.2.11).
+    /// first-match repeats (12.2.10–12.2.12).
     Repeat {
         kind: RepeatKind,
         low: Option<Expr>,
         high: Option<Expr>,
         te: Box<TemporalExpr>,
     },
-    /// `te @event` — the binary sampling operator (12.2.5); the sampling
+    /// `te @event` — the binary sampling operator (12.2.6); the sampling
     /// event applies to all sub-expressions.
     Sampled {
         te: Box<TemporalExpr>,

@@ -49,7 +49,7 @@ pub struct ElaboratedType {
     /// extends in declaration order — monitored over the run log by the
     /// interpreter.
     pub expects: Vec<crate::ast::ExpectDecl>,
-    /// For a synthesized when-subtype view (6.6): every discriminating
+    /// For a synthesized when-subtype view (6.7): every discriminating
     /// (field id, modifier value) pair — `[("kind", "BUSY")]` for
     /// `when BUSY'kind`, `[("kind", "LO"), ("sel", "HI")]` for the
     /// chained `when LO'kind HI'sel` or the equivalent two-level
@@ -76,9 +76,9 @@ pub struct ElaboratedType {
 pub struct PortInfo {
     pub name: String,
     pub hdl_path: Option<String>,
-    /// An event port (9.4): carries events, not data — its `$` event is
+    /// An event port (9.5): carries events, not data — its `$` event is
     /// triggerable by sampling the bound HDL object per its `edge()`
-    /// attribute (9.7.2.8), not only by `emit port$`.
+    /// attribute (9.7.3), not only by `emit port$`.
     pub is_event: bool,
 }
 
@@ -243,7 +243,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         }
     }
     elaborator.compose_builtin_units(&mut types);
-    // 6.6: synthesize one subtype view per `when` block (`when
+    // 6.7: synthesize one subtype view per `when` block (`when
     // BUSY'kind { .. }` on type `kind`'s owner): the base's composed
     // members with the when block's members appended, under the
     // `VALUE base` name the field-type spelling uses. Instances typed
@@ -251,7 +251,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
     // when block's fields, constraints, methods, on blocks and cover
     // groups apply for them.
     //
-    // Chained modifiers compose conjunctively (6.6.1: subtypes can be
+    // Chained modifiers compose conjunctively (6.7.1: subtypes can be
     // combinations of fields): every modifier names its determinant
     // field, and the view carries all the (field, value) pairs under a
     // name that space-joins the values in modifier order (`V1 V2
@@ -467,7 +467,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                         substitute_statements(&mut owned.body, &extension_bindings, &mut queue);
                         ons.push(owned);
                     }
-                    // A `when` member of an extension is clause 8.4's
+                    // A `when` member of an extension is clause 8.6's
                     // template subtype instance; cover groups, expects,
                     // ports, events, defines, imports and macros in an
                     // extension body do not compose yet — documented gaps.
@@ -812,7 +812,7 @@ fn when_root_base_name(types: &[ElaboratedType], index: usize) -> String {
 
 /// The (field id, value) pairs a when block's modifiers declare, or
 /// `None` when the modifier spelling does not identify its determinant
-/// fields. Two spellings carry the discriminators (6.6.1 — subtypes can
+/// fields. Two spellings carry the discriminators (6.7.1 — subtypes can
 /// be combinations of fields): the conventional `value'id` modifiers,
 /// any number of them (`when BUSY'kind`, `when LO'kind HI'dir`), and
 /// the corpus's space form `when NO_CONSTRAINT env` (two bare modifiers

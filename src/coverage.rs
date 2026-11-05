@@ -3,36 +3,36 @@
 //!
 //! Groups are built from the recorded [`CoverGroupDecl`]s at run start:
 //! `is also` / `empty` extensions merge into their base group by name
-//! (14.5), and each item's `using ranges` clause — recorded as raw
+//! (14.6), and each item's `using ranges` clause — recorded as raw
 //! tokens in the shape `ranges = { range([lo..hi], "label"); ... }` —
 //! is parsed into explicit buckets. Items without a `ranges` clause
-//! get the clause 14.2 defaults: 16 buckets for integers ("buckets are
+//! get the clause 14.3 defaults: 16 buckets for integers ("buckets are
 //! created by default for only the first 16 possible values (0 through
 //! 15)" — the count is the `max_int_buckets` coverage configuration
-//! option, 28.9) and the two values for booleans. Values falling
+//! option, 14.9) and the two values for booleans. Values falling
 //! outside every bucket are ungradeable ("those values are given goals
 //! of 0 and do not affect the grade for the item").
 //!
-//! The 28.9 coverage configuration ([`CoverageConfig`]) carries the
-//! coverage mode (14.1's NOTE: "Unless coverage mode is turned on
-//! first (see 28.9), no coverage results are collected") and
+//! The 14.9 coverage configuration ([`CoverageConfig`]) carries the
+//! coverage mode (14.2's NOTE: "Unless coverage mode is turned on
+//! first (see 14.9), no coverage results are collected") and
 //! `max_int_buckets`. The setting routine the prose names,
-//! `set_config(<category>, <option>, <value>)` (28.9), is not wired
+//! `set_config(<category>, <option>, <value>)` (14.9), is not wired
 //! into the interpreter yet, so the options are reachable through
 //! [`build_with_config`] only. The option entries whose semantics the
 //! extractable prose defines apply from the recorded tokens:
-//! `no_collect`/`instance_no_collect` on the group (14.1.1) or the
-//! item (14.2.3) — when TRUE the group/item "shall not be presented" —
-//! the cross and transition `name` option (14.3/14.4), and the
-//! group-level `at_least`/`weight` spellings (14.8.2/14.8.3: both "can
+//! `no_collect`/`instance_no_collect` on the group (14.3.2) or the
+//! item (14.4.4) — when TRUE the group/item "shall not be presented" —
+//! the cross and transition `name` option (14.4/14.5), and the
+//! group-level `at_least`/`weight` spellings (14.9.3/14.9.4: both "can
 //! be set in the coverage group or item definitions").
 //!
 //! Not modeled yet: the `set_config()` routine itself, the bool-exp
 //! option forms (including the implicit `inst` variable and the
-//! `per_unit_instance` scoping of 14.1.1/14.2.3),
+//! `per_unit_instance` scoping of 14.3.2/14.4.4),
 //! `instance_ignore`/`instance_illegal`, the `radix`/`when`/`never`
 //! option semantics (Tables 40/41 are images in the local redline
-//! copy), item `using also` extension overrides (14.6), and the
+//! copy), item `using also` extension overrides (14.7), and the
 //! numeric parameters of `range(...)` beyond the bounds and label
 //! (their semantics live in Table 41, an image in the local redline
 //! copy — they are recorded and counted but not applied).
@@ -64,7 +64,7 @@ pub struct CoverItemData {
     pub samples: u64,
     /// Why the item has no buckets, when it does not.
     pub note: Option<&'static str>,
-    /// 14.2.1: the `per_instance = TRUE` option — each bucket becomes
+    /// 14.4.2: the `per_instance = TRUE` option — each bucket becomes
     /// its own graded instance.
     pub per_instance: bool,
     /// The `weight` option (Table 41 is an image in the local copy;
@@ -73,7 +73,7 @@ pub struct CoverItemData {
 }
 
 impl CoverItemData {
-    /// The item's grade (14.2): the fraction of buckets that reached
+    /// The item's grade (14.3): the fraction of buckets that reached
     /// their goal; `None` when the item is ungradeable.
     pub fn grade(&self) -> Option<f64> {
         if self.buckets.is_empty() {
@@ -88,7 +88,7 @@ impl CoverItemData {
     }
 }
 
-/// One per-instance unit of a `per_instance` item (14.2.1): "an
+/// One per-instance unit of a `per_instance` item (14.4.2): "an
 /// instance is created for every valid bucket of the per_instance
 /// item. Any instance that is not sampled is marked as a hole." The
 /// instance name is the per_type item's name, `==`, and the bucket's.
@@ -114,13 +114,13 @@ impl CoverInstanceData {
     }
 }
 
-/// A derived coverage item (14.3/14.4): a cross over the group's items
+/// A derived coverage item (14.4/14.5): a cross over the group's items
 /// or a transition over one item's consecutive samples. Each sampling
 /// event records one combination — the crossed items' bucket labels,
 /// or the base item's previous→current labels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverDerivedData {
-    /// The 14.3/14.4 default names: `cross_a__b` and
+    /// The 14.4/14.5 default names: `cross_a__b` and
     /// `transition__base`.
     pub name: String,
     /// The crossed item names, or the single base item for a
@@ -167,21 +167,21 @@ pub struct CoverGroupData {
     /// The sampling event as a dotted path, when it resolves to one.
     pub event_path: Option<String>,
     pub items: Vec<CoverItemData>,
-    /// Derived items (crosses and transitions, 14.3/14.4).
+    /// Derived items (crosses and transitions, 14.4/14.5).
     pub derived: Vec<CoverDerivedData>,
     pub samples: u64,
     /// Each item's containing-bucket label (or raw value) at the last
-    /// sampling event — the transition source (14.4's previous-value).
+    /// sampling event — the transition source (14.5's previous-value).
     last_values: BTreeMap<String, String>,
 }
 
 impl CoverGroupData {
-    /// The group's grade (14.2/14.2.1). With no `per_instance` items:
+    /// The group's grade (14.3/14.4.2). With no `per_instance` items:
     /// the plain average of the gradeable items' (basic and derived)
     /// grades. With `per_instance` items: "the grade of the cover
     /// group is the weighted grades of all the per_instance items" —
     /// one weighted unit per instance (per valid bucket), plus the
-    /// per_type data as one bucket (14.2.1's "sum of all valid buckets
+    /// per_type data as one bucket (14.4.2's "sum of all valid buckets
     /// for all the per_instance items +1 (the per_type bucket)"), whose
     /// grade is the average of the per_type items' grades. `None` when
     /// nothing is gradeable.
@@ -246,7 +246,7 @@ impl CoverGroupData {
         Some(weighted_sum / weight_total as f64)
     }
 
-    /// The per-instance units (14.2.1) of the group's `per_instance`
+    /// The per-instance units (14.4.2) of the group's `per_instance`
     /// items, in item-then-bucket order.
     pub fn instances(&self) -> Vec<CoverInstanceData> {
         let mut instances = Vec::new();
@@ -267,19 +267,19 @@ impl CoverGroupData {
     }
 
     /// Record one sampled value for the named item, then update the
-    /// transition/cross derived items (14.4: the transition derives
+    /// transition/cross derived items (14.5: the transition derives
     /// `previous-value, value` pairs from the base item's consecutive
-    /// samples; 14.3: the cross records every combination of the
+    /// samples; 14.4: the cross records every combination of the
     /// crossed items' values). The group's sample count is kept by the
     /// caller — once per sampling event, not once per item.
     pub fn sample(&mut self, item_name: &str, value: &crate::interp::Value) {
         let item = self.items.iter().find(|item| item.name == item_name);
         let as_int = value_to_int(value);
-        // The bucket label this value lands in (14.2's bucket model),
+        // The bucket label this value lands in (14.3's bucket model),
         // or the raw value when the item is unbucketed.
         let label = item.and_then(|item| item_label(item, as_int));
         let label = label.unwrap_or_else(|| render_value(value));
-        // The transition over this item: previous → current (14.4).
+        // The transition over this item: previous → current (14.5).
         let previous = self.last_values.get(item_name).cloned();
         if let (Some(derived), Some(previous)) = (
             self.derived
@@ -314,12 +314,12 @@ impl CoverGroupData {
         {
             bucket.hits += 1;
         } else {
-            // Outside every bucket: ungradeable (14.2).
+            // Outside every bucket: ungradeable (14.3).
             item.ungradeable_hits += 1;
         }
     }
 
-    /// The cross pass of one sampling event (14.3): record each cross
+    /// The cross pass of one sampling event (14.4): record each cross
     /// item's combination from its sources' current labels.
     pub fn record_crosses(&mut self) {
         let crosses: Vec<(String, Vec<String>)> = self
@@ -351,7 +351,7 @@ fn value_to_int(value: &crate::interp::Value) -> Option<i128> {
     }
 }
 
-/// The label of the bucket containing the value (14.2), or `None` when
+/// The label of the bucket containing the value (14.3), or `None` when
 /// the item has no buckets or the value misses them all.
 fn item_label(item: &CoverItemData, as_int: Option<i128>) -> Option<String> {
     let as_int = as_int?;
@@ -393,28 +393,28 @@ impl TypeCoverage {
     }
 }
 
-/// The coverage configuration options (28.9). The prose names the
+/// The coverage configuration options (14.9). The prose names the
 /// setting mechanism — the `set_config()` predefined routine, "sets
 /// the configuration options to the specified values" (the category,
 /// option, value shape of its syntax example; 7.6.1's `set_config_max`
 /// variant sets "the numeric options of a particular category to the
 /// specified maximum values") — and two coverage options by name: the
-/// coverage mode (14.1's NOTE) and `max_int_buckets` (14.2). The
+/// coverage mode (14.2's NOTE) and `max_int_buckets` (14.3). The
 /// routine itself is not wired into the interpreter yet, so the
 /// options are reachable through [`build_with_config`] only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverageConfig {
-    /// 14.1's NOTE: "Unless coverage mode is turned on first (see
-    /// 28.9), no coverage results are collected, even if cover groups
+    /// 14.2's NOTE: "Unless coverage mode is turned on first (see
+    /// 14.9), no coverage results are collected, even if cover groups
     /// and cover items are defined." With the mode off nothing is
     /// built, so the interpreter finds no groups to sample and the
     /// report presents none. The default keeps collection on — a
     /// documented deviation: the standard's mode starts off until
     /// `set_config` turns it on, and the routine is not wired yet.
     pub mode: bool,
-    /// 14.2: "If ranges is not specified, the default number of
+    /// 14.3: "If ranges is not specified, the default number of
     /// buckets is 16 [set by the max_int_buckets coverage
-    /// configuration option (see 28.9)]." The integer items' default
+    /// configuration option (see 14.9)]." The integer items' default
     /// bucket count; 0 leaves the item without default buckets
     /// (ungradeable).
     pub max_int_buckets: u64,
@@ -431,18 +431,18 @@ impl Default for CoverageConfig {
 
 /// Build the coverage data model from the elaborated types' recorded
 /// cover groups: one [`TypeCoverage`] per type that declares (or
-/// extends) groups, extensions merged into their base by name (14.5),
+/// extends) groups, extensions merged into their base by name (14.6),
 /// in any declaration order. Uses the default [`CoverageConfig`].
 pub fn build(elaborated: &crate::elab::Elaborated) -> Vec<TypeCoverage> {
     build_with_config(elaborated, &CoverageConfig::default())
 }
 
-/// [`build`] with explicit 28.9 coverage configuration options.
+/// [`build`] with explicit 14.9 coverage configuration options.
 pub fn build_with_config(
     elaborated: &crate::elab::Elaborated,
     config: &CoverageConfig,
 ) -> Vec<TypeCoverage> {
-    // 14.1's NOTE (see [`CoverageConfig::mode`]).
+    // 14.2's NOTE (see [`CoverageConfig::mode`]).
     if !config.mode {
         return Vec::new();
     }
@@ -491,7 +491,7 @@ pub fn build_with_config(
             }
         }
         // Group-level options: `per_instance = TRUE` marks every item
-        // per-instance (the group-level spelling of 14.2.1).
+        // per-instance (the group-level spelling of 14.4.2).
         for decl in &ty.covers {
             if decl.is_also {
                 continue;
@@ -510,7 +510,7 @@ pub fn build_with_config(
                 }
             }
         }
-        // 14.1.1: "if one or both of no_collect and instance_no_collect
+        // 14.3.2: "if one or both of no_collect and instance_no_collect
         // options of the group are evaluated to TRUE, the group shall
         // not be presented under that instance." The OR relation of the
         // prose, over every declaration of the group; the constant TRUE
@@ -528,11 +528,11 @@ pub fn build_with_config(
                     })
             })
         });
-        // Group-level `at_least`/`weight` (14.8.2/14.8.3: both "can be
+        // Group-level `at_least`/`weight` (14.9.3/14.9.4: both "can be
         // set in the coverage group or item definitions"): the group
         // option applies to every item of the group that does not set
         // its own; a later declaration's reading overrides an earlier
-        // one (14.5's override reading). The item-level spellings win
+        // one (14.6's override reading). The item-level spellings win
         // where present.
         for group in groups.iter_mut() {
             let matching: Vec<&CoverGroupDecl> = ty
@@ -591,7 +591,7 @@ pub fn build_with_config(
     result
 }
 
-/// Synthesize a group's derived items (14.3/14.4) from its recorded
+/// Synthesize a group's derived items (14.4/14.5) from its recorded
 /// cross/transition entries, with totals over the basic items' buckets.
 fn build_derived(decl: &CoverGroupDecl, items: &[CoverItemData]) -> Vec<CoverDerivedData> {
     let mut derived = Vec::new();
@@ -606,7 +606,7 @@ fn build_derived(decl: &CoverGroupDecl, items: &[CoverItemData]) -> Vec<CoverDer
                     .find(|item| &item.name == base)
                     .filter(|item| !item.buckets.is_empty())
                     .map(|item| (item.buckets.len() * item.buckets.len()) as u64);
-                // 14.4: "If no name is specified for the transition item
+                // 14.5: "If no name is specified for the transition item
                 // with the name option, it gets a default name of
                 // transition item-name" (two underscores).
                 let name = scan_string_option(&entry.using, "name")
@@ -638,7 +638,7 @@ fn build_derived(decl: &CoverGroupDecl, items: &[CoverItemData]) -> Vec<CoverDer
                         }
                     })
                 });
-                // 14.3: "It creates a new item with a name specified
+                // 14.4: "It creates a new item with a name specified
                 // using a name option or by using the default name of
                 // cross item-name-1 item-name-2" (two underscores).
                 let name = scan_string_option(&entry.using, "name")
@@ -685,13 +685,13 @@ fn group_event_path(decl: &CoverGroupDecl) -> Option<String> {
 }
 
 /// Build one item's data: explicit `ranges` buckets when the recorded
-/// `using` tokens carry them, the 14.2 defaults otherwise.
+/// `using` tokens carry them, the 14.3 defaults otherwise.
 fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItemData> {
     if item.kind != CoverItemKind::Item {
         // cross/transition items are recorded, not collected yet.
         return None;
     }
-    // 14.2.3: "if one or both of no_collect and instance_no_collect
+    // 14.4.4: "if one or both of no_collect and instance_no_collect
     // options of the item are evaluated to TRUE, the item shall not be
     // presented under that instance." The constant TRUE spelling (the
     // OR relation of the prose) drops the item from the collected
@@ -710,7 +710,7 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
     // The item options (Table 41 is an image in the local copy; the
     // common readings apply): `at_least = N` is the per-bucket goal,
     // `per_instance = TRUE` makes each bucket its own graded instance
-    // (14.2.1), `weight = N` weights the grade.
+    // (14.4.2), `weight = N` weights the grade.
     let at_least = scan_uint_option(&item.using, "at_least")
         .unwrap_or_default()
         .unwrap_or(1);
@@ -731,8 +731,8 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
         });
     }
     let (mut buckets, note) = if ranges.is_empty() {
-        // 14.2 defaults: integers grade over the first `max_int_buckets`
-        // values (16 unless the 28.9 configuration option says
+        // 14.3 defaults: integers grade over the first `max_int_buckets`
+        // values (16 unless the 14.9 configuration option says
         // otherwise); booleans over their two values; anything else has
         // no default bucket set and is ungradeable.
         match &item.ty {
@@ -835,9 +835,9 @@ fn bool_buckets() -> Vec<CoverBucket> {
     ]
 }
 
-/// The 14.2 default integer buckets: one bucket per value, "for only
+/// The 14.3 default integer buckets: one bucket per value, "for only
 /// the first 16 possible values (0 through 15)" — the count being the
-/// `max_int_buckets` coverage configuration option's default (28.9).
+/// `max_int_buckets` coverage configuration option's default (14.9).
 fn default_int_buckets(max: u64) -> Vec<CoverBucket> {
     (0..max)
         .map(|value| CoverBucket {

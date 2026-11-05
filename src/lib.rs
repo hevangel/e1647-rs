@@ -9,7 +9,7 @@
 //! subset, including `gen` as a seeded rejection sampler ([`interp`]).
 //! The clause 12 temporal-engine core evaluates sampled normal forms
 //! over explicit finite paths ([`temporal`]), and the run loop drives
-//! it: an event log fed by `emit`, a clause 13.1.1 scheduler running
+//! it: an event log fed by `emit`, a clause 13.2.2 scheduler running
 //! started TCMs concurrently (round-robin turns suspending at
 //! `wait`/`sync`), and quit-time `expect`/`assume` monitoring. The
 //! clause 21 preprocessor applies `#define` replacement rules as a

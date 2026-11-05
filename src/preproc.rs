@@ -12,7 +12,7 @@
 //! identifier token. The parser then sees ordinary code.
 //!
 //! What the clause 21 prose confirms (the local redline PDF renders the
-//! 21.2/21.3 syntax examples as images; only the prose was extractable):
+//! clause 21 syntax examples as images; only the prose was extractable):
 //! - the replacement is the text between the name and the terminating
 //!   `;` or the end of the name's line (the 21.3 example shows
 //!   `#define PLIST_SIZE 100`); a replacement may cross a line break
@@ -25,7 +25,7 @@
 //!   are skipped by construction;
 //! - "a #define statement applies only to code that comes later", and
 //!   `#undef` removes the rule "from that point onward" (21.4);
-//! - excluded `#ifdef`/`#ifndef` code is ignored (21.2), so a `#define`
+//! - excluded `#ifdef`/`#ifndef` code is ignored (21.3), so a `#define`
 //!   inside an excluded branch defines nothing and its region gets no
 //!   substitutions.
 //!
@@ -155,7 +155,7 @@ fn directive(
         _ => {
             // `#ifdef` / `#ifndef`: evaluate the condition with the
             // rules in force here, then walk the included group and
-            // carry the excluded one through untouched (21.2's "ignore
+            // carry the excluded one through untouched (21.3's "ignore
             // it").
             let included = if word == "ifdef" {
                 rules.contains_key(name)
@@ -241,7 +241,7 @@ fn is_punct(token: &Token, symbol: &str) -> bool {
 }
 
 /// The index of the `}` matching the `{` at `open`, counting nested
-/// braces (the tokens inside are counted, not parsed — 21.2's ignored
+/// braces (the tokens inside are counted, not parsed — 21.3's ignored
 /// code). `None` when the group never closes within `end`.
 fn scan_group(tokens: &[Token], open: usize, end: usize) -> Option<usize> {
     let mut depth = 0usize;
