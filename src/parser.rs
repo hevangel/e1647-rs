@@ -45,6 +45,12 @@
 //!   member now reports `E0120` when missing)
 //! - `E0120` unsupported, unexpected or missing temporal-expression
 //!   construct (clause 12)
+//! - `E0121` `in_table` row/tuple arity mismatch (clause 4.11.8)
+//! - `E0122` `evaluate` result type cannot be inferred (clause 4.17.7) —
+//!   documented here per the migration's code allocation; raised by the
+//!   interpreter, where the inference contexts (the declared type of the
+//!   assignment/`var` target or of the call's parameter) actually resolve
+//! - `E0123` `return`/`wait`/`sync` inside an `evaluate` block (clause 4.17.7)
 //! - `E0201` duplicate declaration name
 //! - `E0202` duplicate field name
 //! - `E0203` unknown type name
@@ -54,9 +60,9 @@
 //!   enumeral)
 
 use crate::ast::{
-    BinaryOp, Declaration, DeclarationKind, Enumeral, Expr, Field, KeepConstraint, Member,
-    MethodDecl, MethodModifier, OnDecl, Param, ScalarBase, Stmt, SubtypeModifier, TypeExpr,
-    UnaryOp, WhenDecl,
+    BinaryOp, Declaration, DeclarationKind, Enumeral, Expr, Field, InSetExpr, KeepConstraint,
+    Member, MethodDecl, MethodModifier, OnDecl, Param, ScalarBase, Stmt, SubtypeModifier,
+    TableElem, TypeExpr, UnaryOp, WhenDecl,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Position, Token, TokenKind};
@@ -4020,6 +4026,25 @@ impl Parser {
                 };
                 self.parse_postfix_chain(expr, start)
             }
+            Some(TokenKind::Identifier(name)) if name == "evaluate" => {
+                // `evaluate [type] [(var)] { action; ... }` (clause
+                // 4.17.7). `evaluate` is not a Table 8 keyword — a
+                // program may also name a field or method `evaluate` —
+                // so the construct is recognized by position and the
+                // recognizer backtracks to a plain identifier when the
+                // tokens after `evaluate` do not fit it.
+                match self.try_parse_evaluate(start) {
+                    Some(expr) => Some(expr),
+                    None => {
+                        let (name, _) = self.take_identifier();
+                        let expr = Expr::Ident {
+                            name,
+                            span: (start, end),
+                        };
+                        self.parse_postfix_chain(expr, start)
+                    }
+                }
+            }
             Some(TokenKind::Identifier(_)) => {
                 let (name, _) = self.take_identifier();
                 let expr = Expr::Ident {
@@ -4062,6 +4087,15 @@ impl Parser {
                 })
             }
             Some(TokenKind::Punctuation(p)) if p == "(" => {
+                // `(exp1, ..., expN) [not] in_table { row; row; ... }`
+                // (clause 4.11.8): a parenthesized comma list is an
+                // expression only in this construct, so the whole
+                // `tuple in_table` shape parses atomically here. The
+                // decision is made with a token scan (matching `)`, then
+                // the `[not] in_table` follow), never by backtracking.
+                if self.paren_group_followed_by_in_table() {
+                    return self.parse_in_table(start);
+                }
                 self.bump();
                 let inner = self.parse_expr()?;
                 self.expect_punct(")", "E0110", "expected ')' to close the expression")?;
@@ -4077,6 +4111,323 @@ impl Parser {
             _ => {
                 self.error_here("E0108", "expected an expression");
                 None
+            }
+        }
+    }
+
+    /// Whether the `(` at the current position opens a parenthesized
+    /// group whose matching `)` is directly followed by `[not] in_table`
+    /// — the shape of the clause 4.11.8 membership test. Decided by a
+    /// token scan over the group (parenthesis depth counting), never by
+    /// backtracking; unbalanced input reports false and the regular
+    /// parenthesized-expression parse produces its own diagnostic.
+    fn paren_group_followed_by_in_table(&self) -> bool {
+        let Some(close) = self.matching_paren_index() else {
+            return false;
+        };
+        let follow = |offset: usize| self.tokens.get(close + 1 + offset).map(|t| &t.kind);
+        match follow(0) {
+            Some(TokenKind::Keyword(k)) if k == "in_table" => true,
+            Some(TokenKind::Keyword(k)) if k == "not" => {
+                matches!(follow(1), Some(TokenKind::Keyword(k)) if k == "in_table")
+            }
+            _ => false,
+        }
+    }
+
+    /// The token index of the `)` matching the `(` at the current
+    /// position, if the group is balanced in the remaining tokens.
+    fn matching_paren_index(&self) -> Option<usize> {
+        let mut depth: usize = 0;
+        for (offset, token) in self.tokens[self.pos..].iter().enumerate() {
+            match &token.kind {
+                TokenKind::Punctuation(p) if p == "(" => depth += 1,
+                TokenKind::Punctuation(p) if p == ")" => {
+                    depth = depth.wrapping_sub(1);
+                    if depth == 0 {
+                        return Some(self.pos + offset);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// `(exp1, ..., expN) [not] in_table { row; row; ... }` (clause
+    /// 4.11.8). Called with the current token at the opening `(`. Every
+    /// row must carry exactly N elements; a different count reports
+    /// `E0121` at the row's first element and the parse continues.
+    fn parse_in_table(&mut self, start: Position) -> Option<Expr> {
+        self.bump(); // '('
+        let mut tuple = Vec::new();
+        if !self.at_punct(")") {
+            loop {
+                tuple.push(self.parse_expr()?);
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_punct(")", "E0110", "expected ')' to close the in_table tuple")?;
+        let negated = self.eat_keyword("not");
+        if !self.eat_keyword("in_table") {
+            self.error_here("E0108", "expected 'in_table' after the tuple");
+            return None;
+        }
+        self.expect_punct("{", "E0106", "expected '{' to open the in_table rows")?;
+        let mut rows: Vec<Vec<TableElem>> = Vec::new();
+        while !self.at_punct("}") && self.peek().is_some() {
+            if self.eat_punct(";") {
+                // The separator between rows (also the optional trailing
+                // one before '}').
+                continue;
+            }
+            let mut row = Vec::new();
+            let mut first_span: Option<crate::ast::Span> = None;
+            loop {
+                let element_start = self.current_span().0;
+                let element = self.parse_table_row_element()?;
+                if first_span.is_none() {
+                    first_span = Some((element_start, self.last_end()));
+                }
+                row.push(element);
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            if row.len() != tuple.len()
+                && let Some((row_start, row_end)) = first_span
+            {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0121",
+                    format!(
+                        "in_table row has {} elements, tuple has {}",
+                        row.len(),
+                        tuple.len()
+                    ),
+                    row_start,
+                    row_end,
+                ));
+            }
+            rows.push(row);
+            if !self.eat_punct(";") {
+                break;
+            }
+        }
+        self.expect_punct("}", "E0107", "expected '}' to close the in_table rows")?;
+        let end = self.last_end();
+        Some(Expr::InTable {
+            tuple,
+            rows,
+            negated,
+            span: (start, end),
+        })
+    }
+
+    /// One element of an `in_table` row (clause 4.11.8): a set literal
+    /// `[a, b]` / `[lo..hi]` (matched by `in`), `set_of_values(T)` /
+    /// `full_set_of_values(T)` (matched by `in` over the type's value
+    /// set), or any other expression (a scalar, matched by `==`).
+    fn parse_table_row_element(&mut self) -> Option<TableElem> {
+        if self.at_punct("[") {
+            self.bump();
+            let first = self.parse_expr()?;
+            let set = if self.eat_punct("..") {
+                let high = self.parse_expr()?;
+                self.expect_punct("]", "E0107", "expected ']' to close the range")?;
+                InSetExpr::Range(Box::new(first), Box::new(high))
+            } else {
+                let mut items = vec![first];
+                while self.eat_punct(",") {
+                    items.push(self.parse_expr()?);
+                }
+                self.expect_punct("]", "E0107", "expected ']' to close the set")?;
+                InSetExpr::Items(items)
+            };
+            return Some(TableElem::Set(set));
+        }
+        match self.parse_expr()? {
+            Expr::SetOfValues { ty, full, .. } => Some(TableElem::TypeSet { ty, full }),
+            other => Some(TableElem::Scalar(other)),
+        }
+    }
+
+    /// Try to parse `evaluate [type] [(var)] { action; ... }` (clause
+    /// 4.17.7) with the current token at `evaluate`. `None` means the
+    /// tokens after `evaluate` do not fit the construct — a field or
+    /// method may legitimately be named `evaluate` — and position plus
+    /// any speculative diagnostics are restored so the caller parses a
+    /// plain identifier. Once the shape commits (a `{` body follows),
+    /// failures are real parse errors.
+    fn try_parse_evaluate(&mut self, start: Position) -> Option<Expr> {
+        let saved_pos = self.pos;
+        let saved_diagnostics = self.diagnostics.len();
+        self.bump(); // 'evaluate'
+        // `evaluate { ... }` — no type, no named variable.
+        // `evaluate (var) { ... }` — a variable without a type. The
+        // three-token shape `( name ) {` cannot be a call: an expression
+        // position never continues with a `{` body after a call.
+        let var_only = self.at_punct("(")
+            && matches!(self.peek_second_kind(), Some(TokenKind::Identifier(_)))
+            && matches!(
+                self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                Some(TokenKind::Punctuation(p)) if p == ")"
+            )
+            && matches!(
+                self.tokens.get(self.pos + 3).map(|t| &t.kind),
+                Some(TokenKind::Punctuation(p)) if p == "{"
+            );
+        let (ty, var) = if self.at_punct("{") {
+            (None, None)
+        } else if var_only {
+            self.bump(); // '('
+            let (name, _) = self.take_identifier();
+            self.expect_punct(")", "E0110", "expected ')' after the evaluate variable")?;
+            (None, Some(name))
+        } else if self.at_identifier() || self.at_scalar_type_keyword() || self.at_keyword("list") {
+            // A scalar type followed directly by `( name ) {` — the name
+            // is the evaluate variable, not a `(bits: n)` width
+            // specification, so the shape is decided here and the scalar
+            // type is taken without a width.
+            if self.at_scalar_type_keyword()
+                && matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == "(")
+                && matches!(
+                    self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                    Some(TokenKind::Identifier(_))
+                )
+                && matches!(
+                    self.tokens.get(self.pos + 3).map(|t| &t.kind),
+                    Some(TokenKind::Punctuation(p)) if p == ")"
+                )
+                && matches!(
+                    self.tokens.get(self.pos + 4).map(|t| &t.kind),
+                    Some(TokenKind::Punctuation(p)) if p == "{"
+                )
+            {
+                let (type_start, type_end) = self.current_span();
+                let token = self.bump();
+                let TokenKind::Keyword(word) = token.kind else {
+                    unreachable!("peeked a scalar type keyword");
+                };
+                let Some(base) = ScalarBase::from_keyword(&word) else {
+                    unreachable!("at_scalar_type_keyword checked the word");
+                };
+                self.bump(); // '('
+                let (name, _) = self.take_identifier();
+                self.expect_punct(")", "E0110", "expected ')' after the evaluate variable")?;
+                let ty = TypeExpr::Scalar {
+                    base,
+                    width: None,
+                    span: (type_start, type_end),
+                };
+                let var = Some(name);
+                self.expect_punct("{", "E0106", "expected '{' to open the evaluate block")?;
+                let body = self.parse_statements();
+                self.expect_punct("}", "E0107", "expected '}' to close the evaluate block")?;
+                self.check_evaluate_body(&body);
+                let end = self.last_end();
+                return Some(Expr::Evaluate {
+                    ty: Some(ty),
+                    var,
+                    body,
+                    span: (start, end),
+                });
+            }
+            // A type: parsed speculatively — when no `(var)` or `{`
+            // follows, this was not an evaluate block after all.
+            let ty = self.parse_type()?;
+            let var = if self.at_punct("{") {
+                None
+            } else if self.at_punct("(")
+                && matches!(self.peek_second_kind(), Some(TokenKind::Identifier(_)))
+                && matches!(
+                    self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                    Some(TokenKind::Punctuation(p)) if p == ")"
+                )
+            {
+                self.bump(); // '('
+                let (name, _) = self.take_identifier();
+                self.expect_punct(")", "E0110", "expected ')' after the evaluate variable")?;
+                Some(name)
+            } else {
+                self.pos = saved_pos;
+                self.diagnostics.truncate(saved_diagnostics);
+                return None;
+            };
+            (Some(ty), var)
+        } else {
+            self.pos = saved_pos;
+            self.diagnostics.truncate(saved_diagnostics);
+            return None;
+        };
+        self.expect_punct("{", "E0106", "expected '{' to open the evaluate block")?;
+        let body = self.parse_statements();
+        self.expect_punct("}", "E0107", "expected '}' to close the evaluate block")?;
+        self.check_evaluate_body(&body);
+        let end = self.last_end();
+        Some(Expr::Evaluate {
+            ty,
+            var,
+            body,
+            span: (start, end),
+        })
+    }
+
+    /// Whether the current token is a scalar base type keyword (`int`,
+    /// `uint`, ...) usable to start the type of an `evaluate` block.
+    fn at_scalar_type_keyword(&self) -> bool {
+        matches!(
+            self.peek_kind(),
+            Some(TokenKind::Keyword(k)) if ScalarBase::from_keyword(k).is_some()
+        )
+    }
+
+    /// 4.17.7: the actions of an `evaluate` block may not include
+    /// `return`, `wait` or `sync` — at any depth of the block. Every
+    /// occurrence reports `E0123` at the offending action; the parse
+    /// continues so one run can surface every problem.
+    fn check_evaluate_body(&mut self, statements: &[Stmt]) {
+        for statement in statements {
+            let offending = match statement {
+                Stmt::Return { .. } => Some("return"),
+                Stmt::Wait { .. } | Stmt::WaitTemporal { .. } => Some("wait"),
+                Stmt::Sync { .. } => Some("sync"),
+                _ => None,
+            };
+            if let Some(action) = offending {
+                let span = statement.span();
+                self.diagnostics.push(Diagnostic::new(
+                    "E0123",
+                    format!("'{action}' is not allowed in an evaluate block (clause 4.17.7)"),
+                    span.0,
+                    span.1,
+                ));
+            }
+            match statement {
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.check_evaluate_body(then_body);
+                    if let Some(else_body) = else_body {
+                        self.check_evaluate_body(else_body);
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::RepeatUntil { body, .. }
+                | Stmt::ForEach { body, .. }
+                | Stmt::ForTo { body, .. } => self.check_evaluate_body(body),
+                Stmt::Case { arms, default, .. } => {
+                    for (_, body) in arms {
+                        self.check_evaluate_body(body);
+                    }
+                    if let Some(default) = default {
+                        self.check_evaluate_body(default);
+                    }
+                }
+                _ => {}
             }
         }
     }

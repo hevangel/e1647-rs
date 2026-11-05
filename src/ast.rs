@@ -849,6 +849,47 @@ pub enum Expr {
         negated: bool,
         span: Span,
     },
+    /// `(exp1, ..., expN) [not] in_table { row; row; ... }` (clause
+    /// 4.11.8). TRUE iff some row matches the tuple element-wise — a
+    /// scalar row element by `==`, a set row element by `in`; `not`
+    /// negates. A tuple is an expression only in this construct, so the
+    /// parser produces [`Expr::InTable`] atomically (never an
+    /// intermediate tuple expression).
+    InTable {
+        tuple: Vec<Expr>,
+        rows: Vec<Vec<TableElem>>,
+        negated: bool,
+        span: Span,
+    },
+    /// `evaluate [type] [(var)] { action; ... }` (clause 4.17.7) — an
+    /// expression: the actions run, and the value of the named variable
+    /// (`value` by default) after the block is the value. The variable
+    /// is visible only inside the block and starts at its type's
+    /// default. `type` given → that type; otherwise the type is
+    /// inferred at run time from the context (the declared type of the
+    /// assignment/`var` target or of the call's parameter); when
+    /// neither exists the interpreter reports `E0122`. `return`/`wait`/
+    /// `sync` inside are rejected at parse time (`E0123`).
+    Evaluate {
+        ty: Option<TypeExpr>,
+        var: Option<String>,
+        body: Vec<Stmt>,
+        span: Span,
+    },
+}
+
+/// One element of an `in_table` row (clause 4.11.8): a scalar expression
+/// (matched against the tuple element by `==`) or a set (matched by
+/// `in` — a set literal for enum/bool elements, any set expression for
+/// numeric elements).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableElem {
+    /// A scalar row element.
+    Scalar(Expr),
+    /// A set literal `[a, b]` / `[lo..hi]`.
+    Set(InSetExpr),
+    /// `set_of_values(T)` / `full_set_of_values(T)` (5.10.5/5.10.6).
+    TypeSet { ty: TypeExpr, full: bool },
 }
 
 /// The right-hand side of an `in` membership expression.
@@ -956,6 +997,8 @@ impl Expr {
             | Expr::BitSlice { span, .. }
             | Expr::InSet { span, .. }
             | Expr::IsA { span, .. }
+            | Expr::InTable { span, .. }
+            | Expr::Evaluate { span, .. }
             | Expr::New { span, .. }
             | Expr::Select { span, .. }
             | Expr::HdlPath { span, .. } => *span,

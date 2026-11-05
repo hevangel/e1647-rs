@@ -1790,3 +1790,115 @@ fn sync_statements_parse_bare_and_temporal_forms() {
         );
     }
 }
+
+#[test]
+fn in_table_parses_tuple_rows_and_negation() {
+    // 4.11.8: `(a, b) [not] in_table { row; row; }` — the tuple is an
+    // expression only in this construct; a row element is a scalar
+    // expression or a set literal.
+    let declarations = expect_clean(
+        "struct s {\n    a: uint;\n    b: uint;\n    \
+         keep (a, b) in_table { 1, [0..300]; 2, [7, 9]; };\n\
+         keep (a, b) not in_table { 1, 2; };\n};\n",
+    );
+    let Member::Constraint(positive) = &declarations[0].members[2] else {
+        panic!("expected the in_table keep");
+    };
+    let Expr::InTable {
+        tuple,
+        rows,
+        negated,
+        ..
+    } = &positive.expr
+    else {
+        panic!("expected an in_table expression: {:?}", positive.expr);
+    };
+    assert_eq!(tuple.len(), 2);
+    assert_eq!(rows.len(), 2);
+    assert!(!*negated);
+    assert!(
+        matches!(rows[0][0], e1647::ast::TableElem::Scalar(_)),
+        "a scalar row element: {:?}",
+        rows[0][0]
+    );
+    assert!(
+        matches!(
+            rows[0][1],
+            e1647::ast::TableElem::Set(e1647::ast::InSetExpr::Range(_, _))
+        ),
+        "a range set row element: {:?}",
+        rows[0][1]
+    );
+    assert!(
+        matches!(
+            rows[1][1],
+            e1647::ast::TableElem::Set(e1647::ast::InSetExpr::Items(_))
+        ),
+        "an item-list set row element: {:?}",
+        rows[1][1]
+    );
+    let Member::Constraint(negative) = &declarations[0].members[3] else {
+        panic!("expected the negated in_table keep");
+    };
+    let Expr::InTable { negated, .. } = &negative.expr else {
+        panic!("expected an in_table expression: {:?}", negative.expr);
+    };
+    assert!(*negated);
+}
+
+#[test]
+fn evaluate_parses_type_variable_and_body() {
+    // 4.17.7: `evaluate [type] [(var)] { actions }` — all spellings,
+    // and the `evaluate(x)` call fallback for a method named evaluate.
+    let declarations = expect_clean(
+        "struct s {\n    run() is {\n        \
+         var x: int = evaluate { value = 1 };\n        \
+         var y: uint = evaluate uint (acc) { acc = 2 };\n        \
+         var z: int = evaluate int { value = 3 };\n        \
+         evaluate(x);\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected the run method");
+    };
+    assert_eq!(run.body.len(), 4);
+    let Stmt::VarDecl {
+        init: Some(init), ..
+    } = &run.body[0]
+    else {
+        panic!("expected the first var decl");
+    };
+    let Expr::Evaluate { ty, var, body, .. } = init else {
+        panic!("expected an evaluate expression: {init:?}");
+    };
+    assert!(ty.is_none() && var.is_none() && body.len() == 1);
+    let Stmt::VarDecl {
+        init: Some(init), ..
+    } = &run.body[1]
+    else {
+        panic!("expected the second var decl");
+    };
+    let Expr::Evaluate { ty, var, .. } = init else {
+        panic!("expected an evaluate expression: {init:?}");
+    };
+    assert!(
+        matches!(
+            ty,
+            Some(TypeExpr::Scalar {
+                base: ScalarBase::Uint,
+                ..
+            })
+        ),
+        "expected a uint type: {ty:?}"
+    );
+    assert_eq!(var.as_deref(), Some("acc"));
+    let Stmt::ExprStmt { expr, .. } = &run.body[3] else {
+        panic!("expected the call statement");
+    };
+    let Expr::Call { callee, .. } = expr else {
+        panic!("expected 'evaluate(x)' to parse as a call: {expr:?}");
+    };
+    let Expr::Ident { name, .. } = callee.as_ref() else {
+        panic!("expected a plain callee: {callee:?}");
+    };
+    assert_eq!(name, "evaluate");
+}
