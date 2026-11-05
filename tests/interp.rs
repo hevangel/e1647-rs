@@ -150,7 +150,7 @@ fn lists_support_push_size_and_indexing() {
     assert_eq!(output, "2 7\n10\n");
 }
 
-// --- Clause 26 list pseudo-methods ---
+// --- Clause 27 list pseudo-methods ---
 
 /// The rendered diagnostics of a run expected to fail.
 fn run_error(source: &str) -> Vec<String> {
@@ -343,6 +343,89 @@ fn list_modifiers_work_through_struct_fields() {
         1,
     );
     assert_eq!(output, "3\n2\n[9, 1, 2]\n");
+}
+
+// --- Clause 4.11.4 list identity (`list_ptr==` / `!list_ptr=`) ---
+
+#[test]
+fn clause_4_11_4_list_ptr_compares_object_identity() {
+    // The migration plan's runtime test for `list_ptr==` / `!list_ptr=`:
+    // `.copy()` mints a distinct list object, assignment aliases the same
+    // object, and the regular `==` stays item-by-item.
+    let output = clean_output(
+        "<'\nextend sys {\n    run() is also {\n        var l1: list of int = {1; 2; 3};\n        \
+         var l2: list of int = l1.copy();\n        var l3: list of int = l1;\n        \
+         out(l1 list_ptr== l2, \"\\n\");\n        out(l1 list_ptr== l3, \"\\n\");\n        \
+         out(l1 !list_ptr= l2, \"\\n\");\n        out(l1 !list_ptr= l3, \"\\n\");\n        \
+         out(l1 == l2, \"\\n\");\n    };\n};\n'>\n",
+        1,
+    );
+    assert_eq!(output, "FALSE\nTRUE\nTRUE\nFALSE\nTRUE\n");
+}
+
+#[test]
+fn clause_4_11_4_regular_equality_stays_item_by_item() {
+    // Two independently built lists with equal contents: `==` is TRUE,
+    // `list_ptr==` is FALSE (distinct objects), and length/item
+    // differences make `==` FALSE.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var a: list of int = {1; 2};\n        \
+         var b: list of int = {1; 2};\n        var c: list of int = {1; 2; 3};\n        \
+         out(a == b, \" \", a == c, \" \", a list_ptr== b, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUE FALSE FALSE\n");
+}
+
+#[test]
+fn clause_4_11_4_list_assignment_aliases_and_copy_isolates() {
+    // The shared list object: mutations through one alias are visible
+    // through the other; a `.copy()` result is isolated.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var l1: list of int = {1; 2};\n        \
+         var alias: list of int = l1;\n        var l2: list of int = l1.copy();\n        \
+         l1.push(3);\n        out(l1, \" \", alias, \" \", l2, \"\\n\");\n        \
+         alias.push0(0);\n        out(l1, \"\\n\");\n        \
+         l2.push(9);\n        out(l1, \" \", l2, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        output,
+        "[1, 2, 3] [1, 2, 3] [1, 2]\n[0, 1, 2, 3]\n[0, 1, 2, 3] [1, 2, 9]\n"
+    );
+}
+
+#[test]
+fn clause_4_11_4_list_ptr_requires_lists_of_the_same_type() {
+    // 4.11.4: both operands must be lists of the same type. A mismatched
+    // declared element type (`list of int` vs `list of uint`) and a
+    // non-list operand both report `E0411` at run time.
+    let diagnostics = run_error(
+        "extend sys {\n    run() is also {\n        var a: list of int;\n        \
+         var b: list of uint;\n        out(a list_ptr== b);\n    };\n};\n",
+    );
+    assert!(
+        diagnostics[0].contains("E0411") && diagnostics[0].contains("lists of the same type"),
+        "{diagnostics:?}"
+    );
+    let diagnostics = run_error(
+        "extend sys {\n    run() is also {\n        var a: list of int;\n        \
+         out(a list_ptr== 3);\n    };\n};\n",
+    );
+    assert!(diagnostics[0].contains("E0411"), "{diagnostics:?}");
+}
+
+#[test]
+fn clause_4_6_list_concat_builds_a_fresh_list() {
+    // `{ e1; e2; ... }` (clause 4.6, Table 12): a list element
+    // contributes its items, a scalar element contributes itself.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var l1: list of int = {1; 2};\n        \
+         var l2: list of int = {3};\n        var joined: list of int = {l1; 9; l2};\n        \
+         out(joined, \" \", joined.size(), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "[1, 2, 9, 3] 4\n");
 }
 
 #[test]
@@ -990,6 +1073,37 @@ fn gen_domain_narrowing_leaves_unconstrained_fields_alone() {
 }
 
 #[test]
+fn longint_and_longuint_hold_64_bit_values() {
+    // The long bases (Table 17, clause 5.2.3.1) are signed/unsigned
+    // 64-bit: initialization and out() carry the full values, including
+    // the unsigned maximum 2^64-1, untruncated.
+    let output = clean_output(
+        "<'\nextend sys {\n    run() is also {\n        var a: longuint = 1;\n        \
+         var b: longint = -1;\n        out(a, \"\\n\");\n        out(b, \"\\n\");\n        \
+         var c: longuint = 18446744073709551615;\n        out(c, \"\\n\");\n    };\n};\n'>\n",
+        3,
+    );
+    assert_eq!(output, "1\n-1\n18446744073709551615\n");
+}
+
+#[test]
+fn gen_of_long_bases_samples_the_full_64_bit_range() {
+    // An unconstrained `longuint` samples the full unsigned 64-bit range
+    // and a `longint` the full signed one: constraints in the top quarter
+    // of the unsigned range and the bottom quarter of the signed range are
+    // both satisfiable. A sampler capped at 32 bits would exhaust the
+    // 1000 rejection attempts and report E0407.
+    let output = clean_output(
+        "struct s {\n    u: longuint;\n    i: longint;\n    \
+         keep u > 9223372036854775808;\n    keep i < -4611686018427387904;\n};\n\
+         extend sys {\n    run() is also {\n        var p: s;\n        gen p;\n        \
+         var x: longint;\n        gen x;\n        out(\"OK\\n\");\n    };\n};\n",
+        5,
+    );
+    assert_eq!(output, "OK\n");
+}
+
+#[test]
 fn down_to_counts_and_reverse_for_each_binds_the_index() {
     let output = clean_output(
         "extend sys {\n    run() is also {\n        var l: list of int;\n        \
@@ -1029,11 +1143,14 @@ fn compute_calls_inline_and_untyped_params_accept_anything() {
 
 #[test]
 fn new_reports_a_clean_runtime_diagnostic() {
+    // An untyped `new` without a declared type to infer from (here: an
+    // assignment target's field has no type known to `new`) stays
+    // unsupported.
     let result = run(
         &elaborate(
             &parse(
                 "struct s {\n    v: int;\n};\n\
-             extend sys {\n    run() is also {\n        var p: s = new;\n    };\n};\n",
+             extend sys {\n    p: s;\n    run() is also {\n        p = new;\n    };\n};\n",
             )
             .declarations,
         ),
@@ -1044,6 +1161,93 @@ fn new_reports_a_clean_runtime_diagnostic() {
         result.diagnostics[0].render().contains("E0402"),
         "expected E0402 for 'new': {:?}",
         result.diagnostics[0].render()
+    );
+}
+
+#[test]
+fn untyped_new_creates_the_var_declared_type() {
+    // `var p: s = new;` — the declared type is the instance (clause 18).
+    let output = clean_output(
+        "struct s {\n    v: int;\n};\n\
+         extend sys {\n    run() is also {\n        var p: s = new;\n        p.v = 7;\n        out(p.v, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "7\n");
+}
+
+#[test]
+fn untyped_new_in_a_typed_var_declaration_takes_the_var_type() {
+    // `var c: cfg = new;` — clause 6.3's typed creation where the type
+    // comes from the assignment target.
+    let output = clean_output(
+        "struct s {\n    v: int;\n};\n\
+         extend sys {\n    run() is also {\n        var c: s = new;\n        out(c.v, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "0\n");
+}
+
+#[test]
+fn field_init_values_are_set_at_instance_creation() {
+    // Clause 6.9.1/6.9.2/6.9.4: `!` and `const !` fields with init
+    // values; the values are set on instance creation, before `init()`
+    // would run. (The plan's list-literal init `{1; 0; 1}` needs the
+    // list-concat expression, which is not on this base — the third
+    // field is a scalar instead; see the T1.11 deviation note.)
+    let output = clean_output(
+        "<'\nstruct cfg {\n    !depth: uint = 16;\n    !name: string = \"dut\";\n    !radix: uint = 8;\n    const !limit: uint = 3;\n};\n\
+         extend sys {\n    run() is also {\n        var c: cfg = new;\n        out(c.depth, \"\\n\");\n        out(c.name, \"\\n\");\n        out(c.radix, \"\\n\");\n        out(c.limit, \"\\n\");\n    };\n};\n'>\n",
+        1,
+    );
+    assert_eq!(output, "16\ndut\n8\n3\n");
+}
+
+#[test]
+fn field_init_values_apply_to_every_instance() {
+    // Clause 6.9.4: each instance creation re-applies the init value,
+    // and `gen` does not overwrite it on a `!` field.
+    let output = clean_output(
+        "struct cfg {\n    !seed: uint = 7;\n};\n\
+         extend sys {\n    run() is also {\n        var a: cfg = new;\n        var b: cfg = new;\n        out(a.seed, \" \", b.seed, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "7 7\n");
+}
+
+#[test]
+fn const_field_keeps_its_init_value_through_gen() {
+    // Clause 6.9.4: a const field is initialised once — by its init
+    // value here — so `gen` must not overwrite it.
+    let output = clean_output(
+        "struct cfg {\n    const limit: uint = 3;\n};\n\
+         extend sys {\n    run() is also {\n        var c: cfg = new;\n        gen c;\n        out(c.limit, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "3\n");
+}
+
+#[test]
+fn static_field_prefix_is_rejected_as_unsupported() {
+    // Clause 6.9.3: the contextual `static` prefix is not parsed yet;
+    // the static-members stage owns it. A member genuinely named
+    // `static` keeps parsing.
+    let result = parse("struct s {\n    static count: uint;\n};\n");
+    let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
+    assert_eq!(rendered.len(), 1);
+    assert!(
+        rendered[0].contains("E0113") && rendered[0].contains("static"),
+        "expected the static not-supported diagnostic: {:?}",
+        rendered
+    );
+    let named = parse("struct s {\n    static: uint;\n    m: uint;\n};\n");
+    assert!(
+        named.diagnostics.is_empty(),
+        "a field named 'static' must keep parsing: {:?}",
+        named
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -2463,4 +2667,264 @@ fn event_port_edge_attribute_selects_the_edge() {
     )
     .output;
     assert_eq!(output, "EDGE\nEDGE\nDONE\n");
+}
+
+#[test]
+fn brace_grouped_members_generate_and_run() {
+    // 4.3.2 / 4.3.3: grouped statements and members are pure syntax —
+    // the generated struct behaves exactly as if its members were
+    // written flat. The grouped `keep a < 10` holds on gen (the
+    // comparison narrows the sampling domain), so `out("ok")` runs.
+    let output = clean_output(include_str!("fixtures/s2019_brace_groups.e"), 1);
+    assert_eq!(output, "ok");
+}
+
+#[test]
+fn comparison_constraints_narrow_generation() {
+    // A constant comparison in a `keep` narrows the field's sampling
+    // domain (`a < 10` directly, `0 > b` mirrored), so gen succeeds
+    // where plain rejection sampling over an unbounded scalar would
+    // exhaust its attempts. The drawn values still satisfy the
+    // constraints as written.
+    let output = clean_output(
+        "struct s {\n    a: uint;\n    keep a < 10;\n    b: int;\n    keep 0 > b;\n};\n\
+         extend sys {\n    run() is also {\n        var x: s;\n        gen x;\n        \
+         out(x.a < 10, \" \", x.b < 0, \"\\n\");\n    };\n};\n",
+        7,
+    );
+    assert_eq!(output, "TRUE TRUE\n");
+}
+
+#[test]
+fn in_table_keep_constrains_gen_and_direct_checks_decide() {
+    // 4.11.8: a `keep (a, b, c) in_table { rows }` constrains the tuple
+    // to the rows — every generated instance must match at least one
+    // row — and the same construct decides directly as an expression
+    // (with `not` negating).
+    let output = clean_output(
+        "type speed_t: [LOW, HIGH, FULL];\n\
+         type kind_t: [DATA, INTERRUPT, CONTROL];\n\
+         struct pipe {\n\
+         \x20   kind: kind_t;\n\
+         \x20   speed: speed_t;\n\
+         \x20   size: uint;\n\
+         \x20   keep (kind, speed, size) in_table {\n\
+         \x20       INTERRUPT, FULL, [0..300];\n\
+         \x20       CONTROL,   HIGH, 100;\n\
+         \x20       DATA,      LOW,  1;\n\
+         \x20   };\n\
+         };\n\
+         extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var p: pipe;\n\
+         \x20       for i from 1 to 20 {\n\
+         \x20           gen p;\n\
+         \x20           if (p.kind, p.speed, p.size) not in_table {\n\
+         \x20               INTERRUPT, FULL, [0..300];\n\
+         \x20               CONTROL,   HIGH, 100;\n\
+         \x20               DATA,      LOW,  1;\n\
+         \x20           } then { out(\"BAD\") };\n\
+         \x20       };\n\
+         \x20       out((DATA, LOW, 1) in_table { DATA, LOW, 1 });\n\
+         \x20       out((DATA, LOW, 2) in_table { DATA, LOW, 1 });\n\
+         \x20       out((DATA, LOW, 2) not in_table { DATA, LOW, 1 });\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert!(
+        !output.contains("BAD"),
+        "every generated instance matches a row: {output}"
+    );
+    assert!(output.ends_with("TRUEFALSETRUE"), "output: {output}");
+}
+
+#[test]
+fn in_table_set_row_elements_match_by_membership() {
+    // 4.11.8: a set row element matches by `in` — a range literal, an
+    // item list, and a set_of_values type set; a scalar element by `==`.
+    let output = clean_output(
+        "extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       out((5) in_table { [1, 5, 9]; });\n\
+         \x20       out((5) in_table { [0..4]; });\n\
+         \x20       out((5) in_table { [0..300]; });\n\
+         \x20       out((5) in_table { set_of_values(uint(bits: 3)); });\n\
+         \x20       out((TRUE) in_table { [TRUE, FALSE]; });\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "TRUEFALSETRUETRUETRUE");
+}
+
+#[test]
+fn in_table_element_type_mismatch_reports_e0412() {
+    // A tuple element and a row element of incompatible kinds — an
+    // integer against a string — report E0412 at run time.
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        out((1, \"a\") in_table { 1, 2; });\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>(),
+        vec!["E0412"]
+    );
+}
+
+#[test]
+fn evaluate_expression_yields_the_block_variable() {
+    // 4.17.7: the actions run; the implicit `value` (or the named
+    // variable) after the block is the expression's value.
+    let output = clean_output(
+        "extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var x: int = evaluate { value = 3; value = value * 4 };\n\
+         \x20       var y: uint = evaluate uint (acc) { acc = 1; for i from 1 to 4 { acc = acc * 2 } };\n\
+         \x20       out(x); out(y);\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "1216");
+}
+
+#[test]
+fn evaluate_infers_from_assignment_and_var_forms() {
+    // 4.17.7 type inference v1: the declared type of the assignment
+    // target, and the `(var)` form without a declared type.
+    let output = clean_output(
+        "extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var z: int;\n\
+         \x20       z = evaluate { value = 7 };\n\
+         \x20       out(z);\n\
+         \x20       var w: int = evaluate (v) { v = 1 + 1 };\n\
+         \x20       out(w);\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "72");
+}
+
+#[test]
+fn evaluate_without_an_inferable_type_reports_e0122() {
+    // 4.17.7: an untyped evaluate with no assignment/var target and no
+    // parameter context cannot infer its result type (E0122).
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        out(evaluate { value = 1; });\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>(),
+        vec!["E0122"]
+    );
+}
+
+#[test]
+fn typeof_and_typeof_item_resolve_in_type_positions() {
+    // 5.9: `typeof_item(data)` is the element type of the list field
+    // (`byte`), `typeof(first_item)` chains to the same static type —
+    // the expression is never evaluated, the resolved type substitutes
+    // wherever the type position is used. `x.n` therefore behaves as a
+    // byte (200 + 55 wraps to 255) and `typeof(x.n)` types a local var.
+    let output = clean_output(
+        "struct s {\n    data: list of byte;\n    first_item: typeof_item(data);\n    n: typeof(first_item);\n};\n\
+         extend sys {\n    run() is also {\n        var x: s = new;\n        x.first_item = 200;\n        \
+         x.n = x.first_item + 55;\n        out(x.n, \"\\n\");\n        var k: typeof(x.n) = 7;\n        \
+         out(k, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "255\n7\n");
+}
+
+#[test]
+fn typeof_resolves_through_local_vars_and_literals() {
+    // 5.9: a local var's declared type and a literal's scalar base are
+    // the static types typeof() resolves against; `typeof(x.first_item)`
+    // walks a member path through a struct-typed local, and a literal
+    // argument types a list's element.
+    let output = clean_output(
+        "struct s {\n    data: list of byte;\n    first_item: typeof_item(data);\n};\n\
+         extend sys {\n    run() is also {\n        var x: s = new;\n        var k: typeof(x.first_item) = 3;\n        \
+         var l: list of typeof(k);\n        l.push(k * 2);\n        out(l[0], \"\\n\");\n        \
+         var m: typeof(5) = 9;\n        out(m + 1, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "6\n10\n");
+}
+
+#[test]
+fn qualified_field_access_reads_when_subtype_fields() {
+    // 4.17.3: a subtype-qualified access reads the field declared in the
+    // matching when subtype — with short qualifiers (`red'good`), full
+    // ones (`TRUE'good`, `red'color`), order-independent words
+    // (`green'color'big'size`), and qualifiers already implied by the
+    // static type omitted (`red'color` on a `good packet`, `big'green`).
+    // The instance must currently match the subtype; the sys keeps fix
+    // the determinants before run() reads them.
+    let output = clean_output(
+        "type color_t: [red, green, blue];\n\
+         type size_t: [big, medium, small];\n\
+         struct packet {\n    color: color_t;\n    size: size_t;\n    good: bool;\n    \
+         when red good packet { x: int; keep x == 5; };\n    \
+         when big'size green'color packet { y: uint; keep y == 9; };\n};\n\
+         extend sys {\n    p1: good packet;  keep p1.color == red;\n    \
+         p2: packet;       keep p2.color == green; keep p2.size == big;\n    \
+         run() is also {\n        out(p1.red'good'x, \"\\n\");\n        out(p1.TRUE'good'red'x, \"\\n\");\n        \
+         out(p1.red'color'x, \"\\n\");\n        out(p2.green'color'big'size'y, \"\\n\");\n        \
+         out(p2.big'green'y, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "5\n5\n5\n9\n9\n");
+}
+
+#[test]
+fn qualified_field_access_on_non_matching_subtype_reports_e0413() {
+    // 4.17.3 at run time: p2's color is green (its keep), so it is not a
+    // `red good packet` and the field x is not present — E0413 names the
+    // field and the subtype.
+    let result = run_source(
+        "type color_t: [red, green, blue];\n\
+         struct packet {\n    color: color_t;\n    good: bool;\n    \
+         when red good packet { x: int; keep x == 5; };\n};\n\
+         extend sys {\n    p2: packet; keep p2.color == green;\n    \
+         run() is also {\n        out(p2.red'good'x, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0413");
+    assert!(
+        diagnostic
+            .render()
+            .contains("field 'x' is not present: instance is not of subtype 'red good packet'"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn qualified_field_access_writes_and_checks_presence() {
+    // 4.17.3: a write through a subtype-qualified access lands only when
+    // the instance currently matches the subtype, and `is a` still
+    // dispatches on the plain base type.
+    let output = clean_output(
+        "type color_t: [red, green, blue];\n\
+         struct packet {\n    color: color_t;\n    good: bool;\n    \
+         when red good packet { x: int; keep x == 5; };\n};\n\
+         extend sys {\n    p1: good packet; keep p1.color == red;\n    \
+         run() is also {\n        p1.red'good'x = 41;\n        out(p1.red'good'x + 1, \"\\n\");\n        \
+         if p1 is a packet {\n            out(\"IS A PACKET\\n\");\n        };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "42\nIS A PACKET\n");
 }

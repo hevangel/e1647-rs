@@ -258,7 +258,7 @@ fn expression_precedence() {
 }
 
 #[test]
-fn clause_4_5_places_xor_identity_and_in() {
+fn clause_4_6_places_xor_identity_and_in() {
     let declarations = expect_clean(
         "struct s {\n    a: uint;\n    b: uint;\n    c: uint;\n    flag: bool;\n    y: bool;\n    \
          keep a === b == c;\n    keep a == b === c;\n    keep flag && a in [1, 2];\n    \
@@ -352,6 +352,180 @@ fn clause_4_5_places_xor_identity_and_in() {
             ..
         }
     ));
+}
+
+#[test]
+fn clause_4_6_table_12_row_order() {
+    // IEEE 1647-2019 Table 12 (clause 4.6), over the rows implemented:
+    // `in` binds tighter than the bitwise `&` / `|` / `^` rows, which in
+    // turn bind tighter than `&&`; `=>` binds looser than `||`; `? :` is
+    // the loosest construct. (`list_ptr==`/`!list_ptr=` share the
+    // equality row and `in_table` the `in` row — other tasks.)
+    let declarations = expect_clean(
+        "struct s {\n    x: uint;\n    y: uint;\n    z: uint;\n    flag: bool;\n    \
+         keep x & y in [1, 2];\n    keep x | y in [1, 2];\n    keep x ^ y in [1, 2];\n    \
+         keep x & y && flag;\n    keep x | y && flag;\n    keep x ^ y && flag;\n    \
+         keep x || y => flag;\n    keep flag || x ? y : z;\n};\n",
+    );
+    let keep = |index: usize| match &declarations[0].members[4 + index] {
+        Member::Constraint(constraint) => &constraint.expr,
+        _ => panic!("expected a keep constraint"),
+    };
+    // `in` is tighter than `&`, `|` and `^`: x op (y in [1, 2])
+    for (index, op) in [
+        (0, BinaryOp::BitAnd),
+        (1, BinaryOp::BitOr),
+        (2, BinaryOp::BitXor),
+    ] {
+        let Expr::Binary { op: top, rhs, .. } = keep(index) else {
+            panic!("expected a binary constraint at keep {index}");
+        };
+        assert_eq!(
+            *top, op,
+            "expected the bitwise operator on top of keep {index}"
+        );
+        assert!(
+            matches!(rhs.as_ref(), Expr::InSet { .. }),
+            "expected 'in' absorbed into the right operand of keep {index}"
+        );
+    }
+    // `&`, `|` and `^` are tighter than `&&`: (x op y) && flag
+    for (index, op) in [
+        (3, BinaryOp::BitAnd),
+        (4, BinaryOp::BitOr),
+        (5, BinaryOp::BitXor),
+    ] {
+        let Expr::Binary {
+            op: top, lhs, rhs, ..
+        } = keep(index)
+        else {
+            panic!("expected a binary constraint at keep {index}");
+        };
+        assert_eq!(
+            *top,
+            BinaryOp::LogicalAnd,
+            "expected && on top of keep {index}"
+        );
+        assert!(
+            matches!(lhs.as_ref(), Expr::Binary { op: lhs_op, .. } if *lhs_op == op),
+            "expected the bitwise operator under the && of keep {index}"
+        );
+        assert!(matches!(rhs.as_ref(), Expr::Ident { .. }));
+    }
+    // `=>` is looser than `||`: (x || y) => flag
+    let Expr::Binary {
+        op: BinaryOp::Imply,
+        lhs,
+        ..
+    } = keep(6)
+    else {
+        panic!("expected => at the top of x || y => flag");
+    };
+    assert!(matches!(
+        lhs.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::LogicalOr,
+            ..
+        }
+    ));
+    // `? :` is the loosest: (flag || x) ? y : z
+    let Expr::Ternary { cond, .. } = keep(7) else {
+        panic!("expected the ternary on top of flag || x ? y : z");
+    };
+    assert!(matches!(
+        cond.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::LogicalOr,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn clause_4_11_4_places_list_ptr_in_the_equality_row() {
+    let declarations = expect_clean(
+        "struct s {\n    a: uint;\n    b: uint;\n    c: uint;\n    l1: list of int;\n    l2: list of int;\n    \
+         keep a == b list_ptr== c;\n    keep a list_ptr== b == c;\n    keep l1 !list_ptr= l2;\n};\n",
+    );
+    let keep = |index: usize| match &declarations[0].members[5 + index] {
+        Member::Constraint(constraint) => &constraint.expr,
+        _ => panic!("expected a keep constraint"),
+    };
+    // Left-associative at one level (clause 4.6, Table 12): the equality
+    // operators share a row, so `a == b list_ptr== c` groups as
+    // `(a == b) list_ptr== c`.
+    let Expr::Binary {
+        op: BinaryOp::ListPtrEq,
+        lhs,
+        rhs,
+        ..
+    } = keep(0)
+    else {
+        panic!("expected list_ptr== at the top of a == b list_ptr== c");
+    };
+    assert!(matches!(
+        lhs.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            ..
+        }
+    ));
+    assert!(matches!(rhs.as_ref(), Expr::Ident { name, .. } if name == "c"));
+    // ... and `a list_ptr== b == c` groups as `(a list_ptr== b) == c`.
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        lhs,
+        ..
+    } = keep(1)
+    else {
+        panic!("expected == at the top of a list_ptr== b == c");
+    };
+    assert!(matches!(
+        lhs.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::ListPtrEq,
+            ..
+        }
+    ));
+    // `!list_ptr=` is the negation, at the same row.
+    let Expr::Binary {
+        op: BinaryOp::ListPtrNe,
+        ..
+    } = keep(2)
+    else {
+        panic!("expected !list_ptr= for the third constraint");
+    };
+}
+
+#[test]
+fn clause_4_6_list_concat_parses_in_expression_position() {
+    let declarations = expect_clean(
+        "struct s {\n    run() is {\n        var l1: list of int = {1; 2; 3};\n        \
+         var l2: list of int = {};\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    let Some(Stmt::VarDecl {
+        init: Some(init), ..
+    }) = run.body.first()
+    else {
+        panic!("expected a var declaration with an initializer");
+    };
+    let Expr::ListConcat { items, .. } = init else {
+        panic!("expected a list concat");
+    };
+    assert_eq!(items.len(), 3);
+    let Some(Stmt::VarDecl {
+        init: Some(init), ..
+    }) = run.body.get(1)
+    else {
+        panic!("expected a second var declaration");
+    };
+    let Expr::ListConcat { items, .. } = init else {
+        panic!("expected a list concat");
+    };
+    assert!(items.is_empty());
 }
 
 #[test]
@@ -864,7 +1038,7 @@ fn prefixed_field_declarations_parse() {
 }
 
 #[test]
-fn clause_4_5_places_string_match_between_identity_and_in() {
+fn clause_4_6_places_string_match_between_identity_and_in() {
     let declarations = expect_clean(
         "struct s {\n    a: string;\n    b: string;\n    c: string;\n    \
          keep a ~ b;\n    keep a !~ b;\n    keep a === b ~ c;\n    \
@@ -1023,14 +1197,15 @@ fn bare_is_is_not_consumed_as_a_type_check() {
 
 #[test]
 fn extend_global_is_rejected() {
-    // Clause 4.4.2.2: extensions of `global` are reserved for the runtime.
+    // Clause 4.4.2.2: extensions of `global` are reserved for the
+    // implementation.
     let result = parse("extend global {\n    helper: uint;\n};\n");
     assert!(result.declarations.is_empty());
     let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
     assert_eq!(
         rendered,
         vec![
-            "1:8: error[E0116]: cannot extend 'global': extensions of the root type are reserved for the runtime"
+            "1:8: error[E0116]: extending 'global' is reserved for the implementation (clause 4.4.2.2)"
                 .to_owned()
         ]
     );
@@ -1789,4 +1964,116 @@ fn sync_statements_parse_bare_and_temporal_forms() {
             "expected an event atom or sampled sequence: {te:?}"
         );
     }
+}
+
+#[test]
+fn in_table_parses_tuple_rows_and_negation() {
+    // 4.11.8: `(a, b) [not] in_table { row; row; }` — the tuple is an
+    // expression only in this construct; a row element is a scalar
+    // expression or a set literal.
+    let declarations = expect_clean(
+        "struct s {\n    a: uint;\n    b: uint;\n    \
+         keep (a, b) in_table { 1, [0..300]; 2, [7, 9]; };\n\
+         keep (a, b) not in_table { 1, 2; };\n};\n",
+    );
+    let Member::Constraint(positive) = &declarations[0].members[2] else {
+        panic!("expected the in_table keep");
+    };
+    let Expr::InTable {
+        tuple,
+        rows,
+        negated,
+        ..
+    } = &positive.expr
+    else {
+        panic!("expected an in_table expression: {:?}", positive.expr);
+    };
+    assert_eq!(tuple.len(), 2);
+    assert_eq!(rows.len(), 2);
+    assert!(!*negated);
+    assert!(
+        matches!(rows[0][0], e1647::ast::TableElem::Scalar(_)),
+        "a scalar row element: {:?}",
+        rows[0][0]
+    );
+    assert!(
+        matches!(
+            rows[0][1],
+            e1647::ast::TableElem::Set(e1647::ast::InSetExpr::Range(_, _))
+        ),
+        "a range set row element: {:?}",
+        rows[0][1]
+    );
+    assert!(
+        matches!(
+            rows[1][1],
+            e1647::ast::TableElem::Set(e1647::ast::InSetExpr::Items(_))
+        ),
+        "an item-list set row element: {:?}",
+        rows[1][1]
+    );
+    let Member::Constraint(negative) = &declarations[0].members[3] else {
+        panic!("expected the negated in_table keep");
+    };
+    let Expr::InTable { negated, .. } = &negative.expr else {
+        panic!("expected an in_table expression: {:?}", negative.expr);
+    };
+    assert!(*negated);
+}
+
+#[test]
+fn evaluate_parses_type_variable_and_body() {
+    // 4.17.7: `evaluate [type] [(var)] { actions }` — all spellings,
+    // and the `evaluate(x)` call fallback for a method named evaluate.
+    let declarations = expect_clean(
+        "struct s {\n    run() is {\n        \
+         var x: int = evaluate { value = 1 };\n        \
+         var y: uint = evaluate uint (acc) { acc = 2 };\n        \
+         var z: int = evaluate int { value = 3 };\n        \
+         evaluate(x);\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected the run method");
+    };
+    assert_eq!(run.body.len(), 4);
+    let Stmt::VarDecl {
+        init: Some(init), ..
+    } = &run.body[0]
+    else {
+        panic!("expected the first var decl");
+    };
+    let Expr::Evaluate { ty, var, body, .. } = init else {
+        panic!("expected an evaluate expression: {init:?}");
+    };
+    assert!(ty.is_none() && var.is_none() && body.len() == 1);
+    let Stmt::VarDecl {
+        init: Some(init), ..
+    } = &run.body[1]
+    else {
+        panic!("expected the second var decl");
+    };
+    let Expr::Evaluate { ty, var, .. } = init else {
+        panic!("expected an evaluate expression: {init:?}");
+    };
+    assert!(
+        matches!(
+            ty,
+            Some(TypeExpr::Scalar {
+                base: ScalarBase::Uint,
+                ..
+            })
+        ),
+        "expected a uint type: {ty:?}"
+    );
+    assert_eq!(var.as_deref(), Some("acc"));
+    let Stmt::ExprStmt { expr, .. } = &run.body[3] else {
+        panic!("expected the call statement");
+    };
+    let Expr::Call { callee, .. } = expr else {
+        panic!("expected 'evaluate(x)' to parse as a call: {expr:?}");
+    };
+    let Expr::Ident { name, .. } = callee.as_ref() else {
+        panic!("expected a plain callee: {callee:?}");
+    };
+    assert_eq!(name, "evaluate");
 }

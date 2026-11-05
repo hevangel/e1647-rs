@@ -1,1 +1,1 @@
-1:8: error[E0116]: cannot extend 'global': extensions of the root type are reserved for the runtime
+1:8: error[E0116]: extending 'global' is reserved for the implementation (clause 4.4.2.2)

@@ -35,8 +35,8 @@ browser sandbox API is not started.
   literals accept MVL digits. A bare `'` is punctuation, so
   `'path.to.signal'` can be parsed later. Reports the first lexical
   error; later stages collect many. MVL literals are tokenized and not
-  evaluated. Block comments (`/* */`) are still accepted beyond
-  clause 4.2.4.
+  evaluated. Block comments (`/* */`) are standard (clause 4.2.4):
+  they span lines and code segments and do not nest.
 - `src/ast.rs` — typed AST for declarations (including `type` enumerals,
   `when` subtypes, `simple_port`, `event`, `import` and `define`), fields,
   type expressions, constraint expressions, methods (including a TCM
@@ -242,7 +242,13 @@ browser sandbox API is not started.
   prose names is not wired; `range(...)`'s numeric parameters beyond
   bounds/label are recorded, not applied.
 - `src/interp.rs` — interpreter for the statement subset (codes
-  `E0401`–`E0410`). Entry: the built-in `sys` unit's `run()` methods, with
+  `E0401`–`E0413`). List values (clause 4.11.4's `list_ptr==`) carry
+  reference identity: a `Value::List` holds its items behind a shared
+  `Rc<RefCell<Vec<Value>>>` handle — assignment aliases the same list
+  object, `copy()` (27.4.3) mints a fresh one, the 27.3 modifying
+  pseudo-methods mutate the shared storage in place, and the recursive
+  read paths are depth-bounded. Entry: the built-in `sys` unit's `run()`
+  methods, with
   and named types by declared name, walking `like` bases — subtype-aware
   dispatch is a later milestone. String matching evaluates only the
   case-insensitive full-string literal subset; `/.../` AWK patterns and

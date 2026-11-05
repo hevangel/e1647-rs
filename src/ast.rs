@@ -41,6 +41,11 @@ pub struct Declaration {
     /// the underlying representation, recorded only. Distinct-type
     /// semantics over it are a later milestone.
     pub underlying: Option<TypeExpr>,
+    /// `type name: <scalar> [low..high];` — the range qualification of a
+    /// numeric subtype declaration (clause 5.2.3.1), recorded only. The
+    /// well-formedness check rejects subtypes of `longint`/`longuint`
+    /// (E0207); the range does not narrow values yet.
+    pub subtype_range: Option<(Expr, Expr)>,
     /// `template struct name of <params> { .. }` (clause 8): the formal
     /// type parameters, recorded. Instantiation (monomorphization) is a
     /// later milestone.
@@ -131,6 +136,14 @@ pub struct SubtypeModifier {
     pub id: Option<(String, Span)>,
 }
 
+/// A subtype qualifier of a dot access (`p.red'good'x`, clause 4.17.3).
+/// The same shape as a `when` block's [`SubtypeModifier`]: the resolution
+/// matches a qualifier word against a synthesized when view's
+/// discriminating (field id, value) pairs — a short word (`red`) may name
+/// the pair's value (`red'color`) or, for a Boolean determinant, the pair's
+/// field id (`good` for `TRUE'good`).
+pub type WhenQualifier = SubtypeModifier;
+
 /// Port direction of a [`PortDecl`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortDirection {
@@ -203,8 +216,20 @@ pub struct Field {
     pub physical: bool,
     /// `!name` do-not-generate field (skipped by `gen`).
     pub no_gen: bool,
-    /// `package name: ...;` / `private name: ...;` visibility prefix
-    /// (clause 22), recorded only.
+    /// `~name` range-generated field (clause 6.9.7). Parsed here; the
+    /// reduced-set generation semantics are the range-generation stage.
+    pub range_gen: bool,
+    /// `const name` prefix (clause 6.9.4): the field is initialised once
+    /// — by its init value, in `init()`, or by `do_unpack()`.
+    pub is_const: bool,
+    /// `= init-value` suffix (clause 6.9.1/6.9.2), as written. Allowed
+    /// only where a value is not generated (a `!` or `const` field;
+    /// `static` is a later stage) and only for scalar/string/set fields
+    /// or lists thereof; `check.rs` enforces the generated-field rule
+    /// (E0211).
+    pub init: Option<Expr>,
+    /// `package name: ...;` / `protected name: ...;` / `private name:
+    /// ...;` visibility prefix (clause 22), recorded only.
     pub visibility: Option<String>,
 }
 
@@ -554,6 +579,13 @@ impl Stmt {
 pub enum ScalarBase {
     Uint,
     Int,
+    /// Signed 64-bit (Table 17, clause 5.2.3.1). Not the same type as
+    /// `int(bits: 64)` — the two differ in expression sizing and
+    /// arithmetic rules (the T7.4 milestone; not modeled yet).
+    Longint,
+    /// Unsigned 64-bit (Table 17, clause 5.2.3.1). Not the same type as
+    /// `uint(bits: 64)` — see [`ScalarBase::Longint`].
+    Longuint,
     Bit,
     Byte,
     Nibble,
@@ -564,10 +596,18 @@ pub enum ScalarBase {
 }
 
 impl ScalarBase {
+    /// The predefined scalar base named by a type word. `int`, `uint` and
+    /// friends lex as keywords; `longint`/`longuint` are Table 17 names
+    /// that lex as identifiers and reach here from the identifier branch
+    /// of the type grammar (the reference grammar treats type names as
+    /// identifiers, so they are deliberately not in the lexer's
+    /// [`crate::lexer::KEYWORDS`]).
     pub fn from_keyword(keyword: &str) -> Option<Self> {
         Some(match keyword {
             "uint" => Self::Uint,
             "int" => Self::Int,
+            "longint" => Self::Longint,
+            "longuint" => Self::Longuint,
             "bit" => Self::Bit,
             "byte" => Self::Byte,
             "nibble" => Self::Nibble,
@@ -583,6 +623,8 @@ impl ScalarBase {
         match self {
             Self::Uint => "uint",
             Self::Int => "int",
+            Self::Longint => "longint",
+            Self::Longuint => "longuint",
             Self::Bit => "bit",
             Self::Byte => "byte",
             Self::Nibble => "nibble",
@@ -633,6 +675,16 @@ pub enum TypeExpr {
         args: Vec<TypeExpr>,
         span: Span,
     },
+    /// `typeof(exp)` in a type position (clause 5.9): the static type of
+    /// `exp` — the expression is never evaluated (purely compile-time;
+    /// typical use is inside macros). Resolution against the current
+    /// minimal type information happens during elaboration: a field path,
+    /// a local `var`, a method parameter or a literal resolves; anything
+    /// else is reported (`E0208`) and the placeholder stays.
+    TypeOf { expr: Box<Expr>, span: Span },
+    /// `typeof_item(exp)` in a type position (clause 5.9): the element
+    /// type of a list-typed `exp`. A non-list argument is `E0209`.
+    TypeOfItem { expr: Box<Expr>, span: Span },
 }
 
 impl TypeExpr {
@@ -644,7 +696,9 @@ impl TypeExpr {
             | TypeExpr::WhenQualified { span, .. }
             | TypeExpr::InlineEnum { span, .. }
             | TypeExpr::Formal { span, .. }
-            | TypeExpr::TemplateRef { span, .. } => *span,
+            | TypeExpr::TemplateRef { span, .. }
+            | TypeExpr::TypeOf { span, .. }
+            | TypeExpr::TypeOfItem { span, .. } => *span,
         }
     }
 
@@ -668,7 +722,35 @@ impl TypeExpr {
             TypeExpr::InlineEnum { names, .. } => format!("[{}]", names.join(", ")),
             TypeExpr::Formal { name, .. } => format!("<{name}>"),
             TypeExpr::TemplateRef { name, args, .. } => template_instance_name(name, args),
+            TypeExpr::TypeOf { expr, .. } => format!("typeof({})", render_expr_compact(expr)),
+            TypeExpr::TypeOfItem { expr, .. } => {
+                format!("typeof_item({})", render_expr_compact(expr))
+            }
         }
+    }
+}
+
+/// A compact source-like rendering of an expression, used only for
+/// diagnostics and canonical type names (there is no general expression
+/// printer in this milestone). Shapes beyond these render as `...`.
+pub fn render_expr_compact(expr: &Expr) -> String {
+    match expr {
+        Expr::IntLiteral { text, .. } | Expr::RealLiteral { text, .. } => text.clone(),
+        Expr::BitLiteral { text, .. } => text.clone(),
+        Expr::BoolLiteral { value, .. } => {
+            if *value {
+                "TRUE".to_owned()
+            } else {
+                "FALSE".to_owned()
+            }
+        }
+        Expr::StringLiteral { value, .. } => format!("\"{value}\""),
+        Expr::Ident { name, .. } => name.clone(),
+        Expr::MemberAccess { object, name, .. } => {
+            format!("{}.{}", render_expr_compact(object), name)
+        }
+        Expr::Paren { expr, .. } => format!("({})", render_expr_compact(expr)),
+        _ => "...".to_owned(),
     }
 }
 
@@ -688,6 +770,13 @@ pub enum BinaryOp {
     BitAnd,
     Eq,
     NotEq,
+    /// `lhs list_ptr== rhs` — TRUE iff both operands denote the same list
+    /// object (pointer identity, clause 4.11.4); the regular [`BinaryOp::Eq`]
+    /// stays item-by-item. Both operands must be lists of the same type.
+    ListPtrEq,
+    /// `lhs !list_ptr= rhs` — the negation of [`BinaryOp::ListPtrEq`]
+    /// (clause 4.11.4).
+    ListPtrNe,
     IdentityEq,
     IdentityNe,
     Lt,
@@ -838,6 +927,15 @@ pub enum Expr {
         set: InSetExpr,
         span: Span,
     },
+    /// `{ e1; e2; ... }` — the list-concat operator of the precedence
+    /// table (clause 4.6, Table 12): a fresh list; each element
+    /// contributes itself, and a list element contributes its items. The
+    /// element type is not known at the literal (a variable's declared
+    /// type names it at run time).
+    ListConcat {
+        items: Vec<Expr>,
+        span: Span,
+    },
     /// `expr is a ty` / `expr is not a ty` — the type check operator
     /// (clause 4.17.1), with the optional `(name)` binding of a true match
     /// to a local. Runtime type dispatch is exact-name only; there is
@@ -849,6 +947,50 @@ pub enum Expr {
         negated: bool,
         span: Span,
     },
+    /// `(exp1, ..., expN) [not] in_table { row; row; ... }` (clause
+    /// 4.11.8). TRUE iff some row matches the tuple element-wise — a
+    /// scalar row element by `==`, a set row element by `in`; `not`
+    /// negates. A tuple is an expression only in this construct, so the
+    /// parser produces [`Expr::InTable`] atomically (never an
+    /// intermediate tuple expression).
+    InTable {
+        tuple: Vec<Expr>,
+        rows: Vec<Vec<TableElem>>,
+        negated: bool,
+        span: Span,
+    },
+    /// `evaluate [type] [(var)] { action; ... }` (clause 4.17.7) — an
+    /// expression: the actions run, and the value of the named variable
+    /// (`value` by default) after the block is the value. The variable
+    /// is visible only inside the block and starts at its type's
+    /// default. `type` given → that type; otherwise the type is
+    /// inferred at run time from the context (the declared type of the
+    /// assignment/`var` target or of the call's parameter); when
+    /// neither exists the interpreter reports `E0122`. `return`/`wait`/
+    /// `sync` inside are rejected at parse time (`E0123`).
+    Evaluate {
+        ty: Option<TypeExpr>,
+        var: Option<String>,
+        body: Vec<Stmt>,
+        span: Span,
+    },
+    /// `struct-exp.qual'qual'...'field` — a field access qualified by
+    /// when-subtype words (clause 4.17.3). The qualifier sequence is
+    /// legal iff the same words separated by spaces would form a legal
+    /// when-subtype name; qualifiers already implied by the static type
+    /// of the base expression may be omitted. Each qualifier is a value
+    /// word (`red`) or a full `value'id` pair (`red'color`) — both
+    /// spellings lex identically after the dot here, so every qualifier
+    /// is recorded value-only and resolution matches a word against the
+    /// synthesized when view's (field id, value) pairs, by value or (for
+    /// a Boolean determinant's short form) by field id.
+    QualifiedField {
+        base: Box<Expr>,
+        qualifiers: Vec<WhenQualifier>,
+        field: String,
+        field_span: Span,
+        span: Span,
+    },
 }
 
 /// The right-hand side of an `in` membership expression.
@@ -858,6 +1000,20 @@ pub enum InSetExpr {
     Items(Vec<Expr>),
     /// `[low .. high]` — inclusive numeric range.
     Range(Box<Expr>, Box<Expr>),
+}
+
+/// One element of an `in_table` row (clause 4.11.8): a scalar expression
+/// (matched against the tuple element by `==`) or a set (matched by
+/// `in` — a set literal for enum/bool elements, any set expression for
+/// numeric elements).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableElem {
+    /// A scalar row element.
+    Scalar(Expr),
+    /// A set literal `[a, b]` / `[lo..hi]`.
+    Set(InSetExpr),
+    /// `set_of_values(T)` / `full_set_of_values(T)` (5.10.5/5.10.6).
+    TypeSet { ty: TypeExpr, full: bool },
 }
 
 /// One weighted arm of a [`Expr::Select`] distribution: the weight
@@ -955,7 +1111,11 @@ impl Expr {
             | Expr::SetOfValues { span, .. }
             | Expr::BitSlice { span, .. }
             | Expr::InSet { span, .. }
+            | Expr::ListConcat { span, .. }
             | Expr::IsA { span, .. }
+            | Expr::InTable { span, .. }
+            | Expr::Evaluate { span, .. }
+            | Expr::QualifiedField { span, .. }
             | Expr::New { span, .. }
             | Expr::Select { span, .. }
             | Expr::HdlPath { span, .. } => *span,

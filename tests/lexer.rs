@@ -309,6 +309,56 @@ fn negative_string_match_is_one_token() {
 }
 
 #[test]
+fn list_identity_operators_are_one_token_each() {
+    // `list_ptr==` / `!list_ptr=` (clause 4.11.4) are glued word+symbol
+    // operators, tokenized by longest match as single tokens.
+    assert_eq!(
+        kinds("l1 list_ptr== l2"),
+        vec![
+            TokenKind::Identifier("l1".into()),
+            TokenKind::Punctuation("list_ptr==".into()),
+            TokenKind::Identifier("l2".into())
+        ]
+    );
+    assert_eq!(
+        kinds("l1!list_ptr=l2"),
+        vec![
+            TokenKind::Identifier("l1".into()),
+            TokenKind::Punctuation("!list_ptr=".into()),
+            TokenKind::Identifier("l2".into())
+        ]
+    );
+    // `list_ptr` alone is an ordinary identifier (not a keyword), and a
+    // `!` before anything but `list_ptr=` keeps the old two-token read.
+    assert_eq!(
+        kinds("list_ptr"),
+        vec![TokenKind::Identifier("list_ptr".into())]
+    );
+    assert_eq!(
+        kinds("list_ptr =="),
+        vec![
+            TokenKind::Identifier("list_ptr".into()),
+            TokenKind::Punctuation("==".into())
+        ]
+    );
+    assert_eq!(
+        kinds("!x"),
+        vec![
+            TokenKind::Punctuation("!".into()),
+            TokenKind::Identifier("x".into())
+        ]
+    );
+    assert_eq!(
+        kinds("a != b"),
+        vec![
+            TokenKind::Identifier("a".into()),
+            TokenKind::Punctuation("!=".into()),
+            TokenKind::Identifier("b".into())
+        ]
+    );
+}
+
+#[test]
 fn based_and_prefixed_numerals() {
     assert_eq!(
         kinds("8'b1010 'hFF 'b1010 'd15 'o17 'x1f 'F0F 0xAB 0b1010 0o17 0xAB CD"),
@@ -354,10 +404,25 @@ fn rejects_bad_based_literals() {
     // `Z` is an MVL digit on a hex value (clause 4.2.5.4), so this is one
     // literal rather than a bad hex digit.
     assert_eq!(kinds("8'xZZ"), vec![TokenKind::Number("8'xZZ".into())]);
-    let error = tokenize("'d").unwrap_err();
-    assert_eq!(error.message, "invalid based literal");
     let error = tokenize("8'").unwrap_err();
     assert_eq!(error.message, "invalid based literal");
+}
+
+#[test]
+fn unsized_base_letter_without_digits_is_a_quote_not_a_literal() {
+    // 4.17.3's subtype qualifiers (`p.red'x`, `p.big'd`) lex `'` plus a
+    // base-letter word as the standalone quote and an identifier: a
+    // based literal commits only when a digit of its base follows the
+    // base letter. The sized form (`8'` above) keeps its error.
+    assert_eq!(
+        kinds("'d"),
+        vec![
+            TokenKind::Punctuation("'".into()),
+            TokenKind::Identifier("d".into()),
+        ]
+    );
+    assert_eq!(kinds("'hFF"), vec![TokenKind::Number("'hFF".into())]);
+    assert_eq!(kinds("'bX"), vec![TokenKind::Number("'bX".into())]);
 }
 
 #[test]
@@ -574,5 +639,79 @@ fn source_without_code_blocks_is_all_code() {
         tokens
             .iter()
             .any(|t| matches!(&t.kind, TokenKind::Keyword(k) if k == "keep"))
+    );
+}
+
+#[test]
+fn block_comments_are_standard_multiline_and_non_nesting() {
+    // Clause 4.2.4: `/* ... */` may start and end anywhere on a line and
+    // span lines; it does not nest — a second `/*` inside a comment is
+    // comment text and the first `*/` closes it, so `e: int;` after the
+    // inner opener is code, not part of the comment.
+    let tokens = tokenize(
+        "<'\nstruct foo {\n    c: int; /* inline comment */\n    d: int; /* \
+         starts here\n               continues\n            ends here */\n    \
+         /* nested /* opener is ignored */ e: int;\n};\n'>\n",
+    )
+    .expect("valid input");
+    let kinds: Vec<TokenKind> = tokens.into_iter().map(|token| token.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            TokenKind::Keyword("struct".into()),
+            TokenKind::Identifier("foo".into()),
+            TokenKind::Punctuation("{".into()),
+            TokenKind::Identifier("c".into()),
+            TokenKind::Punctuation(":".into()),
+            TokenKind::Keyword("int".into()),
+            TokenKind::Punctuation(";".into()),
+            TokenKind::Identifier("d".into()),
+            TokenKind::Punctuation(":".into()),
+            TokenKind::Keyword("int".into()),
+            TokenKind::Punctuation(";".into()),
+            TokenKind::Identifier("e".into()),
+            TokenKind::Punctuation(":".into()),
+            TokenKind::Keyword("int".into()),
+            TokenKind::Punctuation(";".into()),
+            TokenKind::Punctuation("}".into()),
+            TokenKind::Punctuation(";".into()),
+        ]
+    );
+}
+
+#[test]
+fn block_comment_spans_code_segments() {
+    // Clause 4.2.4: a comment may span code segments. The markers inside
+    // the comment delimit segments even while the comment runs, so a
+    // comment that closes between segments leaves the scan in prose
+    // until the next `<'` — the stray prose word after the close is not
+    // code, and the following segment opens normally.
+    let tokens = tokenize("<'\nx: int; /* starts\n'>\nprose */ stray prose\n<'\ny: int;\n'>\n")
+        .expect("valid input");
+    let kinds: Vec<TokenKind> = tokens.into_iter().map(|token| token.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            TokenKind::Identifier("x".into()),
+            TokenKind::Punctuation(":".into()),
+            TokenKind::Keyword("int".into()),
+            TokenKind::Punctuation(";".into()),
+            TokenKind::Identifier("y".into()),
+            TokenKind::Punctuation(":".into()),
+            TokenKind::Keyword("int".into()),
+            TokenKind::Punctuation(";".into()),
+        ]
+    );
+    // The comment closes inside the second segment; `x: int;` after the
+    // close is code of that segment.
+    let tokens = tokenize(include_str!(
+        "fixtures/s2019_block_comment_across_segments.e"
+    ))
+    .expect("valid input");
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(w) if w == "x")),
+        "code after the comment close must be tokenized: {tokens:?}"
     );
 }

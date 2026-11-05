@@ -10,11 +10,27 @@
 //! occupy the first column and the rest of that line is whitespace. A file
 //! that contains such a begin marker is a comment until the first one, and
 //! again between segments. A file with no begin marker is tokenized as code
-//! throughout, so snippet tests need not wrap a segment. Decimal integers
-//! may end in a `K`/`k` (×1024) or `M`/`m` (×1024×1024) multiplier
-//! (clause 4.2.5.2). `0c"..."` is a one-character literal (clause 4.2.5.7).
+//! throughout, so snippet tests need not wrap a segment. Block comments
+//! `/* ... */` are standard (clause 4.2.4): they may start and end anywhere
+//! on a line, span lines, and span code segments, and they do not nest — a
+//! second `/*` inside a comment is comment text and the first `*/` closes
+//! it. `--` and `//` stay line comments. A segment marker inside a block
+//! comment is comment text, but it still delimits segments: the segment
+//! state after the comment follows the markers the comment swallowed.
+//! Decimal integers may end in a `K`/`k` (×1024) or `M`/`m` (×1024×1024)
+//! multiplier (clause 4.2.5.2). `0c"..."` is a one-character literal
+//! (clause 4.2.5.7).
 //! Based literals may include the MVL digits `x z u l h w n`
 //! (clause 4.2.5.4); evaluating those literals is a later stage.
+//!
+//! The clause 4.11.4 list identity operators are glued word+symbol
+//! spellings, tokenized by longest match as single tokens: `list_ptr==`
+//! (a word that would otherwise be the identifier `list_ptr` followed by
+//! `==`) and `!list_ptr=` (a `!` followed by the eight-character word and
+//! `=`). `list_ptr` on its own — and `!` before anything else — still
+//! tokenizes as before: `list_ptr` is an ordinary identifier and `!x` is
+//! two tokens. Only the glued spellings form the operators; a spaced
+//! `list_ptr ==` reads as an identifier and a comparison.
 
 use std::fmt;
 
@@ -88,8 +104,10 @@ impl std::error::Error for LexError {}
 /// recognized by position in `src/parser.rs` instead, because promoting it
 /// could break existing sources that use the spelling as an identifier (for
 /// example `out` as a routine name and `set` as a type name). `static`,
-/// `evaluate`, `typeof`, `typeof_item`, `table`, `rgf`, `list_ptr` are not
-/// in Table 8 and stay contextual too.
+/// `evaluate`, `typeof`, `typeof_item`, `table`, `rgf` are not in Table 8
+/// and stay contextual too, and so does `list_ptr` — except inside the two
+/// glued operator spellings `list_ptr==` / `!list_ptr=` (clause 4.11.4),
+/// which are single multi-character tokens here (see the module docs).
 pub const KEYWORDS: &[&str] = &[
     "all",
     "also",
@@ -257,7 +275,10 @@ pub fn is_keyword(word: &str) -> bool {
 /// Multi-character operators, longest match first. `===`/`!==` are the
 /// e identity comparisons; `!~` is the negative string match; `=>` is
 /// implication; `..` is a range; `:=` is the type-inferring `var`
-/// initialization (clause 18).
+/// initialization (clause 18). The glued list identity operators
+/// `list_ptr==` / `!list_ptr=` (clause 4.11.4) are not in this table —
+/// they start with word characters, so [`Cursor::next_token`] matches
+/// them on the word and `!` paths.
 const OPERATORS: &[&str] = &[
     "===", "!==", "==", "!=", "!~", "<=", ">=", "=>", "&&", "||", "<<", ">>", "..", "+=", "-=",
     ":=",
@@ -362,12 +383,24 @@ impl<'a> Cursor<'a> {
                     self.bump();
                     self.bump();
                     let mut closed = false;
-                    while let Some(ch) = self.bump() {
-                        if ch == '*' && self.peek() == Some('/') {
+                    while let Some(ch) = self.peek() {
+                        // Clause 4.2.4: a comment may span code segments.
+                        // A segment marker inside a comment is comment
+                        // text, but it still moves the scan between code
+                        // and prose, so the segment state follows the
+                        // markers the comment swallows.
+                        if let Some(open) = self.line_is_code_marker() {
+                            self.consume_rest_of_line();
+                            self.in_code = open;
+                            continue;
+                        }
+                        if ch == '*' && self.peek_second() == Some('/') {
+                            self.bump();
                             self.bump();
                             closed = true;
                             break;
                         }
+                        self.bump();
                     }
                     if !closed {
                         return Err(LexError {
@@ -635,11 +668,26 @@ impl<'a> Cursor<'a> {
         };
         let kind = if first.is_ascii_alphabetic() || first == '_' {
             let word = self.read_word();
-            if is_keyword(&word) {
+            // `list_ptr==` (clause 4.11.4) is one glued operator token:
+            // the word `list_ptr` immediately followed by `==`. `list_ptr`
+            // alone — or before anything but `==` — stays an identifier.
+            if word == "list_ptr" && self.source[self.byte..].starts_with("==") {
+                self.bump();
+                self.bump();
+                TokenKind::Punctuation("list_ptr==".to_owned())
+            } else if is_keyword(&word) {
                 TokenKind::Keyword(word)
             } else {
                 TokenKind::Identifier(word)
             }
+        } else if first == '!' && self.source[self.byte..].starts_with("!list_ptr=") {
+            // `!list_ptr=` (the negation of `list_ptr==`, clause 4.11.4) is
+            // one glued operator token. A `!` before anything else falls
+            // through to the operator table (`!=`, `!~`) or the bare `!`.
+            for _ in 0.."!list_ptr=".chars().count() {
+                self.bump();
+            }
+            TokenKind::Punctuation("!list_ptr=".to_owned())
         } else if first.is_ascii_digit() {
             self.read_number()?
         } else if first == '"' {
@@ -670,17 +718,32 @@ impl<'a> Cursor<'a> {
             TokenKind::StringLiteral(value)
         } else if first == '\'' {
             // Either a based literal (`'hFF`, including MVL digits), the
-            // subtype modifier quote (`read'kind`), or the opening or
-            // closing quote of a quoted hierarchical path
-            // (`'memory_tb.address'`). Non-literal quotes become standalone
-            // punctuation tokens (like the reference grammar's `SNG_QUOTE`);
-            // the parser decides what they delimit.
+            // subtype modifier quote (`read'kind`, and 4.17.3's subtype
+            // qualifiers `p.red'good'x`), or the opening or closing
+            // quote of a quoted hierarchical path
+            // (`'memory_tb.address'`). A based literal commits only when
+            // a digit of its base follows the base letter — `'x` in a
+            // qualifier run (`red'x`) is the qualifier quote, not the
+            // start of a hex literal. Non-literal quotes become
+            // standalone punctuation tokens (like the reference grammar's
+            // `SNG_QUOTE`); the parser decides what they delimit.
             match self.peek_second() {
                 Some(base) if Self::based_base_letter(base) => {
-                    self.bump();
-                    self.bump();
-                    self.read_based_digits(base, start, true)?;
-                    self.finish_number(start)
+                    let third = {
+                        let mut chars = self.source[self.byte..].chars();
+                        chars.next();
+                        chars.next();
+                        chars.next()
+                    };
+                    if third.is_some_and(|c| based_digit_ok(base, c, true)) {
+                        self.bump();
+                        self.bump();
+                        self.read_based_digits(base, start, true)?;
+                        self.finish_number(start)
+                    } else {
+                        self.bump();
+                        TokenKind::Punctuation("'".to_owned())
+                    }
                 }
                 _ => {
                     self.bump();

@@ -1,0 +1,2 @@
+2:19: error[E0207]: subtype of 'longint' is not allowed
+3:15: error[E0207]: subtype of 'longuint' is not allowed

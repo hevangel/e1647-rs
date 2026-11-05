@@ -14,7 +14,10 @@
 //! `fast_delete`/`clear`, the 27.4.15-27.4.19 extremes
 //! `min`/`max`/`min_index`/`max_index`, the 27.5.1/27.5.2/27.5.4/27.5.5
 //! aggregates `and_all`/`or_all`/`product`/`sum`, and 27.4.11
-//! `is_a_permutation`), struct instances, method calls (every composed block with the
+//! `is_a_permutation`), the `{...;...}` list-concat operand (clause 4.6,
+//! Table 12), the clause 4.11.4 list identity operators `list_ptr==` /
+//! `!list_ptr=` (see "List identity" below), struct instances, method
+//! calls (every composed block with the
 //! name runs, in composition order; the last returned value wins), local
 //! variables, assignments, `if`/`else`, `while` with `break`/`continue`,
 //! `return`, `print`, the built-in `out` routine, and `gen`.
@@ -26,8 +29,10 @@
 //! sampled inside their declared bounds, a candidate is accepted only when
 //! every top-level `keep` constraint of the enclosing type evaluates to
 //! TRUE, and after 1000 failed attempts a diagnostic is reported. Soft
-//! constraints and `when` blocks are not enforced. Every run takes an
-//! explicit seed and is fully deterministic per backend.
+//! constraints are not enforced; a `when` subtype view's determinant
+//! fields are fixed to the view's values (6.7) and never sampled, while
+//! the enclosing type's when-block constraints stay unenforced. Every
+//! run takes an explicit seed and is fully deterministic per backend.
 //!
 //! ## Diagnostic codes
 //!
@@ -42,8 +47,41 @@
 //! - `E0409` cycle budget exceeded (runaway TCM)
 //! - `E0410` unsupported string-match pattern shape (`/.../` or a
 //!   native meta-character)
+//! - `E0411` `list_ptr==` operands must be lists of the same type
+//! - `E0412` `in_table` element type mismatch (clause 4.11.8): a tuple
+//!   element and a row element of incompatible kinds
+//! - `E0413` a subtype-qualified field access (4.17.3) on an instance
+//!   that does not currently match the qualifiers' subtype — the field
+//!   is not present on it
 //!
-//! ## Clause 26 list pseudo-methods — documented gaps
+//! The parser's `E0122` (an untyped `evaluate { ... }` whose result type
+//! cannot be inferred, clause 4.17.7) is also raised here: the inference
+//! contexts — the declared type of the assignment/`var` target or of the
+//! call's parameter — resolve at run time, so the diagnostic surfaces
+//! when an evaluation actually reaches the untyped block.
+//!
+//! ## List identity (clause 4.11.4)
+//!
+//! A list value ([`Value::List`]) holds its items behind a shared
+//! `Rc<RefCell<Vec<Value>>>` handle: cloning the value — by `var l3 = l1`
+//! assignment, method-argument passing or struct-field copy — **aliases**
+//! the same list object, and the modifying pseudo-methods (27.3) mutate
+//! that shared storage in place. `list_ptr==` compares exactly this
+//! object identity: TRUE iff both operands denote the same handle, so
+//! `l1 list_ptr== l1.copy()` is FALSE (a real copy mints a fresh handle)
+//! while `l1 list_ptr== l3` after `var l3: list of int = l1;` is TRUE.
+//! The regular `==` stays item-by-item. The handle's `RefCell` is
+//! borrowed in short scopes only (no borrow is held across a nested
+//! evaluation), and the recursive read paths (formatting, item-wise
+//! equality) are depth-bounded so a list that was illegally stored inside
+//! itself renders or compares unequal instead of overflowing the stack.
+//! A list value also carries the declared element type of its creation
+//! site when it is known (`list of int` → `"int"`); the value model does
+//! not infer it from the items, so the `list_ptr==` same-type check is
+//! skipped for a pair where either side's creation site could not know —
+//! a documented approximation.
+//!
+//! ## Clause 27 list pseudo-methods — documented gaps
 //!
 //! Pseudo-methods are macros, not struct methods (27.1). The ones whose
 //! semantics take a per-item expression argument cannot pass through the
@@ -82,14 +120,16 @@
 //! the one-cycle implicit sync of the stand-alone model.
 
 use crate::ast::{
-    BinaryOp, DeclarationKind, Expr, MethodDecl, ScalarBase, Stmt, TypeExpr, UnaryOp,
+    BinaryOp, DeclarationKind, Expr, MethodDecl, ScalarBase, Stmt, TypeExpr, UnaryOp, WhenQualifier,
 };
 use crate::diagnostic::Diagnostic;
 use crate::elab::Elaborated;
 use crate::lexer::Position;
 use crate::lexer::Token;
 use crate::lexer::TokenKind;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 /// Outcome of one run: the text produced by `out`/`print`, any run-time
 /// diagnostics, and the coverage collected by the cover groups
@@ -112,12 +152,42 @@ pub enum Value {
         type_name: String,
         name: String,
     },
-    List(Vec<Value>),
+    List(ListValue),
     /// A set (5.2.12): inclusive intervals in canonical form — sorted,
     /// non-overlapping, non-neighboring.
     Set(Vec<(i128, i128)>),
     Object(usize),
     Void,
+}
+
+/// The storage of a [`Value::List`] (`list of <t>`, 5.2.11). The items
+/// live behind a shared handle: cloning a list value aliases the same
+/// list object (which `var l3 = l1`, argument passing and struct-field
+/// copy all do), and `list_ptr==` (clause 4.11.4) compares this object
+/// identity. `copy()` (27.4.3) mints a fresh handle — a real copy. The
+/// 27.3 modifying pseudo-methods mutate the shared storage in place.
+///
+/// `element` is the declared element type rendered canonically (`"int"`,
+/// `"uint"`, ...), recorded when the creation site knows it: defaults,
+/// sampling and variables initialized from a typed declaration. It is
+/// `None` where nothing at the site can know it (a bare `{...;...}` list
+/// concat outside such an initialization). The value model does not
+/// infer the element type from the items.
+#[derive(Debug, Clone)]
+pub struct ListValue {
+    pub items: Rc<RefCell<Vec<Value>>>,
+    pub element: Option<String>,
+}
+
+impl ListValue {
+    /// A fresh, empty list with the given (optional) declared element
+    /// type. Every call allocates a distinct object.
+    fn new(element: Option<String>) -> Self {
+        Self {
+            items: Rc::new(RefCell::new(Vec::new())),
+            element,
+        }
+    }
 }
 
 struct ObjectInstance {
@@ -396,6 +466,23 @@ struct Interp<'a> {
     dut_errors: usize,
     /// `define` constants resolved to values.
     defines: std::collections::BTreeMap<String, Value>,
+    /// The declared type expected of the expression currently being
+    /// evaluated, when the evaluation site knows one: the declared type
+    /// of a `var`/assignment target or of the call argument's parameter.
+    /// An untyped `evaluate { ... }` block (4.17.7) takes its result
+    /// type from it; every site sets it immediately before its eval call
+    /// and restores it afterwards.
+    expected_type: Option<TypeExpr>,
+    /// The type name an untyped `new` creates with while the enclosing
+    /// `var x: t = new;` initializer evaluates (clause 18: the
+    /// variable's declared type is the instance's): set just before the
+    /// initializer evaluates, cleared right after.
+    new_type_hint: Option<String>,
+    /// Field init-value evaluation failures (clause 6.9.1/6.9.4) that
+    /// surfaced where no diagnostic can propagate — instance creation
+    /// returns an index, not a `Result`. Drained into the run's
+    /// diagnostics; the affected fields keep their type default.
+    pending_diagnostics: Vec<Diagnostic>,
 }
 
 /// How many `wait` statements and scheduler cycles one run may consume
@@ -514,6 +601,9 @@ fn run_inner(
         stop_requested: false,
         dut_errors: 0,
         defines,
+        expected_type: None,
+        new_type_hint: None,
+        pending_diagnostics: Vec::new(),
     };
     let types: &[crate::elab::ElaboratedType] = interp.types;
     let Some(sys) = types
@@ -524,7 +614,7 @@ fn run_inner(
         // output.
         return RunResult {
             output: interp.output,
-            diagnostics: Vec::new(),
+            diagnostics: interp.pending_diagnostics,
             coverage: interp.coverage,
         };
     };
@@ -724,6 +814,9 @@ fn run_inner(
             interp.dut_errors
         ));
     }
+    // Field init-value failures collected during instance creation
+    // (clause 6.9.1/6.9.4) join the run's diagnostics.
+    diagnostics.append(&mut interp.pending_diagnostics);
     RunResult {
         output: interp.output,
         diagnostics,
@@ -809,24 +902,107 @@ impl<'a> Interp<'a> {
     fn instantiate(&mut self, type_name: &str) -> usize {
         let mut fields = Vec::new();
         let mut ports = Vec::new();
+        let mut when_of: Vec<(String, String)> = Vec::new();
         let types: &[crate::elab::ElaboratedType] = self.types;
         if let Some(ty) = types.iter().find(|t| t.name == type_name) {
             for field in &ty.fields {
-                let default = self.default_for(&field.ty);
-                fields.push((field.name.clone(), default));
+                let value = match &field.init {
+                    // Clause 6.9.1/6.9.4: a field's init value is set at
+                    // instance creation, before `init()` runs (the
+                    // `init()` dispatch itself is a later milestone, so
+                    // instance creation is the only init point today).
+                    // Init values are constant expressions, so the empty
+                    // frame / no-instance context suffices; an expression
+                    // that cannot evaluate keeps the type default and the
+                    // failure is reported through the run diagnostics.
+                    Some(init) => {
+                        let mut frame = Frame::default();
+                        match self.eval(init, &mut frame, None) {
+                            Ok(value) => value,
+                            Err(diagnostic) => {
+                                self.pending_diagnostics.push(diagnostic);
+                                self.default_for(&field.ty)
+                            }
+                        }
+                    }
+                    None => self.default_for(&field.ty),
+                };
+                fields.push((field.name.clone(), value));
             }
             for port in &ty.ports {
                 if let Some(hdl_path) = &port.hdl_path {
                     ports.push((port.name.clone(), hdl_path.clone()));
                 }
             }
+            when_of = ty.when_of.clone();
+        } else if let Some(base_name) = type_name.rsplit(' ').next()
+            && let Some(base) = types.iter().find(|t| t.name == base_name)
+        {
+            // A when-qualified type spelling (`good packet`) whose exact
+            // subtype view was not synthesized (no `when good packet`
+            // block): the instance carries the base's fields under the
+            // spelling's name (6.7). Its determinants are fixed by the
+            // qualifier words at the type position that named it (see
+            // [`Interp::default_for`]).
+            for field in &base.fields {
+                let default = self.default_for(&field.ty);
+                fields.push((field.name.clone(), default));
+            }
         }
+        let index = self.instances.len();
         self.instances.push(ObjectInstance {
             type_name: type_name.to_owned(),
             fields,
             ports,
         });
-        self.instances.len() - 1
+        // A subtype view instance carries its determinant values (6.7):
+        // the view's (field id, value) pairs hold from instantiation on,
+        // and generation never samples them (they are what the view is).
+        for (id, value) in when_of {
+            if let Some(v) = self.determinant_value(index, &id, &value) {
+                self.instances[index].set(&id, v);
+            }
+        }
+        index
+    }
+
+    /// The value a determinant field of an instance takes under a
+    /// subtype view's (field id, value) pair: an enumerand of the
+    /// field's type, a Boolean, or a numeric literal.
+    fn determinant_value(&self, index: usize, id: &str, word: &str) -> Option<Value> {
+        let type_name = self.instances[index].type_name.clone();
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let ty = types.iter().find(|t| t.name == type_name)?;
+        let field = ty.fields.iter().find(|field| field.name == id)?;
+        match &field.ty {
+            TypeExpr::Scalar {
+                base: ScalarBase::Bool,
+                ..
+            } => Some(Value::Bool(word.eq_ignore_ascii_case("true"))),
+            TypeExpr::Scalar { .. } => word.parse::<i128>().ok().map(Value::Int),
+            TypeExpr::Named { name, .. } => {
+                let declared = types
+                    .iter()
+                    .find(|t| &t.name == name && t.kind == DeclarationKind::Type)?;
+                // The word must be one of the type's enumerands.
+                if !declared
+                    .enumerals
+                    .iter()
+                    .any(|enumeral| enumeral.name == word)
+                {
+                    return None;
+                }
+                Some(Value::Enum {
+                    type_name: name.clone(),
+                    name: word.to_owned(),
+                })
+            }
+            TypeExpr::InlineEnum { names, .. } => Some(Value::Enum {
+                type_name: inline_enum_key(names),
+                name: word.to_owned(),
+            }),
+            _ => None,
+        }
     }
 
     fn default_for(&mut self, ty: &TypeExpr) -> Value {
@@ -837,7 +1013,7 @@ impl<'a> Interp<'a> {
                 ScalarBase::String => Value::Str(String::new()),
                 _ => Value::Int(0),
             },
-            TypeExpr::List { .. } => Value::List(Vec::new()),
+            TypeExpr::List { element, .. } => Value::List(ListValue::new(Some(element.render()))),
             TypeExpr::Named { name, .. } if name == "set" => {
                 // The set type's default is the empty set (5.2.12: `[]`).
                 Value::Set(Vec::new())
@@ -884,6 +1060,19 @@ impl<'a> Interp<'a> {
                 self.depth += 1;
                 let index = self.instantiate(&view_name);
                 self.depth -= 1;
+                // A spelling whose view was not synthesized (no `when`
+                // block for it) still fixes its qualifier words as
+                // determinants on the base-carried instance: `good
+                // packet` means the instance's `good` determinant is
+                // TRUE from instantiation on (6.7).
+                if !self.types.iter().any(|t| t.name == view_name) {
+                    let words = when_spelling_words(value, base);
+                    if let Some(base_name) = when_view_base(base) {
+                        for word in words {
+                            self.set_spelled_determinant(index, &base_name, &word);
+                        }
+                    }
+                }
                 Value::Object(index)
             }
             // A template reference instantiates its monomorphized view
@@ -900,7 +1089,62 @@ impl<'a> Interp<'a> {
                 self.depth -= 1;
                 Value::Object(index)
             }
+            // `typeof()`/`typeof_item()` placeholders resolve during
+            // elaboration (5.9); reaching the interpreter with one means
+            // the static type was undetermined — no value.
+            TypeExpr::TypeOf { .. } | TypeExpr::TypeOfItem { .. } => Value::Void,
             TypeExpr::Formal { .. } => Value::Void,
+        }
+    }
+
+    /// Fix one qualifier word of a when-qualified type spelling as a
+    /// determinant value on a freshly instantiated base-carried
+    /// instance: a Boolean field's own name means TRUE (`good` for
+    /// `TRUE'good`); otherwise the word is an enumerand of some field's
+    /// type (`red` of `color`).
+    fn set_spelled_determinant(&mut self, index: usize, base_name: &str, word: &str) {
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let Some(base) = types.iter().find(|t| t.name == base_name) else {
+            return;
+        };
+        // Boolean field named by the word (the bare `TRUE'good` form).
+        if let Some(field) = base.fields.iter().find(|field| field.name == word)
+            && matches!(
+                &field.ty,
+                TypeExpr::Scalar {
+                    base: ScalarBase::Bool,
+                    ..
+                }
+            )
+        {
+            self.instances[index].set(word, Value::Bool(true));
+            return;
+        }
+        // An enumerand of a field's declared or inline enumeral type.
+        for field in &base.fields {
+            let holds = match &field.ty {
+                TypeExpr::Named { name, .. } => types.iter().any(|t| {
+                    &t.name == name
+                        && t.kind == DeclarationKind::Type
+                        && t.enumerals.iter().any(|e| e.name == word)
+                }),
+                TypeExpr::InlineEnum { names, .. } => names.iter().any(|n| n == word),
+                _ => false,
+            };
+            if holds {
+                self.instances[index].set(
+                    &field.name,
+                    Value::Enum {
+                        type_name: match &field.ty {
+                            TypeExpr::Named { name, .. } => name.clone(),
+                            TypeExpr::InlineEnum { names, .. } => inline_enum_key(names),
+                            _ => unreachable!("matched above"),
+                        },
+                        name: word.to_owned(),
+                    },
+                );
+                return;
+            }
         }
     }
 
@@ -1283,20 +1527,60 @@ impl<'a> Interp<'a> {
     ) -> Result<Flow, Diagnostic> {
         match statement {
             Stmt::VarDecl { name, ty, init, .. } => {
-                let value = match (ty, init) {
-                    (_, Some(expr)) => self.eval(expr, frame, me)?,
+                // `var c: cfg = new;` — an untyped `new` in a var
+                // declaration with a declared struct type takes that
+                // type (clause 6.3's typed creation: the target's type
+                // is known). Other untyped `new` uses keep the explicit
+                // not-supported diagnostic below.
+                let inferred_new: Option<Expr> = match (ty, init) {
+                    (
+                        Some(
+                            var_ty @ TypeExpr::Named { .. } | var_ty @ TypeExpr::TemplateRef { .. },
+                        ),
+                        Some(Expr::New {
+                            ty: None,
+                            inits,
+                            span,
+                        }),
+                    ) => Some(Expr::New {
+                        ty: Some(var_ty.clone()),
+                        inits: inits.clone(),
+                        span: *span,
+                    }),
+                    _ => None,
+                };
+                let mut value = match (&inferred_new, init) {
+                    (Some(new_expr), _) => self.eval(new_expr, frame, me)?,
+                    (None, Some(expr)) => {
+                        // The declared type is the inference context for an
+                        // untyped `evaluate { ... }` in the initializer
+                        // (4.17.7); the `var x := e` form declares none.
+                        self.eval_with_hint(ty.clone(), expr, frame, me)?
+                    }
                     // A declared type without an initializer takes the
                     // type's default; the type-inferring `:=` form
                     // always carries an initializer.
-                    (Some(ty), None) => self.default_for(ty),
-                    (None, None) => {
-                        return Err(self.error(
-                            "E0402",
-                            "type-inferring 'var' without an initializer",
-                            statement.span(),
-                        ));
-                    }
+                    (None, None) => match ty {
+                        Some(ty) => self.default_for(ty),
+                        None => {
+                            return Err(self.error(
+                                "E0402",
+                                "type-inferring 'var' without an initializer",
+                                statement.span(),
+                            ));
+                        }
+                    },
                 };
+                // A bare list-concat literal does not know its element
+                // type at its creation site; the declared type of the
+                // variable it initializes names it (5.2.11). A value that
+                // arrived from an existing list keeps that list's record.
+                if let (Some(ty), Value::List(list)) = (ty, &mut value)
+                    && list.element.is_none()
+                    && let TypeExpr::List { element, .. } = ty
+                {
+                    list.element = Some(element.render());
+                }
                 if let Some(ty) = ty {
                     frame.local_types.insert(name.clone(), ty.clone());
                 }
@@ -1304,7 +1588,11 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             Stmt::Assign { target, value, .. } => {
-                let value = self.eval(value, frame, me)?;
+                // The target's declared type is the inference context for
+                // an untyped `evaluate { ... }` in the assigned value
+                // (4.17.7).
+                let hint = self.static_type_of(target, frame, me);
+                let value = self.eval_with_hint(hint, value, frame, me)?;
                 match target {
                     Expr::HdlPath { path, span } => {
                         if self.hdl.is_none() {
@@ -1336,11 +1624,13 @@ impl<'a> Interp<'a> {
                                 *span,
                             ));
                         };
-                        let mut list = self.read_slot(base, frame, me)?;
-                        let Value::List(items) = &mut list else {
+                        let list = self.read_slot(base, frame, me)?;
+                        let Value::List(list) = list else {
                             return Err(self.error("E0402", "indexed value is not a list", *span));
                         };
-                        let len = items.len() as i128;
+                        // The slot's list object is shared; the assignment
+                        // mutates it in place through the handle.
+                        let len = list.items.borrow().len() as i128;
                         if i < 0 || i >= len {
                             return Err(self.error(
                                 "E0404",
@@ -1348,8 +1638,7 @@ impl<'a> Interp<'a> {
                                 *span,
                             ));
                         }
-                        items[i as usize] = value;
-                        self.write_slot(base, list, frame, me, *span)?;
+                        list.items.borrow_mut()[i as usize] = value;
                         Ok(Flow::Normal)
                     }
                     _ => {
@@ -1487,8 +1776,11 @@ impl<'a> Interp<'a> {
                 let _ = using;
                 let list_value = self.eval(list, frame, me)?;
                 match list_value {
-                    Value::List(mut items) => {
+                    Value::List(list) => {
                         let binding = var.clone().unwrap_or_else(|| "it".to_owned());
+                        // Iterate a snapshot of the items; the loop body
+                        // may modify the shared list object.
+                        let mut items = list.items.borrow().clone();
                         if *reversed {
                             items.reverse();
                         }
@@ -2011,11 +2303,20 @@ impl<'a> Interp<'a> {
         };
         let type_span = ty.span;
         // `!` fields keep their value; instance (unit-typed) fields are
-        // not generated — they are instantiated structurally.
+        // not generated — they are instantiated structurally. A `const`
+        // field keeps its value too: it is initialised once (by its init
+        // value, in `init()`, or by `do_unpack()` — clause 6.9.4), so
+        // generation must not overwrite it. A subtype view's determinant
+        // fields are fixed by the view (6.7) and are not sampled.
         let field_types: Vec<(String, TypeExpr)> = ty
             .fields
             .iter()
-            .filter(|field| !field.no_gen && !self.is_unit_typed(&field.ty))
+            .filter(|field| {
+                !field.no_gen
+                    && !field.is_const
+                    && !self.is_unit_typed(&field.ty)
+                    && !ty.when_of.iter().any(|(id, _)| id == &field.name)
+            })
             .map(|field| (field.name.clone(), field.ty.clone()))
             .collect();
         let mut constraints: Vec<Expr> = ty
@@ -2058,12 +2359,12 @@ impl<'a> Interp<'a> {
                 // length: fill the sampled (empty) list with generated
                 // elements so the constraint can pass.
                 if let Some(length) = self.required_list_size(name, &constraints)
-                    && let Value::List(items) = self.instances[index]
+                    && let Value::List(list) = self.instances[index]
                         .get(name)
                         .cloned()
                         .unwrap_or(Value::Void)
                 {
-                    let mut filled = items;
+                    let mut filled = list.items.borrow().clone();
                     filled.resize(length, Value::Void);
                     for slot in filled.iter_mut() {
                         let element_ty = list_element_type(field_ty);
@@ -2073,7 +2374,9 @@ impl<'a> Interp<'a> {
                             self.gen_object(element_index, &[])?;
                         }
                     }
-                    self.instances[index].set(name, Value::List(filled));
+                    // Replace the shared storage contents in one short
+                    // borrow (the sampling above must not run inside it).
+                    *list.items.borrow_mut() = filled;
                 }
             }
             let mut pass = true;
@@ -2157,14 +2460,17 @@ impl<'a> Interp<'a> {
     }
 
     /// Per-field sampling domains implied by the constraint list's simple
-    /// shapes: `f in [lo..hi]` and `f == c` (either orientation), where
+    /// shapes: `f in [lo..hi]`, `f == c`, and a constant comparison
+    /// `f < c` / `f <= c` / `f > c` / `f >= c` (either orientation), where
     /// the bounds evaluate to integer constants without an instance
     /// context. Conjuncts contribute independently; everything else —
     /// soft shapes included, which the rejection predicate enforces
     /// as written — leaves the field's domain untouched. An empty
     /// intersection is left as-is: sampling then uses the declared
     /// bounds and the predicate fails the attempt (E0407), which is the
-    /// honest outcome for contradictory constraints.
+    /// honest outcome for contradictory constraints. A comparison against
+    /// a constant narrows only the sampling domain; the rejection
+    /// predicate still enforces the constraint as written.
     fn constraint_domains(
         &mut self,
         constraints: &[Expr],
@@ -2237,7 +2543,129 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
+            // A constant comparison narrows the side that names a field:
+            // `a < 10` and its mirror `10 > a` narrow identically. Bounds
+            // saturate so extreme constants stay representable; sampling
+            // clamps the domain to the field's natural range anyway.
+            Expr::Binary { op, lhs, rhs, .. }
+                if matches!(
+                    op,
+                    BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+                ) =>
+            {
+                for (side, other, direct) in [(lhs, rhs, true), (rhs, lhs, false)] {
+                    let Some(value) = self.const_int_eval(other) else {
+                        continue;
+                    };
+                    // `a < 10` / `a <= 10` bound the field above; the
+                    // mirrored `10 > a` / `10 >= a` bound it below.
+                    let upper = if direct {
+                        matches!(op, BinaryOp::Lt | BinaryOp::Le)
+                    } else {
+                        matches!(op, BinaryOp::Gt | BinaryOp::Ge)
+                    };
+                    let strict = matches!(op, BinaryOp::Lt | BinaryOp::Gt);
+                    let (lower, high) = if upper {
+                        let bound = if strict {
+                            value.saturating_sub(1)
+                        } else {
+                            value
+                        };
+                        (i128::MIN, bound)
+                    } else {
+                        let bound = if strict {
+                            value.saturating_add(1)
+                        } else {
+                            value
+                        };
+                        (bound, i128::MAX)
+                    };
+                    if let Expr::Ident { name, .. } = side.as_ref() {
+                        intersect_domain(domains, name, (lower, high));
+                    }
+                }
+            }
+            Expr::InTable { tuple, rows, .. } => {
+                // 4.11.8 in a `keep`: the disjunction of the rows, enforced
+                // as written by the rejection predicate. For the sampling
+                // domains, the projection of a disjunction onto one tuple
+                // element is the union of the rows' projections, so a
+                // bare-identifier element narrows to that union — sound
+                // (every row-satisfying assignment stays inside it) and
+                // necessary in practice: the rejection sampler alone does
+                // not target the rows, so a wide scalar field would make
+                // the disjunction practically unsampleable. A row whose
+                // element for the position is not a constant (an enumerand
+                // included) leaves the projection unknown — the narrowing
+                // for that field is dropped entirely, because that row
+                // could match with any value of the field.
+                if rows.is_empty() {
+                    return;
+                }
+                let mut projections: Vec<Vec<(i128, i128)>> = vec![Vec::new(); tuple.len()];
+                for row in rows {
+                    for (position, element) in row.iter().enumerate() {
+                        let Some(Expr::Ident { .. }) = tuple.get(position) else {
+                            continue;
+                        };
+                        if let Some(domain) = self.table_row_element_domain(element) {
+                            projections[position].push(domain);
+                        }
+                    }
+                }
+                for (position, element_domains) in projections.into_iter().enumerate() {
+                    if element_domains.len() != rows.len() {
+                        continue;
+                    }
+                    if let Expr::Ident { name, .. } = &tuple[position] {
+                        let low = element_domains
+                            .iter()
+                            .map(|d| d.0)
+                            .min()
+                            .unwrap_or(i128::MIN);
+                        let high = element_domains
+                            .iter()
+                            .map(|d| d.1)
+                            .max()
+                            .unwrap_or(i128::MAX);
+                        intersect_domain(domains, name, (low, high));
+                    }
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// The constant integer domain one `in_table` row element constrains
+    /// its tuple element to, when computable: a scalar element by
+    /// constant evaluation, a set literal from its bounds, a type set
+    /// from the type's value range. `None` for anything non-constant
+    /// (enumerands included — those fields keep their full natural
+    /// range). An item list's span `[min, max]` is a superset of its
+    /// points, which keeps the narrowing sound.
+    fn table_row_element_domain(
+        &mut self,
+        element: &crate::ast::TableElem,
+    ) -> Option<(i128, i128)> {
+        match element {
+            crate::ast::TableElem::Scalar(expr) => {
+                let value = self.const_int_eval(expr)?;
+                Some((value, value))
+            }
+            crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
+                Some((self.const_int_eval(low)?, self.const_int_eval(high)?))
+            }
+            crate::ast::TableElem::Set(crate::ast::InSetExpr::Items(items)) => {
+                let mut low = i128::MAX;
+                let mut high = i128::MIN;
+                for item in items {
+                    let value = self.const_int_eval(item)?;
+                    low = low.min(value);
+                    high = high.max(value);
+                }
+                Some((low, high))
+            }
+            crate::ast::TableElem::TypeSet { ty, .. } => self.type_value_range(ty),
         }
     }
 
@@ -2354,6 +2782,16 @@ impl<'a> Interp<'a> {
                     let raw = self.rng.below(1u128 << bits) as i128;
                     Value::Int(raw - ((1i128 << bits) >> 1))
                 }
+                // The long bases are 64-bit wide (Table 17, clause
+                // 5.2.3.1): an unconstrained `longuint` samples the full
+                // unsigned 64-bit range, a `longint` the full signed one.
+                // i128 storage holds both without truncation.
+                ScalarBase::Longuint => Value::Int(self.below_width(width, 64)),
+                ScalarBase::Longint => {
+                    let bits = width_bits(width, 64);
+                    let raw = self.rng.below(1u128 << bits) as i128;
+                    Value::Int(raw - ((1i128 << bits) >> 1))
+                }
                 ScalarBase::Bit => Value::Int(self.rng.below(2) as i128),
                 ScalarBase::Byte => Value::Int(self.rng.below(256) as i128),
                 ScalarBase::Nibble => Value::Int(self.rng.below(16) as i128),
@@ -2368,7 +2806,10 @@ impl<'a> Interp<'a> {
                 for _ in 0..len {
                     items.push(self.sample_type(element)?);
                 }
-                Ok(Value::List(items))
+                Ok(Value::List(ListValue {
+                    items: Rc::new(RefCell::new(items)),
+                    element: Some(element.render()),
+                }))
             }
             TypeExpr::Named { name, .. } => {
                 let types: &[crate::elab::ElaboratedType] = self.types;
@@ -2411,6 +2852,18 @@ impl<'a> Interp<'a> {
                 let result = self.gen_object(index, &[]);
                 self.depth -= 1;
                 result?;
+                // A spelling whose view was not synthesized still fixes
+                // its qualifier words as determinants (6.7) — but after
+                // the base fields' generation, which must not overwrite
+                // them back.
+                if !self.types.iter().any(|t| t.name == view_name) {
+                    let words = when_spelling_words(value, base);
+                    if let Some(base_name) = when_view_base(base) {
+                        for word in words {
+                            self.set_spelled_determinant(index, &base_name, &word);
+                        }
+                    }
+                }
                 Ok(Value::Object(index))
             }
             TypeExpr::InlineEnum { names, .. } => {
@@ -2439,6 +2892,10 @@ impl<'a> Interp<'a> {
                 result?;
                 Ok(Value::Object(index))
             }
+            // `typeof()`/`typeof_item()` placeholders resolve during
+            // elaboration (5.9); reaching the sampler with one means the
+            // static type was undetermined — nothing to generate.
+            TypeExpr::TypeOf { .. } | TypeExpr::TypeOfItem { .. } => Ok(Value::Void),
             TypeExpr::Formal { .. } => Ok(Value::Void),
         }
     }
@@ -3187,23 +3644,22 @@ impl<'a> Interp<'a> {
 
     /// The clause 27 list pseudo-methods, dispatched on a `Value::List`
     /// receiver. Pseudo-methods are macros, not struct methods (27.1) —
-    /// they attach to any list expression, and a modifying one writes the
-    /// changed list back through the receiver expression (the same slot
-    /// `push` has always used). `None` when the name is not one of this
-    /// subset (the caller reports `E0405`).
+    /// they attach to any list expression. A modifying one mutates the
+    /// receiver's shared list object in place through its handle
+    /// ([`ListValue::items`]), so every alias of the object sees the
+    /// change; `items` is a snapshot the caller took for the read-only
+    /// arithmetic. `None` when the name is not one of this subset (the
+    /// caller reports `E0405`).
     ///
     /// The methods taking a per-item expression (`apply`, `sort`, `all`,
     /// `has`, ...) cannot pass through this value-only dispatch — see the
     /// documented gaps in the module docs.
-    #[allow(clippy::too_many_arguments)]
     fn call_list_pseudo_method(
         &mut self,
+        list: &ListValue,
         items: &[Value],
-        receiver: &Expr,
         name: &str,
         args: &[Value],
-        frame: &mut Frame,
-        me: Option<usize>,
         span: crate::ast::Span,
     ) -> Option<Result<Value, Diagnostic>> {
         let result = match (name, args) {
@@ -3220,15 +3676,22 @@ impl<'a> Interp<'a> {
                 Err(self.error("E0402", "exists() expects an integer index", span))
             }
             // 27.4.3 copy(): a copy of the list — the list case of
-            // exp.copy() (28.5.1). Values clone; struct items stay shared
+            // exp.copy() (28.5.1). A fresh list object mints a new handle
+            // (a `list_ptr==` mismatch, 4.11.4); struct items stay shared
             // by instance index.
-            ("copy", []) => Ok(Value::List(items.to_vec())),
+            ("copy", []) => Ok(Value::List(ListValue {
+                items: Rc::new(RefCell::new(items.to_vec())),
+                element: list.element.clone(),
+            })),
             // 27.4.21 reverse(): a new list of all the items in reverse
             // order (the receiver is unchanged).
             ("reverse", []) => {
                 let mut reversed = items.to_vec();
                 reversed.reverse();
-                Ok(Value::List(reversed))
+                Ok(Value::List(ListValue {
+                    items: Rc::new(RefCell::new(reversed)),
+                    element: list.element.clone(),
+                }))
             }
             // 27.4.26 top(): the last item, not removed; empty is an
             // error (the prose's exception).
@@ -3247,9 +3710,7 @@ impl<'a> Interp<'a> {
             ("pop", []) => match items.split_last() {
                 Some((last, rest)) => {
                     let popped = last.clone();
-                    return Some(
-                        self.store_list(receiver, rest.to_vec(), popped, frame, me, span),
-                    );
+                    return Some(self.store_list(list, rest.to_vec(), popped));
                 }
                 None => Err(self.error("E0402", "pop of an empty list", span)),
             },
@@ -3258,42 +3719,43 @@ impl<'a> Interp<'a> {
             ("pop0", []) => match items.split_first() {
                 Some((first, rest)) => {
                     let popped = first.clone();
-                    return Some(
-                        self.store_list(receiver, rest.to_vec(), popped, frame, me, span),
-                    );
+                    return Some(self.store_list(list, rest.to_vec(), popped));
                 }
                 None => Err(self.error("E0402", "pop0 of an empty list", span)),
             },
             // 27.3.1 add(item) / 27.3.12 push(item): the same function —
             // the item goes to the end of the list.
-            // 27.3.2 add(list) / 27.3.14 push(list): a copy of the
-            // argument list is appended. e declares no lists of lists
-            // (27.4.25), so a list-valued argument is unambiguously the
-            // list form.
+            // 27.3.2 add(list) / 27.3.14 push(list): the argument list's
+            // items are appended. e declares no lists of lists (27.4.25),
+            // so a list-valued argument is unambiguously the list form.
             ("push" | "add", [Value::List(added)]) => {
-                let mut grown = items.to_vec();
-                grown.extend(added.iter().cloned());
-                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+                // Read the argument's items before the mutating borrow:
+                // the argument may be the receiver itself, and a
+                // simultaneous mutable borrow of the same cell would
+                // panic.
+                let added_items = added.items.borrow().clone();
+                list.items.borrow_mut().extend(added_items);
+                Ok(Value::Void)
             }
             ("push" | "add", [item]) => {
-                let mut grown = items.to_vec();
-                grown.push(item.clone());
-                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+                list.items.borrow_mut().push(item.clone());
+                Ok(Value::Void)
             }
             // 27.3.3 add0(item) / 27.3.13 push0(item): the item becomes
             // the first position (index 0); later items reindex by +1.
             // 27.3.4 add0(list) / 27.3.15 push0(list): the argument list
             // is placed at the head (same list-form reading as above).
             ("push0" | "add0", [Value::List(added)]) => {
-                let mut grown = added.clone();
+                let added_items = added.items.borrow().clone();
+                let mut grown = added_items;
                 grown.extend(items.iter().cloned());
-                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+                return Some(self.store_list(list, grown, Value::Void));
             }
             ("push0" | "add0", [item]) => {
                 let mut grown = Vec::with_capacity(items.len() + 1);
                 grown.push(item.clone());
                 grown.extend(items.iter().cloned());
-                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+                return Some(self.store_list(list, grown, Value::Void));
             }
             ("push" | "add" | "push0" | "add0", _) => {
                 Err(self.error("E0402", "push/add expects exactly one argument", span))
@@ -3311,11 +3773,12 @@ impl<'a> Interp<'a> {
                     Ok(at) => at,
                     Err(diagnostic) => return Some(Err(diagnostic)),
                 };
-                let mut grown = Vec::with_capacity(items.len() + inserted.len());
+                let inserted_items = inserted.items.borrow().clone();
+                let mut grown = Vec::with_capacity(items.len() + inserted_items.len());
                 grown.extend_from_slice(&items[..at]);
-                grown.extend(inserted.iter().cloned());
+                grown.extend(inserted_items);
                 grown.extend_from_slice(&items[at..]);
-                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+                return Some(self.store_list(list, grown, Value::Void));
             }
             ("insert", [Value::Int(index), item]) => {
                 let at = match self.list_insert_position(items, *index, span) {
@@ -3324,7 +3787,7 @@ impl<'a> Interp<'a> {
                 };
                 let mut grown = items.to_vec();
                 grown.insert(at, item.clone());
-                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+                return Some(self.store_list(list, grown, Value::Void));
             }
             ("insert", _) => Err(self.error(
                 "E0402",
@@ -3341,7 +3804,7 @@ impl<'a> Interp<'a> {
                 };
                 let mut shrunk = items.to_vec();
                 shrunk.remove(at);
-                return Some(self.store_list(receiver, shrunk, Value::Void, frame, me, span));
+                return Some(self.store_list(list, shrunk, Value::Void));
             }
             ("delete", _) => Err(self.error("E0402", "delete expects an integer index", span)),
             // 27.3.7 fast_delete(index): the last item's value moves into
@@ -3358,14 +3821,14 @@ impl<'a> Interp<'a> {
                 if at < shrunk.len() {
                     shrunk[at] = last;
                 }
-                return Some(self.store_list(receiver, shrunk, Value::Void, frame, me, span));
+                return Some(self.store_list(list, shrunk, Value::Void));
             }
             ("fast_delete", _) => {
                 Err(self.error("E0402", "fast_delete expects an integer index", span))
             }
             // 27.3.5 clear(): deletes all items in the list.
             ("clear", []) => {
-                return Some(self.store_list(receiver, Vec::new(), Value::Void, frame, me, span));
+                return Some(self.store_list(list, Vec::new(), Value::Void));
             }
             // 27.5.1 and_all(): TRUE when every item is TRUE; empty is
             // TRUE (the prose's stated empty result). The exp-parameter
@@ -3459,7 +3922,8 @@ impl<'a> Interp<'a> {
             // irrelevant); struct items compare by instance index — the
             // prose's "compares the addresses of the struct items".
             ("is_a_permutation", [Value::List(other)]) => {
-                let mut remaining: Vec<&Value> = other.iter().collect();
+                let other_items = other.items.borrow().clone();
+                let mut remaining: Vec<&Value> = other_items.iter().collect();
                 let mut permutation = true;
                 for item in items {
                     match remaining
@@ -3487,20 +3951,17 @@ impl<'a> Interp<'a> {
         Some(result)
     }
 
-    /// Write a modified list back through the receiver expression (the
-    /// pseudo-method attaches to any list expression, 27.2 — the write
-    /// goes to the slot the receiver denotes) and return the
-    /// pseudo-method's own result.
+    /// Replace the shared list object's storage with `items` (the
+    /// modifying pseudo-methods' in-place write: the object keeps its
+    /// identity, so aliases see the change) and return the pseudo-method's
+    /// own result.
     fn store_list(
         &mut self,
-        receiver: &Expr,
+        list: &ListValue,
         items: Vec<Value>,
         result: Value,
-        frame: &mut Frame,
-        me: Option<usize>,
-        span: crate::ast::Span,
     ) -> Result<Value, Diagnostic> {
-        self.write_slot(receiver, Value::List(items), frame, me, span)?;
+        *list.items.borrow_mut() = items;
         Ok(result)
     }
 
@@ -3916,15 +4377,6 @@ impl<'a> Interp<'a> {
                 if name == "TEST_DONE" {
                     return Ok(Value::Int(0));
                 }
-                // Message-verbosity levels.
-                if matches!(name.as_str(), "LOW" | "MEDIUM" | "HIGH") {
-                    let level = match name.as_str() {
-                        "LOW" => 0,
-                        "MEDIUM" => 1,
-                        _ => 2,
-                    };
-                    return Ok(Value::Int(level));
-                }
                 if let Some(value) = frame.locals.get(name) {
                     return Ok(value.clone());
                 }
@@ -3966,6 +4418,33 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
+                // Message-verbosity levels — the fallback when nothing in
+                // the program declares a same-named enumerand (a declared
+                // `LOW`/`MEDIUM`/`HIGH` enumerand above shadows the
+                // predefined message levels, as scoping requires).
+                if matches!(name.as_str(), "LOW" | "MEDIUM" | "HIGH") {
+                    let level = match name.as_str() {
+                        "LOW" => 0,
+                        "MEDIUM" => 1,
+                        _ => 2,
+                    };
+                    return Ok(Value::Int(level));
+                }
+                // Clause 4.4.5.3 name resolution: for a path-less name,
+                // the resolver checks the literal name `global` (which
+                // denotes the global struct itself) BEFORE checking
+                // whether the name is a member of `global`. The global
+                // struct is not modelled in this interpreter — user
+                // `extend global` is reserved for the implementation
+                // (clause 4.4.2.2, rejected by the parser as E0116), and
+                // the parser's file-level `define`/`import`
+                // pseudo-declaration carries no runtime members — so
+                // there is no global-struct value to produce and no
+                // member-of-`global` namespace to fall back to. A bare
+                // `global` therefore reaches the unknown-identifier
+                // error below; the literal-`global`-first ordering is
+                // recorded here for the stage that models the global
+                // struct.
                 Err(self.error("E0401", format!("unknown identifier '{name}'"), *span))
             }
             Expr::MemberAccess {
@@ -3993,10 +4472,41 @@ impl<'a> Interp<'a> {
                     )),
                 }
             }
+            Expr::QualifiedField {
+                base,
+                qualifiers,
+                field,
+                field_span,
+                span,
+            } => {
+                // 4.17.3: the field is present iff the instance currently
+                // matches the qualifiers' subtype.
+                let object_value = self.eval(base, frame, me)?;
+                let Value::Object(index) = object_value else {
+                    return Err(self.error(
+                        "E0402",
+                        "subtype-qualified access requires an object",
+                        *span,
+                    ));
+                };
+                self.read_qualified_field(index, qualifiers, field, *field_span, *span)
+            }
             Expr::Call { callee, args, span } => {
+                // A call argument's parameter type is the inference
+                // context for an untyped `evaluate { ... }` in the
+                // argument (4.17.7). Looked up only when an argument can
+                // use it, and best-effort: a builtin or unknown callee
+                // contributes no hints (the call itself reports its own
+                // error).
+                let hints = if args.iter().any(expr_has_untyped_evaluate) {
+                    self.call_arg_hints(callee, args.len(), frame, me)
+                } else {
+                    Vec::new()
+                };
                 let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval(arg, frame, me)?);
+                for (position, arg) in args.iter().enumerate() {
+                    let hint = hints.get(position).cloned().unwrap_or(None);
+                    values.push(self.eval_with_hint(hint, arg, frame, me)?);
                 }
                 match callee.as_ref() {
                     Expr::Ident { name, .. } => {
@@ -4022,10 +4532,14 @@ impl<'a> Interp<'a> {
                         let object_value = self.eval(object, frame, me)?;
                         match object_value {
                             Value::Object(index) => self.call_method(index, name, values, *span),
-                            Value::List(items) => {
-                                match self.call_list_pseudo_method(
-                                    &items, object, name, &values, frame, me, *span,
-                                ) {
+                            Value::List(list) => {
+                                // The modifying pseudo-methods mutate the
+                                // shared storage through the handle; the
+                                // dispatch reads a snapshot of the items.
+                                let items = list.items.borrow().clone();
+                                match self
+                                    .call_list_pseudo_method(&list, &items, name, &values, *span)
+                                {
                                     Some(result) => result,
                                     None => Err(self.error(
                                         "E0405",
@@ -4062,19 +4576,35 @@ impl<'a> Interp<'a> {
                             )),
                         }
                     }
+                    // A method named through a subtype-qualified access
+                    // (`p.red'f()`) resolves on the qualified base object
+                    // — the field dispatch is the plain one (4.17.3
+                    // qualifies field presence, not method lookup).
+                    Expr::QualifiedField { base, field, .. } => {
+                        let object_value = self.eval(base, frame, me)?;
+                        let Value::Object(index) = object_value else {
+                            return Err(self.error(
+                                "E0402",
+                                "subtype-qualified call requires an object",
+                                *span,
+                            ));
+                        };
+                        self.call_method(index, field, values, *span)
+                    }
                     _ => Err(self.error("E0402", "call target not supported", *span)),
                 }
             }
             Expr::Index { base, index, span } => {
                 let base_value = self.eval(base, frame, me)?;
                 let index_value = self.eval(index, frame, me)?;
-                let (Value::List(items), Value::Int(i)) = (&base_value, &index_value) else {
+                let (Value::List(list), Value::Int(i)) = (&base_value, &index_value) else {
                     return Err(self.error(
                         "E0402",
                         "indexing requires a list and an integer",
                         *span,
                     ));
                 };
+                let items = list.items.borrow();
                 let len = items.len() as i128;
                 if *i < 0 || *i >= len {
                     return Err(self.error(
@@ -4084,6 +4614,26 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 Ok(items[*i as usize].clone())
+            }
+            Expr::ListConcat { items, .. } => {
+                // `{ e1; e2; ... }` (clause 4.6, Table 12): a fresh list;
+                // a list element contributes its items, any other element
+                // contributes itself. The creation site cannot know the
+                // element type — a variable's declared type records it at
+                // the `var` initialization.
+                let mut values = Vec::new();
+                for item in items {
+                    match self.eval(item, frame, me)? {
+                        Value::List(list) => {
+                            values.extend(list.items.borrow().iter().cloned());
+                        }
+                        value => values.push(value),
+                    }
+                }
+                Ok(Value::List(ListValue {
+                    items: Rc::new(RefCell::new(values)),
+                    element: None,
+                }))
             }
             Expr::Binary { op, lhs, rhs, span } => match op {
                 BinaryOp::LogicalAnd => {
@@ -4288,6 +4838,94 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Bool(is_a != *negated))
             }
+            Expr::InTable {
+                tuple,
+                rows,
+                negated,
+                span,
+            } => {
+                // 4.11.8: the tuple matches a row when every element
+                // matches — a scalar row element by `==`, a set row
+                // element by membership. The first matching row decides;
+                // `not` negates the result.
+                let mut values = Vec::with_capacity(tuple.len());
+                for element in tuple {
+                    values.push(self.eval(element, frame, me)?);
+                }
+                let mut matched = false;
+                'rows: for row in rows {
+                    for (element, value) in row.iter().zip(values.iter()) {
+                        if !self.row_element_matches(element, value, frame, me, *span)? {
+                            continue 'rows;
+                        }
+                    }
+                    matched = true;
+                    break;
+                }
+                Ok(Value::Bool(matched != *negated))
+            }
+            Expr::Evaluate {
+                ty,
+                var,
+                body,
+                span,
+            } => {
+                // 4.17.7: the actions run; the named variable's value
+                // after the block is the expression's value. The variable
+                // is visible only inside the block (it shadows an outer
+                // name of the same spelling and is removed afterwards)
+                // and starts at its type's default. `wait`/`sync`/`return`
+                // are rejected at parse time (E0123).
+                let result_ty = match ty {
+                    Some(ty) => ty.clone(),
+                    // Type inference v1: the declared type of the
+                    // assignment/`var` target or of the call's parameter,
+                    // threaded through `expected_type` by those eval
+                    // sites. E0122 is raised here — where the inference
+                    // contexts actually resolve — not at parse time; the
+                    // parser accepts the untyped form because it cannot
+                    // know the surrounding declaration's type.
+                    None => match self.expected_type.clone() {
+                        Some(ty) => ty,
+                        None => {
+                            return Err(self.error(
+                                "E0122",
+                                "evaluate: result type cannot be inferred; write `evaluate <type> { ... }`",
+                                *span,
+                            ));
+                        }
+                    },
+                };
+                let var_name = var.clone().unwrap_or_else(|| "value".to_owned());
+                let saved_local = frame
+                    .locals
+                    .insert(var_name.clone(), self.default_for(&result_ty));
+                let saved_type = frame.local_types.insert(var_name.clone(), result_ty);
+                // The hint does not flow into the block: the body's own
+                // evaluates infer from their own contexts.
+                let saved_hint = self.expected_type.take();
+                let flow = self.exec_block(body, frame, me);
+                self.expected_type = saved_hint;
+                match saved_type {
+                    Some(ty) => {
+                        frame.local_types.insert(var_name.clone(), ty);
+                    }
+                    None => {
+                        frame.local_types.remove(&var_name);
+                    }
+                }
+                let value = frame.locals.get(&var_name).cloned();
+                match saved_local {
+                    Some(value) => {
+                        frame.locals.insert(var_name.clone(), value);
+                    }
+                    None => {
+                        frame.locals.remove(&var_name);
+                    }
+                }
+                flow?;
+                Ok(value.unwrap_or(Value::Void))
+            }
             Expr::Select { span, .. } => Err(self.error(
                 "E0402",
                 "select distribution expressions are not evaluated yet",
@@ -4298,34 +4936,40 @@ impl<'a> Interp<'a> {
                 // creation instantiates the named type — the
                 // monomorphized template instance's canonical name for a
                 // template reference — and runs the `with` assignments
-                // against the fresh instance. Untyped `new` and other
-                // type spellings stay the explicit not-supported
-                // diagnostic.
-                let Some(new_ty) = ty else {
-                    return Err(self.error(
-                        "E0402",
-                        "untyped 'new' instance creation is not supported yet",
-                        *span,
-                    ));
-                };
-                let name = match new_ty {
-                    TypeExpr::Named { name, .. } => name.clone(),
-                    TypeExpr::TemplateRef { name, args, .. } => {
-                        crate::ast::template_instance_name(name, args)
-                    }
-                    _ => {
-                        return Err(self.error(
-                            "E0402",
-                            "'new' supports named and template-instance types only",
-                            new_ty.span(),
-                        ));
-                    }
+                // against the fresh instance. An untyped `new` creates
+                // with the enclosing `var x: t = new;`'s declared type
+                // (clause 18) when one is evaluating; other untyped
+                // spellings stay the explicit not-supported diagnostic.
+                let new_name = match ty {
+                    None => match self.new_type_hint.clone() {
+                        Some(name) => name,
+                        None => {
+                            return Err(self.error(
+                                "E0402",
+                                "untyped 'new' instance creation is not supported yet",
+                                *span,
+                            ));
+                        }
+                    },
+                    Some(new_ty) => match new_ty {
+                        TypeExpr::Named { name, .. } => name.clone(),
+                        TypeExpr::TemplateRef { name, args, .. } => {
+                            crate::ast::template_instance_name(name, args)
+                        }
+                        _ => {
+                            return Err(self.error(
+                                "E0402",
+                                "'new' supports named and template-instance types only",
+                                new_ty.span(),
+                            ));
+                        }
+                    },
                 };
                 if self.depth > 100 {
                     return Ok(Value::Void);
                 }
                 self.depth += 1;
-                let index = self.instantiate(&name);
+                let index = self.instantiate(&new_name);
                 let mut frame = Frame::default();
                 let flow = self.exec_block(inits, &mut frame, Some(index))?;
                 self.depth -= 1;
@@ -4370,6 +5014,8 @@ impl<'a> Interp<'a> {
                 (
                     ScalarBase::Int
                         | ScalarBase::Uint
+                        | ScalarBase::Longint
+                        | ScalarBase::Longuint
                         | ScalarBase::Bit
                         | ScalarBase::Byte
                         | ScalarBase::Nibble
@@ -4413,6 +5059,14 @@ impl<'a> Interp<'a> {
                 ),
                 _ => false,
             }),
+            // `typeof()`/`typeof_item()` placeholders resolve during
+            // elaboration (5.9); an `is a` against an unresolved one has
+            // no static type to check against.
+            TypeExpr::TypeOf { span, .. } | TypeExpr::TypeOfItem { span, .. } => Err(self.error(
+                "E0402",
+                "'is a' against an unresolved typeof() type is not supported",
+                *span,
+            )),
             TypeExpr::Formal { .. } => Ok(false),
             TypeExpr::InlineEnum { .. } => Err(self.error(
                 "E0402",
@@ -4438,6 +5092,216 @@ impl<'a> Interp<'a> {
             }
         }
         false
+    }
+
+    /// Evaluate `expr` with `hint` as the declared type expected of it —
+    /// the inference context for an untyped `evaluate { ... }` (4.17.7).
+    /// The hint is set for the call and restored on both outcomes, so a
+    /// swallowed error cannot leak it into a later evaluation.
+    fn eval_with_hint(
+        &mut self,
+        hint: Option<TypeExpr>,
+        expr: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Value, Diagnostic> {
+        let saved = std::mem::replace(&mut self.expected_type, hint);
+        let result = self.eval(expr, frame, me);
+        self.expected_type = saved;
+        result
+    }
+
+    /// The declared type of an expression, when statically known: a
+    /// local's declared type, a field of the enclosing instance, or a
+    /// field reached through names of known instance type. Used as the
+    /// inference context for an untyped `evaluate { ... }` (4.17.7).
+    fn static_type_of(&self, expr: &Expr, frame: &Frame, me: Option<usize>) -> Option<TypeExpr> {
+        match expr {
+            Expr::Ident { name, .. } => {
+                if let Some(ty) = frame.local_types.get(name) {
+                    return Some(ty.clone());
+                }
+                if let Some(index) = me {
+                    let type_name = &self.instances[index].type_name;
+                    let types: &[crate::elab::ElaboratedType] = self.types;
+                    return types
+                        .iter()
+                        .find(|t| t.name == *type_name)
+                        .and_then(|t| t.fields.iter().find(|f| f.name == *name))
+                        .map(|f| f.ty.clone());
+                }
+                None
+            }
+            Expr::MemberAccess { object, name, .. } => {
+                let base = self.static_type_of(object, frame, me)?;
+                let type_name = match base {
+                    TypeExpr::Named { name, .. } => name,
+                    TypeExpr::WhenQualified { value, base, .. } => when_view_name(&value, &base)?,
+                    _ => return None,
+                };
+                let types: &[crate::elab::ElaboratedType] = self.types;
+                types
+                    .iter()
+                    .find(|t| t.name == type_name)
+                    .and_then(|t| t.fields.iter().find(|f| f.name == *name))
+                    .map(|f| f.ty.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// The parameter types of a called method, one per argument position
+    /// (`None` where the parameter is untyped, the callee is a builtin,
+    /// or the callee cannot be resolved — the call itself reports its
+    /// own error in those cases). The inference context for an untyped
+    /// `evaluate { ... }` in an argument (4.17.7).
+    fn call_arg_hints(
+        &self,
+        callee: &Expr,
+        arg_count: usize,
+        frame: &Frame,
+        me: Option<usize>,
+    ) -> Vec<Option<TypeExpr>> {
+        let mut hints: Vec<Option<TypeExpr>> = vec![None; arg_count];
+        // The type the callee is a method of, and the callee's name.
+        let (type_name, method_name) = match callee {
+            Expr::Ident { name, .. } => {
+                if crate::builtins::is_builtin_routine(name) {
+                    return hints;
+                }
+                let Some(index) = me else {
+                    return hints;
+                };
+                (self.instances[index].type_name.clone(), name.clone())
+            }
+            Expr::MemberAccess { object, name, .. } => {
+                let type_name = match self.static_type_of(object, frame, me) {
+                    Some(TypeExpr::Named { name, .. }) => name,
+                    Some(TypeExpr::WhenQualified { value, base, .. }) => {
+                        match when_view_name(&value, &base) {
+                            Some(view) => view,
+                            None => return hints,
+                        }
+                    }
+                    _ => return hints,
+                };
+                (type_name, name.clone())
+            }
+            _ => return hints,
+        };
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let Some(ty) = types.iter().find(|t| t.name == type_name) else {
+            return hints;
+        };
+        for method in &ty.methods {
+            if method.name != *method_name {
+                continue;
+            }
+            for (position, param) in method.params.iter().enumerate().take(arg_count) {
+                if hints[position].is_none() {
+                    hints[position] = param.ty.clone();
+                }
+            }
+        }
+        hints
+    }
+
+    /// Whether one `in_table` row element matches the tuple element's
+    /// value (clause 4.11.8): a scalar element by `==`, a set element by
+    /// membership. A tuple element and a row element of incompatible
+    /// kinds (integer vs string, enumerals of different types, a range
+    /// against a non-integer, ...) report `E0412`.
+    fn row_element_matches(
+        &mut self,
+        element: &crate::ast::TableElem,
+        value: &Value,
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<bool, Diagnostic> {
+        match element {
+            crate::ast::TableElem::Scalar(expr) => {
+                let other = self.eval(expr, frame, me)?;
+                if !table_values_compatible(value, &other) {
+                    return Err(self.error("E0412", "in_table element type mismatch", span));
+                }
+                Ok(matches!(
+                    self.apply_binary(BinaryOp::Eq, value.clone(), other, span)?,
+                    Value::Bool(true)
+                ))
+            }
+            crate::ast::TableElem::Set(crate::ast::InSetExpr::Items(items)) => {
+                for item in items {
+                    let item_value = self.eval(item, frame, me)?;
+                    if !table_values_compatible(value, &item_value) {
+                        return Err(self.error("E0412", "in_table element type mismatch", span));
+                    }
+                    if matches!(
+                        self.apply_binary(BinaryOp::Eq, value.clone(), item_value, span)?,
+                        Value::Bool(true)
+                    ) {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
+                let Value::Int(v) = value else {
+                    return Err(self.error("E0412", "in_table element type mismatch", span));
+                };
+                let (Value::Int(low), Value::Int(high)) =
+                    (self.eval(low, frame, me)?, self.eval(high, frame, me)?)
+                else {
+                    return Err(self.error("E0402", "range bound must be an integer", span));
+                };
+                Ok(low <= *v && *v <= high)
+            }
+            crate::ast::TableElem::TypeSet { ty, .. } => self.type_set_contains(ty, value, span),
+        }
+    }
+
+    /// Whether `value` is a member of the value set of `ty`
+    /// (5.10.5/5.10.6, as an `in_table` row element): integers and
+    /// booleans by index over the type's range, enumerals by their
+    /// enumerand index over their own type's set. Any other pairing is
+    /// `E0412`.
+    fn type_set_contains(
+        &self,
+        ty: &TypeExpr,
+        value: &Value,
+        span: crate::ast::Span,
+    ) -> Result<bool, Diagnostic> {
+        let Some(range) = self.type_value_range(ty) else {
+            return Err(self.error(
+                "E0402",
+                format!(
+                    "set_of_values expects a numeric or enumeral type; '{}' has none",
+                    ty.render()
+                ),
+                ty.span(),
+            ));
+        };
+        let index = match value {
+            Value::Int(v) => {
+                return Ok(range.0 <= *v && *v <= range.1);
+            }
+            Value::Bool(b) => i128::from(*b),
+            Value::Enum { type_name, name } => {
+                if type_set_key(ty).as_deref() != Some(type_name.as_str()) {
+                    return Err(self.error("E0412", "in_table element type mismatch", span));
+                }
+                let types: &[crate::elab::ElaboratedType] = self.types;
+                let Some(declared) = types.iter().find(|t| t.name == *type_name) else {
+                    return Err(self.error("E0412", "in_table element type mismatch", span));
+                };
+                match declared.enumerals.iter().position(|e| e.name == *name) {
+                    Some(index) => index as i128,
+                    None => return Ok(false),
+                }
+            }
+            _ => return Err(self.error("E0412", "in_table element type mismatch", span)),
+        };
+        Ok(range.0 <= index && index <= range.1)
     }
 
     fn apply_binary(
@@ -4476,6 +5340,9 @@ impl<'a> Interp<'a> {
                         },
                     ) => ta == tb && na == nb,
                     (Value::Object(a), Value::Object(b)) => a == b,
+                    // The regular `==` on lists is item-by-item (4.11.4's
+                    // contrast with `list_ptr==`).
+                    (Value::List(a), Value::List(b)) => lists_equal(a, b, 0),
                     _ => return Err(err("comparison")),
                 };
                 // `===`/`!==` are treated as `==`/`!=` in this subset: value
@@ -4484,6 +5351,31 @@ impl<'a> Interp<'a> {
                     Eq | IdentityEq => equal,
                     _ => !equal,
                 }))
+            }
+            // `list_ptr==` / `!list_ptr=` (clause 4.11.4): object identity
+            // of the two list operands. Both must be lists of the same
+            // type — the declared element types, where both creation
+            // sites recorded them, must match, and either operand that is
+            // not a list reports `E0411`.
+            ListPtrEq | ListPtrNe => {
+                let (Value::List(a), Value::List(b)) = (&lhs, &rhs) else {
+                    return Err(self.error(
+                        "E0411",
+                        "list_ptr== operands must be lists of the same type",
+                        span,
+                    ));
+                };
+                if let (Some(ta), Some(tb)) = (&a.element, &b.element)
+                    && ta != tb
+                {
+                    return Err(self.error(
+                        "E0411",
+                        "list_ptr== operands must be lists of the same type",
+                        span,
+                    ));
+                }
+                let same = Rc::ptr_eq(&a.items, &b.items);
+                Ok(Value::Bool(if op == ListPtrEq { same } else { !same }))
             }
             Lt | Le | Gt | Ge => {
                 use std::cmp::Ordering::*;
@@ -4605,6 +5497,208 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Read a subtype-qualified field (4.17.3): the accessed field must
+    /// be provided by a when-subtype view of the instance's type whose
+    /// when-of set contains every qualifier word, and the instance must
+    /// currently match that subtype — otherwise `E0413` ("the field is
+    /// not present").
+    fn read_qualified_field(
+        &mut self,
+        index: usize,
+        qualifiers: &[WhenQualifier],
+        field: &str,
+        field_span: crate::ast::Span,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let Some(view) = self.find_qualified_field_view(index, qualifiers, field) else {
+            return Err(self.error(
+                "E0401",
+                format!(
+                    "unknown field '{field}': no when-subtype view of the instance's type provides it under these qualifiers"
+                ),
+                span,
+            ));
+        };
+        if !self.instance_matches_view(index, view) {
+            return Err(self.error(
+                "E0413",
+                format!(
+                    "field '{}' is not present: instance is not of subtype '{}'",
+                    field, view.name
+                ),
+                span,
+            ));
+        }
+        if self.instances[index].get(field).is_none() {
+            self.materialize_qualified_field(index, view, field, field_span)?;
+        }
+        Ok(self.instances[index]
+            .get(field)
+            .cloned()
+            .unwrap_or(Value::Void))
+    }
+
+    /// The elaborated subtype view a subtype-qualified access (4.17.3)
+    /// resolves against: a view derived from the instance's root base
+    /// type whose when-of set contains every qualifier word and whose
+    /// fields include the accessed one. A qualifier word matches a
+    /// (field id, value) pair by value (`red` for `red'color`) or, for a
+    /// Boolean determinant's short form, by field id (`good` for
+    /// `TRUE'good`); the most specific matching view (the most pairs)
+    /// wins.
+    fn find_qualified_field_view(
+        &self,
+        index: usize,
+        qualifiers: &[WhenQualifier],
+        field: &str,
+    ) -> Option<&'a crate::elab::ElaboratedType> {
+        let words: Vec<&str> = qualifiers.iter().map(|q| q.value.as_str()).collect();
+        let mut best: Option<&'a crate::elab::ElaboratedType> = None;
+        for view in self.types {
+            if view.when_of.is_empty() {
+                continue;
+            }
+            if !view.fields.iter().any(|f| f.name == field) {
+                continue;
+            }
+            if !view_contains_words(view, &words) {
+                continue;
+            }
+            if !self.instance_in_view_family(index, view) {
+                continue;
+            }
+            if best.is_none_or(|best| view.when_of.len() > best.when_of.len()) {
+                best = Some(view);
+            }
+        }
+        best
+    }
+
+    /// Whether the instance belongs to the subtype family a view was
+    /// derived from: its type is the view itself, the family's root base
+    /// type, a `like` descendant of the root, or a when-qualified
+    /// spelling over the root (`good packet` — a spelling whose view was
+    /// not synthesized keeps the root's name as its last word).
+    fn instance_in_view_family(&self, index: usize, view: &crate::elab::ElaboratedType) -> bool {
+        let type_name = self.instances[index].type_name.as_str();
+        if type_name == view.name {
+            return true;
+        }
+        let Some(root) = self.when_root_base(view) else {
+            return false;
+        };
+        type_name == root
+            || self.type_is_a(type_name, &root)
+            || type_name.rsplit(' ').next() == Some(root.as_str())
+    }
+
+    /// The unmarked base type a when view was derived from (the same
+    /// walk the elaborator's view synthesis uses).
+    fn when_root_base(&self, view: &crate::elab::ElaboratedType) -> Option<String> {
+        let mut current = view;
+        for _ in 0..=self.types.len() {
+            if current.when_of.is_empty() {
+                return Some(current.name.clone());
+            }
+            let base_name = current.base.as_deref()?;
+            current = self.types.iter().find(|t| t.name == base_name)?;
+        }
+        None
+    }
+
+    /// Whether the instance currently satisfies a view's subtype
+    /// (4.17.3): every determinant pair whose field id names a field of
+    /// the instance holds on its value. Pairs whose id names no field
+    /// (the corpus's space form keeps the struct name as the pair's id)
+    /// cannot be verified and are skipped.
+    fn instance_matches_view(&self, index: usize, view: &crate::elab::ElaboratedType) -> bool {
+        view.when_of.iter().all(|(id, value)| {
+            match self.instances[index].get(id) {
+                Some(field_value) => value_holds(field_value, value),
+                // No such field on the instance: the pair is
+                // unverifiable here, not violated.
+                None => true,
+            }
+        })
+    }
+
+    /// A subtype-qualified access whose subtype matched but whose field
+    /// is not on the instance (the instance was created from a less
+    /// specific view or from the base type): the field's presence
+    /// follows from the subtype match (4.17.3 — the field is there iff
+    /// the instance is of the subtype), so it materializes from the
+    /// view's declaration and generates under the view's hard `keep`
+    /// constraints. A constraint that cannot be evaluated against the
+    /// instance (it names a field the instance does not carry) is
+    /// unverifiable and does not gate the materialization.
+    fn materialize_qualified_field(
+        &mut self,
+        index: usize,
+        view: &crate::elab::ElaboratedType,
+        field: &str,
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        let Some(declaration) = view.fields.iter().find(|f| f.name == field) else {
+            return Err(self.error("E0401", format!("unknown field '{field}'"), span));
+        };
+        let ty = declaration.ty.clone();
+        let default = self.default_for(&ty);
+        self.instances[index]
+            .fields
+            .push((field.to_owned(), default));
+        let constraints: Vec<Expr> = view
+            .constraints
+            .iter()
+            .filter(|constraint| !constraint.is_bind)
+            .map(|constraint| constraint.expr.clone())
+            .collect();
+        // The same domain narrowing gen uses: a `keep x == 5` shapes the
+        // sampling domain before the rejection loop.
+        let domains = self.constraint_domains(&constraints, &[(field.to_owned(), ty.clone())]);
+        for _ in 0..1000 {
+            let value = match domains.get(field) {
+                Some(domain) => self.sample_int_in(&ty, *domain),
+                None => self.sample_type(&ty)?,
+            };
+            self.instances[index].set(field, value);
+            let mut pass = true;
+            for constraint in &constraints {
+                // The same shapes gen skips (HDL bindings, soft and
+                // select constraints) do not gate a materialization.
+                if expr_calls_any(
+                    constraint,
+                    &["hdl_path", "delayed", "soft", "select", "edge"],
+                ) {
+                    continue;
+                }
+                match self.eval(constraint, &mut Frame::default(), Some(index)) {
+                    Ok(Value::Bool(true)) => {}
+                    Ok(Value::Bool(false)) => {
+                        pass = false;
+                        break;
+                    }
+                    Ok(_) => {
+                        return Err(self.error(
+                            "E0402",
+                            "constraint did not evaluate to a boolean",
+                            span,
+                        ));
+                    }
+                    // Unverifiable here (a missing sibling field): skip.
+                    Err(_) => {}
+                }
+            }
+            if pass {
+                return Ok(());
+            }
+        }
+        Err(self.error(
+            "E0407",
+            format!("no solution found for the constraints of field '{field}' after 1000 attempts"),
+            span,
+        ))
+    }
+
     fn read_slot(
         &mut self,
         target: &Expr,
@@ -4653,6 +5747,23 @@ impl<'a> Interp<'a> {
                 self.instances[index].get(name).cloned().ok_or_else(|| {
                     self.error("E0401", format!("unknown field '{name}'"), target.span())
                 })
+            }
+            Expr::QualifiedField {
+                base,
+                qualifiers,
+                field,
+                field_span,
+                span,
+            } => {
+                let object_value = self.eval(base, frame, me)?;
+                let Value::Object(index) = object_value else {
+                    return Err(self.error(
+                        "E0402",
+                        "subtype-qualified access requires an object",
+                        target.span(),
+                    ));
+                };
+                self.read_qualified_field(index, qualifiers, field, *field_span, *span)
             }
             _ => Err(self.error("E0402", "unsupported assignment target", target.span())),
         }
@@ -4707,6 +5818,50 @@ impl<'a> Interp<'a> {
                 } else {
                     Err(self.error("E0401", format!("unknown field '{name}'"), span))
                 }
+            }
+            Expr::QualifiedField {
+                base,
+                qualifiers,
+                field,
+                field_span,
+                ..
+            } => {
+                // The same presence rule as the read (4.17.3): the write
+                // lands only if the instance currently matches the
+                // qualifiers' subtype.
+                let object_value = self.eval(base, frame, me)?;
+                let Value::Object(index) = object_value else {
+                    return Err(self.error(
+                        "E0402",
+                        "subtype-qualified assignment requires an object",
+                        span,
+                    ));
+                };
+                let Some(view) = self.find_qualified_field_view(index, qualifiers, field) else {
+                    return Err(self.error(
+                        "E0401",
+                        format!(
+                            "unknown field '{field}': no when-subtype view of the instance's type provides it under these qualifiers"
+                        ),
+                        span,
+                    ));
+                };
+                if !self.instance_matches_view(index, view) {
+                    return Err(self.error(
+                        "E0413",
+                        format!(
+                            "field '{}' is not present: instance is not of subtype '{}'",
+                            field, view.name
+                        ),
+                        span,
+                    ));
+                }
+                if self.instances[index].get(field).is_none() {
+                    let field_span = *field_span;
+                    self.materialize_qualified_field(index, view, field, field_span)?;
+                }
+                self.instances[index].set(field, value);
+                Ok(())
             }
             _ => Err(self.error("E0402", "unsupported assignment target", span)),
         }
@@ -4767,6 +5922,17 @@ impl<'a> Interp<'a> {
     }
 
     fn format_value(&self, value: &Value) -> String {
+        self.format_value_bounded(value, 0)
+    }
+
+    /// Depth-bounded rendering: `MAX_VALUE_DEPTH` is far above any legal
+    /// nesting, so hitting it means a value cycle (a list stored inside
+    /// itself) — rendered as a placeholder instead of overflowing the
+    /// stack.
+    fn format_value_bounded(&self, value: &Value, depth: usize) -> String {
+        if depth > MAX_VALUE_DEPTH {
+            return "...".to_owned();
+        }
         match value {
             Value::Int(i) => i.to_string(),
             Value::Real(f) => {
@@ -4779,8 +5945,12 @@ impl<'a> Interp<'a> {
             Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_owned(),
             Value::Str(s) => s.clone(),
             Value::Enum { name, .. } => name.clone(),
-            Value::List(items) => {
-                let parts: Vec<String> = items.iter().map(|item| self.format_value(item)).collect();
+            Value::List(list) => {
+                let items = list.items.borrow();
+                let parts: Vec<String> = items
+                    .iter()
+                    .map(|item| self.format_value_bounded(item, depth + 1))
+                    .collect();
                 format!("[{}]", parts.join(", "))
             }
             Value::Set(intervals) => render_set(intervals),
@@ -4789,7 +5959,9 @@ impl<'a> Interp<'a> {
                 let parts: Vec<String> = instance
                     .fields
                     .iter()
-                    .map(|(name, value)| format!("{name}: {}", self.format_value(value)))
+                    .map(|(name, value)| {
+                        format!("{name}: {}", self.format_value_bounded(value, depth + 1))
+                    })
                     .collect();
                 format!("{}{{{}}}", instance.type_name, parts.join(", "))
             }
@@ -4867,7 +6039,7 @@ fn as_i64(value: &Value) -> Option<i64> {
 /// `LO HI pkt`, matching the elaborator's synthesized
 /// [`crate::elab::ElaboratedType`] entry. `None` when the chain does
 /// not bottom out in a named base type.
-fn when_view_name(value: &str, base: &TypeExpr) -> Option<String> {
+pub(crate) fn when_view_name(value: &str, base: &TypeExpr) -> Option<String> {
     let mut name = String::from(value);
     let mut base = base;
     loop {
@@ -4893,6 +6065,61 @@ fn when_view_name(value: &str, base: &TypeExpr) -> Option<String> {
     }
 }
 
+/// The qualifier words of a when-qualified type spelling, in written
+/// order (`["LO", "HI"]` for `LO HI pkt`).
+pub(crate) fn when_spelling_words(value: &str, base: &TypeExpr) -> Vec<String> {
+    let mut words = vec![value.to_owned()];
+    let mut base = base;
+    while let TypeExpr::WhenQualified {
+        value: inner_value,
+        base: inner_base,
+        ..
+    } = base
+    {
+        words.push(inner_value.clone());
+        base = inner_base;
+    }
+    words
+}
+
+/// The named base type a when-qualified spelling bottoms out in.
+fn when_view_base(base: &TypeExpr) -> Option<String> {
+    match base {
+        TypeExpr::Named { name, .. } => Some(name.clone()),
+        TypeExpr::WhenQualified { base, .. } => when_view_base(base),
+        _ => None,
+    }
+}
+
+/// Whether a view's when-of set contains every qualifier word (4.17.3's
+/// legality reading): each word denotes a (field id, value) determinant
+/// of the view — by value (`red` for `red'color`, `TRUE` for
+/// `TRUE'good`) or by field id (a determinant's full or short spelling,
+/// `color` for `red'color`, `good` for `TRUE'good`). Several words may
+/// denote the same determinant (the full `TRUE'good` spelling of the
+/// short `good`), and qualifiers already implied by the static type are
+/// simply absent — so the words only need to cover a subset of the
+/// view's determinants; the subtype check below verifies the rest.
+fn view_contains_words(view: &crate::elab::ElaboratedType, words: &[&str]) -> bool {
+    words.iter().all(|word| {
+        view.when_of
+            .iter()
+            .any(|(id, value)| value == word || id == word)
+    })
+}
+
+/// Whether a determinant value word holds on a field value: an
+/// enumerand by name, a Boolean by its TRUE/FALSE word, a number by its
+/// decimal text.
+fn value_holds(value: &Value, word: &str) -> bool {
+    match value {
+        Value::Bool(b) => word.eq_ignore_ascii_case("true") == *b,
+        Value::Enum { name, .. } => name == word,
+        Value::Int(i) => word.parse::<i128>().map(|w| w == *i).unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// The MAX_UINT predefined constant (the 28.5 guards' bound).
 const MAX_UINT_VALUE: i128 = (1i128 << 32) - 1;
 
@@ -4907,6 +6134,9 @@ fn scalar_range(base: ScalarBase, width: &Option<Box<Expr>>) -> Option<(i128, i1
             let bits = width_bits(width, 32);
             Some((-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1))
         }
+        // The long bases are 64-bit wide (Table 17, clause 5.2.3.1).
+        ScalarBase::Longuint => Some((0, (1i128 << 64) - 1)),
+        ScalarBase::Longint => Some((-(1i128 << 63), (1i128 << 63) - 1)),
         ScalarBase::Bit => Some((0, 1)),
         ScalarBase::Byte => Some((0, 255)),
         ScalarBase::Nibble => Some((0, 15)),
@@ -5073,6 +6303,9 @@ fn natural_range(ty: &TypeExpr) -> Option<(i128, i128)> {
             let bits = width_bits(width, 32);
             Some((-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1))
         }
+        // The long bases are 64-bit wide (Table 17, clause 5.2.3.1).
+        ScalarBase::Longuint => Some((0, (1i128 << 64) - 1)),
+        ScalarBase::Longint => Some((-(1i128 << 63), (1i128 << 63) - 1)),
         ScalarBase::Bit => Some((0, 1)),
         ScalarBase::Byte => Some((0, 255)),
         ScalarBase::Nibble => Some((0, 15)),
@@ -5442,6 +6675,106 @@ fn as_f64(value: &Value) -> Option<f64> {
     }
 }
 
+/// Whether an `in_table` tuple element and a row element may be compared
+/// at all (clause 4.11.8): same-kind scalars, the mixed integer/real
+/// pair (as `==` accepts), objects by identity. Enumerals only compare
+/// within their own type; anything else is the E0412 mismatch.
+fn table_values_compatible(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(_), Value::Int(_))
+        | (Value::Int(_), Value::Real(_))
+        | (Value::Real(_), Value::Int(_))
+        | (Value::Real(_), Value::Real(_))
+        | (Value::Bool(_), Value::Bool(_))
+        | (Value::Str(_), Value::Str(_))
+        | (Value::Object(_), Value::Object(_)) => true,
+        (
+            Value::Enum {
+                type_name: type_a, ..
+            },
+            Value::Enum {
+                type_name: type_b, ..
+            },
+        ) => type_a == type_b,
+        _ => false,
+    }
+}
+
+/// The canonical type name a `set_of_values`-style type argument denotes,
+/// for comparison with an enumerand value's type: the declared name, or
+/// the inline enum's synthetic key for an inline enumeral list.
+fn type_set_key(ty: &TypeExpr) -> Option<String> {
+    match ty {
+        TypeExpr::Named { name, .. } => Some(name.clone()),
+        TypeExpr::InlineEnum { names, .. } => Some(inline_enum_key(names)),
+        _ => None,
+    }
+}
+
+/// Whether the expression anywhere contains an `evaluate { ... }` block
+/// without an explicit type — the only case a call argument needs its
+/// parameter's declared type as the inference context (4.17.7).
+fn expr_has_untyped_evaluate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Evaluate { ty, .. } => ty.is_none(),
+        Expr::Unary { expr, .. } | Expr::Paren { expr, .. } | Expr::CastAs { expr, .. } => {
+            expr_has_untyped_evaluate(expr)
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_has_untyped_evaluate(lhs) || expr_has_untyped_evaluate(rhs)
+        }
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            expr_has_untyped_evaluate(cond)
+                || expr_has_untyped_evaluate(then_expr)
+                || expr_has_untyped_evaluate(else_expr)
+        }
+        Expr::Index { base, index, .. } => {
+            expr_has_untyped_evaluate(base) || expr_has_untyped_evaluate(index)
+        }
+        Expr::BitSlice {
+            base, high, low, ..
+        } => {
+            expr_has_untyped_evaluate(base)
+                || expr_has_untyped_evaluate(high)
+                || expr_has_untyped_evaluate(low)
+        }
+        Expr::MemberAccess { object, .. } => expr_has_untyped_evaluate(object),
+        Expr::Call { callee, args, .. } => {
+            expr_has_untyped_evaluate(callee) || args.iter().any(expr_has_untyped_evaluate)
+        }
+        Expr::InSet { element, set, .. } => {
+            let set_has = match set {
+                crate::ast::InSetExpr::Items(items) => items.iter().any(expr_has_untyped_evaluate),
+                crate::ast::InSetExpr::Range(low, high) => {
+                    expr_has_untyped_evaluate(low) || expr_has_untyped_evaluate(high)
+                }
+            };
+            expr_has_untyped_evaluate(element) || set_has
+        }
+        Expr::InTable { tuple, rows, .. } => {
+            tuple.iter().any(expr_has_untyped_evaluate)
+                || rows.iter().any(|row| {
+                    row.iter().any(|element| match element {
+                        crate::ast::TableElem::Scalar(expr) => expr_has_untyped_evaluate(expr),
+                        crate::ast::TableElem::Set(crate::ast::InSetExpr::Items(items)) => {
+                            items.iter().any(expr_has_untyped_evaluate)
+                        }
+                        crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
+                            expr_has_untyped_evaluate(low) || expr_has_untyped_evaluate(high)
+                        }
+                        crate::ast::TableElem::TypeSet { .. } => false,
+                    })
+                })
+        }
+        _ => false,
+    }
+}
+
 /// The ordering used by the list `min`/`max` family (27.4.15-27.4.19):
 /// the operand rules of the relational operators (the `Lt`..`Ge` arms of
 /// `apply_binary`). `None` when the pair is not comparable.
@@ -5461,6 +6794,17 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 /// instance index — the prose's "compares the addresses of the struct
 /// items". Pairs `==` does not accept compare unequal.
 fn values_equal(a: &Value, b: &Value) -> bool {
+    values_equal_bounded(a, b, 0)
+}
+
+/// The recursion cap of the value-level comparisons and formatting. Far
+/// above any legal nesting (e declares no lists of lists), it exists so a
+/// list that was illegally stored inside itself — the runtime performs no
+/// element-type check on item stores — reports unequal or renders a
+/// placeholder instead of overflowing the stack.
+const MAX_VALUE_DEPTH: usize = 64;
+
+fn values_equal_bounded(a: &Value, b: &Value, depth: usize) -> bool {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Real(x), Value::Real(y)) => x == y,
@@ -5478,8 +6822,24 @@ fn values_equal(a: &Value, b: &Value) -> bool {
             },
         ) => type_x == type_y && name_x == name_y,
         (Value::Object(x), Value::Object(y)) => x == y,
+        (Value::List(x), Value::List(y)) => lists_equal(x, y, depth),
         _ => false,
     }
+}
+
+/// Item-wise list equality (the regular `==`, 4.11.4's contrast with
+/// `list_ptr==`): same length, items equal pairwise.
+fn lists_equal(a: &ListValue, b: &ListValue, depth: usize) -> bool {
+    if depth > MAX_VALUE_DEPTH {
+        return false;
+    }
+    let a_items = a.items.borrow();
+    let b_items = b.items.borrow();
+    a_items.len() == b_items.len()
+        && a_items
+            .iter()
+            .zip(b_items.iter())
+            .all(|(x, y)| values_equal_bounded(x, y, depth + 1))
 }
 
 /// The element type of a list type expression (identity for non-lists).
@@ -5491,13 +6851,17 @@ fn list_element_type(ty: &TypeExpr) -> TypeExpr {
 }
 
 /// The bit width of a scalar type declaration (`uint(bits: 3)` → 3);
-/// unsized scalars count as one bit for packing.
+/// unsized scalars count as one bit for packing — except the long bases,
+/// whose default packing width is 64 bits (Table 17, clause 5.2.3.1).
 fn field_width_bits(ty: &TypeExpr) -> Option<i128> {
-    let TypeExpr::Scalar {
-        width: Some(width), ..
-    } = ty
-    else {
+    let TypeExpr::Scalar { base, width, .. } = ty else {
         return None;
+    };
+    let Some(width) = width else {
+        return match base {
+            ScalarBase::Longint | ScalarBase::Longuint => Some(64),
+            _ => None,
+        };
     };
     match width.as_ref() {
         Expr::IntLiteral { text, .. } => parse_int_literal(text),

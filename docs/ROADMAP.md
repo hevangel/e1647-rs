@@ -16,8 +16,7 @@
       code. Decimal `K`/`M` multipliers, `0c"..."` character literals,
       and MVL digits in non-decimal based literals are tokenized.
       Not yet the complete lexical grammar: MVL literals are not
-      evaluated, `/* */` block comments are an extension beyond
-      clause 4.2.4, and the 32-bit default width is not applied
+      evaluated, and the 32-bit default width is not applied
 - [x] Build AST and parser for a declared subset: `struct`/`unit`/`extend`/
       `type` with `like` (when-modifier prefixes recorded on the
       declaration; user `extend global` is rejected per clause 4.4.2.2),
@@ -419,12 +418,20 @@ the work.
       words stay contextual, each documented in `src/lexer.rs`), and the
       2019 designation in `README.md`, `AGENTS.md`, `docs/REFERENCES.md`
       and the verification-log header
-- [ ] Phase 1 — Lexical/syntactic foundation (T1.1–T1.13): standard
-      multi-line comments, statements spanning code segments, brace groups,
-      `longint`/`longuint`, precedence Table 12 updates, `list_ptr==` /
-      `!list_ptr=`, `in_table`, `evaluate`, `typeof()`/`typeof_item()`,
-      subtype qualifiers in dot access, field initial values, `extend
-      global` policy, literal `global` resolution
+- [x] Phase 1 — Lexical/syntactic foundation (T1.1–T1.13): standard
+      multi-line comments (span lines and code segments, non-nesting —
+      4.2.4), statements spanning code segments (4.2.3), brace-grouped
+      statements and members (4.3.2/4.3.3), `longint`/`longuint` with
+      E0207 for subtypes of either (5.2.3.1), the Table 12 row order
+      pinned by a precedence test (4.6), `list_ptr==`/`!list_ptr=` over
+      reference-identity lists (4.11.4, E0411), `in_table` (4.11.8,
+      E0121/E0412, gen narrows to the rows' projection), `evaluate`
+      (4.17.7, E0122/E0123), `typeof()`/`typeof_item()` in type position
+      (5.9, E0208/E0209), subtype qualifiers in dot access (4.17.3,
+      E0413), field initial values (6.9, E0211/E0213/E0214; E0212 waits
+      for Phase 2 with the contextual `static` prefix), the 4.4.2.2
+      `extend global` rewording, and the 4.4.5.3 literal-`global`
+      ordering recorded (the global struct itself is not modelled yet)
 - [ ] Phase 2 — Static members (T2.1–T2.4): static fields and `::` access,
       static methods and their restrictions, static events and `on
       Type::event`, keyed-list key restrictions

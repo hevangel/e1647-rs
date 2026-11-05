@@ -47,7 +47,16 @@
 > expand before
 > parsing, and the reflection set (`set_of_values` with the 28.5 set
 > pseudo-methods) evaluates. Clause 20's `repeat until` loops and the
-> `do` sugar run. The simulator-side temporal integration samples
+> `do` sugar run. The IEEE 1647-2019 lexical/syntactic foundation runs:
+> `/* */` comments are standard and may span code segments (4.2.4),
+> statements may span code segments (4.2.3), statements and members may
+> be brace-grouped (4.3.2/4.3.3), `longint`/`longuint` exist (5.2.3.1),
+> `list_ptr==`/`!list_ptr=` compare reference-identity lists (4.11.4),
+> `in_table` rows match tuples (4.11.8), `evaluate { … }` is an
+> expression (4.17.7), `typeof()`/`typeof_item()` resolve in type
+> positions (5.9), subtype qualifiers qualify dot access (4.17.3), and
+> field declarations take initial values (6.9). The simulator-side
+> temporal integration samples
 > `rise/fall/change(HDL expression) @sim` events and `hdl_path()`-bound
 > event ports each virtual cycle (a live session, or an injected signal
 > history where the simulator is unavailable), and TCMs declared

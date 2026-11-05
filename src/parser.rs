@@ -2,14 +2,21 @@
 //!
 //! Supported: `struct` / `unit` / `extend` / `type` declarations with
 //! optional `like` inheritance, field declarations (single names and `a, b:`
-//! name groups) with scalar (`uint(bits: 8)`-style widths included), `list
-//! of`, and named types, enumeral type declarations, `keep` and `keep soft`
+//! name groups) with the clause 6.9.1 prefix set (`package`/`protected`/
+//! `private` visibility, `const`, `!`, `~`, `%` — the contextual `static`
+//! prefix is a later stage), scalar (`uint(bits: 8)`-style widths included),
+//! `list of`, and named types, field init values (`= init-value`, clause
+//! 6.9.1/6.9.2), enumeral type declarations, `keep` and `keep soft`
 //! constraint expressions, `when` subtype members (`value'id` modifiers per
 //! the reference grammar's `struct_type_modifier`), and method members with
 //! parameter lists and statement bodies (local `var` declarations,
 //! assignments, expression statements including calls and indexing,
 //! `return`, braced `if`/`else`, `while` with `break`/`continue`, `print`
-//! and `gen`).
+//! and `gen`). Brace grouping is pure syntax (clause 4.3.2 module level,
+//! 4.3.3 member lists): a bare `{ ... }` splices its contents into the
+//! enclosing list, and groups nest. A statement (or member) may also span
+//! code segments (clause 4.2.3): the lexer skips prose between `'>` and
+//! `<'`, so the parser sees one continuous token stream.
 //!
 //! Everything else (events, temporal expressions, coverage, the
 //! single-statement `if ... do` form, `for`/`repeat` loops) is a later
@@ -45,6 +52,12 @@
 //!   member now reports `E0120` when missing)
 //! - `E0120` unsupported, unexpected or missing temporal-expression
 //!   construct (clause 12)
+//! - `E0121` `in_table` row/tuple arity mismatch (clause 4.11.8)
+//! - `E0122` `evaluate` result type cannot be inferred (clause 4.17.7) —
+//!   documented here per the migration's code allocation; raised by the
+//!   interpreter, where the inference contexts (the declared type of the
+//!   assignment/`var` target or of the call's parameter) actually resolve
+//! - `E0123` `return`/`wait`/`sync` inside an `evaluate` block (clause 4.17.7)
 //! - `E0201` duplicate declaration name
 //! - `E0202` duplicate field name
 //! - `E0203` unknown type name
@@ -54,9 +67,9 @@
 //!   enumeral)
 
 use crate::ast::{
-    BinaryOp, Declaration, DeclarationKind, Enumeral, Expr, Field, KeepConstraint, Member,
-    MethodDecl, MethodModifier, OnDecl, Param, ScalarBase, Stmt, SubtypeModifier, TypeExpr,
-    UnaryOp, WhenDecl,
+    BinaryOp, Declaration, DeclarationKind, Enumeral, Expr, Field, InSetExpr, KeepConstraint,
+    Member, MethodDecl, MethodModifier, OnDecl, Param, ScalarBase, Stmt, SubtypeModifier,
+    TableElem, TypeExpr, UnaryOp, WhenDecl, WhenQualifier,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Position, Token, TokenKind};
@@ -99,14 +112,28 @@ fn is_predefined_name(word: &str) -> bool {
     PREDEFINED_NAMES.contains(&word)
 }
 
-/// Binary operator rows from loosest to tightest binding (clause 4.6,
-/// Table 12). Arithmetic, shifts, relational operators, and `&&` / `||`
-/// follow C. `^` is looser than `|`, `===` / `!==` are looser than
-/// `==` / `!=`. The word spellings (`and`, `or`, `xor`) share the level of
-/// their symbol twins. All of these are left-associative. Three operators
-/// of Table 12 are not rows here: `in` and `~` / `!~` sit between these
-/// rows (see [`IN_LEVEL`], [`MATCH_LEVEL`]), and `is [not] a` has a type
-/// operand instead of an expression (see [`ISA_LEVEL`]).
+/// Binary operator rows of IEEE 1647-2019 Table 12 (clause 4.6), loosest
+/// first to match the parse order. The full table, tightest binding
+/// first: `[]`/`[..]`/`[:]` indexing, slicing and bit slicing · `f()`
+/// calls · `::` static access (a later phase) · `.` dot · unary `~ ! not` ·
+/// `{...;...}` list concatenation · `%{...}` bit concatenation · unary
+/// `+ -` · `* / %` · binary `+ -` · `>> <<` · `< <= > >=` ·
+/// `is [not] a` · `== != list_ptr== !list_ptr=` · `=== !==` · `~ !~`
+/// string match · `in not in` (and `in_table`, a later task) · `&` ·
+/// `|` · `^` · `&& and` · `|| or` · `=>` · `? :`.
+///
+/// The rows here carry the expression-binary operators of that order.
+/// Arithmetic, shifts, relations and the logical rows follow C; `&`
+/// binds tighter than `|`, which binds tighter than `^`; `==` / `!=`
+/// bind tighter than `===` / `!==`. The word spellings (`and`, `or`,
+/// `xor`) share the level of their symbol twins. All rows are
+/// left-associative. Four table entries are not rows here: `in` and
+/// `~` / `!~` sit between these rows (see [`IN_LEVEL`],
+/// [`MATCH_LEVEL`]), `is [not] a` takes a type operand instead of an
+/// expression (see [`ISA_LEVEL`]), and `? :` — the loosest construct —
+/// is parsed in [`Parser::parse_expr`]. The `{...;...}` list concat of
+/// Table 12 is an operand shape, not a binary row: it parses in primary
+/// position.
 const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
     &[("=>", BinaryOp::Imply)],
     &[("||", BinaryOp::LogicalOr), ("or", BinaryOp::LogicalOr)],
@@ -115,7 +142,12 @@ const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
     &[("|", BinaryOp::BitOr)],
     &[("&", BinaryOp::BitAnd)],
     &[("===", BinaryOp::IdentityEq), ("!==", BinaryOp::IdentityNe)],
-    &[("==", BinaryOp::Eq), ("!=", BinaryOp::NotEq)],
+    &[
+        ("==", BinaryOp::Eq),
+        ("!=", BinaryOp::NotEq),
+        ("list_ptr==", BinaryOp::ListPtrEq),
+        ("!list_ptr=", BinaryOp::ListPtrNe),
+    ],
     &[
         ("<", BinaryOp::Lt),
         ("<=", BinaryOp::Le),
@@ -131,24 +163,30 @@ const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
     ],
 ];
 
-/// `in` membership is not a [`BINARY_LEVELS`] row. It binds looser than
-/// the string-match operators and tighter than `&` (clause 4.6).
+/// `in` membership (Table 12's `in not in` row, which will also carry
+/// `in_table`) is not a [`BINARY_LEVELS`] row: its right operand is a
+/// set. It binds tighter than the `&` row and looser than the `~ !~`
+/// string-match row (clause 4.6).
 const IN_LEVEL: usize = 6;
 
-/// `~` / `!~` string match is not a [`BINARY_LEVELS`] row. It binds looser
-/// than `===` / `!==` and tighter than `in` (clause 4.6, Table 12).
+/// `~` / `!~` string match (Table 12's match row) is not a
+/// [`BINARY_LEVELS`] row: neither operand is restricted to a string. It
+/// binds tighter than the `in` row and looser than the `=== !==` row
+/// (clause 4.6, Table 12).
 const MATCH_LEVEL: usize = 7;
 
-/// `is [not] a <type>` is not a [`BINARY_LEVELS`] row: its right operand
-/// is a type, not an expression. It binds tighter than `==` / `!=` and
-/// looser than the comparisons (clause 4.6, Table 12).
+/// `is [not] a <type>` (Table 12's `is a / is not a` row) is not a
+/// [`BINARY_LEVELS`] row: its right operand is a type, not an
+/// expression. It binds tighter than the `== !=` row and looser than the
+/// relational row (clause 4.6, Table 12).
 const ISA_LEVEL: usize = 10;
 
 /// The [`BINARY_LEVELS`] row for a parse level, if the level is a plain
-/// binary-operator row. Two special levels (`in` at [`IN_LEVEL`] and
-/// string match at [`MATCH_LEVEL`]) sit between rows 5 and 6, and `is
-/// [not] a` ([`ISA_LEVEL`]) between rows 7 and 8, so levels above a
-/// special level shift by the number of specials passed.
+/// binary-operator row. Three special levels sit between rows: `in`
+/// ([`IN_LEVEL`]) and string match ([`MATCH_LEVEL`]) between the `===`
+/// row and the `&` row, and `is [not] a` ([`ISA_LEVEL`]) between the
+/// equality row and the relational row, so levels above a special level
+/// shift by the number of specials passed.
 fn binary_row_for(level: usize) -> Option<&'static [(&'static str, BinaryOp)]> {
     match level {
         0..=5 => BINARY_LEVELS.get(level).copied(),
@@ -263,6 +301,13 @@ struct Parser {
     /// `package` / `private` visibility prefix of the member being
     /// parsed (clause 22), recorded on the field, not enforced.
     member_visibility: Option<String>,
+    /// Nesting depth of bare `{ ... }` statement groups at module level
+    /// (clause 4.3.2). A group is pure syntax — its contents splice into
+    /// the enclosing top-level list — so the group's braces are consumed
+    /// transparently in `parse_program` and only tracked here to find the
+    /// matching `}` of nested groups. A `}` at depth 0 is still the
+    /// stray-brace diagnostic it was before the migration.
+    module_group_depth: usize,
 }
 
 /// The included body of one preprocessor directive: members in member
@@ -284,6 +329,7 @@ impl Parser {
             diagnostics: Vec::new(),
             defined: BTreeSet::new(),
             member_visibility: None,
+            module_group_depth: 0,
         }
     }
 
@@ -380,6 +426,10 @@ impl Parser {
 
     /// Skip tokens until the next top-level declaration keyword.
     fn recover_to_declaration_boundary(&mut self) {
+        // Recovery abandons the current top-level construct, so any
+        // module-level `{ ... }` group open at the error point is
+        // abandoned with it (clause 4.3.2 groups carry no state).
+        self.module_group_depth = 0;
         while let Some(token) = self.peek() {
             match &token.kind {
                 TokenKind::Keyword(k) if matches!(k.as_str(), "struct" | "unit" | "extend") => {
@@ -497,6 +547,7 @@ impl Parser {
                             name: "global".to_owned(),
                             name_span: (gstart, gstart),
                             underlying: None,
+                            subtype_range: None,
                             template_params: Vec::new(),
                             template_extend: false,
                             packaged: false,
@@ -532,6 +583,7 @@ impl Parser {
                             name: "global".to_owned(),
                             name_span: (gstart, gstart),
                             underlying: None,
+                            subtype_range: None,
                             template_params: Vec::new(),
                             template_extend: false,
                             packaged: false,
@@ -604,6 +656,23 @@ impl Parser {
                             self.recover_to_declaration_boundary();
                         }
                     }
+                    continue;
+                }
+                // Clause 4.3.2: a bare `{ ... }` group of top-level
+                // statements is pure syntax — no scope, no semantics. Its
+                // contents splice into the enclosing list, so the group's
+                // braces are consumed transparently and the existing
+                // declaration dispatch parses the contents. Groups nest,
+                // hence the depth tracking; a `}` at depth 0 keeps the
+                // stray-brace diagnostic it always had.
+                Some(TokenKind::Punctuation(p)) if p == "{" => {
+                    self.module_group_depth += 1;
+                    self.bump();
+                    continue;
+                }
+                Some(TokenKind::Punctuation(p)) if p == "}" && self.module_group_depth > 0 => {
+                    self.module_group_depth -= 1;
+                    self.bump();
                     continue;
                 }
                 _ => {
@@ -703,6 +772,7 @@ impl Parser {
                 name: kind,
                 name_span: (start, start),
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -718,6 +788,7 @@ impl Parser {
                 name: driver,
                 name_span: (start, start),
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -753,6 +824,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -837,6 +909,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                subtype_range: None,
                 template_params,
                 template_extend,
                 packaged: false,
@@ -856,6 +929,7 @@ impl Parser {
             name,
             name_span,
             underlying: None,
+            subtype_range: None,
             template_params,
             template_extend,
             packaged: false,
@@ -892,9 +966,11 @@ impl Parser {
     }
 
     /// `type name: [ENUMERAL [= expr] , ..];` or the clause 5 scalar
-    /// form `type name: <type>;` (`type addr_t: int (bits: 8);`) — the
-    /// underlying representation is recorded; distinct-type semantics
-    /// over it are a later milestone.
+    /// form `type name: <type>;` (`type addr_t: int (bits: 8);`), with
+    /// the optional range qualification of a numeric subtype
+    /// (`type small: uint [0..7];` — clause 5.2.3.1) — the underlying
+    /// representation and the range are recorded; distinct-type
+    /// semantics and range narrowing over them are a later milestone.
     fn parse_type_declaration(&mut self) -> Option<Declaration> {
         let start = self.current_span().0;
         self.bump(); // 'type'
@@ -903,6 +979,13 @@ impl Parser {
         if !self.at_punct("[") {
             // Scalar/list type declaration: record the representation.
             let underlying = self.parse_type()?;
+            // The range qualification applies to a scalar base only; a
+            // `[` after any other underlying type stays a syntax error.
+            let subtype_range = if matches!(underlying, TypeExpr::Scalar { .. }) {
+                self.parse_subtype_range()?
+            } else {
+                None
+            };
             self.expect_punct(";", "E0105", "expected ';' after the type declaration")?;
             let end = self.last_end();
             return Some(Declaration {
@@ -910,6 +993,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: Some(underlying),
+                subtype_range,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -931,6 +1015,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -976,6 +1061,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -1006,6 +1092,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -1023,6 +1110,7 @@ impl Parser {
             name,
             name_span,
             underlying: None,
+            subtype_range: None,
             template_params: Vec::new(),
             template_extend: false,
             packaged: false,
@@ -1033,6 +1121,38 @@ impl Parser {
             members,
             span: (start, end),
         })
+    }
+
+    /// `[low..high]` — the range qualification of a numeric subtype
+    /// declaration (clause 5.2.3.1's subtypes over scalar bases). The
+    /// qualification is recorded on the declaration; the well-formedness
+    /// check rejects the forms derived from `longint`/`longuint` (E0207).
+    /// Returns `None` when no `[` follows (the common case), so callers
+    /// can chain it with `?`.
+    fn parse_subtype_range(&mut self) -> Option<Option<(Expr, Expr)>> {
+        if !self.at_punct("[") {
+            return Some(None);
+        }
+        self.expect_punct("[", "E0106", "expected '[' to open the subtype range")?;
+        let low = self.parse_expr()?;
+        self.expect_punct("..", "E0108", "expected '..' in the subtype range")?;
+        let high = self.parse_expr()?;
+        self.expect_punct("]", "E0107", "expected ']' to close the subtype range")?;
+        Some(Some((low, high)))
+    }
+
+    /// `(bits: <expr>)` — the width specification after a scalar base
+    /// type (clause 5.2.3.2). The caller has checked the opening `(`.
+    fn parse_scalar_width(&mut self) -> Option<Box<Expr>> {
+        self.bump(); // '('
+        if !self.eat_keyword("bits") {
+            self.error_here("E0111", "expected 'bits' in width specification");
+            return None;
+        }
+        self.expect_punct(":", "E0103", "expected ':' after 'bits'")?;
+        let expr = self.parse_expr()?;
+        self.expect_punct(")", "E0110", "expected ')' after width specification")?;
+        Some(Box::new(expr))
     }
 
     fn parse_declaration(&mut self, keyword: &str) -> Option<Declaration> {
@@ -1086,15 +1206,18 @@ impl Parser {
         } else {
             self.expect_type_name("expected declaration name")?
         };
-        // Clause 4.4.2.2: extensions of the root `global` type are reserved
-        // for the runtime; user code shall not write `extend global`. The
-        // parser's own `extend global` pseudo-declaration (the holder of
-        // file-level `define`/`import` members) is built in
-        // `parse_program` and never passes through here.
+        // Clause 4.4.2.2 (2019): extensions of `global` are reserved for
+        // the implementation, so user code shall not write `extend
+        // global`; the parser keeps it an error (the conservative
+        // reading — an implementation-provided extension is not a user
+        // extension). The parser's own `extend global`
+        // pseudo-declaration (the holder of file-level `define`/`import`
+        // members) is built in `parse_program` and never passes through
+        // here.
         if kind == DeclarationKind::Extend && name == "global" {
             self.diagnostics.push(Diagnostic::new(
                 "E0116",
-                "cannot extend 'global': extensions of the root type are reserved for the runtime",
+                "extending 'global' is reserved for the implementation (clause 4.4.2.2)",
                 name_span.0,
                 name_span.1,
             ));
@@ -1128,6 +1251,7 @@ impl Parser {
                 name,
                 name_span,
                 underlying: None,
+                subtype_range: None,
                 template_params: Vec::new(),
                 template_extend: false,
                 packaged: false,
@@ -1149,6 +1273,7 @@ impl Parser {
             name,
             name_span,
             underlying: None,
+            subtype_range: None,
             template_params: Vec::new(),
             template_extend: false,
             packaged: false,
@@ -1162,7 +1287,7 @@ impl Parser {
     }
 
     /// Members up to (and including) the closing `}` of the enclosing
-    /// declaration or `when` body.
+    /// declaration, `when` body or clause 4.3.3 member group.
     fn parse_member_list(&mut self) -> Vec<Member> {
         let mut members = Vec::new();
         loop {
@@ -1174,8 +1299,16 @@ impl Parser {
                 self.bump();
                 break;
             }
+            let before = self.pos;
             if let Some(mut parsed) = self.parse_member() {
                 members.append(&mut parsed);
+            }
+            if self.pos == before {
+                // No progress: the member parser errored and its recovery
+                // stopped at a boundary token it does not consume (a `}`
+                // or a declaration keyword). Force past it so the loop
+                // terminates; the recorded diagnostics are authoritative.
+                self.bump();
             }
         }
         members
@@ -1184,11 +1317,13 @@ impl Parser {
     /// One member often produces several AST members (`a, b: uint;` is two
     /// fields), hence the vector.
     fn parse_member(&mut self) -> Option<Vec<Member>> {
-        // `package` / `private` visibility prefix of a member
-        // (`package items: …`, `private mset: …`, clause 22) — recorded
-        // on the field, not enforced. The prefix is consumed by the
-        // field parser one level down.
-        if (self.peek_word_is("package") || self.peek_word_is("private"))
+        // `package` / `protected` / `private` visibility prefix of a
+        // member (`package items: …`, `private mset: …`, clause 22) —
+        // recorded on the field, not enforced. The prefix is consumed by
+        // the field parser one level down.
+        if (self.peek_word_is("package")
+            || self.peek_word_is("protected")
+            || self.peek_word_is("private"))
             && !matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == "(")
         {
             let word = match self.peek_kind() {
@@ -1200,6 +1335,25 @@ impl Parser {
             let members = self.parse_member();
             self.member_visibility = None;
             return members;
+        }
+        // The contextual `static` member prefix (clause 6.9.3) is not
+        // parsed into the AST yet: static fields are per-type singletons
+        // with their own storage and access rules, which the
+        // static-members stage (plan T2.1) owns. A `static`-prefixed
+        // member shape (`static x: uint;`, `static const n: int = 0;`,
+        // `static !l: string;`) is therefore rejected here with an
+        // explicit not-supported diagnostic instead of the misleading
+        // "expected ':'" that would follow otherwise. A field or method
+        // genuinely named `static` (`static: uint;`, `static() is { … }`,
+        // the name group `static, x: uint;`) keeps its existing handling:
+        // the prefix trigger requires a prefix token or a following name.
+        if self.peek_word_is("static") && self.peek_second_starts_member_declarator() {
+            self.error_here(
+                "E0113",
+                "static member declarations are not supported yet (clause 6.9.3; static fields and methods are a planned stage)",
+            );
+            self.recover_to_member_boundary();
+            return None;
         }
         match self.peek_kind() {
             Some(TokenKind::Keyword(k)) if k == "import" => self.parse_import(),
@@ -1228,6 +1382,18 @@ impl Parser {
                 self.parse_expect().map(|e| vec![Member::Expect(e)])
             }
             Some(TokenKind::Punctuation(p)) if p == "#" => self.parse_hash_members(),
+            // Clause 4.3.3: a bare `{ ... }` group of struct members is
+            // pure syntax — no scope, no semantics. Its members splice
+            // into the enclosing member list, in source order. Groups
+            // nest: the inner `parse_member_list` reaches this arm again
+            // for an inner group. The e convention writes the closing
+            // brace as `};`, so a trailing `;` is accepted but optional.
+            Some(TokenKind::Punctuation(p)) if p == "{" => {
+                self.bump(); // '{' opens the group
+                let group = self.parse_member_list();
+                self.eat_punct(";");
+                Some(group)
+            }
             // The explicit `method name() …` spelling; the bare
             // `name() …` init style is handled by the identifier arm.
             Some(TokenKind::Keyword(k)) if k == "method" => self.parse_method().map(|m| vec![m]),
@@ -1246,8 +1412,14 @@ impl Parser {
             {
                 self.parse_fields()
             }
-            // `%name` physical / `!name` do-not-generate field prefixes.
-            Some(TokenKind::Punctuation(p)) if p == "%" || p == "!" => self.parse_fields(),
+            // `%name` physical, `!name` do-not-generate and `~name`
+            // range-generated field prefixes (clause 6.9.1/6.9.7). `!~`
+            // lexes as one string-match operator token, but in member
+            // position it can only be the two field prefixes read
+            // together (rejected by `check.rs`, E0213).
+            Some(TokenKind::Punctuation(p)) if p == "%" || p == "!" || p == "~" || p == "!~" => {
+                self.parse_fields()
+            }
             _ => {
                 self.error_here(
                     "E0113",
@@ -1362,6 +1534,18 @@ impl Parser {
             self.peek_second_kind(),
             Some(TokenKind::Keyword(w)) if w == word
         )
+    }
+
+    /// Whether the token after the current one can start the declarator
+    /// of a `static`-prefixed member: the `const` prefix or one of the
+    /// `!` / `~` / `%` field prefixes, or the member name itself. A
+    /// following `:`, `,`, `(` or `is` leaves the member to the regular
+    /// field/method paths (a member genuinely named `static`).
+    fn peek_second_starts_member_declarator(&self) -> bool {
+        matches!(
+            self.peek_second_kind(),
+            Some(TokenKind::Punctuation(p)) if p == "!" || p == "~" || p == "%"
+        ) || matches!(self.peek_second_kind(), Some(TokenKind::Identifier(_)))
     }
 
     /// Collect the raw tokens up to and including the `}` matching the
@@ -2061,15 +2245,46 @@ impl Parser {
         })])
     }
 
-    /// `name, name: type;` — a name group declares one field per name.
+    /// `name, name: type [= init];` — a name group declares one field per
+    /// name, with the shared prefixes, type and init value (clause 6.9.1:
+    /// `[package|protected|private] [static] [const] [!|~] [%] name[: type]
+    /// [[lo..hi]] [((bits|bytes): n)] [= init-value]`; `static` is
+    /// rejected earlier in `parse_member`).
     fn parse_fields(&mut self) -> Option<Vec<Member>> {
-        // `%name` physical / `!name` do-not-generate prefixes.
+        // `const` prefix (clause 6.9.4). The word is contextual, so it is
+        // only a prefix when a prefix token or the name follows it — a
+        // field genuinely named `const` (`const: uint;`, `const, x:
+        // uint;`) keeps parsing as a name.
+        let is_const = self.peek_word_is("const")
+            && (self.peek_second_is_punct("!")
+                || self.peek_second_is_punct("~")
+                || self.peek_second_is_punct("%")
+                || matches!(self.peek_second_kind(), Some(TokenKind::Identifier(_))));
+        if is_const {
+            self.bump();
+        }
+        // `!name` do-not-generate and `~name` range-generated (clause
+        // 6.9.7) prefixes, in either written order; `%name` physical
+        // after them (`!%` and `~%` are legal shapes, clause 6.9.1).
+        // `!` with `~` parses and is rejected by `check.rs` (E0213).
+        let mut no_gen = false;
+        let mut range_gen = false;
+        // `!~` lexes as one string-match operator token; in member
+        // position it can only be the two field prefixes read together.
+        if self.eat_punct("!~") {
+            no_gen = true;
+            range_gen = true;
+        }
+        loop {
+            if !no_gen && self.eat_punct("!") {
+                no_gen = true;
+            } else if !range_gen && self.eat_punct("~") {
+                range_gen = true;
+            } else {
+                break;
+            }
+        }
         let physical = self.eat_punct("%");
-        let no_gen = if !physical {
-            self.eat_punct("!")
-        } else {
-            false
-        };
         let (first, first_span) = self.expect_word("E0102", "expected field name")?;
         let mut names = vec![(first, first_span)];
         while self.eat_punct(",") {
@@ -2109,6 +2324,9 @@ impl Parser {
                             },
                             physical: false,
                             no_gen: false,
+                            range_gen: false,
+                            is_const: false,
+                            init: None,
                             visibility: self.member_visibility.clone(),
                         })
                     })
@@ -2117,6 +2335,16 @@ impl Parser {
         }
         self.expect_punct(":", "E0103", "expected ':' after field name")?;
         let ty = self.parse_type()?;
+        // `= init-value` (clause 6.9.1/6.9.2): recorded as written and
+        // applied to every name of the group. It must be a constant
+        // expression; `check.rs` rejects an init value on a generated
+        // field (E0211) and the interpreter applies it at instance
+        // creation.
+        let init = if self.eat_punct("=") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         // `is instance` / `is inline` suffixes are syntactic in this
         // subset.
         if self.eat_keyword("is") && !self.eat_keyword("instance") && !self.eat_keyword("inline") {
@@ -2138,6 +2366,9 @@ impl Parser {
                         ty: ty.clone(),
                         physical,
                         no_gen,
+                        range_gen,
+                        is_const,
+                        init: init.clone(),
                         visibility: self.member_visibility.clone(),
                     })
                 })
@@ -2559,6 +2790,49 @@ impl Parser {
                     };
                     continue;
                 }
+                // 4.17.3: subtype qualifiers in dot access —
+                // `struct-exp.qual'qual'...'field`. After the first name,
+                // a `'`-joined run of further names makes the whole
+                // sequence a qualifier list whose last name is the
+                // accessed field (`p.red'good'x`, `p.TRUE'good'red'x`,
+                // `p.red'color'x`). The `'`-joined spellings of a full
+                // qualifier (`red'color`) and of two short qualifiers
+                // (`red`, `color`) are identical token runs, so every
+                // qualifier is recorded value-only and the resolution
+                // matches each word against the when view's (field id,
+                // value) pairs.
+                if self.at_punct("'") {
+                    let mut qualifiers = Vec::new();
+                    let mut current = (member, member_span);
+                    let mut field = current.clone();
+                    while self.at_punct("'") {
+                        qualifiers.push(WhenQualifier {
+                            value: current.0,
+                            value_span: current.1,
+                            id: None,
+                        });
+                        self.bump();
+                        let (word, word_span) = if self.at_identifier() {
+                            self.take_identifier()
+                        } else if let Some(word) = self.take_word() {
+                            let span = self.last_end();
+                            (word, (span, span))
+                        } else {
+                            self.error_here("E0102", "expected a subtype qualifier after \"'\"");
+                            return None;
+                        };
+                        current = (word, word_span);
+                        field = current.clone();
+                    }
+                    expr = Expr::QualifiedField {
+                        base: Box::new(expr),
+                        qualifiers,
+                        field: field.0,
+                        field_span: field.1,
+                        span: (start, self.last_end()),
+                    };
+                    continue;
+                }
                 expr = Expr::MemberAccess {
                     object: Box::new(expr),
                     name: member,
@@ -2750,6 +3024,43 @@ impl Parser {
         }
         if self.at_identifier() {
             let (name, span) = self.take_identifier();
+            // `typeof(exp)` / `typeof_item(exp)` in a type position
+            // (clause 5.9): the static type of the (never evaluated)
+            // expression, or its list element type. The argument is
+            // recorded as an expression; resolution against the current
+            // type information happens during elaboration.
+            if (name == "typeof" || name == "typeof_item") && self.at_punct("(") {
+                self.bump();
+                let expr = self.parse_expr()?;
+                self.expect_punct(")", "E0110", "expected ')' to close the typeof expression")?;
+                let end = self.last_end();
+                return Some(if name == "typeof" {
+                    TypeExpr::TypeOf {
+                        expr: Box::new(expr),
+                        span: (span.0, end),
+                    }
+                } else {
+                    TypeExpr::TypeOfItem {
+                        expr: Box::new(expr),
+                        span: (span.0, end),
+                    }
+                });
+            }
+            // Table 17's long types are predefined scalar names that lex
+            // as identifiers — `KEYWORDS` does not list them (the
+            // reference grammar treats type names as identifiers), so
+            // they are recognized here, ahead of the named-type fallback.
+            // Like `uint`/`int`, a `(bits: N)` width specification makes
+            // the type a subtype — rejected for the long bases by the
+            // well-formedness check (E0207, clause 5.2.3.1).
+            if let Some(base) = ScalarBase::from_keyword(&name) {
+                let width = if self.at_punct("(") {
+                    Some(self.parse_scalar_width()?)
+                } else {
+                    None
+                };
+                return Some(TypeExpr::Scalar { base, width, span });
+            }
             // A when-qualified type (`NO_CONSTRAINT env` — the subtype
             // modifier naming the variant of the base type, 6.7): the
             // qualifier and the base are both recorded. Chained
@@ -2838,18 +3149,12 @@ impl Parser {
         }
         if let Some(base) = ScalarBase::from_keyword(&keyword) {
             self.bump();
-            let mut width = None;
-            if (base == ScalarBase::Uint || base == ScalarBase::Int) && self.at_punct("(") {
-                self.bump();
-                if !self.eat_keyword("bits") {
-                    self.error_here("E0111", "expected 'bits' in width specification");
-                    return None;
-                }
-                self.expect_punct(":", "E0103", "expected ':' after 'bits'")?;
-                let expr = self.parse_expr()?;
-                width = Some(Box::new(expr));
-                self.expect_punct(")", "E0110", "expected ')' after width specification")?;
-            }
+            let width =
+                if (base == ScalarBase::Uint || base == ScalarBase::Int) && self.at_punct("(") {
+                    Some(self.parse_scalar_width()?)
+                } else {
+                    None
+                };
             let end = self.last_end();
             return Some(TypeExpr::Scalar {
                 base,
@@ -3948,6 +4253,28 @@ impl Parser {
             return self.parse_postfix_chain(ident, start);
         }
         match self.peek_kind() {
+            // `{ e1; e2; ... }` — the list-concat operand (clause 4.6,
+            // Table 12): each `;`-separated element expression contributes
+            // itself to a fresh list (a list element contributes its items
+            // at run time). In expression position only; statement and
+            // member bodies reach their `{` through their own parsers.
+            Some(TokenKind::Punctuation(p)) if p == "{" => {
+                self.bump();
+                let mut items = Vec::new();
+                while !self.at_punct("}") {
+                    items.push(self.parse_expr()?);
+                    if !self.eat_punct(";") {
+                        break;
+                    }
+                }
+                self.expect_punct("}", "E0107", "expected '}' to close the list concat")?;
+                let end = self.last_end();
+                let concat = Expr::ListConcat {
+                    items,
+                    span: (start, end),
+                };
+                self.parse_postfix_chain(concat, start)
+            }
             Some(TokenKind::Number(_)) => {
                 let token = self.bump();
                 let TokenKind::Number(text) = token.kind else {
@@ -4020,6 +4347,25 @@ impl Parser {
                 };
                 self.parse_postfix_chain(expr, start)
             }
+            Some(TokenKind::Identifier(name)) if name == "evaluate" => {
+                // `evaluate [type] [(var)] { action; ... }` (clause
+                // 4.17.7). `evaluate` is not a Table 8 keyword — a
+                // program may also name a field or method `evaluate` —
+                // so the construct is recognized by position and the
+                // recognizer backtracks to a plain identifier when the
+                // tokens after `evaluate` do not fit it.
+                match self.try_parse_evaluate(start) {
+                    Some(expr) => Some(expr),
+                    None => {
+                        let (name, _) = self.take_identifier();
+                        let expr = Expr::Ident {
+                            name,
+                            span: (start, end),
+                        };
+                        self.parse_postfix_chain(expr, start)
+                    }
+                }
+            }
             Some(TokenKind::Identifier(_)) => {
                 let (name, _) = self.take_identifier();
                 let expr = Expr::Ident {
@@ -4062,6 +4408,15 @@ impl Parser {
                 })
             }
             Some(TokenKind::Punctuation(p)) if p == "(" => {
+                // `(exp1, ..., expN) [not] in_table { row; row; ... }`
+                // (clause 4.11.8): a parenthesized comma list is an
+                // expression only in this construct, so the whole
+                // `tuple in_table` shape parses atomically here. The
+                // decision is made with a token scan (matching `)`, then
+                // the `[not] in_table` follow), never by backtracking.
+                if self.paren_group_followed_by_in_table() {
+                    return self.parse_in_table(start);
+                }
                 self.bump();
                 let inner = self.parse_expr()?;
                 self.expect_punct(")", "E0110", "expected ')' to close the expression")?;
@@ -4077,6 +4432,323 @@ impl Parser {
             _ => {
                 self.error_here("E0108", "expected an expression");
                 None
+            }
+        }
+    }
+
+    /// Whether the `(` at the current position opens a parenthesized
+    /// group whose matching `)` is directly followed by `[not] in_table`
+    /// — the shape of the clause 4.11.8 membership test. Decided by a
+    /// token scan over the group (parenthesis depth counting), never by
+    /// backtracking; unbalanced input reports false and the regular
+    /// parenthesized-expression parse produces its own diagnostic.
+    fn paren_group_followed_by_in_table(&self) -> bool {
+        let Some(close) = self.matching_paren_index() else {
+            return false;
+        };
+        let follow = |offset: usize| self.tokens.get(close + 1 + offset).map(|t| &t.kind);
+        match follow(0) {
+            Some(TokenKind::Keyword(k)) if k == "in_table" => true,
+            Some(TokenKind::Keyword(k)) if k == "not" => {
+                matches!(follow(1), Some(TokenKind::Keyword(k)) if k == "in_table")
+            }
+            _ => false,
+        }
+    }
+
+    /// The token index of the `)` matching the `(` at the current
+    /// position, if the group is balanced in the remaining tokens.
+    fn matching_paren_index(&self) -> Option<usize> {
+        let mut depth: usize = 0;
+        for (offset, token) in self.tokens[self.pos..].iter().enumerate() {
+            match &token.kind {
+                TokenKind::Punctuation(p) if p == "(" => depth += 1,
+                TokenKind::Punctuation(p) if p == ")" => {
+                    depth = depth.wrapping_sub(1);
+                    if depth == 0 {
+                        return Some(self.pos + offset);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// `(exp1, ..., expN) [not] in_table { row; row; ... }` (clause
+    /// 4.11.8). Called with the current token at the opening `(`. Every
+    /// row must carry exactly N elements; a different count reports
+    /// `E0121` at the row's first element and the parse continues.
+    fn parse_in_table(&mut self, start: Position) -> Option<Expr> {
+        self.bump(); // '('
+        let mut tuple = Vec::new();
+        if !self.at_punct(")") {
+            loop {
+                tuple.push(self.parse_expr()?);
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_punct(")", "E0110", "expected ')' to close the in_table tuple")?;
+        let negated = self.eat_keyword("not");
+        if !self.eat_keyword("in_table") {
+            self.error_here("E0108", "expected 'in_table' after the tuple");
+            return None;
+        }
+        self.expect_punct("{", "E0106", "expected '{' to open the in_table rows")?;
+        let mut rows: Vec<Vec<TableElem>> = Vec::new();
+        while !self.at_punct("}") && self.peek().is_some() {
+            if self.eat_punct(";") {
+                // The separator between rows (also the optional trailing
+                // one before '}').
+                continue;
+            }
+            let mut row = Vec::new();
+            let mut first_span: Option<crate::ast::Span> = None;
+            loop {
+                let element_start = self.current_span().0;
+                let element = self.parse_table_row_element()?;
+                if first_span.is_none() {
+                    first_span = Some((element_start, self.last_end()));
+                }
+                row.push(element);
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            if row.len() != tuple.len()
+                && let Some((row_start, row_end)) = first_span
+            {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0121",
+                    format!(
+                        "in_table row has {} elements, tuple has {}",
+                        row.len(),
+                        tuple.len()
+                    ),
+                    row_start,
+                    row_end,
+                ));
+            }
+            rows.push(row);
+            if !self.eat_punct(";") {
+                break;
+            }
+        }
+        self.expect_punct("}", "E0107", "expected '}' to close the in_table rows")?;
+        let end = self.last_end();
+        Some(Expr::InTable {
+            tuple,
+            rows,
+            negated,
+            span: (start, end),
+        })
+    }
+
+    /// One element of an `in_table` row (clause 4.11.8): a set literal
+    /// `[a, b]` / `[lo..hi]` (matched by `in`), `set_of_values(T)` /
+    /// `full_set_of_values(T)` (matched by `in` over the type's value
+    /// set), or any other expression (a scalar, matched by `==`).
+    fn parse_table_row_element(&mut self) -> Option<TableElem> {
+        if self.at_punct("[") {
+            self.bump();
+            let first = self.parse_expr()?;
+            let set = if self.eat_punct("..") {
+                let high = self.parse_expr()?;
+                self.expect_punct("]", "E0107", "expected ']' to close the range")?;
+                InSetExpr::Range(Box::new(first), Box::new(high))
+            } else {
+                let mut items = vec![first];
+                while self.eat_punct(",") {
+                    items.push(self.parse_expr()?);
+                }
+                self.expect_punct("]", "E0107", "expected ']' to close the set")?;
+                InSetExpr::Items(items)
+            };
+            return Some(TableElem::Set(set));
+        }
+        match self.parse_expr()? {
+            Expr::SetOfValues { ty, full, .. } => Some(TableElem::TypeSet { ty, full }),
+            other => Some(TableElem::Scalar(other)),
+        }
+    }
+
+    /// Try to parse `evaluate [type] [(var)] { action; ... }` (clause
+    /// 4.17.7) with the current token at `evaluate`. `None` means the
+    /// tokens after `evaluate` do not fit the construct — a field or
+    /// method may legitimately be named `evaluate` — and position plus
+    /// any speculative diagnostics are restored so the caller parses a
+    /// plain identifier. Once the shape commits (a `{` body follows),
+    /// failures are real parse errors.
+    fn try_parse_evaluate(&mut self, start: Position) -> Option<Expr> {
+        let saved_pos = self.pos;
+        let saved_diagnostics = self.diagnostics.len();
+        self.bump(); // 'evaluate'
+        // `evaluate { ... }` — no type, no named variable.
+        // `evaluate (var) { ... }` — a variable without a type. The
+        // three-token shape `( name ) {` cannot be a call: an expression
+        // position never continues with a `{` body after a call.
+        let var_only = self.at_punct("(")
+            && matches!(self.peek_second_kind(), Some(TokenKind::Identifier(_)))
+            && matches!(
+                self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                Some(TokenKind::Punctuation(p)) if p == ")"
+            )
+            && matches!(
+                self.tokens.get(self.pos + 3).map(|t| &t.kind),
+                Some(TokenKind::Punctuation(p)) if p == "{"
+            );
+        let (ty, var) = if self.at_punct("{") {
+            (None, None)
+        } else if var_only {
+            self.bump(); // '('
+            let (name, _) = self.take_identifier();
+            self.expect_punct(")", "E0110", "expected ')' after the evaluate variable")?;
+            (None, Some(name))
+        } else if self.at_identifier() || self.at_scalar_type_keyword() || self.at_keyword("list") {
+            // A scalar type followed directly by `( name ) {` — the name
+            // is the evaluate variable, not a `(bits: n)` width
+            // specification, so the shape is decided here and the scalar
+            // type is taken without a width.
+            if self.at_scalar_type_keyword()
+                && matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == "(")
+                && matches!(
+                    self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                    Some(TokenKind::Identifier(_))
+                )
+                && matches!(
+                    self.tokens.get(self.pos + 3).map(|t| &t.kind),
+                    Some(TokenKind::Punctuation(p)) if p == ")"
+                )
+                && matches!(
+                    self.tokens.get(self.pos + 4).map(|t| &t.kind),
+                    Some(TokenKind::Punctuation(p)) if p == "{"
+                )
+            {
+                let (type_start, type_end) = self.current_span();
+                let token = self.bump();
+                let TokenKind::Keyword(word) = token.kind else {
+                    unreachable!("peeked a scalar type keyword");
+                };
+                let Some(base) = ScalarBase::from_keyword(&word) else {
+                    unreachable!("at_scalar_type_keyword checked the word");
+                };
+                self.bump(); // '('
+                let (name, _) = self.take_identifier();
+                self.expect_punct(")", "E0110", "expected ')' after the evaluate variable")?;
+                let ty = TypeExpr::Scalar {
+                    base,
+                    width: None,
+                    span: (type_start, type_end),
+                };
+                let var = Some(name);
+                self.expect_punct("{", "E0106", "expected '{' to open the evaluate block")?;
+                let body = self.parse_statements();
+                self.expect_punct("}", "E0107", "expected '}' to close the evaluate block")?;
+                self.check_evaluate_body(&body);
+                let end = self.last_end();
+                return Some(Expr::Evaluate {
+                    ty: Some(ty),
+                    var,
+                    body,
+                    span: (start, end),
+                });
+            }
+            // A type: parsed speculatively — when no `(var)` or `{`
+            // follows, this was not an evaluate block after all.
+            let ty = self.parse_type()?;
+            let var = if self.at_punct("{") {
+                None
+            } else if self.at_punct("(")
+                && matches!(self.peek_second_kind(), Some(TokenKind::Identifier(_)))
+                && matches!(
+                    self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                    Some(TokenKind::Punctuation(p)) if p == ")"
+                )
+            {
+                self.bump(); // '('
+                let (name, _) = self.take_identifier();
+                self.expect_punct(")", "E0110", "expected ')' after the evaluate variable")?;
+                Some(name)
+            } else {
+                self.pos = saved_pos;
+                self.diagnostics.truncate(saved_diagnostics);
+                return None;
+            };
+            (Some(ty), var)
+        } else {
+            self.pos = saved_pos;
+            self.diagnostics.truncate(saved_diagnostics);
+            return None;
+        };
+        self.expect_punct("{", "E0106", "expected '{' to open the evaluate block")?;
+        let body = self.parse_statements();
+        self.expect_punct("}", "E0107", "expected '}' to close the evaluate block")?;
+        self.check_evaluate_body(&body);
+        let end = self.last_end();
+        Some(Expr::Evaluate {
+            ty,
+            var,
+            body,
+            span: (start, end),
+        })
+    }
+
+    /// Whether the current token is a scalar base type keyword (`int`,
+    /// `uint`, ...) usable to start the type of an `evaluate` block.
+    fn at_scalar_type_keyword(&self) -> bool {
+        matches!(
+            self.peek_kind(),
+            Some(TokenKind::Keyword(k)) if ScalarBase::from_keyword(k).is_some()
+        )
+    }
+
+    /// 4.17.7: the actions of an `evaluate` block may not include
+    /// `return`, `wait` or `sync` — at any depth of the block. Every
+    /// occurrence reports `E0123` at the offending action; the parse
+    /// continues so one run can surface every problem.
+    fn check_evaluate_body(&mut self, statements: &[Stmt]) {
+        for statement in statements {
+            let offending = match statement {
+                Stmt::Return { .. } => Some("return"),
+                Stmt::Wait { .. } | Stmt::WaitTemporal { .. } => Some("wait"),
+                Stmt::Sync { .. } => Some("sync"),
+                _ => None,
+            };
+            if let Some(action) = offending {
+                let span = statement.span();
+                self.diagnostics.push(Diagnostic::new(
+                    "E0123",
+                    format!("'{action}' is not allowed in an evaluate block (clause 4.17.7)"),
+                    span.0,
+                    span.1,
+                ));
+            }
+            match statement {
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.check_evaluate_body(then_body);
+                    if let Some(else_body) = else_body {
+                        self.check_evaluate_body(else_body);
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::RepeatUntil { body, .. }
+                | Stmt::ForEach { body, .. }
+                | Stmt::ForTo { body, .. } => self.check_evaluate_body(body),
+                Stmt::Case { arms, default, .. } => {
+                    for (_, body) in arms {
+                        self.check_evaluate_body(body);
+                    }
+                    if let Some(default) = default {
+                        self.check_evaluate_body(default);
+                    }
+                }
+                _ => {}
             }
         }
     }

@@ -474,3 +474,155 @@ fn method_body_instance_references_substitute_and_materialize() {
     assert_eq!(args.len(), 1);
     assert_eq!(args[0].render(), "int".to_owned());
 }
+
+#[test]
+fn statement_may_span_code_segments() {
+    // 4.2.3: a code segment may end in the middle of a statement (here,
+    // inside a struct body between two fields); the statement completes
+    // in the next code segment of the same module. The lexer skips the
+    // prose between `'>` and `<'`, so the parser sees one continuous
+    // member list.
+    let result = elaborated(include_str!("fixtures/s2019_statement_spans_segments.e"));
+    assert_eq!(field_names(find(&result, "pkt")), vec!["a", "b"]);
+}
+
+#[test]
+fn brace_groups_splice_members_and_statements() {
+    // 4.3.2 / 4.3.3: bare `{ ... }` groups at module level and in member
+    // lists are pure syntax — no scope, no semantics. Members splice
+    // into the enclosing list in source order, groups nest, and an
+    // `#ifdef` inside a group keeps its member-position meaning.
+    let result = elaborated(include_str!("fixtures/s2019_brace_groups.e"));
+    let pkt = find(&result, "pkt");
+    assert_eq!(field_names(pkt), vec!["a", "b", "c"]);
+    assert_eq!(pkt.constraints.len(), 1, "the grouped `keep` spliced in");
+    let color = find(&result, "color_t");
+    let enumeral_names: Vec<&str> = color
+        .enumerals
+        .iter()
+        .map(|enumeral| enumeral.name.as_str())
+        .collect();
+    assert_eq!(enumeral_names, vec!["RED", "GREEN"]);
+    // A nested group and an `#ifdef` whose body sits inside a group.
+    let result = elaborated(
+        "<'\n#define X\nstruct s {\n    { { x: uint; } }\n    {\n        \
+         #ifdef X { y: uint; }\n    }\n    z: uint;\n};\n'>\n",
+    );
+    assert_eq!(field_names(find(&result, "s")), vec!["x", "y", "z"]);
+}
+
+#[test]
+fn typeof_type_positions_resolve_in_elaboration() {
+    // 5.9: `typeof_item(data)` resolves to the list's element type and
+    // `typeof(first_item)` chains to the same static type — the
+    // elaborated fields carry the resolved types (`byte`), the
+    // placeholders rewritten in place.
+    let result = elaborated(
+        "struct s {\n    data: list of byte;\n    first_item: typeof_item(data);\n    n: typeof(first_item);\n};\n",
+    );
+    let s = find(&result, "s");
+    for field in &s.fields {
+        assert_eq!(
+            field.ty.render(),
+            match field.name.as_str() {
+                "data" => "list of byte",
+                "first_item" => "byte",
+                "n" => "byte",
+                other => panic!("unexpected field '{other}'"),
+            },
+            "field '{}' resolves to '{}'",
+            field.name,
+            field.ty.render()
+        );
+    }
+}
+
+#[test]
+fn typeof_resolves_method_signature_and_local_var_positions() {
+    // 5.9: the resolution covers method parameters, return types and
+    // local `var` declarations, in declaration order — `wrap()`'s
+    // parameter and locals type against the struct's resolved fields.
+    let result = elaborated(
+        "struct s {\n    data: list of byte;\n    first_item: typeof_item(data);\n    \
+         wrap(v: typeof(first_item)): typeof(first_item) is {\n        \
+         var k: typeof(v);\n        k = v + 1;\n        return k;\n    };\n};\n",
+    );
+    let s = find(&result, "s");
+    let wrap = s
+        .methods
+        .iter()
+        .find(|method| method.name == "wrap")
+        .expect("method 'wrap' elaborated");
+    let param_ty = wrap.params[0].ty.as_ref().expect("typed parameter");
+    assert_eq!(param_ty.render(), "byte");
+    assert_eq!(
+        wrap.return_type.as_ref().expect("return type").render(),
+        "byte"
+    );
+    let e1647::ast::Stmt::VarDecl {
+        ty: Some(local), ..
+    } = &wrap.body[0]
+    else {
+        panic!("expected a typed local declaration");
+    };
+    assert_eq!(local.render(), "byte");
+}
+
+#[test]
+fn bare_when_words_resolve_to_their_determinants() {
+    // 6.7 with 4.17.3: a when header's bare value words name their
+    // determinant fields — `when red good packet` fixes `color == red`
+    // and `good == TRUE`, and the synthesized view is named with the
+    // written words (`red good packet`), which the subtype-qualified
+    // access resolves against.
+    let result = elaborated(
+        "type color_t: [red, green, blue];\n\
+         struct packet {\n    color: color_t;\n    good: bool;\n    \
+         when red good packet { x: int; keep x == 5; };\n};\n",
+    );
+    let view = find(&result, "red good packet");
+    assert_eq!(
+        view.when_of,
+        vec![
+            ("color".to_owned(), "red".to_owned()),
+            ("good".to_owned(), "TRUE".to_owned())
+        ]
+    );
+    assert_eq!(view.base.as_deref(), Some("packet"));
+    assert_eq!(field_names(view), vec!["color", "good", "x"]);
+    // The chained full-form header keeps its own reading.
+    let result = elaborated(
+        "type color_t: [red, green, blue];\n\
+         type size_t: [big, medium, small];\n\
+         struct packet {\n    color: color_t;\n    size: size_t;\n    \
+         when big'size green'color packet { y: uint; };\n};\n",
+    );
+    let view = find(&result, "big green packet");
+    assert_eq!(
+        view.when_of,
+        vec![
+            ("size".to_owned(), "big".to_owned()),
+            ("color".to_owned(), "green".to_owned())
+        ]
+    );
+}
+
+#[test]
+fn spelled_when_types_materialize_as_views() {
+    // 6.7: a when-qualified type spelling without a when block (`good
+    // packet`) still names a subtype view — the root base's members
+    // under the spelling's name, with the spelling's words resolved as
+    // determinants (`good` is the Boolean field's short form, so the
+    // view fixes `good == TRUE`).
+    let result = elaborated(
+        "type color_t: [red, green, blue];\n\
+         struct packet {\n    color: color_t;\n    good: bool;\n    \
+         when red good packet { x: int; };\n};\n\
+         extend sys {\n    p1: good packet;\n};\n",
+    );
+    let view = find(&result, "good packet");
+    assert_eq!(view.when_of, vec![("good".to_owned(), "TRUE".to_owned())]);
+    assert_eq!(view.base.as_deref(), Some("packet"));
+    assert_eq!(field_names(view), vec!["color", "good"]);
+    assert!(!view.fields.iter().any(|f| f.name == "x"));
+}
