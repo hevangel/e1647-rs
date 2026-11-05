@@ -309,6 +309,56 @@ fn negative_string_match_is_one_token() {
 }
 
 #[test]
+fn list_identity_operators_are_one_token_each() {
+    // `list_ptr==` / `!list_ptr=` (clause 4.11.4) are glued word+symbol
+    // operators, tokenized by longest match as single tokens.
+    assert_eq!(
+        kinds("l1 list_ptr== l2"),
+        vec![
+            TokenKind::Identifier("l1".into()),
+            TokenKind::Punctuation("list_ptr==".into()),
+            TokenKind::Identifier("l2".into())
+        ]
+    );
+    assert_eq!(
+        kinds("l1!list_ptr=l2"),
+        vec![
+            TokenKind::Identifier("l1".into()),
+            TokenKind::Punctuation("!list_ptr=".into()),
+            TokenKind::Identifier("l2".into())
+        ]
+    );
+    // `list_ptr` alone is an ordinary identifier (not a keyword), and a
+    // `!` before anything but `list_ptr=` keeps the old two-token read.
+    assert_eq!(
+        kinds("list_ptr"),
+        vec![TokenKind::Identifier("list_ptr".into())]
+    );
+    assert_eq!(
+        kinds("list_ptr =="),
+        vec![
+            TokenKind::Identifier("list_ptr".into()),
+            TokenKind::Punctuation("==".into())
+        ]
+    );
+    assert_eq!(
+        kinds("!x"),
+        vec![
+            TokenKind::Punctuation("!".into()),
+            TokenKind::Identifier("x".into())
+        ]
+    );
+    assert_eq!(
+        kinds("a != b"),
+        vec![
+            TokenKind::Identifier("a".into()),
+            TokenKind::Punctuation("!=".into()),
+            TokenKind::Identifier("b".into())
+        ]
+    );
+}
+
+#[test]
 fn based_and_prefixed_numerals() {
     assert_eq!(
         kinds("8'b1010 'hFF 'b1010 'd15 'o17 'x1f 'F0F 0xAB 0b1010 0o17 0xAB CD"),
