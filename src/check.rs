@@ -552,6 +552,43 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
             collect_root_identifiers(high, roots);
         }
         Expr::IsA { expr, .. } => collect_root_identifiers(expr, roots),
+        // An `in_table` test's tuple elements and row elements all name
+        // values (a type-set element names a type, not a variable).
+        Expr::InTable { tuple, rows, .. } => {
+            for element in tuple {
+                collect_root_identifiers(element, roots);
+            }
+            for row in rows {
+                for element in row {
+                    match element {
+                        crate::ast::TableElem::Scalar(expr) => {
+                            collect_root_identifiers(expr, roots)
+                        }
+                        crate::ast::TableElem::Set(crate::ast::InSetExpr::Items(items)) => {
+                            for item in items {
+                                collect_root_identifiers(item, roots);
+                            }
+                        }
+                        crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
+                            collect_root_identifiers(low, roots);
+                            collect_root_identifiers(high, roots);
+                        }
+                        crate::ast::TableElem::TypeSet { .. } => {}
+                    }
+                }
+            }
+        }
+        // The actions of an `evaluate` block contribute the roots of the
+        // expressions they evaluate (assigned values and statement
+        // expressions); the block's own variable is scoped to it, so
+        // references to that name inside the block resolve to the
+        // variable, not to an outer field of the same name.
+        Expr::Evaluate { var, body, .. } => {
+            let mut inner_roots = Vec::new();
+            collect_statement_roots(body, &mut inner_roots);
+            let var_name = var.as_deref().unwrap_or("value");
+            roots.extend(inner_roots.into_iter().filter(|(name, _)| name != var_name));
+        }
         // A select distribution's weights are the only AST side; the
         // choices are recorded as raw tokens.
         Expr::Select { arms, .. } => {
@@ -593,6 +630,75 @@ fn collect_with_init_roots(statement: &Stmt, roots: &mut Vec<(String, crate::ast
         Stmt::Assign { value, .. } => collect_root_identifiers(value, roots),
         Stmt::ExprStmt { expr, .. } => collect_root_identifiers(expr, roots),
         _ => {}
+    }
+}
+
+/// Root identifiers of the expressions a statement list evaluates:
+/// assigned values (the targets resolve in the enclosing scope) and
+/// statement expressions, descended into compound statements. Used for
+/// the action body of an `evaluate` block (clause 4.17.7).
+fn collect_statement_roots(statements: &[Stmt], roots: &mut Vec<(String, crate::ast::Span)>) {
+    for statement in statements {
+        match statement {
+            Stmt::Assign { target, value, .. } => {
+                collect_root_identifiers(target, roots);
+                collect_root_identifiers(value, roots);
+            }
+            Stmt::ExprStmt { expr, .. } => collect_root_identifiers(expr, roots),
+            Stmt::VarDecl {
+                init: Some(init), ..
+            } => collect_root_identifiers(init, roots),
+            Stmt::Return {
+                value: Some(value), ..
+            } => collect_root_identifiers(value, roots),
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_root_identifiers(cond, roots);
+                collect_statement_roots(then_body, roots);
+                if let Some(else_body) = else_body {
+                    collect_statement_roots(else_body, roots);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                collect_root_identifiers(cond, roots);
+                collect_statement_roots(body, roots);
+            }
+            Stmt::RepeatUntil { body, cond, .. } => {
+                collect_statement_roots(body, roots);
+                collect_root_identifiers(cond, roots);
+            }
+            Stmt::ForTo { from, to, body, .. } => {
+                collect_root_identifiers(from, roots);
+                collect_root_identifiers(to, roots);
+                collect_statement_roots(body, roots);
+            }
+            Stmt::ForEach { list, body, .. } => {
+                collect_root_identifiers(list, roots);
+                collect_statement_roots(body, roots);
+            }
+            Stmt::Case {
+                scrutinee,
+                arms,
+                default,
+                ..
+            } => {
+                collect_root_identifiers(scrutinee, roots);
+                for (alternatives, body) in arms {
+                    for alternative in alternatives {
+                        collect_root_identifiers(alternative, roots);
+                    }
+                    collect_statement_roots(body, roots);
+                }
+                if let Some(default) = default {
+                    collect_statement_roots(default, roots);
+                }
+            }
+            _ => {}
+        }
     }
 }
 

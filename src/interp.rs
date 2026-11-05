@@ -46,6 +46,14 @@
 //! - `E0410` unsupported string-match pattern shape (`/.../` or a
 //!   native meta-character)
 //! - `E0411` `list_ptr==` operands must be lists of the same type
+//! - `E0412` `in_table` element type mismatch (clause 4.11.8): a tuple
+//!   element and a row element of incompatible kinds
+//!
+//! The parser's `E0122` (an untyped `evaluate { ... }` whose result type
+//! cannot be inferred, clause 4.17.7) is also raised here: the inference
+//! contexts — the declared type of the assignment/`var` target or of the
+//! call's parameter — resolve at run time, so the diagnostic surfaces
+//! when an evaluation actually reaches the untyped block.
 //!
 //! ## List identity (clause 4.11.4)
 //!
@@ -453,6 +461,13 @@ struct Interp<'a> {
     dut_errors: usize,
     /// `define` constants resolved to values.
     defines: std::collections::BTreeMap<String, Value>,
+    /// The declared type expected of the expression currently being
+    /// evaluated, when the evaluation site knows one: the declared type
+    /// of a `var`/assignment target or of the call argument's parameter.
+    /// An untyped `evaluate { ... }` block (4.17.7) takes its result
+    /// type from it; every site sets it immediately before its eval call
+    /// and restores it afterwards.
+    expected_type: Option<TypeExpr>,
 }
 
 /// How many `wait` statements and scheduler cycles one run may consume
@@ -571,6 +586,7 @@ fn run_inner(
         stop_requested: false,
         dut_errors: 0,
         defines,
+        expected_type: None,
     };
     let types: &[crate::elab::ElaboratedType] = interp.types;
     let Some(sys) = types
@@ -1341,7 +1357,10 @@ impl<'a> Interp<'a> {
         match statement {
             Stmt::VarDecl { name, ty, init, .. } => {
                 let mut value = match (ty, init) {
-                    (_, Some(expr)) => self.eval(expr, frame, me)?,
+                    // The declared type is the inference context for an
+                    // untyped `evaluate { ... }` in the initializer
+                    // (4.17.7); the `var x := e` form declares none.
+                    (ty, Some(expr)) => self.eval_with_hint(ty.clone(), expr, frame, me)?,
                     // A declared type without an initializer takes the
                     // type's default; the type-inferring `:=` form
                     // always carries an initializer.
@@ -1371,7 +1390,11 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             Stmt::Assign { target, value, .. } => {
-                let value = self.eval(value, frame, me)?;
+                // The target's declared type is the inference context for
+                // an untyped `evaluate { ... }` in the assigned value
+                // (4.17.7).
+                let hint = self.static_type_of(target, frame, me);
+                let value = self.eval_with_hint(hint, value, frame, me)?;
                 match target {
                     Expr::HdlPath { path, span } => {
                         if self.hdl.is_none() {
@@ -2355,7 +2378,87 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
+            Expr::InTable { tuple, rows, .. } => {
+                // 4.11.8 in a `keep`: the disjunction of the rows, enforced
+                // as written by the rejection predicate. For the sampling
+                // domains, the projection of a disjunction onto one tuple
+                // element is the union of the rows' projections, so a
+                // bare-identifier element narrows to that union — sound
+                // (every row-satisfying assignment stays inside it) and
+                // necessary in practice: the rejection sampler alone does
+                // not target the rows, so a wide scalar field would make
+                // the disjunction practically unsampleable. A row whose
+                // element for the position is not a constant (an enumerand
+                // included) leaves the projection unknown — the narrowing
+                // for that field is dropped entirely, because that row
+                // could match with any value of the field.
+                if rows.is_empty() {
+                    return;
+                }
+                let mut projections: Vec<Vec<(i128, i128)>> = vec![Vec::new(); tuple.len()];
+                for row in rows {
+                    for (position, element) in row.iter().enumerate() {
+                        let Some(Expr::Ident { .. }) = tuple.get(position) else {
+                            continue;
+                        };
+                        if let Some(domain) = self.table_row_element_domain(element) {
+                            projections[position].push(domain);
+                        }
+                    }
+                }
+                for (position, element_domains) in projections.into_iter().enumerate() {
+                    if element_domains.len() != rows.len() {
+                        continue;
+                    }
+                    if let Expr::Ident { name, .. } = &tuple[position] {
+                        let low = element_domains
+                            .iter()
+                            .map(|d| d.0)
+                            .min()
+                            .unwrap_or(i128::MIN);
+                        let high = element_domains
+                            .iter()
+                            .map(|d| d.1)
+                            .max()
+                            .unwrap_or(i128::MAX);
+                        intersect_domain(domains, name, (low, high));
+                    }
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// The constant integer domain one `in_table` row element constrains
+    /// its tuple element to, when computable: a scalar element by
+    /// constant evaluation, a set literal from its bounds, a type set
+    /// from the type's value range. `None` for anything non-constant
+    /// (enumerands included — those fields keep their full natural
+    /// range). An item list's span `[min, max]` is a superset of its
+    /// points, which keeps the narrowing sound.
+    fn table_row_element_domain(
+        &mut self,
+        element: &crate::ast::TableElem,
+    ) -> Option<(i128, i128)> {
+        match element {
+            crate::ast::TableElem::Scalar(expr) => {
+                let value = self.const_int_eval(expr)?;
+                Some((value, value))
+            }
+            crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
+                Some((self.const_int_eval(low)?, self.const_int_eval(high)?))
+            }
+            crate::ast::TableElem::Set(crate::ast::InSetExpr::Items(items)) => {
+                let mut low = i128::MAX;
+                let mut high = i128::MIN;
+                for item in items {
+                    let value = self.const_int_eval(item)?;
+                    low = low.min(value);
+                    high = high.max(value);
+                }
+                Some((low, high))
+            }
+            crate::ast::TableElem::TypeSet { ty, .. } => self.type_value_range(ty),
         }
     }
 
@@ -4051,15 +4154,6 @@ impl<'a> Interp<'a> {
                 if name == "TEST_DONE" {
                     return Ok(Value::Int(0));
                 }
-                // Message-verbosity levels.
-                if matches!(name.as_str(), "LOW" | "MEDIUM" | "HIGH") {
-                    let level = match name.as_str() {
-                        "LOW" => 0,
-                        "MEDIUM" => 1,
-                        _ => 2,
-                    };
-                    return Ok(Value::Int(level));
-                }
                 if let Some(value) = frame.locals.get(name) {
                     return Ok(value.clone());
                 }
@@ -4101,6 +4195,18 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
+                // Message-verbosity levels — the fallback when nothing in
+                // the program declares a same-named enumerand (a declared
+                // `LOW`/`MEDIUM`/`HIGH` enumerand above shadows the
+                // predefined message levels, as scoping requires).
+                if matches!(name.as_str(), "LOW" | "MEDIUM" | "HIGH") {
+                    let level = match name.as_str() {
+                        "LOW" => 0,
+                        "MEDIUM" => 1,
+                        _ => 2,
+                    };
+                    return Ok(Value::Int(level));
+                }
                 Err(self.error("E0401", format!("unknown identifier '{name}'"), *span))
             }
             Expr::MemberAccess {
@@ -4129,9 +4235,21 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::Call { callee, args, span } => {
+                // A call argument's parameter type is the inference
+                // context for an untyped `evaluate { ... }` in the
+                // argument (4.17.7). Looked up only when an argument can
+                // use it, and best-effort: a builtin or unknown callee
+                // contributes no hints (the call itself reports its own
+                // error).
+                let hints = if args.iter().any(expr_has_untyped_evaluate) {
+                    self.call_arg_hints(callee, args.len(), frame, me)
+                } else {
+                    Vec::new()
+                };
                 let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval(arg, frame, me)?);
+                for (position, arg) in args.iter().enumerate() {
+                    let hint = hints.get(position).cloned().unwrap_or(None);
+                    values.push(self.eval_with_hint(hint, arg, frame, me)?);
                 }
                 match callee.as_ref() {
                     Expr::Ident { name, .. } => {
@@ -4448,6 +4566,94 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Bool(is_a != *negated))
             }
+            Expr::InTable {
+                tuple,
+                rows,
+                negated,
+                span,
+            } => {
+                // 4.11.8: the tuple matches a row when every element
+                // matches — a scalar row element by `==`, a set row
+                // element by membership. The first matching row decides;
+                // `not` negates the result.
+                let mut values = Vec::with_capacity(tuple.len());
+                for element in tuple {
+                    values.push(self.eval(element, frame, me)?);
+                }
+                let mut matched = false;
+                'rows: for row in rows {
+                    for (element, value) in row.iter().zip(values.iter()) {
+                        if !self.row_element_matches(element, value, frame, me, *span)? {
+                            continue 'rows;
+                        }
+                    }
+                    matched = true;
+                    break;
+                }
+                Ok(Value::Bool(matched != *negated))
+            }
+            Expr::Evaluate {
+                ty,
+                var,
+                body,
+                span,
+            } => {
+                // 4.17.7: the actions run; the named variable's value
+                // after the block is the expression's value. The variable
+                // is visible only inside the block (it shadows an outer
+                // name of the same spelling and is removed afterwards)
+                // and starts at its type's default. `wait`/`sync`/`return`
+                // are rejected at parse time (E0123).
+                let result_ty = match ty {
+                    Some(ty) => ty.clone(),
+                    // Type inference v1: the declared type of the
+                    // assignment/`var` target or of the call's parameter,
+                    // threaded through `expected_type` by those eval
+                    // sites. E0122 is raised here — where the inference
+                    // contexts actually resolve — not at parse time; the
+                    // parser accepts the untyped form because it cannot
+                    // know the surrounding declaration's type.
+                    None => match self.expected_type.clone() {
+                        Some(ty) => ty,
+                        None => {
+                            return Err(self.error(
+                                "E0122",
+                                "evaluate: result type cannot be inferred; write `evaluate <type> { ... }`",
+                                *span,
+                            ));
+                        }
+                    },
+                };
+                let var_name = var.clone().unwrap_or_else(|| "value".to_owned());
+                let saved_local = frame
+                    .locals
+                    .insert(var_name.clone(), self.default_for(&result_ty));
+                let saved_type = frame.local_types.insert(var_name.clone(), result_ty);
+                // The hint does not flow into the block: the body's own
+                // evaluates infer from their own contexts.
+                let saved_hint = self.expected_type.take();
+                let flow = self.exec_block(body, frame, me);
+                self.expected_type = saved_hint;
+                match saved_type {
+                    Some(ty) => {
+                        frame.local_types.insert(var_name.clone(), ty);
+                    }
+                    None => {
+                        frame.local_types.remove(&var_name);
+                    }
+                }
+                let value = frame.locals.get(&var_name).cloned();
+                match saved_local {
+                    Some(value) => {
+                        frame.locals.insert(var_name.clone(), value);
+                    }
+                    None => {
+                        frame.locals.remove(&var_name);
+                    }
+                }
+                flow?;
+                Ok(value.unwrap_or(Value::Void))
+            }
             Expr::Select { span, .. } => Err(self.error(
                 "E0402",
                 "select distribution expressions are not evaluated yet",
@@ -4600,6 +4806,216 @@ impl<'a> Interp<'a> {
             }
         }
         false
+    }
+
+    /// Evaluate `expr` with `hint` as the declared type expected of it —
+    /// the inference context for an untyped `evaluate { ... }` (4.17.7).
+    /// The hint is set for the call and restored on both outcomes, so a
+    /// swallowed error cannot leak it into a later evaluation.
+    fn eval_with_hint(
+        &mut self,
+        hint: Option<TypeExpr>,
+        expr: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Value, Diagnostic> {
+        let saved = std::mem::replace(&mut self.expected_type, hint);
+        let result = self.eval(expr, frame, me);
+        self.expected_type = saved;
+        result
+    }
+
+    /// The declared type of an expression, when statically known: a
+    /// local's declared type, a field of the enclosing instance, or a
+    /// field reached through names of known instance type. Used as the
+    /// inference context for an untyped `evaluate { ... }` (4.17.7).
+    fn static_type_of(&self, expr: &Expr, frame: &Frame, me: Option<usize>) -> Option<TypeExpr> {
+        match expr {
+            Expr::Ident { name, .. } => {
+                if let Some(ty) = frame.local_types.get(name) {
+                    return Some(ty.clone());
+                }
+                if let Some(index) = me {
+                    let type_name = &self.instances[index].type_name;
+                    let types: &[crate::elab::ElaboratedType] = self.types;
+                    return types
+                        .iter()
+                        .find(|t| t.name == *type_name)
+                        .and_then(|t| t.fields.iter().find(|f| f.name == *name))
+                        .map(|f| f.ty.clone());
+                }
+                None
+            }
+            Expr::MemberAccess { object, name, .. } => {
+                let base = self.static_type_of(object, frame, me)?;
+                let type_name = match base {
+                    TypeExpr::Named { name, .. } => name,
+                    TypeExpr::WhenQualified { value, base, .. } => when_view_name(&value, &base)?,
+                    _ => return None,
+                };
+                let types: &[crate::elab::ElaboratedType] = self.types;
+                types
+                    .iter()
+                    .find(|t| t.name == type_name)
+                    .and_then(|t| t.fields.iter().find(|f| f.name == *name))
+                    .map(|f| f.ty.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// The parameter types of a called method, one per argument position
+    /// (`None` where the parameter is untyped, the callee is a builtin,
+    /// or the callee cannot be resolved — the call itself reports its
+    /// own error in those cases). The inference context for an untyped
+    /// `evaluate { ... }` in an argument (4.17.7).
+    fn call_arg_hints(
+        &self,
+        callee: &Expr,
+        arg_count: usize,
+        frame: &Frame,
+        me: Option<usize>,
+    ) -> Vec<Option<TypeExpr>> {
+        let mut hints: Vec<Option<TypeExpr>> = vec![None; arg_count];
+        // The type the callee is a method of, and the callee's name.
+        let (type_name, method_name) = match callee {
+            Expr::Ident { name, .. } => {
+                if crate::builtins::is_builtin_routine(name) {
+                    return hints;
+                }
+                let Some(index) = me else {
+                    return hints;
+                };
+                (self.instances[index].type_name.clone(), name.clone())
+            }
+            Expr::MemberAccess { object, name, .. } => {
+                let type_name = match self.static_type_of(object, frame, me) {
+                    Some(TypeExpr::Named { name, .. }) => name,
+                    Some(TypeExpr::WhenQualified { value, base, .. }) => {
+                        match when_view_name(&value, &base) {
+                            Some(view) => view,
+                            None => return hints,
+                        }
+                    }
+                    _ => return hints,
+                };
+                (type_name, name.clone())
+            }
+            _ => return hints,
+        };
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let Some(ty) = types.iter().find(|t| t.name == type_name) else {
+            return hints;
+        };
+        for method in &ty.methods {
+            if method.name != *method_name {
+                continue;
+            }
+            for (position, param) in method.params.iter().enumerate().take(arg_count) {
+                if hints[position].is_none() {
+                    hints[position] = param.ty.clone();
+                }
+            }
+        }
+        hints
+    }
+
+    /// Whether one `in_table` row element matches the tuple element's
+    /// value (clause 4.11.8): a scalar element by `==`, a set element by
+    /// membership. A tuple element and a row element of incompatible
+    /// kinds (integer vs string, enumerals of different types, a range
+    /// against a non-integer, ...) report `E0412`.
+    fn row_element_matches(
+        &mut self,
+        element: &crate::ast::TableElem,
+        value: &Value,
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<bool, Diagnostic> {
+        match element {
+            crate::ast::TableElem::Scalar(expr) => {
+                let other = self.eval(expr, frame, me)?;
+                if !table_values_compatible(value, &other) {
+                    return Err(self.error("E0412", "in_table element type mismatch", span));
+                }
+                Ok(matches!(
+                    self.apply_binary(BinaryOp::Eq, value.clone(), other, span)?,
+                    Value::Bool(true)
+                ))
+            }
+            crate::ast::TableElem::Set(crate::ast::InSetExpr::Items(items)) => {
+                for item in items {
+                    let item_value = self.eval(item, frame, me)?;
+                    if !table_values_compatible(value, &item_value) {
+                        return Err(self.error("E0412", "in_table element type mismatch", span));
+                    }
+                    if matches!(
+                        self.apply_binary(BinaryOp::Eq, value.clone(), item_value, span)?,
+                        Value::Bool(true)
+                    ) {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
+                let Value::Int(v) = value else {
+                    return Err(self.error("E0412", "in_table element type mismatch", span));
+                };
+                let (Value::Int(low), Value::Int(high)) =
+                    (self.eval(low, frame, me)?, self.eval(high, frame, me)?)
+                else {
+                    return Err(self.error("E0402", "range bound must be an integer", span));
+                };
+                Ok(low <= *v && *v <= high)
+            }
+            crate::ast::TableElem::TypeSet { ty, .. } => self.type_set_contains(ty, value, span),
+        }
+    }
+
+    /// Whether `value` is a member of the value set of `ty`
+    /// (5.10.5/5.10.6, as an `in_table` row element): integers and
+    /// booleans by index over the type's range, enumerals by their
+    /// enumerand index over their own type's set. Any other pairing is
+    /// `E0412`.
+    fn type_set_contains(
+        &self,
+        ty: &TypeExpr,
+        value: &Value,
+        span: crate::ast::Span,
+    ) -> Result<bool, Diagnostic> {
+        let Some(range) = self.type_value_range(ty) else {
+            return Err(self.error(
+                "E0402",
+                format!(
+                    "set_of_values expects a numeric or enumeral type; '{}' has none",
+                    ty.render()
+                ),
+                ty.span(),
+            ));
+        };
+        let index = match value {
+            Value::Int(v) => {
+                return Ok(range.0 <= *v && *v <= range.1);
+            }
+            Value::Bool(b) => i128::from(*b),
+            Value::Enum { type_name, name } => {
+                if type_set_key(ty).as_deref() != Some(type_name.as_str()) {
+                    return Err(self.error("E0412", "in_table element type mismatch", span));
+                }
+                let types: &[crate::elab::ElaboratedType] = self.types;
+                let Some(declared) = types.iter().find(|t| t.name == *type_name) else {
+                    return Err(self.error("E0412", "in_table element type mismatch", span));
+                };
+                match declared.enumerals.iter().position(|e| e.name == *name) {
+                    Some(index) => index as i128,
+                    None => return Ok(false),
+                }
+            }
+            _ => return Err(self.error("E0412", "in_table element type mismatch", span)),
+        };
+        Ok(range.0 <= index && index <= range.1)
     }
 
     fn apply_binary(
@@ -5652,6 +6068,106 @@ fn as_f64(value: &Value) -> Option<f64> {
         Value::Int(i) => Some(*i as f64),
         Value::Real(r) => Some(*r),
         _ => None,
+    }
+}
+
+/// Whether an `in_table` tuple element and a row element may be compared
+/// at all (clause 4.11.8): same-kind scalars, the mixed integer/real
+/// pair (as `==` accepts), objects by identity. Enumerals only compare
+/// within their own type; anything else is the E0412 mismatch.
+fn table_values_compatible(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(_), Value::Int(_))
+        | (Value::Int(_), Value::Real(_))
+        | (Value::Real(_), Value::Int(_))
+        | (Value::Real(_), Value::Real(_))
+        | (Value::Bool(_), Value::Bool(_))
+        | (Value::Str(_), Value::Str(_))
+        | (Value::Object(_), Value::Object(_)) => true,
+        (
+            Value::Enum {
+                type_name: type_a, ..
+            },
+            Value::Enum {
+                type_name: type_b, ..
+            },
+        ) => type_a == type_b,
+        _ => false,
+    }
+}
+
+/// The canonical type name a `set_of_values`-style type argument denotes,
+/// for comparison with an enumerand value's type: the declared name, or
+/// the inline enum's synthetic key for an inline enumeral list.
+fn type_set_key(ty: &TypeExpr) -> Option<String> {
+    match ty {
+        TypeExpr::Named { name, .. } => Some(name.clone()),
+        TypeExpr::InlineEnum { names, .. } => Some(inline_enum_key(names)),
+        _ => None,
+    }
+}
+
+/// Whether the expression anywhere contains an `evaluate { ... }` block
+/// without an explicit type — the only case a call argument needs its
+/// parameter's declared type as the inference context (4.17.7).
+fn expr_has_untyped_evaluate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Evaluate { ty, .. } => ty.is_none(),
+        Expr::Unary { expr, .. } | Expr::Paren { expr, .. } | Expr::CastAs { expr, .. } => {
+            expr_has_untyped_evaluate(expr)
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_has_untyped_evaluate(lhs) || expr_has_untyped_evaluate(rhs)
+        }
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            expr_has_untyped_evaluate(cond)
+                || expr_has_untyped_evaluate(then_expr)
+                || expr_has_untyped_evaluate(else_expr)
+        }
+        Expr::Index { base, index, .. } => {
+            expr_has_untyped_evaluate(base) || expr_has_untyped_evaluate(index)
+        }
+        Expr::BitSlice {
+            base, high, low, ..
+        } => {
+            expr_has_untyped_evaluate(base)
+                || expr_has_untyped_evaluate(high)
+                || expr_has_untyped_evaluate(low)
+        }
+        Expr::MemberAccess { object, .. } => expr_has_untyped_evaluate(object),
+        Expr::Call { callee, args, .. } => {
+            expr_has_untyped_evaluate(callee) || args.iter().any(expr_has_untyped_evaluate)
+        }
+        Expr::InSet { element, set, .. } => {
+            let set_has = match set {
+                crate::ast::InSetExpr::Items(items) => items.iter().any(expr_has_untyped_evaluate),
+                crate::ast::InSetExpr::Range(low, high) => {
+                    expr_has_untyped_evaluate(low) || expr_has_untyped_evaluate(high)
+                }
+            };
+            expr_has_untyped_evaluate(element) || set_has
+        }
+        Expr::InTable { tuple, rows, .. } => {
+            tuple.iter().any(expr_has_untyped_evaluate)
+                || rows.iter().any(|row| {
+                    row.iter().any(|element| match element {
+                        crate::ast::TableElem::Scalar(expr) => expr_has_untyped_evaluate(expr),
+                        crate::ast::TableElem::Set(crate::ast::InSetExpr::Items(items)) => {
+                            items.iter().any(expr_has_untyped_evaluate)
+                        }
+                        crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
+                            expr_has_untyped_evaluate(low) || expr_has_untyped_evaluate(high)
+                        }
+                        crate::ast::TableElem::TypeSet { .. } => false,
+                    })
+                })
+        }
+        _ => false,
     }
 }
 

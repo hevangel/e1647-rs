@@ -2604,3 +2604,138 @@ fn comparison_constraints_narrow_generation() {
     );
     assert_eq!(output, "TRUE TRUE\n");
 }
+
+#[test]
+fn in_table_keep_constrains_gen_and_direct_checks_decide() {
+    // 4.11.8: a `keep (a, b, c) in_table { rows }` constrains the tuple
+    // to the rows — every generated instance must match at least one
+    // row — and the same construct decides directly as an expression
+    // (with `not` negating).
+    let output = clean_output(
+        "type speed_t: [LOW, HIGH, FULL];\n\
+         type kind_t: [DATA, INTERRUPT, CONTROL];\n\
+         struct pipe {\n\
+         \x20   kind: kind_t;\n\
+         \x20   speed: speed_t;\n\
+         \x20   size: uint;\n\
+         \x20   keep (kind, speed, size) in_table {\n\
+         \x20       INTERRUPT, FULL, [0..300];\n\
+         \x20       CONTROL,   HIGH, 100;\n\
+         \x20       DATA,      LOW,  1;\n\
+         \x20   };\n\
+         };\n\
+         extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var p: pipe;\n\
+         \x20       for i from 1 to 20 {\n\
+         \x20           gen p;\n\
+         \x20           if (p.kind, p.speed, p.size) not in_table {\n\
+         \x20               INTERRUPT, FULL, [0..300];\n\
+         \x20               CONTROL,   HIGH, 100;\n\
+         \x20               DATA,      LOW,  1;\n\
+         \x20           } then { out(\"BAD\") };\n\
+         \x20       };\n\
+         \x20       out((DATA, LOW, 1) in_table { DATA, LOW, 1 });\n\
+         \x20       out((DATA, LOW, 2) in_table { DATA, LOW, 1 });\n\
+         \x20       out((DATA, LOW, 2) not in_table { DATA, LOW, 1 });\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert!(
+        !output.contains("BAD"),
+        "every generated instance matches a row: {output}"
+    );
+    assert!(output.ends_with("TRUEFALSETRUE"), "output: {output}");
+}
+
+#[test]
+fn in_table_set_row_elements_match_by_membership() {
+    // 4.11.8: a set row element matches by `in` — a range literal, an
+    // item list, and a set_of_values type set; a scalar element by `==`.
+    let output = clean_output(
+        "extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       out((5) in_table { [1, 5, 9]; });\n\
+         \x20       out((5) in_table { [0..4]; });\n\
+         \x20       out((5) in_table { [0..300]; });\n\
+         \x20       out((5) in_table { set_of_values(uint(bits: 3)); });\n\
+         \x20       out((TRUE) in_table { [TRUE, FALSE]; });\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "TRUEFALSETRUETRUETRUE");
+}
+
+#[test]
+fn in_table_element_type_mismatch_reports_e0412() {
+    // A tuple element and a row element of incompatible kinds — an
+    // integer against a string — report E0412 at run time.
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        out((1, \"a\") in_table { 1, 2; });\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>(),
+        vec!["E0412"]
+    );
+}
+
+#[test]
+fn evaluate_expression_yields_the_block_variable() {
+    // 4.17.7: the actions run; the implicit `value` (or the named
+    // variable) after the block is the expression's value.
+    let output = clean_output(
+        "extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var x: int = evaluate { value = 3; value = value * 4 };\n\
+         \x20       var y: uint = evaluate uint (acc) { acc = 1; for i from 1 to 4 { acc = acc * 2 } };\n\
+         \x20       out(x); out(y);\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "1216");
+}
+
+#[test]
+fn evaluate_infers_from_assignment_and_var_forms() {
+    // 4.17.7 type inference v1: the declared type of the assignment
+    // target, and the `(var)` form without a declared type.
+    let output = clean_output(
+        "extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var z: int;\n\
+         \x20       z = evaluate { value = 7 };\n\
+         \x20       out(z);\n\
+         \x20       var w: int = evaluate (v) { v = 1 + 1 };\n\
+         \x20       out(w);\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "72");
+}
+
+#[test]
+fn evaluate_without_an_inferable_type_reports_e0122() {
+    // 4.17.7: an untyped evaluate with no assignment/var target and no
+    // parameter context cannot infer its result type (E0122).
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        out(evaluate { value = 1; });\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>(),
+        vec!["E0122"]
+    );
+}
