@@ -2,8 +2,11 @@
 //!
 //! Supported: `struct` / `unit` / `extend` / `type` declarations with
 //! optional `like` inheritance, field declarations (single names and `a, b:`
-//! name groups) with scalar (`uint(bits: 8)`-style widths included), `list
-//! of`, and named types, enumeral type declarations, `keep` and `keep soft`
+//! name groups) with the clause 6.9.1 prefix set (`package`/`protected`/
+//! `private` visibility, `const`, `!`, `~`, `%` — the contextual `static`
+//! prefix is a later stage), scalar (`uint(bits: 8)`-style widths included),
+//! `list of`, and named types, field init values (`= init-value`, clause
+//! 6.9.1/6.9.2), enumeral type declarations, `keep` and `keep soft`
 //! constraint expressions, `when` subtype members (`value'id` modifiers per
 //! the reference grammar's `struct_type_modifier`), and method members with
 //! parameter lists and statement bodies (local `var` declarations,
@@ -1203,15 +1206,18 @@ impl Parser {
         } else {
             self.expect_type_name("expected declaration name")?
         };
-        // Clause 4.4.2.2: extensions of the root `global` type are reserved
-        // for the runtime; user code shall not write `extend global`. The
-        // parser's own `extend global` pseudo-declaration (the holder of
-        // file-level `define`/`import` members) is built in
-        // `parse_program` and never passes through here.
+        // Clause 4.4.2.2 (2019): extensions of `global` are reserved for
+        // the implementation, so user code shall not write `extend
+        // global`; the parser keeps it an error (the conservative
+        // reading — an implementation-provided extension is not a user
+        // extension). The parser's own `extend global`
+        // pseudo-declaration (the holder of file-level `define`/`import`
+        // members) is built in `parse_program` and never passes through
+        // here.
         if kind == DeclarationKind::Extend && name == "global" {
             self.diagnostics.push(Diagnostic::new(
                 "E0116",
-                "cannot extend 'global': extensions of the root type are reserved for the runtime",
+                "extending 'global' is reserved for the implementation (clause 4.4.2.2)",
                 name_span.0,
                 name_span.1,
             ));
@@ -1311,11 +1317,13 @@ impl Parser {
     /// One member often produces several AST members (`a, b: uint;` is two
     /// fields), hence the vector.
     fn parse_member(&mut self) -> Option<Vec<Member>> {
-        // `package` / `private` visibility prefix of a member
-        // (`package items: …`, `private mset: …`, clause 22) — recorded
-        // on the field, not enforced. The prefix is consumed by the
-        // field parser one level down.
-        if (self.peek_word_is("package") || self.peek_word_is("private"))
+        // `package` / `protected` / `private` visibility prefix of a
+        // member (`package items: …`, `private mset: …`, clause 22) —
+        // recorded on the field, not enforced. The prefix is consumed by
+        // the field parser one level down.
+        if (self.peek_word_is("package")
+            || self.peek_word_is("protected")
+            || self.peek_word_is("private"))
             && !matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == "(")
         {
             let word = match self.peek_kind() {
@@ -1327,6 +1335,25 @@ impl Parser {
             let members = self.parse_member();
             self.member_visibility = None;
             return members;
+        }
+        // The contextual `static` member prefix (clause 6.9.3) is not
+        // parsed into the AST yet: static fields are per-type singletons
+        // with their own storage and access rules, which the
+        // static-members stage (plan T2.1) owns. A `static`-prefixed
+        // member shape (`static x: uint;`, `static const n: int = 0;`,
+        // `static !l: string;`) is therefore rejected here with an
+        // explicit not-supported diagnostic instead of the misleading
+        // "expected ':'" that would follow otherwise. A field or method
+        // genuinely named `static` (`static: uint;`, `static() is { … }`,
+        // the name group `static, x: uint;`) keeps its existing handling:
+        // the prefix trigger requires a prefix token or a following name.
+        if self.peek_word_is("static") && self.peek_second_starts_member_declarator() {
+            self.error_here(
+                "E0113",
+                "static member declarations are not supported yet (clause 6.9.3; static fields and methods are a planned stage)",
+            );
+            self.recover_to_member_boundary();
+            return None;
         }
         match self.peek_kind() {
             Some(TokenKind::Keyword(k)) if k == "import" => self.parse_import(),
@@ -1385,8 +1412,14 @@ impl Parser {
             {
                 self.parse_fields()
             }
-            // `%name` physical / `!name` do-not-generate field prefixes.
-            Some(TokenKind::Punctuation(p)) if p == "%" || p == "!" => self.parse_fields(),
+            // `%name` physical, `!name` do-not-generate and `~name`
+            // range-generated field prefixes (clause 6.9.1/6.9.7). `!~`
+            // lexes as one string-match operator token, but in member
+            // position it can only be the two field prefixes read
+            // together (rejected by `check.rs`, E0213).
+            Some(TokenKind::Punctuation(p)) if p == "%" || p == "!" || p == "~" || p == "!~" => {
+                self.parse_fields()
+            }
             _ => {
                 self.error_here(
                     "E0113",
@@ -1501,6 +1534,18 @@ impl Parser {
             self.peek_second_kind(),
             Some(TokenKind::Keyword(w)) if w == word
         )
+    }
+
+    /// Whether the token after the current one can start the declarator
+    /// of a `static`-prefixed member: the `const` prefix or one of the
+    /// `!` / `~` / `%` field prefixes, or the member name itself. A
+    /// following `:`, `,`, `(` or `is` leaves the member to the regular
+    /// field/method paths (a member genuinely named `static`).
+    fn peek_second_starts_member_declarator(&self) -> bool {
+        matches!(
+            self.peek_second_kind(),
+            Some(TokenKind::Punctuation(p)) if p == "!" || p == "~" || p == "%"
+        ) || matches!(self.peek_second_kind(), Some(TokenKind::Identifier(_)))
     }
 
     /// Collect the raw tokens up to and including the `}` matching the
@@ -2200,15 +2245,46 @@ impl Parser {
         })])
     }
 
-    /// `name, name: type;` — a name group declares one field per name.
+    /// `name, name: type [= init];` — a name group declares one field per
+    /// name, with the shared prefixes, type and init value (clause 6.9.1:
+    /// `[package|protected|private] [static] [const] [!|~] [%] name[: type]
+    /// [[lo..hi]] [((bits|bytes): n)] [= init-value]`; `static` is
+    /// rejected earlier in `parse_member`).
     fn parse_fields(&mut self) -> Option<Vec<Member>> {
-        // `%name` physical / `!name` do-not-generate prefixes.
+        // `const` prefix (clause 6.9.4). The word is contextual, so it is
+        // only a prefix when a prefix token or the name follows it — a
+        // field genuinely named `const` (`const: uint;`, `const, x:
+        // uint;`) keeps parsing as a name.
+        let is_const = self.peek_word_is("const")
+            && (self.peek_second_is_punct("!")
+                || self.peek_second_is_punct("~")
+                || self.peek_second_is_punct("%")
+                || matches!(self.peek_second_kind(), Some(TokenKind::Identifier(_))));
+        if is_const {
+            self.bump();
+        }
+        // `!name` do-not-generate and `~name` range-generated (clause
+        // 6.9.7) prefixes, in either written order; `%name` physical
+        // after them (`!%` and `~%` are legal shapes, clause 6.9.1).
+        // `!` with `~` parses and is rejected by `check.rs` (E0213).
+        let mut no_gen = false;
+        let mut range_gen = false;
+        // `!~` lexes as one string-match operator token; in member
+        // position it can only be the two field prefixes read together.
+        if self.eat_punct("!~") {
+            no_gen = true;
+            range_gen = true;
+        }
+        loop {
+            if !no_gen && self.eat_punct("!") {
+                no_gen = true;
+            } else if !range_gen && self.eat_punct("~") {
+                range_gen = true;
+            } else {
+                break;
+            }
+        }
         let physical = self.eat_punct("%");
-        let no_gen = if !physical {
-            self.eat_punct("!")
-        } else {
-            false
-        };
         let (first, first_span) = self.expect_word("E0102", "expected field name")?;
         let mut names = vec![(first, first_span)];
         while self.eat_punct(",") {
@@ -2248,6 +2324,9 @@ impl Parser {
                             },
                             physical: false,
                             no_gen: false,
+                            range_gen: false,
+                            is_const: false,
+                            init: None,
                             visibility: self.member_visibility.clone(),
                         })
                     })
@@ -2256,6 +2335,16 @@ impl Parser {
         }
         self.expect_punct(":", "E0103", "expected ':' after field name")?;
         let ty = self.parse_type()?;
+        // `= init-value` (clause 6.9.1/6.9.2): recorded as written and
+        // applied to every name of the group. It must be a constant
+        // expression; `check.rs` rejects an init value on a generated
+        // field (E0211) and the interpreter applies it at instance
+        // creation.
+        let init = if self.eat_punct("=") {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         // `is instance` / `is inline` suffixes are syntactic in this
         // subset.
         if self.eat_keyword("is") && !self.eat_keyword("instance") && !self.eat_keyword("inline") {
@@ -2277,6 +2366,9 @@ impl Parser {
                         ty: ty.clone(),
                         physical,
                         no_gen,
+                        range_gen,
+                        is_const,
+                        init: init.clone(),
                         visibility: self.member_visibility.clone(),
                     })
                 })

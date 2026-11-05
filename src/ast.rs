@@ -216,8 +216,20 @@ pub struct Field {
     pub physical: bool,
     /// `!name` do-not-generate field (skipped by `gen`).
     pub no_gen: bool,
-    /// `package name: ...;` / `private name: ...;` visibility prefix
-    /// (clause 22), recorded only.
+    /// `~name` range-generated field (clause 6.9.7). Parsed here; the
+    /// reduced-set generation semantics are the range-generation stage.
+    pub range_gen: bool,
+    /// `const name` prefix (clause 6.9.4): the field is initialised once
+    /// — by its init value, in `init()`, or by `do_unpack()`.
+    pub is_const: bool,
+    /// `= init-value` suffix (clause 6.9.1/6.9.2), as written. Allowed
+    /// only where a value is not generated (a `!` or `const` field;
+    /// `static` is a later stage) and only for scalar/string/set fields
+    /// or lists thereof; `check.rs` enforces the generated-field rule
+    /// (E0211).
+    pub init: Option<Expr>,
+    /// `package name: ...;` / `protected name: ...;` / `private name:
+    /// ...;` visibility prefix (clause 22), recorded only.
     pub visibility: Option<String>,
 }
 

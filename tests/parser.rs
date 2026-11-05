@@ -1197,14 +1197,15 @@ fn bare_is_is_not_consumed_as_a_type_check() {
 
 #[test]
 fn extend_global_is_rejected() {
-    // Clause 4.4.2.2: extensions of `global` are reserved for the runtime.
+    // Clause 4.4.2.2: extensions of `global` are reserved for the
+    // implementation.
     let result = parse("extend global {\n    helper: uint;\n};\n");
     assert!(result.declarations.is_empty());
     let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
     assert_eq!(
         rendered,
         vec![
-            "1:8: error[E0116]: cannot extend 'global': extensions of the root type are reserved for the runtime"
+            "1:8: error[E0116]: extending 'global' is reserved for the implementation (clause 4.4.2.2)"
                 .to_owned()
         ]
     );

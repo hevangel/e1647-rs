@@ -1,0 +1,1 @@
+5:19: error[E0211]: initial value is not allowed on a generated field (declare it '!'): field 'depth'

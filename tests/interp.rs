@@ -1143,14 +1143,14 @@ fn compute_calls_inline_and_untyped_params_accept_anything() {
 
 #[test]
 fn new_reports_a_clean_runtime_diagnostic() {
-    // An untyped `new` creates with the enclosing `var x: t = new;`'s
-    // declared type (clause 18); away from such an initializer it stays
-    // unsupported and reports the clean E0402 diagnostic.
+    // An untyped `new` without a declared type to infer from (here: an
+    // assignment target's field has no type known to `new`) stays
+    // unsupported.
     let result = run(
         &elaborate(
             &parse(
                 "struct s {\n    v: int;\n};\n\
-             extend sys {\n    run() is also {\n        var p: s;\n        p = new;\n    };\n};\n",
+             extend sys {\n    p: s;\n    run() is also {\n        p = new;\n    };\n};\n",
             )
             .declarations,
         ),
@@ -1173,6 +1173,82 @@ fn untyped_new_creates_the_var_declared_type() {
         1,
     );
     assert_eq!(output, "7\n");
+}
+
+#[test]
+fn untyped_new_in_a_typed_var_declaration_takes_the_var_type() {
+    // `var c: cfg = new;` — clause 6.3's typed creation where the type
+    // comes from the assignment target.
+    let output = clean_output(
+        "struct s {\n    v: int;\n};\n\
+         extend sys {\n    run() is also {\n        var c: s = new;\n        out(c.v, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "0\n");
+}
+
+#[test]
+fn field_init_values_are_set_at_instance_creation() {
+    // Clause 6.9.1/6.9.2/6.9.4: `!` and `const !` fields with init
+    // values; the values are set on instance creation, before `init()`
+    // would run. (The plan's list-literal init `{1; 0; 1}` needs the
+    // list-concat expression, which is not on this base — the third
+    // field is a scalar instead; see the T1.11 deviation note.)
+    let output = clean_output(
+        "<'\nstruct cfg {\n    !depth: uint = 16;\n    !name: string = \"dut\";\n    !radix: uint = 8;\n    const !limit: uint = 3;\n};\n\
+         extend sys {\n    run() is also {\n        var c: cfg = new;\n        out(c.depth, \"\\n\");\n        out(c.name, \"\\n\");\n        out(c.radix, \"\\n\");\n        out(c.limit, \"\\n\");\n    };\n};\n'>\n",
+        1,
+    );
+    assert_eq!(output, "16\ndut\n8\n3\n");
+}
+
+#[test]
+fn field_init_values_apply_to_every_instance() {
+    // Clause 6.9.4: each instance creation re-applies the init value,
+    // and `gen` does not overwrite it on a `!` field.
+    let output = clean_output(
+        "struct cfg {\n    !seed: uint = 7;\n};\n\
+         extend sys {\n    run() is also {\n        var a: cfg = new;\n        var b: cfg = new;\n        out(a.seed, \" \", b.seed, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "7 7\n");
+}
+
+#[test]
+fn const_field_keeps_its_init_value_through_gen() {
+    // Clause 6.9.4: a const field is initialised once — by its init
+    // value here — so `gen` must not overwrite it.
+    let output = clean_output(
+        "struct cfg {\n    const limit: uint = 3;\n};\n\
+         extend sys {\n    run() is also {\n        var c: cfg = new;\n        gen c;\n        out(c.limit, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "3\n");
+}
+
+#[test]
+fn static_field_prefix_is_rejected_as_unsupported() {
+    // Clause 6.9.3: the contextual `static` prefix is not parsed yet;
+    // the static-members stage owns it. A member genuinely named
+    // `static` keeps parsing.
+    let result = parse("struct s {\n    static count: uint;\n};\n");
+    let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
+    assert_eq!(rendered.len(), 1);
+    assert!(
+        rendered[0].contains("E0113") && rendered[0].contains("static"),
+        "expected the static not-supported diagnostic: {:?}",
+        rendered
+    );
+    let named = parse("struct s {\n    static: uint;\n    m: uint;\n};\n");
+    assert!(
+        named.diagnostics.is_empty(),
+        "a field named 'static' must keep parsing: {:?}",
+        named
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
