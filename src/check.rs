@@ -16,6 +16,19 @@
 //! - `E0205` a `uint`/`int` width literal is zero
 //! - `E0206` duplicate name in an inner scope: method parameter, local
 //!   variable, or enumeral
+//! - `E0211` a field init value on a generated field (clause 6.9.1: an
+//!   init value requires `!`, `const`, or — in the later static-members
+//!   stage — `static`)
+//! - `E0213` the `!` and `~` field prefixes combined (clause 6.9.1: a
+//!   field is either do-not-generate or range-generated, never both)
+//! - `E0214` a range-generated (`~`) field declared `const` (clause
+//!   6.9.4: a const field is initialised once; a `~` field's reduced set
+//!   is produced per generation)
+//!
+//! `E0212` ("a `static const` field requires an init value", clause
+//! 6.9.4) is reserved for the static-members stage, which owns the
+//! contextual `static` prefix; static-prefixed members are rejected
+//! earlier, by the parser.
 //!
 //! Fields, methods and constraints are collected through `when` subtype
 //! members as well. A `keep` constraint sees every field of the enclosing
@@ -183,7 +196,63 @@ fn check_fields(
         {
             check_width(width, diagnostics);
         }
+        check_field_prefixes(field, diagnostics);
     });
+}
+
+/// Clause 6.9.1/6.9.4 field-prefix rules over one parsed field.
+///
+/// - `!` and `~` are mutually exclusive (`E0213`). The diagnostic points
+///   at the field name — the declaration carrying the conflicting
+///   prefixes.
+/// - A range-generated (`~`) field is not `const` (`E0214`), for the
+///   same reason: a const field holds one initialised value, while a
+///   `~` field's reduced set is produced per generation (clause 6.9.4,
+///   6.9.7).
+/// - An init value is not allowed on a generated field (`E0211`): a
+///   field without `!` (and without `const`; `static` is the later
+///   static-members stage) has its value produced by `gen`, so a
+///   written initial value would never survive. The diagnostic points
+///   at the init expression. A `~` field is generated too, so the same
+///   rule covers it.
+fn check_field_prefixes(field: &Field, diagnostics: &mut Vec<Diagnostic>) {
+    if field.no_gen && field.range_gen {
+        diagnostics.push(Diagnostic::new(
+            "E0213",
+            format!(
+                "'!' and '~' cannot be combined on field '{}' (clause 6.9.1)",
+                field.name
+            ),
+            field.name_span.0,
+            field.name_span.1,
+        ));
+    }
+    if field.range_gen && field.is_const {
+        diagnostics.push(Diagnostic::new(
+            "E0214",
+            format!(
+                "range-generated field '{}' cannot be const (clause 6.9.4)",
+                field.name
+            ),
+            field.name_span.0,
+            field.name_span.1,
+        ));
+    }
+    if let Some(init) = &field.init
+        && !field.no_gen
+        && !field.is_const
+    {
+        let span = init.span();
+        diagnostics.push(Diagnostic::new(
+            "E0211",
+            format!(
+                "initial value is not allowed on a generated field (declare it '!'): field '{}'",
+                field.name
+            ),
+            span.0,
+            span.1,
+        ));
+    }
 }
 
 /// A `type` declaration may not name the same enumeral twice.

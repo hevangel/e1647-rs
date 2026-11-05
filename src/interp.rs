@@ -396,6 +396,11 @@ struct Interp<'a> {
     dut_errors: usize,
     /// `define` constants resolved to values.
     defines: std::collections::BTreeMap<String, Value>,
+    /// Field init-value evaluation failures (clause 6.9.1/6.9.4) that
+    /// surfaced where no diagnostic can propagate — instance creation
+    /// returns an index, not a `Result`. Drained into the run's
+    /// diagnostics; the affected fields keep their type default.
+    pending_diagnostics: Vec<Diagnostic>,
 }
 
 /// How many `wait` statements and scheduler cycles one run may consume
@@ -514,6 +519,7 @@ fn run_inner(
         stop_requested: false,
         dut_errors: 0,
         defines,
+        pending_diagnostics: Vec::new(),
     };
     let types: &[crate::elab::ElaboratedType] = interp.types;
     let Some(sys) = types
@@ -524,7 +530,7 @@ fn run_inner(
         // output.
         return RunResult {
             output: interp.output,
-            diagnostics: Vec::new(),
+            diagnostics: interp.pending_diagnostics,
             coverage: interp.coverage,
         };
     };
@@ -724,6 +730,9 @@ fn run_inner(
             interp.dut_errors
         ));
     }
+    // Field init-value failures collected during instance creation
+    // (clause 6.9.1/6.9.4) join the run's diagnostics.
+    diagnostics.append(&mut interp.pending_diagnostics);
     RunResult {
         output: interp.output,
         diagnostics,
@@ -812,8 +821,28 @@ impl<'a> Interp<'a> {
         let types: &[crate::elab::ElaboratedType] = self.types;
         if let Some(ty) = types.iter().find(|t| t.name == type_name) {
             for field in &ty.fields {
-                let default = self.default_for(&field.ty);
-                fields.push((field.name.clone(), default));
+                let value = match &field.init {
+                    // Clause 6.9.1/6.9.4: a field's init value is set at
+                    // instance creation, before `init()` runs (the
+                    // `init()` dispatch itself is a later milestone, so
+                    // instance creation is the only init point today).
+                    // Init values are constant expressions, so the empty
+                    // frame / no-instance context suffices; an expression
+                    // that cannot evaluate keeps the type default and the
+                    // failure is reported through the run diagnostics.
+                    Some(init) => {
+                        let mut frame = Frame::default();
+                        match self.eval(init, &mut frame, None) {
+                            Ok(value) => value,
+                            Err(diagnostic) => {
+                                self.pending_diagnostics.push(diagnostic);
+                                self.default_for(&field.ty)
+                            }
+                        }
+                    }
+                    None => self.default_for(&field.ty),
+                };
+                fields.push((field.name.clone(), value));
             }
             for port in &ty.ports {
                 if let Some(hdl_path) = &port.hdl_path {
@@ -1283,19 +1312,44 @@ impl<'a> Interp<'a> {
     ) -> Result<Flow, Diagnostic> {
         match statement {
             Stmt::VarDecl { name, ty, init, .. } => {
-                let value = match (ty, init) {
-                    (_, Some(expr)) => self.eval(expr, frame, me)?,
+                // `var c: cfg = new;` — an untyped `new` in a var
+                // declaration with a declared struct type takes that
+                // type (clause 6.3's typed creation: the target's type
+                // is known). Other untyped `new` uses keep the explicit
+                // not-supported diagnostic below.
+                let inferred_new: Option<Expr> = match (ty, init) {
+                    (
+                        Some(
+                            var_ty @ TypeExpr::Named { .. } | var_ty @ TypeExpr::TemplateRef { .. },
+                        ),
+                        Some(Expr::New {
+                            ty: None,
+                            inits,
+                            span,
+                        }),
+                    ) => Some(Expr::New {
+                        ty: Some(var_ty.clone()),
+                        inits: inits.clone(),
+                        span: *span,
+                    }),
+                    _ => None,
+                };
+                let value = match (&inferred_new, init) {
+                    (Some(new_expr), _) => self.eval(new_expr, frame, me)?,
+                    (None, Some(expr)) => self.eval(expr, frame, me)?,
                     // A declared type without an initializer takes the
                     // type's default; the type-inferring `:=` form
                     // always carries an initializer.
-                    (Some(ty), None) => self.default_for(ty),
-                    (None, None) => {
-                        return Err(self.error(
-                            "E0402",
-                            "type-inferring 'var' without an initializer",
-                            statement.span(),
-                        ));
-                    }
+                    (None, None) => match ty {
+                        Some(ty) => self.default_for(ty),
+                        None => {
+                            return Err(self.error(
+                                "E0402",
+                                "type-inferring 'var' without an initializer",
+                                statement.span(),
+                            ));
+                        }
+                    },
                 };
                 if let Some(ty) = ty {
                     frame.local_types.insert(name.clone(), ty.clone());
@@ -2011,11 +2065,14 @@ impl<'a> Interp<'a> {
         };
         let type_span = ty.span;
         // `!` fields keep their value; instance (unit-typed) fields are
-        // not generated — they are instantiated structurally.
+        // not generated — they are instantiated structurally. A `const`
+        // field keeps its value too: it is initialised once (by its init
+        // value, in `init()`, or by `do_unpack()` — clause 6.9.4), so
+        // generation must not overwrite it.
         let field_types: Vec<(String, TypeExpr)> = ty
             .fields
             .iter()
-            .filter(|field| !field.no_gen && !self.is_unit_typed(&field.ty))
+            .filter(|field| !field.no_gen && !field.is_const && !self.is_unit_typed(&field.ty))
             .map(|field| (field.name.clone(), field.ty.clone()))
             .collect();
         let mut constraints: Vec<Expr> = ty
@@ -3966,6 +4023,21 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
+                // Clause 4.4.5.3 name resolution: for a path-less name,
+                // the resolver checks the literal name `global` (which
+                // denotes the global struct itself) BEFORE checking
+                // whether the name is a member of `global`. The global
+                // struct is not modelled in this interpreter — user
+                // `extend global` is reserved for the implementation
+                // (clause 4.4.2.2, rejected by the parser as E0116), and
+                // the parser's file-level `define`/`import`
+                // pseudo-declaration carries no runtime members — so
+                // there is no global-struct value to produce and no
+                // member-of-`global` namespace to fall back to. A bare
+                // `global` therefore reaches the unknown-identifier
+                // error below; the literal-`global`-first ordering is
+                // recorded here for the stage that models the global
+                // struct.
                 Err(self.error("E0401", format!("unknown identifier '{name}'"), *span))
             }
             Expr::MemberAccess {
