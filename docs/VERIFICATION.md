@@ -3415,4 +3415,112 @@ Verification:
   the local redline PDF is the 2016 copy, so a future spot-check
   against the 2019 text may adjust individual leaf numbers by one.
 
+## 2026-11-05 (49) — Phase 1 of the IEEE 1647-2019 migration: lexical/syntactic foundation (branch `agent/2019-phase1`)
+
+Scope claimed for this change (nothing broader) — T1.1 through T1.13 of
+the migration plan, implemented on six parallel agent branches
+(`p1-segments`, `p1-longint`, `p1-listptr`, `p1-intable`, `p1-typeof`,
+`p1-fields`) and integrated sequentially:
+
+- **T1.1/T1.2 (4.2.4, 4.2.3)**: `/* */` comments are standard — they
+  span lines and code segments (the comment scanner now tracks code
+  segment markers it swallows) and do not nest; the "extension beyond
+  clause 4.1.3" wording is gone. A statement may span code segments:
+  the lexer erases the prose between `'>` and the next `<'`, so the
+  parser sees one stream (fixture + elab assertions).
+- **T1.3 (4.3.2/4.3.3)**: bare `{ ... }` groups at module level and in
+  member lists splice their contents in source order; groups nest;
+  `#ifdef` inside a group keeps its member-position meaning.
+- **T1.4 (5.2.3.1)**: `longint`/`longuint` are predefined 64-bit
+  scalars (identifier-branch recognition, not keywords); `gen` samples
+  their full 64-bit range; the solver path excludes them rather than
+  mis-narrowing; **E0207** rejects subtypes of either base (`(bits: N)`
+  and range-qualification forms; fixture ×2). The related `type t:
+  <scalar> [lo..hi]` range syntax newly parses (recorded-only; ranges
+  do not narrow yet — documented).
+- **T1.5/T1.6 (4.6, 4.11.4)**: Table 12's row order pinned by parser
+  tests; `list_ptr==`/`!list_ptr=` are glued longest-match tokens in
+  the equality row (left-associative precedence test). List values
+  carry **reference identity** (`Rc<RefCell<Vec<Value>>>`): assignment
+  aliases, `.copy()` mints a fresh handle, the 27.3 modifying
+  pseudo-methods mutate the shared storage in place, recursive read
+  paths are depth-bounded (cap 64). **E0411** for non-list or
+  type-mismatched operands. The plan's mandated list literals
+  (`{1; 2; 3}` in expression position) were not supported at all — the
+  Table 12 `{...;...}` list-concat operand now parses and evaluates.
+- **T1.7 (4.11.8)**: `in_table` — parser (tuple + `[not] in_table`
+  lookahead, rows `;`-separated, **E0121** arity), interpreter
+  (scalar-by-`==`, set-by-`in`, type-sets, **E0412** kind mismatch), and
+  gen: the rejection predicate enforces the row disjunction and the
+  sampler narrows each bare-identifier tuple element to the union of
+  the rows' constant projections (sound; a non-constant element drops
+  that field's narrowing — without some narrowing the plan's own test
+  is unsampleable, documented).
+- **T1.8 (4.17.7)**: `evaluate [type] [(var)] { … }` expressions —
+  **E0123** for `return`/`wait`/`sync` inside (parser scan); the result
+  type comes from the explicit `type`, or at run time from the
+  declared type of the assignment/`var` target or call parameter;
+  untyped with no context → **E0122** (raised at run time — the
+  inference contexts only resolve there; documented).
+- **T1.9 (5.9)**: `typeof()`/`typeof_item()` in type positions —
+  resolved in elaboration against fields, locals, parameters and
+  literals (member paths through struct-typed names included);
+  undeterminable → **E0208**, non-list `typeof_item` → **E0209**.
+  `typeof` is type-position-only (expression position stays a call).
+- **T1.10 (4.17.3)**: subtype qualifiers in dot access
+  (`p.red'good'x`) — the qualifier words match the synthesized when
+  view's (field id, value) determinants subset-semantically; the
+  instance's current values gate access (**E0413** when it does not
+  match). Related enablements: bare when-header words
+  (`when red good packet`) resolve to their determinant fields;
+  spelled when-types without a when block materialize as views; view
+  instances fix their determinant values and gen excludes them.
+- **T1.11 (6.9)**: field initial values — `const`/`!`/`~` prefix set
+  parses (in either order for `!`/`~`), `= init-value` per name group,
+  applied at instance creation before any later initialization;
+  **E0211** (init on a generated field), **E0213** (`!`+`~`),
+  **E0214** (`~` + `const`). `gen` no longer overwrites `const` fields
+  (6.9.4's initialised-once rule). `E0212` (static const without init)
+  is reserved for Phase 2 — the contextual `static` prefix is not
+  parsed in this phase (static-prefixed members get a clear E0113
+  not-supported rejection instead).
+- **T1.12 (4.4.2.2)**: `E0116` reworded to "extending 'global' is
+  reserved for the implementation (clause 4.4.2.2)" (fixture updated).
+- **T1.13 (4.4.5.3)**: the literal-`global`-before-members resolution
+  ordering is recorded at the name-lookup site; the global struct is
+  not modelled, so a bare `global` still reports E0401 (documented).
+
+Verification:
+
+- `cargo fmt --all -- --check` — pass
+- `cargo clippy --all-targets -- -D warnings` — pass, no warnings
+- `cargo test --all-targets` — **305 passed, 0 failed** (was 264 on
+  main: 41 new tests across interp/elab/parser/lexer + 9 new fixtures;
+  suites: lib 7, elab 26, fixtures 1 over 41 files, interp 157, lexer
+  29, parser 63, solve 9, temporal 8)
+- Corpus (absolute paths): etl 4, cover-edges 4, golden-imports 3,
+  golden-combined 0, igen-dist 0, type-min-max 0, save-restart 0, d6w
+  0 — unchanged; one sub-agent additionally diffed `run` output on the
+  corpus against a pristine base build byte-for-byte.
+- Integration notes (conflict resolutions, all three-way): the
+  BINARY_LEVELS doc comment, the interp module header (E-code list +
+  list-identity section), check.rs's per-site long-subtype + typeof
+  scope calls, the interp struct's `expected_type`/`new_type_hint`/
+  `pending_diagnostics` fields, the VarDecl arm (inferred-`new` +
+  evaluate type hint combined), the gen field filter (const + view
+  determinant exclusions), and two test-file regions where two agents
+  had added tests at the same anchor (all tests kept). A stray
+  conflict marker committed mid-integration was amended out before
+  push. `TableElem` was restored after it was dropped in an ast.rs
+  resolution.
+- Honest limits recorded: list identity aliases on assignment (the
+  plan's mandated reading) while the standard's value-copy reading
+  would make `list_ptr==` the only identity view — the element-type
+  record exists only where a creation site knows it, so the E0411
+  same-type check is skipped for untagged pairs; in_table's domain
+  narrowing projects constants only; E0122 surfaces at run time;
+  `typeof` is type-position-only; qualified-field materialization is
+  dynamic v1 under the view's hard keeps; static field members are
+  Phase 2.
+
 

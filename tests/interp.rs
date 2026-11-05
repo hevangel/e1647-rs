@@ -150,7 +150,7 @@ fn lists_support_push_size_and_indexing() {
     assert_eq!(output, "2 7\n10\n");
 }
 
-// --- Clause 26 list pseudo-methods ---
+// --- Clause 27 list pseudo-methods ---
 
 /// The rendered diagnostics of a run expected to fail.
 fn run_error(source: &str) -> Vec<String> {
