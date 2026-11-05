@@ -345,6 +345,89 @@ fn list_modifiers_work_through_struct_fields() {
     assert_eq!(output, "3\n2\n[9, 1, 2]\n");
 }
 
+// --- Clause 4.11.4 list identity (`list_ptr==` / `!list_ptr=`) ---
+
+#[test]
+fn clause_4_11_4_list_ptr_compares_object_identity() {
+    // The migration plan's runtime test for `list_ptr==` / `!list_ptr=`:
+    // `.copy()` mints a distinct list object, assignment aliases the same
+    // object, and the regular `==` stays item-by-item.
+    let output = clean_output(
+        "<'\nextend sys {\n    run() is also {\n        var l1: list of int = {1; 2; 3};\n        \
+         var l2: list of int = l1.copy();\n        var l3: list of int = l1;\n        \
+         out(l1 list_ptr== l2, \"\\n\");\n        out(l1 list_ptr== l3, \"\\n\");\n        \
+         out(l1 !list_ptr= l2, \"\\n\");\n        out(l1 !list_ptr= l3, \"\\n\");\n        \
+         out(l1 == l2, \"\\n\");\n    };\n};\n'>\n",
+        1,
+    );
+    assert_eq!(output, "FALSE\nTRUE\nTRUE\nFALSE\nTRUE\n");
+}
+
+#[test]
+fn clause_4_11_4_regular_equality_stays_item_by_item() {
+    // Two independently built lists with equal contents: `==` is TRUE,
+    // `list_ptr==` is FALSE (distinct objects), and length/item
+    // differences make `==` FALSE.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var a: list of int = {1; 2};\n        \
+         var b: list of int = {1; 2};\n        var c: list of int = {1; 2; 3};\n        \
+         out(a == b, \" \", a == c, \" \", a list_ptr== b, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUE FALSE FALSE\n");
+}
+
+#[test]
+fn clause_4_11_4_list_assignment_aliases_and_copy_isolates() {
+    // The shared list object: mutations through one alias are visible
+    // through the other; a `.copy()` result is isolated.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var l1: list of int = {1; 2};\n        \
+         var alias: list of int = l1;\n        var l2: list of int = l1.copy();\n        \
+         l1.push(3);\n        out(l1, \" \", alias, \" \", l2, \"\\n\");\n        \
+         alias.push0(0);\n        out(l1, \"\\n\");\n        \
+         l2.push(9);\n        out(l1, \" \", l2, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        output,
+        "[1, 2, 3] [1, 2, 3] [1, 2]\n[0, 1, 2, 3]\n[0, 1, 2, 3] [1, 2, 9]\n"
+    );
+}
+
+#[test]
+fn clause_4_11_4_list_ptr_requires_lists_of_the_same_type() {
+    // 4.11.4: both operands must be lists of the same type. A mismatched
+    // declared element type (`list of int` vs `list of uint`) and a
+    // non-list operand both report `E0411` at run time.
+    let diagnostics = run_error(
+        "extend sys {\n    run() is also {\n        var a: list of int;\n        \
+         var b: list of uint;\n        out(a list_ptr== b);\n    };\n};\n",
+    );
+    assert!(
+        diagnostics[0].contains("E0411") && diagnostics[0].contains("lists of the same type"),
+        "{diagnostics:?}"
+    );
+    let diagnostics = run_error(
+        "extend sys {\n    run() is also {\n        var a: list of int;\n        \
+         out(a list_ptr== 3);\n    };\n};\n",
+    );
+    assert!(diagnostics[0].contains("E0411"), "{diagnostics:?}");
+}
+
+#[test]
+fn clause_4_6_list_concat_builds_a_fresh_list() {
+    // `{ e1; e2; ... }` (clause 4.6, Table 12): a list element
+    // contributes its items, a scalar element contributes itself.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var l1: list of int = {1; 2};\n        \
+         var l2: list of int = {3};\n        var joined: list of int = {l1; 9; l2};\n        \
+         out(joined, \" \", joined.size(), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "[1, 2, 9, 3] 4\n");
+}
+
 #[test]
 fn empty_list_accessors_report_e0402() {
     // 27.3.10/27.3.11 and 27.4.26/27.4.27: "If the list is empty, an

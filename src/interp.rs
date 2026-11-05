@@ -14,7 +14,10 @@
 //! `fast_delete`/`clear`, the 27.4.15-27.4.19 extremes
 //! `min`/`max`/`min_index`/`max_index`, the 27.5.1/27.5.2/27.5.4/27.5.5
 //! aggregates `and_all`/`or_all`/`product`/`sum`, and 27.4.11
-//! `is_a_permutation`), struct instances, method calls (every composed block with the
+//! `is_a_permutation`), the `{...;...}` list-concat operand (clause 4.6,
+//! Table 12), the clause 4.11.4 list identity operators `list_ptr==` /
+//! `!list_ptr=` (see "List identity" below), struct instances, method
+//! calls (every composed block with the
 //! name runs, in composition order; the last returned value wins), local
 //! variables, assignments, `if`/`else`, `while` with `break`/`continue`,
 //! `return`, `print`, the built-in `out` routine, and `gen`.
@@ -42,6 +45,28 @@
 //! - `E0409` cycle budget exceeded (runaway TCM)
 //! - `E0410` unsupported string-match pattern shape (`/.../` or a
 //!   native meta-character)
+//! - `E0411` `list_ptr==` operands must be lists of the same type
+//!
+//! ## List identity (clause 4.11.4)
+//!
+//! A list value ([`Value::List`]) holds its items behind a shared
+//! `Rc<RefCell<Vec<Value>>>` handle: cloning the value — by `var l3 = l1`
+//! assignment, method-argument passing or struct-field copy — **aliases**
+//! the same list object, and the modifying pseudo-methods (27.3) mutate
+//! that shared storage in place. `list_ptr==` compares exactly this
+//! object identity: TRUE iff both operands denote the same handle, so
+//! `l1 list_ptr== l1.copy()` is FALSE (a real copy mints a fresh handle)
+//! while `l1 list_ptr== l3` after `var l3: list of int = l1;` is TRUE.
+//! The regular `==` stays item-by-item. The handle's `RefCell` is
+//! borrowed in short scopes only (no borrow is held across a nested
+//! evaluation), and the recursive read paths (formatting, item-wise
+//! equality) are depth-bounded so a list that was illegally stored inside
+//! itself renders or compares unequal instead of overflowing the stack.
+//! A list value also carries the declared element type of its creation
+//! site when it is known (`list of int` → `"int"`); the value model does
+//! not infer it from the items, so the `list_ptr==` same-type check is
+//! skipped for a pair where either side's creation site could not know —
+//! a documented approximation.
 //!
 //! ## Clause 26 list pseudo-methods — documented gaps
 //!
@@ -89,7 +114,9 @@ use crate::elab::Elaborated;
 use crate::lexer::Position;
 use crate::lexer::Token;
 use crate::lexer::TokenKind;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 /// Outcome of one run: the text produced by `out`/`print`, any run-time
 /// diagnostics, and the coverage collected by the cover groups
@@ -112,12 +139,42 @@ pub enum Value {
         type_name: String,
         name: String,
     },
-    List(Vec<Value>),
+    List(ListValue),
     /// A set (5.2.12): inclusive intervals in canonical form — sorted,
     /// non-overlapping, non-neighboring.
     Set(Vec<(i128, i128)>),
     Object(usize),
     Void,
+}
+
+/// The storage of a [`Value::List`] (`list of <t>`, 5.2.11). The items
+/// live behind a shared handle: cloning a list value aliases the same
+/// list object (which `var l3 = l1`, argument passing and struct-field
+/// copy all do), and `list_ptr==` (clause 4.11.4) compares this object
+/// identity. `copy()` (27.4.3) mints a fresh handle — a real copy. The
+/// 27.3 modifying pseudo-methods mutate the shared storage in place.
+///
+/// `element` is the declared element type rendered canonically (`"int"`,
+/// `"uint"`, ...), recorded when the creation site knows it: defaults,
+/// sampling and variables initialized from a typed declaration. It is
+/// `None` where nothing at the site can know it (a bare `{...;...}` list
+/// concat outside such an initialization). The value model does not
+/// infer the element type from the items.
+#[derive(Debug, Clone)]
+pub struct ListValue {
+    pub items: Rc<RefCell<Vec<Value>>>,
+    pub element: Option<String>,
+}
+
+impl ListValue {
+    /// A fresh, empty list with the given (optional) declared element
+    /// type. Every call allocates a distinct object.
+    fn new(element: Option<String>) -> Self {
+        Self {
+            items: Rc::new(RefCell::new(Vec::new())),
+            element,
+        }
+    }
 }
 
 struct ObjectInstance {
@@ -837,7 +894,7 @@ impl<'a> Interp<'a> {
                 ScalarBase::String => Value::Str(String::new()),
                 _ => Value::Int(0),
             },
-            TypeExpr::List { .. } => Value::List(Vec::new()),
+            TypeExpr::List { element, .. } => Value::List(ListValue::new(Some(element.render()))),
             TypeExpr::Named { name, .. } if name == "set" => {
                 // The set type's default is the empty set (5.2.12: `[]`).
                 Value::Set(Vec::new())
@@ -1283,7 +1340,7 @@ impl<'a> Interp<'a> {
     ) -> Result<Flow, Diagnostic> {
         match statement {
             Stmt::VarDecl { name, ty, init, .. } => {
-                let value = match (ty, init) {
+                let mut value = match (ty, init) {
                     (_, Some(expr)) => self.eval(expr, frame, me)?,
                     // A declared type without an initializer takes the
                     // type's default; the type-inferring `:=` form
@@ -1297,6 +1354,16 @@ impl<'a> Interp<'a> {
                         ));
                     }
                 };
+                // A bare list-concat literal does not know its element
+                // type at its creation site; the declared type of the
+                // variable it initializes names it (5.2.11). A value that
+                // arrived from an existing list keeps that list's record.
+                if let (Some(ty), Value::List(list)) = (ty, &mut value)
+                    && list.element.is_none()
+                    && let TypeExpr::List { element, .. } = ty
+                {
+                    list.element = Some(element.render());
+                }
                 if let Some(ty) = ty {
                     frame.local_types.insert(name.clone(), ty.clone());
                 }
@@ -1336,11 +1403,13 @@ impl<'a> Interp<'a> {
                                 *span,
                             ));
                         };
-                        let mut list = self.read_slot(base, frame, me)?;
-                        let Value::List(items) = &mut list else {
+                        let list = self.read_slot(base, frame, me)?;
+                        let Value::List(list) = list else {
                             return Err(self.error("E0402", "indexed value is not a list", *span));
                         };
-                        let len = items.len() as i128;
+                        // The slot's list object is shared; the assignment
+                        // mutates it in place through the handle.
+                        let len = list.items.borrow().len() as i128;
                         if i < 0 || i >= len {
                             return Err(self.error(
                                 "E0404",
@@ -1348,8 +1417,7 @@ impl<'a> Interp<'a> {
                                 *span,
                             ));
                         }
-                        items[i as usize] = value;
-                        self.write_slot(base, list, frame, me, *span)?;
+                        list.items.borrow_mut()[i as usize] = value;
                         Ok(Flow::Normal)
                     }
                     _ => {
@@ -1487,8 +1555,11 @@ impl<'a> Interp<'a> {
                 let _ = using;
                 let list_value = self.eval(list, frame, me)?;
                 match list_value {
-                    Value::List(mut items) => {
+                    Value::List(list) => {
                         let binding = var.clone().unwrap_or_else(|| "it".to_owned());
+                        // Iterate a snapshot of the items; the loop body
+                        // may modify the shared list object.
+                        let mut items = list.items.borrow().clone();
                         if *reversed {
                             items.reverse();
                         }
@@ -2058,12 +2129,12 @@ impl<'a> Interp<'a> {
                 // length: fill the sampled (empty) list with generated
                 // elements so the constraint can pass.
                 if let Some(length) = self.required_list_size(name, &constraints)
-                    && let Value::List(items) = self.instances[index]
+                    && let Value::List(list) = self.instances[index]
                         .get(name)
                         .cloned()
                         .unwrap_or(Value::Void)
                 {
-                    let mut filled = items;
+                    let mut filled = list.items.borrow().clone();
                     filled.resize(length, Value::Void);
                     for slot in filled.iter_mut() {
                         let element_ty = list_element_type(field_ty);
@@ -2073,7 +2144,9 @@ impl<'a> Interp<'a> {
                             self.gen_object(element_index, &[])?;
                         }
                     }
-                    self.instances[index].set(name, Value::List(filled));
+                    // Replace the shared storage contents in one short
+                    // borrow (the sampling above must not run inside it).
+                    *list.items.borrow_mut() = filled;
                 }
             }
             let mut pass = true;
@@ -2423,7 +2496,10 @@ impl<'a> Interp<'a> {
                 for _ in 0..len {
                     items.push(self.sample_type(element)?);
                 }
-                Ok(Value::List(items))
+                Ok(Value::List(ListValue {
+                    items: Rc::new(RefCell::new(items)),
+                    element: Some(element.render()),
+                }))
             }
             TypeExpr::Named { name, .. } => {
                 let types: &[crate::elab::ElaboratedType] = self.types;
@@ -3242,23 +3318,22 @@ impl<'a> Interp<'a> {
 
     /// The clause 27 list pseudo-methods, dispatched on a `Value::List`
     /// receiver. Pseudo-methods are macros, not struct methods (27.1) —
-    /// they attach to any list expression, and a modifying one writes the
-    /// changed list back through the receiver expression (the same slot
-    /// `push` has always used). `None` when the name is not one of this
-    /// subset (the caller reports `E0405`).
+    /// they attach to any list expression. A modifying one mutates the
+    /// receiver's shared list object in place through its handle
+    /// ([`ListValue::items`]), so every alias of the object sees the
+    /// change; `items` is a snapshot the caller took for the read-only
+    /// arithmetic. `None` when the name is not one of this subset (the
+    /// caller reports `E0405`).
     ///
     /// The methods taking a per-item expression (`apply`, `sort`, `all`,
     /// `has`, ...) cannot pass through this value-only dispatch — see the
     /// documented gaps in the module docs.
-    #[allow(clippy::too_many_arguments)]
     fn call_list_pseudo_method(
         &mut self,
+        list: &ListValue,
         items: &[Value],
-        receiver: &Expr,
         name: &str,
         args: &[Value],
-        frame: &mut Frame,
-        me: Option<usize>,
         span: crate::ast::Span,
     ) -> Option<Result<Value, Diagnostic>> {
         let result = match (name, args) {
@@ -3275,15 +3350,22 @@ impl<'a> Interp<'a> {
                 Err(self.error("E0402", "exists() expects an integer index", span))
             }
             // 27.4.3 copy(): a copy of the list — the list case of
-            // exp.copy() (28.5.1). Values clone; struct items stay shared
+            // exp.copy() (28.5.1). A fresh list object mints a new handle
+            // (a `list_ptr==` mismatch, 4.11.4); struct items stay shared
             // by instance index.
-            ("copy", []) => Ok(Value::List(items.to_vec())),
+            ("copy", []) => Ok(Value::List(ListValue {
+                items: Rc::new(RefCell::new(items.to_vec())),
+                element: list.element.clone(),
+            })),
             // 27.4.21 reverse(): a new list of all the items in reverse
             // order (the receiver is unchanged).
             ("reverse", []) => {
                 let mut reversed = items.to_vec();
                 reversed.reverse();
-                Ok(Value::List(reversed))
+                Ok(Value::List(ListValue {
+                    items: Rc::new(RefCell::new(reversed)),
+                    element: list.element.clone(),
+                }))
             }
             // 27.4.26 top(): the last item, not removed; empty is an
             // error (the prose's exception).
@@ -3302,9 +3384,7 @@ impl<'a> Interp<'a> {
             ("pop", []) => match items.split_last() {
                 Some((last, rest)) => {
                     let popped = last.clone();
-                    return Some(
-                        self.store_list(receiver, rest.to_vec(), popped, frame, me, span),
-                    );
+                    return Some(self.store_list(list, rest.to_vec(), popped));
                 }
                 None => Err(self.error("E0402", "pop of an empty list", span)),
             },
@@ -3313,42 +3393,43 @@ impl<'a> Interp<'a> {
             ("pop0", []) => match items.split_first() {
                 Some((first, rest)) => {
                     let popped = first.clone();
-                    return Some(
-                        self.store_list(receiver, rest.to_vec(), popped, frame, me, span),
-                    );
+                    return Some(self.store_list(list, rest.to_vec(), popped));
                 }
                 None => Err(self.error("E0402", "pop0 of an empty list", span)),
             },
             // 27.3.1 add(item) / 27.3.12 push(item): the same function —
             // the item goes to the end of the list.
-            // 27.3.2 add(list) / 27.3.14 push(list): a copy of the
-            // argument list is appended. e declares no lists of lists
-            // (27.4.25), so a list-valued argument is unambiguously the
-            // list form.
+            // 27.3.2 add(list) / 27.3.14 push(list): the argument list's
+            // items are appended. e declares no lists of lists (27.4.25),
+            // so a list-valued argument is unambiguously the list form.
             ("push" | "add", [Value::List(added)]) => {
-                let mut grown = items.to_vec();
-                grown.extend(added.iter().cloned());
-                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+                // Read the argument's items before the mutating borrow:
+                // the argument may be the receiver itself, and a
+                // simultaneous mutable borrow of the same cell would
+                // panic.
+                let added_items = added.items.borrow().clone();
+                list.items.borrow_mut().extend(added_items);
+                Ok(Value::Void)
             }
             ("push" | "add", [item]) => {
-                let mut grown = items.to_vec();
-                grown.push(item.clone());
-                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+                list.items.borrow_mut().push(item.clone());
+                Ok(Value::Void)
             }
             // 27.3.3 add0(item) / 27.3.13 push0(item): the item becomes
             // the first position (index 0); later items reindex by +1.
             // 27.3.4 add0(list) / 27.3.15 push0(list): the argument list
             // is placed at the head (same list-form reading as above).
             ("push0" | "add0", [Value::List(added)]) => {
-                let mut grown = added.clone();
+                let added_items = added.items.borrow().clone();
+                let mut grown = added_items;
                 grown.extend(items.iter().cloned());
-                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+                return Some(self.store_list(list, grown, Value::Void));
             }
             ("push0" | "add0", [item]) => {
                 let mut grown = Vec::with_capacity(items.len() + 1);
                 grown.push(item.clone());
                 grown.extend(items.iter().cloned());
-                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+                return Some(self.store_list(list, grown, Value::Void));
             }
             ("push" | "add" | "push0" | "add0", _) => {
                 Err(self.error("E0402", "push/add expects exactly one argument", span))
@@ -3366,11 +3447,12 @@ impl<'a> Interp<'a> {
                     Ok(at) => at,
                     Err(diagnostic) => return Some(Err(diagnostic)),
                 };
-                let mut grown = Vec::with_capacity(items.len() + inserted.len());
+                let inserted_items = inserted.items.borrow().clone();
+                let mut grown = Vec::with_capacity(items.len() + inserted_items.len());
                 grown.extend_from_slice(&items[..at]);
-                grown.extend(inserted.iter().cloned());
+                grown.extend(inserted_items);
                 grown.extend_from_slice(&items[at..]);
-                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+                return Some(self.store_list(list, grown, Value::Void));
             }
             ("insert", [Value::Int(index), item]) => {
                 let at = match self.list_insert_position(items, *index, span) {
@@ -3379,7 +3461,7 @@ impl<'a> Interp<'a> {
                 };
                 let mut grown = items.to_vec();
                 grown.insert(at, item.clone());
-                return Some(self.store_list(receiver, grown, Value::Void, frame, me, span));
+                return Some(self.store_list(list, grown, Value::Void));
             }
             ("insert", _) => Err(self.error(
                 "E0402",
@@ -3396,7 +3478,7 @@ impl<'a> Interp<'a> {
                 };
                 let mut shrunk = items.to_vec();
                 shrunk.remove(at);
-                return Some(self.store_list(receiver, shrunk, Value::Void, frame, me, span));
+                return Some(self.store_list(list, shrunk, Value::Void));
             }
             ("delete", _) => Err(self.error("E0402", "delete expects an integer index", span)),
             // 27.3.7 fast_delete(index): the last item's value moves into
@@ -3413,14 +3495,14 @@ impl<'a> Interp<'a> {
                 if at < shrunk.len() {
                     shrunk[at] = last;
                 }
-                return Some(self.store_list(receiver, shrunk, Value::Void, frame, me, span));
+                return Some(self.store_list(list, shrunk, Value::Void));
             }
             ("fast_delete", _) => {
                 Err(self.error("E0402", "fast_delete expects an integer index", span))
             }
             // 27.3.5 clear(): deletes all items in the list.
             ("clear", []) => {
-                return Some(self.store_list(receiver, Vec::new(), Value::Void, frame, me, span));
+                return Some(self.store_list(list, Vec::new(), Value::Void));
             }
             // 27.5.1 and_all(): TRUE when every item is TRUE; empty is
             // TRUE (the prose's stated empty result). The exp-parameter
@@ -3514,7 +3596,8 @@ impl<'a> Interp<'a> {
             // irrelevant); struct items compare by instance index — the
             // prose's "compares the addresses of the struct items".
             ("is_a_permutation", [Value::List(other)]) => {
-                let mut remaining: Vec<&Value> = other.iter().collect();
+                let other_items = other.items.borrow().clone();
+                let mut remaining: Vec<&Value> = other_items.iter().collect();
                 let mut permutation = true;
                 for item in items {
                     match remaining
@@ -3542,20 +3625,17 @@ impl<'a> Interp<'a> {
         Some(result)
     }
 
-    /// Write a modified list back through the receiver expression (the
-    /// pseudo-method attaches to any list expression, 27.2 — the write
-    /// goes to the slot the receiver denotes) and return the
-    /// pseudo-method's own result.
+    /// Replace the shared list object's storage with `items` (the
+    /// modifying pseudo-methods' in-place write: the object keeps its
+    /// identity, so aliases see the change) and return the pseudo-method's
+    /// own result.
     fn store_list(
         &mut self,
-        receiver: &Expr,
+        list: &ListValue,
         items: Vec<Value>,
         result: Value,
-        frame: &mut Frame,
-        me: Option<usize>,
-        span: crate::ast::Span,
     ) -> Result<Value, Diagnostic> {
-        self.write_slot(receiver, Value::List(items), frame, me, span)?;
+        *list.items.borrow_mut() = items;
         Ok(result)
     }
 
@@ -4077,10 +4157,14 @@ impl<'a> Interp<'a> {
                         let object_value = self.eval(object, frame, me)?;
                         match object_value {
                             Value::Object(index) => self.call_method(index, name, values, *span),
-                            Value::List(items) => {
-                                match self.call_list_pseudo_method(
-                                    &items, object, name, &values, frame, me, *span,
-                                ) {
+                            Value::List(list) => {
+                                // The modifying pseudo-methods mutate the
+                                // shared storage through the handle; the
+                                // dispatch reads a snapshot of the items.
+                                let items = list.items.borrow().clone();
+                                match self
+                                    .call_list_pseudo_method(&list, &items, name, &values, *span)
+                                {
                                     Some(result) => result,
                                     None => Err(self.error(
                                         "E0405",
@@ -4123,13 +4207,14 @@ impl<'a> Interp<'a> {
             Expr::Index { base, index, span } => {
                 let base_value = self.eval(base, frame, me)?;
                 let index_value = self.eval(index, frame, me)?;
-                let (Value::List(items), Value::Int(i)) = (&base_value, &index_value) else {
+                let (Value::List(list), Value::Int(i)) = (&base_value, &index_value) else {
                     return Err(self.error(
                         "E0402",
                         "indexing requires a list and an integer",
                         *span,
                     ));
                 };
+                let items = list.items.borrow();
                 let len = items.len() as i128;
                 if *i < 0 || *i >= len {
                     return Err(self.error(
@@ -4139,6 +4224,26 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 Ok(items[*i as usize].clone())
+            }
+            Expr::ListConcat { items, .. } => {
+                // `{ e1; e2; ... }` (clause 4.6, Table 12): a fresh list;
+                // a list element contributes its items, any other element
+                // contributes itself. The creation site cannot know the
+                // element type — a variable's declared type records it at
+                // the `var` initialization.
+                let mut values = Vec::new();
+                for item in items {
+                    match self.eval(item, frame, me)? {
+                        Value::List(list) => {
+                            values.extend(list.items.borrow().iter().cloned());
+                        }
+                        value => values.push(value),
+                    }
+                }
+                Ok(Value::List(ListValue {
+                    items: Rc::new(RefCell::new(values)),
+                    element: None,
+                }))
             }
             Expr::Binary { op, lhs, rhs, span } => match op {
                 BinaryOp::LogicalAnd => {
@@ -4533,6 +4638,9 @@ impl<'a> Interp<'a> {
                         },
                     ) => ta == tb && na == nb,
                     (Value::Object(a), Value::Object(b)) => a == b,
+                    // The regular `==` on lists is item-by-item (4.11.4's
+                    // contrast with `list_ptr==`).
+                    (Value::List(a), Value::List(b)) => lists_equal(a, b, 0),
                     _ => return Err(err("comparison")),
                 };
                 // `===`/`!==` are treated as `==`/`!=` in this subset: value
@@ -4541,6 +4649,31 @@ impl<'a> Interp<'a> {
                     Eq | IdentityEq => equal,
                     _ => !equal,
                 }))
+            }
+            // `list_ptr==` / `!list_ptr=` (clause 4.11.4): object identity
+            // of the two list operands. Both must be lists of the same
+            // type — the declared element types, where both creation
+            // sites recorded them, must match, and either operand that is
+            // not a list reports `E0411`.
+            ListPtrEq | ListPtrNe => {
+                let (Value::List(a), Value::List(b)) = (&lhs, &rhs) else {
+                    return Err(self.error(
+                        "E0411",
+                        "list_ptr== operands must be lists of the same type",
+                        span,
+                    ));
+                };
+                if let (Some(ta), Some(tb)) = (&a.element, &b.element)
+                    && ta != tb
+                {
+                    return Err(self.error(
+                        "E0411",
+                        "list_ptr== operands must be lists of the same type",
+                        span,
+                    ));
+                }
+                let same = Rc::ptr_eq(&a.items, &b.items);
+                Ok(Value::Bool(if op == ListPtrEq { same } else { !same }))
             }
             Lt | Le | Gt | Ge => {
                 use std::cmp::Ordering::*;
@@ -4824,6 +4957,17 @@ impl<'a> Interp<'a> {
     }
 
     fn format_value(&self, value: &Value) -> String {
+        self.format_value_bounded(value, 0)
+    }
+
+    /// Depth-bounded rendering: `MAX_VALUE_DEPTH` is far above any legal
+    /// nesting, so hitting it means a value cycle (a list stored inside
+    /// itself) — rendered as a placeholder instead of overflowing the
+    /// stack.
+    fn format_value_bounded(&self, value: &Value, depth: usize) -> String {
+        if depth > MAX_VALUE_DEPTH {
+            return "...".to_owned();
+        }
         match value {
             Value::Int(i) => i.to_string(),
             Value::Real(f) => {
@@ -4836,8 +4980,12 @@ impl<'a> Interp<'a> {
             Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_owned(),
             Value::Str(s) => s.clone(),
             Value::Enum { name, .. } => name.clone(),
-            Value::List(items) => {
-                let parts: Vec<String> = items.iter().map(|item| self.format_value(item)).collect();
+            Value::List(list) => {
+                let items = list.items.borrow();
+                let parts: Vec<String> = items
+                    .iter()
+                    .map(|item| self.format_value_bounded(item, depth + 1))
+                    .collect();
                 format!("[{}]", parts.join(", "))
             }
             Value::Set(intervals) => render_set(intervals),
@@ -4846,7 +4994,9 @@ impl<'a> Interp<'a> {
                 let parts: Vec<String> = instance
                     .fields
                     .iter()
-                    .map(|(name, value)| format!("{name}: {}", self.format_value(value)))
+                    .map(|(name, value)| {
+                        format!("{name}: {}", self.format_value_bounded(value, depth + 1))
+                    })
                     .collect();
                 format!("{}{{{}}}", instance.type_name, parts.join(", "))
             }
@@ -5524,6 +5674,17 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 /// instance index — the prose's "compares the addresses of the struct
 /// items". Pairs `==` does not accept compare unequal.
 fn values_equal(a: &Value, b: &Value) -> bool {
+    values_equal_bounded(a, b, 0)
+}
+
+/// The recursion cap of the value-level comparisons and formatting. Far
+/// above any legal nesting (e declares no lists of lists), it exists so a
+/// list that was illegally stored inside itself — the runtime performs no
+/// element-type check on item stores — reports unequal or renders a
+/// placeholder instead of overflowing the stack.
+const MAX_VALUE_DEPTH: usize = 64;
+
+fn values_equal_bounded(a: &Value, b: &Value, depth: usize) -> bool {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Real(x), Value::Real(y)) => x == y,
@@ -5541,8 +5702,24 @@ fn values_equal(a: &Value, b: &Value) -> bool {
             },
         ) => type_x == type_y && name_x == name_y,
         (Value::Object(x), Value::Object(y)) => x == y,
+        (Value::List(x), Value::List(y)) => lists_equal(x, y, depth),
         _ => false,
     }
+}
+
+/// Item-wise list equality (the regular `==`, 4.11.4's contrast with
+/// `list_ptr==`): same length, items equal pairwise.
+fn lists_equal(a: &ListValue, b: &ListValue, depth: usize) -> bool {
+    if depth > MAX_VALUE_DEPTH {
+        return false;
+    }
+    let a_items = a.items.borrow();
+    let b_items = b.items.borrow();
+    a_items.len() == b_items.len()
+        && a_items
+            .iter()
+            .zip(b_items.iter())
+            .all(|(x, y)| values_equal_bounded(x, y, depth + 1))
 }
 
 /// The element type of a list type expression (identity for non-lists).

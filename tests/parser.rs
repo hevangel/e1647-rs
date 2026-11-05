@@ -442,6 +442,93 @@ fn clause_4_6_table_12_row_order() {
 }
 
 #[test]
+fn clause_4_11_4_places_list_ptr_in_the_equality_row() {
+    let declarations = expect_clean(
+        "struct s {\n    a: uint;\n    b: uint;\n    c: uint;\n    l1: list of int;\n    l2: list of int;\n    \
+         keep a == b list_ptr== c;\n    keep a list_ptr== b == c;\n    keep l1 !list_ptr= l2;\n};\n",
+    );
+    let keep = |index: usize| match &declarations[0].members[5 + index] {
+        Member::Constraint(constraint) => &constraint.expr,
+        _ => panic!("expected a keep constraint"),
+    };
+    // Left-associative at one level (clause 4.6, Table 12): the equality
+    // operators share a row, so `a == b list_ptr== c` groups as
+    // `(a == b) list_ptr== c`.
+    let Expr::Binary {
+        op: BinaryOp::ListPtrEq,
+        lhs,
+        rhs,
+        ..
+    } = keep(0)
+    else {
+        panic!("expected list_ptr== at the top of a == b list_ptr== c");
+    };
+    assert!(matches!(
+        lhs.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            ..
+        }
+    ));
+    assert!(matches!(rhs.as_ref(), Expr::Ident { name, .. } if name == "c"));
+    // ... and `a list_ptr== b == c` groups as `(a list_ptr== b) == c`.
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        lhs,
+        ..
+    } = keep(1)
+    else {
+        panic!("expected == at the top of a list_ptr== b == c");
+    };
+    assert!(matches!(
+        lhs.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::ListPtrEq,
+            ..
+        }
+    ));
+    // `!list_ptr=` is the negation, at the same row.
+    let Expr::Binary {
+        op: BinaryOp::ListPtrNe,
+        ..
+    } = keep(2)
+    else {
+        panic!("expected !list_ptr= for the third constraint");
+    };
+}
+
+#[test]
+fn clause_4_6_list_concat_parses_in_expression_position() {
+    let declarations = expect_clean(
+        "struct s {\n    run() is {\n        var l1: list of int = {1; 2; 3};\n        \
+         var l2: list of int = {};\n    };\n};\n",
+    );
+    let Member::Method(run) = &declarations[0].members[0] else {
+        panic!("expected a method");
+    };
+    let Some(Stmt::VarDecl {
+        init: Some(init), ..
+    }) = run.body.first()
+    else {
+        panic!("expected a var declaration with an initializer");
+    };
+    let Expr::ListConcat { items, .. } = init else {
+        panic!("expected a list concat");
+    };
+    assert_eq!(items.len(), 3);
+    let Some(Stmt::VarDecl {
+        init: Some(init), ..
+    }) = run.body.get(1)
+    else {
+        panic!("expected a second var declaration");
+    };
+    let Expr::ListConcat { items, .. } = init else {
+        panic!("expected a list concat");
+    };
+    assert!(items.is_empty());
+}
+
+#[test]
 fn literals_and_member_access() {
     let declarations = expect_clean(
         "struct cfg_t {\n    mode: uint;\n};\nstruct s {\n    cfg: cfg_t;\n    addr: uint;\n    \

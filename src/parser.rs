@@ -106,11 +106,10 @@ fn is_predefined_name(word: &str) -> bool {
 /// Binary operator rows of IEEE 1647-2019 Table 12 (clause 4.6), loosest
 /// first to match the parse order. The full table, tightest binding
 /// first: `[]`/`[..]`/`[:]` indexing, slicing and bit slicing · `f()`
-/// calls · `::` static access (Phase 2) · `.` dot · unary `~ ! not` ·
+/// calls · `::` static access (a later phase) · `.` dot · unary `~ ! not` ·
 /// `{...;...}` list concatenation · `%{...}` bit concatenation · unary
 /// `+ -` · `* / %` · binary `+ -` · `>> <<` · `< <= > >=` ·
-/// `is [not] a` · `== != list_ptr== !list_ptr=` (`list_ptr==` and
-/// `!list_ptr=` join this row in a later task) · `=== !==` · `~ !~`
+/// `is [not] a` · `== != list_ptr== !list_ptr=` · `=== !==` · `~ !~`
 /// string match · `in not in` (and `in_table`, a later task) · `&` ·
 /// `|` · `^` · `&& and` · `|| or` · `=>` · `? :`.
 ///
@@ -123,7 +122,9 @@ fn is_predefined_name(word: &str) -> bool {
 /// `~` / `!~` sit between these rows (see [`IN_LEVEL`],
 /// [`MATCH_LEVEL`]), `is [not] a` takes a type operand instead of an
 /// expression (see [`ISA_LEVEL`]), and `? :` — the loosest construct —
-/// is parsed in [`Parser::parse_expr`].
+/// is parsed in [`Parser::parse_expr`]. The `{...;...}` list concat of
+/// Table 12 is an operand shape, not a binary row: it parses in primary
+/// position.
 const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
     &[("=>", BinaryOp::Imply)],
     &[("||", BinaryOp::LogicalOr), ("or", BinaryOp::LogicalOr)],
@@ -132,7 +133,12 @@ const BINARY_LEVELS: &[&[(&str, BinaryOp)]] = &[
     &[("|", BinaryOp::BitOr)],
     &[("&", BinaryOp::BitAnd)],
     &[("===", BinaryOp::IdentityEq), ("!==", BinaryOp::IdentityNe)],
-    &[("==", BinaryOp::Eq), ("!=", BinaryOp::NotEq)],
+    &[
+        ("==", BinaryOp::Eq),
+        ("!=", BinaryOp::NotEq),
+        ("list_ptr==", BinaryOp::ListPtrEq),
+        ("!list_ptr=", BinaryOp::ListPtrNe),
+    ],
     &[
         ("<", BinaryOp::Lt),
         ("<=", BinaryOp::Le),
@@ -4084,6 +4090,28 @@ impl Parser {
             return self.parse_postfix_chain(ident, start);
         }
         match self.peek_kind() {
+            // `{ e1; e2; ... }` — the list-concat operand (clause 4.6,
+            // Table 12): each `;`-separated element expression contributes
+            // itself to a fresh list (a list element contributes its items
+            // at run time). In expression position only; statement and
+            // member bodies reach their `{` through their own parsers.
+            Some(TokenKind::Punctuation(p)) if p == "{" => {
+                self.bump();
+                let mut items = Vec::new();
+                while !self.at_punct("}") {
+                    items.push(self.parse_expr()?);
+                    if !self.eat_punct(";") {
+                        break;
+                    }
+                }
+                self.expect_punct("}", "E0107", "expected '}' to close the list concat")?;
+                let end = self.last_end();
+                let concat = Expr::ListConcat {
+                    items,
+                    span: (start, end),
+                };
+                self.parse_postfix_chain(concat, start)
+            }
             Some(TokenKind::Number(_)) => {
                 let token = self.bump();
                 let TokenKind::Number(text) = token.kind else {

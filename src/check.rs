@@ -568,6 +568,12 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
         }
         // A set_of_values argument names a type, not a variable.
         Expr::SetOfValues { .. } => {}
+        // A list concat's elements are ordinary sub-expressions.
+        Expr::ListConcat { items, .. } => {
+            for item in items {
+                collect_root_identifiers(item, roots);
+            }
+        }
         Expr::HdlPath { .. } => {}
         Expr::IntLiteral { .. }
         | Expr::RealLiteral { .. }

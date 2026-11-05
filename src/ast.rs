@@ -710,6 +710,13 @@ pub enum BinaryOp {
     BitAnd,
     Eq,
     NotEq,
+    /// `lhs list_ptr== rhs` — TRUE iff both operands denote the same list
+    /// object (pointer identity, clause 4.11.4); the regular [`BinaryOp::Eq`]
+    /// stays item-by-item. Both operands must be lists of the same type.
+    ListPtrEq,
+    /// `lhs !list_ptr= rhs` — the negation of [`BinaryOp::ListPtrEq`]
+    /// (clause 4.11.4).
+    ListPtrNe,
     IdentityEq,
     IdentityNe,
     Lt,
@@ -860,6 +867,15 @@ pub enum Expr {
         set: InSetExpr,
         span: Span,
     },
+    /// `{ e1; e2; ... }` — the list-concat operator of the precedence
+    /// table (clause 4.6, Table 12): a fresh list; each element
+    /// contributes itself, and a list element contributes its items. The
+    /// element type is not known at the literal (a variable's declared
+    /// type names it at run time).
+    ListConcat {
+        items: Vec<Expr>,
+        span: Span,
+    },
     /// `expr is a ty` / `expr is not a ty` — the type check operator
     /// (clause 4.17.1), with the optional `(name)` binding of a true match
     /// to a local. Runtime type dispatch is exact-name only; there is
@@ -977,6 +993,7 @@ impl Expr {
             | Expr::SetOfValues { span, .. }
             | Expr::BitSlice { span, .. }
             | Expr::InSet { span, .. }
+            | Expr::ListConcat { span, .. }
             | Expr::IsA { span, .. }
             | Expr::New { span, .. }
             | Expr::Select { span, .. }
