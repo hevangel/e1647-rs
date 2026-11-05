@@ -576,3 +576,77 @@ fn source_without_code_blocks_is_all_code() {
             .any(|t| matches!(&t.kind, TokenKind::Keyword(k) if k == "keep"))
     );
 }
+
+#[test]
+fn block_comments_are_standard_multiline_and_non_nesting() {
+    // Clause 4.2.4: `/* ... */` may start and end anywhere on a line and
+    // span lines; it does not nest — a second `/*` inside a comment is
+    // comment text and the first `*/` closes it, so `e: int;` after the
+    // inner opener is code, not part of the comment.
+    let tokens = tokenize(
+        "<'\nstruct foo {\n    c: int; /* inline comment */\n    d: int; /* \
+         starts here\n               continues\n            ends here */\n    \
+         /* nested /* opener is ignored */ e: int;\n};\n'>\n",
+    )
+    .expect("valid input");
+    let kinds: Vec<TokenKind> = tokens.into_iter().map(|token| token.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            TokenKind::Keyword("struct".into()),
+            TokenKind::Identifier("foo".into()),
+            TokenKind::Punctuation("{".into()),
+            TokenKind::Identifier("c".into()),
+            TokenKind::Punctuation(":".into()),
+            TokenKind::Keyword("int".into()),
+            TokenKind::Punctuation(";".into()),
+            TokenKind::Identifier("d".into()),
+            TokenKind::Punctuation(":".into()),
+            TokenKind::Keyword("int".into()),
+            TokenKind::Punctuation(";".into()),
+            TokenKind::Identifier("e".into()),
+            TokenKind::Punctuation(":".into()),
+            TokenKind::Keyword("int".into()),
+            TokenKind::Punctuation(";".into()),
+            TokenKind::Punctuation("}".into()),
+            TokenKind::Punctuation(";".into()),
+        ]
+    );
+}
+
+#[test]
+fn block_comment_spans_code_segments() {
+    // Clause 4.2.4: a comment may span code segments. The markers inside
+    // the comment delimit segments even while the comment runs, so a
+    // comment that closes between segments leaves the scan in prose
+    // until the next `<'` — the stray prose word after the close is not
+    // code, and the following segment opens normally.
+    let tokens = tokenize("<'\nx: int; /* starts\n'>\nprose */ stray prose\n<'\ny: int;\n'>\n")
+        .expect("valid input");
+    let kinds: Vec<TokenKind> = tokens.into_iter().map(|token| token.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            TokenKind::Identifier("x".into()),
+            TokenKind::Punctuation(":".into()),
+            TokenKind::Keyword("int".into()),
+            TokenKind::Punctuation(";".into()),
+            TokenKind::Identifier("y".into()),
+            TokenKind::Punctuation(":".into()),
+            TokenKind::Keyword("int".into()),
+            TokenKind::Punctuation(";".into()),
+        ]
+    );
+    // The comment closes inside the second segment; `x: int;` after the
+    // close is code of that segment.
+    let tokens = tokenize(include_str!(
+        "fixtures/s2019_block_comment_across_segments.e"
+    ))
+    .expect("valid input");
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(w) if w == "x")),
+        "code after the comment close must be tokenized: {tokens:?}"
+    );
+}

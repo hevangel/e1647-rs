@@ -10,9 +10,16 @@
 //! occupy the first column and the rest of that line is whitespace. A file
 //! that contains such a begin marker is a comment until the first one, and
 //! again between segments. A file with no begin marker is tokenized as code
-//! throughout, so snippet tests need not wrap a segment. Decimal integers
-//! may end in a `K`/`k` (×1024) or `M`/`m` (×1024×1024) multiplier
-//! (clause 4.2.5.2). `0c"..."` is a one-character literal (clause 4.2.5.7).
+//! throughout, so snippet tests need not wrap a segment. Block comments
+//! `/* ... */` are standard (clause 4.2.4): they may start and end anywhere
+//! on a line, span lines, and span code segments, and they do not nest — a
+//! second `/*` inside a comment is comment text and the first `*/` closes
+//! it. `--` and `//` stay line comments. A segment marker inside a block
+//! comment is comment text, but it still delimits segments: the segment
+//! state after the comment follows the markers the comment swallowed.
+//! Decimal integers may end in a `K`/`k` (×1024) or `M`/`m` (×1024×1024)
+//! multiplier (clause 4.2.5.2). `0c"..."` is a one-character literal
+//! (clause 4.2.5.7).
 //! Based literals may include the MVL digits `x z u l h w n`
 //! (clause 4.2.5.4); evaluating those literals is a later stage.
 
@@ -362,12 +369,24 @@ impl<'a> Cursor<'a> {
                     self.bump();
                     self.bump();
                     let mut closed = false;
-                    while let Some(ch) = self.bump() {
-                        if ch == '*' && self.peek() == Some('/') {
+                    while let Some(ch) = self.peek() {
+                        // Clause 4.2.4: a comment may span code segments.
+                        // A segment marker inside a comment is comment
+                        // text, but it still moves the scan between code
+                        // and prose, so the segment state follows the
+                        // markers the comment swallows.
+                        if let Some(open) = self.line_is_code_marker() {
+                            self.consume_rest_of_line();
+                            self.in_code = open;
+                            continue;
+                        }
+                        if ch == '*' && self.peek_second() == Some('/') {
+                            self.bump();
                             self.bump();
                             closed = true;
                             break;
                         }
+                        self.bump();
                     }
                     if !closed {
                         return Err(LexError {

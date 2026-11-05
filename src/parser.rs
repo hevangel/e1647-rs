@@ -9,7 +9,11 @@
 //! parameter lists and statement bodies (local `var` declarations,
 //! assignments, expression statements including calls and indexing,
 //! `return`, braced `if`/`else`, `while` with `break`/`continue`, `print`
-//! and `gen`).
+//! and `gen`). Brace grouping is pure syntax (clause 4.3.2 module level,
+//! 4.3.3 member lists): a bare `{ ... }` splices its contents into the
+//! enclosing list, and groups nest. A statement (or member) may also span
+//! code segments (clause 4.2.3): the lexer skips prose between `'>` and
+//! `<'`, so the parser sees one continuous token stream.
 //!
 //! Everything else (events, temporal expressions, coverage, the
 //! single-statement `if ... do` form, `for`/`repeat` loops) is a later
@@ -263,6 +267,13 @@ struct Parser {
     /// `package` / `private` visibility prefix of the member being
     /// parsed (clause 22), recorded on the field, not enforced.
     member_visibility: Option<String>,
+    /// Nesting depth of bare `{ ... }` statement groups at module level
+    /// (clause 4.3.2). A group is pure syntax — its contents splice into
+    /// the enclosing top-level list — so the group's braces are consumed
+    /// transparently in `parse_program` and only tracked here to find the
+    /// matching `}` of nested groups. A `}` at depth 0 is still the
+    /// stray-brace diagnostic it was before the migration.
+    module_group_depth: usize,
 }
 
 /// The included body of one preprocessor directive: members in member
@@ -284,6 +295,7 @@ impl Parser {
             diagnostics: Vec::new(),
             defined: BTreeSet::new(),
             member_visibility: None,
+            module_group_depth: 0,
         }
     }
 
@@ -380,6 +392,10 @@ impl Parser {
 
     /// Skip tokens until the next top-level declaration keyword.
     fn recover_to_declaration_boundary(&mut self) {
+        // Recovery abandons the current top-level construct, so any
+        // module-level `{ ... }` group open at the error point is
+        // abandoned with it (clause 4.3.2 groups carry no state).
+        self.module_group_depth = 0;
         while let Some(token) = self.peek() {
             match &token.kind {
                 TokenKind::Keyword(k) if matches!(k.as_str(), "struct" | "unit" | "extend") => {
@@ -604,6 +620,23 @@ impl Parser {
                             self.recover_to_declaration_boundary();
                         }
                     }
+                    continue;
+                }
+                // Clause 4.3.2: a bare `{ ... }` group of top-level
+                // statements is pure syntax — no scope, no semantics. Its
+                // contents splice into the enclosing list, so the group's
+                // braces are consumed transparently and the existing
+                // declaration dispatch parses the contents. Groups nest,
+                // hence the depth tracking; a `}` at depth 0 keeps the
+                // stray-brace diagnostic it always had.
+                Some(TokenKind::Punctuation(p)) if p == "{" => {
+                    self.module_group_depth += 1;
+                    self.bump();
+                    continue;
+                }
+                Some(TokenKind::Punctuation(p)) if p == "}" && self.module_group_depth > 0 => {
+                    self.module_group_depth -= 1;
+                    self.bump();
                     continue;
                 }
                 _ => {
@@ -1162,7 +1195,7 @@ impl Parser {
     }
 
     /// Members up to (and including) the closing `}` of the enclosing
-    /// declaration or `when` body.
+    /// declaration, `when` body or clause 4.3.3 member group.
     fn parse_member_list(&mut self) -> Vec<Member> {
         let mut members = Vec::new();
         loop {
@@ -1174,8 +1207,16 @@ impl Parser {
                 self.bump();
                 break;
             }
+            let before = self.pos;
             if let Some(mut parsed) = self.parse_member() {
                 members.append(&mut parsed);
+            }
+            if self.pos == before {
+                // No progress: the member parser errored and its recovery
+                // stopped at a boundary token it does not consume (a `}`
+                // or a declaration keyword). Force past it so the loop
+                // terminates; the recorded diagnostics are authoritative.
+                self.bump();
             }
         }
         members
@@ -1228,6 +1269,18 @@ impl Parser {
                 self.parse_expect().map(|e| vec![Member::Expect(e)])
             }
             Some(TokenKind::Punctuation(p)) if p == "#" => self.parse_hash_members(),
+            // Clause 4.3.3: a bare `{ ... }` group of struct members is
+            // pure syntax — no scope, no semantics. Its members splice
+            // into the enclosing member list, in source order. Groups
+            // nest: the inner `parse_member_list` reaches this arm again
+            // for an inner group. The e convention writes the closing
+            // brace as `};`, so a trailing `;` is accepted but optional.
+            Some(TokenKind::Punctuation(p)) if p == "{" => {
+                self.bump(); // '{' opens the group
+                let group = self.parse_member_list();
+                self.eat_punct(";");
+                Some(group)
+            }
             // The explicit `method name() …` spelling; the bare
             // `name() …` init style is handled by the identifier arm.
             Some(TokenKind::Keyword(k)) if k == "method" => self.parse_method().map(|m| vec![m]),

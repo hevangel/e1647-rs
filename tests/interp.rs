@@ -2464,3 +2464,29 @@ fn event_port_edge_attribute_selects_the_edge() {
     .output;
     assert_eq!(output, "EDGE\nEDGE\nDONE\n");
 }
+
+#[test]
+fn brace_grouped_members_generate_and_run() {
+    // 4.3.2 / 4.3.3: grouped statements and members are pure syntax —
+    // the generated struct behaves exactly as if its members were
+    // written flat. The grouped `keep a < 10` holds on gen (the
+    // comparison narrows the sampling domain), so `out("ok")` runs.
+    let output = clean_output(include_str!("fixtures/s2019_brace_groups.e"), 1);
+    assert_eq!(output, "ok");
+}
+
+#[test]
+fn comparison_constraints_narrow_generation() {
+    // A constant comparison in a `keep` narrows the field's sampling
+    // domain (`a < 10` directly, `0 > b` mirrored), so gen succeeds
+    // where plain rejection sampling over an unbounded scalar would
+    // exhaust its attempts. The drawn values still satisfy the
+    // constraints as written.
+    let output = clean_output(
+        "struct s {\n    a: uint;\n    keep a < 10;\n    b: int;\n    keep 0 > b;\n};\n\
+         extend sys {\n    run() is also {\n        var x: s;\n        gen x;\n        \
+         out(x.a < 10, \" \", x.b < 0, \"\\n\");\n    };\n};\n",
+        7,
+    );
+    assert_eq!(output, "TRUE TRUE\n");
+}
