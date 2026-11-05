@@ -41,6 +41,11 @@ pub struct Declaration {
     /// the underlying representation, recorded only. Distinct-type
     /// semantics over it are a later milestone.
     pub underlying: Option<TypeExpr>,
+    /// `type name: <scalar> [low..high];` — the range qualification of a
+    /// numeric subtype declaration (clause 5.2.3.1), recorded only. The
+    /// well-formedness check rejects subtypes of `longint`/`longuint`
+    /// (E0207); the range does not narrow values yet.
+    pub subtype_range: Option<(Expr, Expr)>,
     /// `template struct name of <params> { .. }` (clause 8): the formal
     /// type parameters, recorded. Instantiation (monomorphization) is a
     /// later milestone.
@@ -554,6 +559,13 @@ impl Stmt {
 pub enum ScalarBase {
     Uint,
     Int,
+    /// Signed 64-bit (Table 17, clause 5.2.3.1). Not the same type as
+    /// `int(bits: 64)` — the two differ in expression sizing and
+    /// arithmetic rules (the T7.4 milestone; not modeled yet).
+    Longint,
+    /// Unsigned 64-bit (Table 17, clause 5.2.3.1). Not the same type as
+    /// `uint(bits: 64)` — see [`ScalarBase::Longint`].
+    Longuint,
     Bit,
     Byte,
     Nibble,
@@ -564,10 +576,18 @@ pub enum ScalarBase {
 }
 
 impl ScalarBase {
+    /// The predefined scalar base named by a type word. `int`, `uint` and
+    /// friends lex as keywords; `longint`/`longuint` are Table 17 names
+    /// that lex as identifiers and reach here from the identifier branch
+    /// of the type grammar (the reference grammar treats type names as
+    /// identifiers, so they are deliberately not in the lexer's
+    /// [`crate::lexer::KEYWORDS`]).
     pub fn from_keyword(keyword: &str) -> Option<Self> {
         Some(match keyword {
             "uint" => Self::Uint,
             "int" => Self::Int,
+            "longint" => Self::Longint,
+            "longuint" => Self::Longuint,
             "bit" => Self::Bit,
             "byte" => Self::Byte,
             "nibble" => Self::Nibble,
@@ -583,6 +603,8 @@ impl ScalarBase {
         match self {
             Self::Uint => "uint",
             Self::Int => "int",
+            Self::Longint => "longint",
+            Self::Longuint => "longuint",
             Self::Bit => "bit",
             Self::Byte => "byte",
             Self::Nibble => "nibble",

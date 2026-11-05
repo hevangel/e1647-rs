@@ -111,6 +111,12 @@ pub fn int_bounds(ty: &crate::ast::TypeExpr) -> Option<(i64, i64)> {
             let bits = bits.unwrap_or(31);
             Some((-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1))
         }
+        // The long bases are 64-bit wide (Table 17, clause 5.2.3.1);
+        // their full value ranges exceed the solver's i64 bounded-integer
+        // domain (a `longuint` reaches 2^64-1). Excluding them here sends
+        // `gen` to the rejection sampler, which draws over the complete
+        // 64-bit range instead of a narrowed one.
+        ScalarBase::Longint | ScalarBase::Longuint => None,
         ScalarBase::Bit => Some((0, 1)),
         ScalarBase::Byte => Some((0, 255)),
         ScalarBase::Nibble => Some((0, 15)),

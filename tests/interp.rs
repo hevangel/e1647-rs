@@ -990,6 +990,37 @@ fn gen_domain_narrowing_leaves_unconstrained_fields_alone() {
 }
 
 #[test]
+fn longint_and_longuint_hold_64_bit_values() {
+    // The long bases (Table 17, clause 5.2.3.1) are signed/unsigned
+    // 64-bit: initialization and out() carry the full values, including
+    // the unsigned maximum 2^64-1, untruncated.
+    let output = clean_output(
+        "<'\nextend sys {\n    run() is also {\n        var a: longuint = 1;\n        \
+         var b: longint = -1;\n        out(a, \"\\n\");\n        out(b, \"\\n\");\n        \
+         var c: longuint = 18446744073709551615;\n        out(c, \"\\n\");\n    };\n};\n'>\n",
+        3,
+    );
+    assert_eq!(output, "1\n-1\n18446744073709551615\n");
+}
+
+#[test]
+fn gen_of_long_bases_samples_the_full_64_bit_range() {
+    // An unconstrained `longuint` samples the full unsigned 64-bit range
+    // and a `longint` the full signed one: constraints in the top quarter
+    // of the unsigned range and the bottom quarter of the signed range are
+    // both satisfiable. A sampler capped at 32 bits would exhaust the
+    // 1000 rejection attempts and report E0407.
+    let output = clean_output(
+        "struct s {\n    u: longuint;\n    i: longint;\n    \
+         keep u > 9223372036854775808;\n    keep i < -4611686018427387904;\n};\n\
+         extend sys {\n    run() is also {\n        var p: s;\n        gen p;\n        \
+         var x: longint;\n        gen x;\n        out(\"OK\\n\");\n    };\n};\n",
+        5,
+    );
+    assert_eq!(output, "OK\n");
+}
+
+#[test]
 fn down_to_counts_and_reverse_for_each_binds_the_index() {
     let output = clean_output(
         "extend sys {\n    run() is also {\n        var l: list of int;\n        \
