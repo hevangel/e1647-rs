@@ -1972,7 +1972,9 @@ fn for_each_sub_expr<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
         | Expr::HdlPath { .. }
         | Expr::SetOfValues { .. }
         // The `Type` of a static access is a name, not an expression.
-        | Expr::StaticAccess { .. } => {}
+        | Expr::StaticAccess { .. }
+        // A set literal's bounds enumerate, they are not walked here.
+        | Expr::SetLiteral { .. } => {}
         Expr::MemberAccess { object, .. } => for_each_sub_expr(object, f),
         Expr::Call { callee, args, .. } => {
             for_each_sub_expr(callee, f);

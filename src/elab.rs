@@ -225,6 +225,7 @@ impl<'a> Composed<'a> {
             expects,
             events,
             ports,
+            implements,
         } = other;
         let own = std::mem::take(self);
         *self = Composed {
@@ -237,6 +238,7 @@ impl<'a> Composed<'a> {
             expects: expects.into_iter().chain(own.expects).collect(),
             events: events.into_iter().chain(own.events).collect(),
             ports: ports.into_iter().chain(own.ports).collect(),
+            implements: implements.into_iter().chain(own.implements).collect(),
         };
     }
 }
@@ -418,6 +420,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                     events: Vec::new(),
                     underlying: None,
                     ports: Vec::new(),
+                    unit_attributes: Vec::new(),
                     implements: Vec::new(),
                     interface_bases: declaration
                         .bases
