@@ -44,7 +44,30 @@ pub const BUILTIN_ROUTINES: &[&str] = &[
     // inline execution subset treats them as no-ops.
     "raise_objection",
     "drop_objection",
+    // `set_check(name, effect [, root_unit])` (16.3.6): sets the check
+    // effect of a named check action. The check-effect model is a later
+    // milestone; the call is accepted (arity-checked) and ignored.
+    "set_check",
+    // `do_bind()` (9.13.3.2): performs the declarative port bindings.
+    // Legal only in the connect_ports() generation sub-phase (9.13.3);
+    // elsewhere the interpreter reports E0420.
+    "do_bind",
+    // `swap(<exp>)` (19.1): a predefined pack tool; recognised here, the
+    // byte-order swap itself is not implemented (E0419 at run time).
+    "swap",
+    // `deep_copy(<exp>)` (29.2.2): the general deep copy — scalars,
+    // strings and sets are values, a list copy mints a fresh object of
+    // deep-copied items, a struct copy is a fresh instance with deep
+    // copied fields (its `copy()` blocks run).
+    "deep_copy",
 ];
+
+/// Predefined base units whose extends compose into every unit of the
+/// kind: `any_unit` (clause 7.4 — the message hooks of 24.9.2.14 are
+/// extendable on it). `any_struct` and the sequence bases stay
+/// like-only targets — their extends have no composition path here and
+/// are rejected rather than silently dropped.
+pub const EXTENDABLE_BASES: &[&str] = &["any_unit"];
 
 pub fn is_builtin_unit(name: &str) -> bool {
     BUILTIN_UNITS.contains(&name)

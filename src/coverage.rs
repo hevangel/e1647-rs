@@ -733,12 +733,21 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
     let (mut buckets, note) = if ranges.is_empty() {
         // 14.3 defaults: integers grade over the first `max_int_buckets`
         // values (16 unless the 14.9 configuration option says
-        // otherwise); booleans over their two values; anything else has
-        // no default bucket set and is ungradeable.
+        // otherwise) — a sized item's possible-value count caps the
+        // bucket count at 2^width (a `uint(bits: 2)` has four possible
+        // values, so four buckets); booleans over their two values;
+        // anything else has no default bucket set and is ungradeable.
         match &item.ty {
             Some(ty) if type_is_bool(ty) => (bool_buckets(), None),
             Some(ty) if type_is_int(ty) => {
-                let buckets = default_int_buckets(config.max_int_buckets);
+                let buckets = match declared_int_width(ty) {
+                    Some(bits) => {
+                        let possible = 1u128 << bits.min(100) as u32;
+                        let count = possible.min(config.max_int_buckets as u128) as u64;
+                        default_int_buckets(count)
+                    }
+                    None => default_int_buckets(config.max_int_buckets),
+                };
                 let note = if buckets.is_empty() {
                     Some("max_int_buckets is 0: no default buckets")
                 } else {
@@ -858,6 +867,26 @@ fn type_is_bool(ty: &TypeExpr) -> bool {
             ..
         }
     )
+}
+
+/// The declared bit width of an integer scalar type, when it is a
+/// literal (`uint(bits: 2)` → 2). The default bucket count of a sized
+/// item caps at the type's possible-value count.
+fn declared_int_width(ty: &TypeExpr) -> Option<i128> {
+    let TypeExpr::Scalar {
+        width: Some(width_expr),
+        ..
+    } = ty
+    else {
+        return None;
+    };
+    let Expr::IntLiteral { text, .. } = width_expr.as_ref() else {
+        return None;
+    };
+    match crate::interp::parse_int_literal(text) {
+        Some(bits) if bits > 0 => Some(bits),
+        _ => None,
+    }
 }
 
 fn type_is_int(ty: &TypeExpr) -> bool {

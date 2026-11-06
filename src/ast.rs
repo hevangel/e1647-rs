@@ -1042,6 +1042,16 @@ pub enum Expr {
         field_span: Span,
         span: Span,
     },
+    /// A set literal `[a, b, c]` / `[lo..hi]` / `[]` (clause 5.2.12) in
+    /// expression position — the same shape the `in` operator and
+    /// `in_table` rows take, now also usable as a value (`for each in
+    /// [red..blue]`, 20.2.5). Enumeral bounds iterate as the enumerands
+    /// in the `for each` path; as a general value the set carries the
+    /// items' indices (the value model keeps intervals only).
+    SetLiteral {
+        items: InSetExpr,
+        span: Span,
+    },
     /// `Type::member` — the static access (clause 4.17.4). One shared
     /// occurrence per type: a static field's value, a static method
     /// (when the access is a call's callee) or a static event (as an
@@ -1180,6 +1190,7 @@ impl Expr {
             | Expr::InTable { span, .. }
             | Expr::Evaluate { span, .. }
             | Expr::QualifiedField { span, .. }
+            | Expr::SetLiteral { span, .. }
             | Expr::StaticAccess { span, .. }
             | Expr::New { span, .. }
             | Expr::Select { span, .. }

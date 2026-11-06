@@ -305,6 +305,11 @@ fn check_extend_target(
     }
     if !declared.contains(declaration.name.as_str())
         && !crate::builtins::is_builtin_unit(declaration.name.as_str())
+        // `any_unit` is the predefined base unit whose members compose
+        // into every unit (the 24.9.2.14 message hooks are extendable on
+        // it); other builtin bases have no composed members here and
+        // stay rejected as extend targets.
+        && !crate::builtins::EXTENDABLE_BASES.contains(&declaration.name.as_str())
     {
         diagnostics.push(Diagnostic::new(
             "E0203",
@@ -1967,7 +1972,9 @@ fn for_each_sub_expr<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
         | Expr::HdlPath { .. }
         | Expr::SetOfValues { .. }
         // The `Type` of a static access is a name, not an expression.
-        | Expr::StaticAccess { .. } => {}
+        | Expr::StaticAccess { .. }
+        // A set literal's bounds enumerate, they are not walked here.
+        | Expr::SetLiteral { .. } => {}
         Expr::MemberAccess { object, .. } => for_each_sub_expr(object, f),
         Expr::Call { callee, args, .. } => {
             for_each_sub_expr(callee, f);
@@ -2069,8 +2076,18 @@ fn check_constraint_fields(
     }
     let mut roots = Vec::new();
     collect_root_identifiers(&constraint.expr, &mut roots);
+    // Unit attribute constraints (7.3.4 `pack_options()`, 7.3.5
+    // `per_inst_cover()`) compare against the predefined attribute
+    // values — the `packing` type and its enumerands, and the
+    // per_inst_cover settings — which are not fields of the enclosing
+    // declaration. The recording pass (elab) reads them as written.
+    let attribute_constraint =
+        crate::interp::expr_calls_any(&constraint.expr, &["pack_options", "per_inst_cover"]);
     for (name, span) in roots {
         if name == "me" || name == "self" {
+            continue;
+        }
+        if attribute_constraint && matches!(name.as_str(), "packing" | "DEFAULT" | "YES" | "NO") {
             continue;
         }
         if !field_names.contains(name.as_str()) && !enumerals.contains(name.as_str()) {
@@ -2202,6 +2219,22 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
         }
         // A set_of_values argument names a type, not a variable.
         Expr::SetOfValues { .. } => {}
+        // A set literal's bounds are ordinary sub-expressions.
+        Expr::SetLiteral {
+            items: crate::ast::InSetExpr::Items(items),
+            ..
+        } => {
+            for item in items {
+                collect_root_identifiers(item, roots);
+            }
+        }
+        Expr::SetLiteral {
+            items: crate::ast::InSetExpr::Range(low, high),
+            ..
+        } => {
+            collect_root_identifiers(low, roots);
+            collect_root_identifiers(high, roots);
+        }
         // A list concat's elements are ordinary sub-expressions.
         Expr::ListConcat { items, .. } => {
             for item in items {

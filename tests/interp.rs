@@ -3008,6 +3008,85 @@ fn qualified_field_access_writes_and_checks_presence() {
 }
 
 #[test]
+fn table1_phase_order_setup_run_extract_check_finalize() {
+    // T8.1 (Table 1, 28.3.3.6-28.3.3.8, 28.3.5.1): the extract, check
+    // and finalize phases call the same-named method on every live
+    // instance after the scheduler drains, in the field-tree DFS order
+    // run() uses; setup() runs before generation.
+    let output = clean_output(
+        "struct leaf { run() is also { out(\"leaf run\\n\"); }; \
+         extract() is also { out(\"leaf extract\\n\"); }; \
+         check() is also { out(\"leaf check\\n\"); }; \
+         finalize() is also { out(\"leaf finalize\\n\"); }; };\n\
+         extend sys {\n    l: leaf;\n    \
+         setup() is also { out(\"setup\\n\"); };\n    \
+         run() is also { out(\"sys run\\n\"); };\n    \
+         extract() is also { out(\"sys extract\\n\"); };\n    \
+         check() is also { out(\"sys check\\n\"); };\n    \
+         finalize() is also { out(\"sys finalize\\n\"); };\n};\n",
+        1,
+    );
+    assert_eq!(
+        output,
+        "setup\n\
+         sys run\n\
+         leaf run\n\
+         sys extract\n\
+         leaf extract\n\
+         sys check\n\
+         leaf check\n\
+         sys finalize\n\
+         leaf finalize\n"
+    );
+}
+
+#[test]
+fn generation_subphases_run_depth_first_after_post_generate() {
+    // T8.2 (9.13.2-9.13.4): after generation and every post_generate(),
+    // connect_pointers(), then connect_ports(), then check_generation()
+    // run over the unit tree depth-first in field order; run() comes
+    // after all of them.
+    let output = clean_output(
+        "unit u {\n    \
+         connect_pointers() is also { out(\"cp \", e_path(), \"\\n\"); };\n    \
+         connect_ports() is also { out(\"cpt \", e_path(), \"\\n\"); };\n    \
+         check_generation() is also { out(\"cg \", e_path(), \"\\n\"); };\n    \
+         post_generate() is also { out(\"pg \", e_path(), \"\\n\"); };\n};\n\
+         extend sys {\n    a: u;\n    b: u;\n    \
+         run() is also { out(\"run starts\\n\"); };\n};\n",
+        1,
+    );
+    assert_eq!(
+        output,
+        "pg sys.a\n\
+         pg sys.b\n\
+         cp sys.a\n\
+         cp sys.b\n\
+         cpt sys.a\n\
+         cpt sys.b\n\
+         cg sys.a\n\
+         cg sys.b\n\
+         run starts\n"
+    );
+}
+
+#[test]
+fn do_bind_outside_connect_ports_is_e0420() {
+    // T8.2: do_bind() may only run in the connect_ports() sub-phase;
+    // anywhere else it reports E0420 (9.13.3).
+    let result = run_source("extend sys {\n    run() is also { do_bind(); };\n};\n", 1);
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0420");
+    assert!(
+        diagnostic
+            .render()
+            .contains("do_bind() may only be called in the connect_ports() sub-phase"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
 fn interface_dispatch_casts_and_is_a_compose() {
     // 5.2.9/5.4.4.4/5.7.1/5.10.2.4 (the migration's T3.3): an
     // interface-typed variable holds the implementing instance; a call
@@ -3077,6 +3156,444 @@ fn interface_call_without_implementation_reports_e0414() {
         diagnostic
             .render()
             .contains("struct 'lazy' does not implement interface method 'area'"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn do_bind_inside_connect_ports_is_accepted() {
+    // T8.2: inside the connect_ports() sub-phase the call is legal; the
+    // keep-bind model has no procedural bindings pending, so it is a
+    // no-op there.
+    let output = clean_output(
+        "extend sys {\n    \
+         connect_ports() is also { do_bind(); out(\"bound\\n\"); };\n    \
+         run() is also { out(\"run\\n\"); };\n};\n",
+        1,
+    );
+    assert_eq!(output, "bound\nrun\n");
+}
+
+#[test]
+fn port_bound_set_and_is_connected_over_keep_bind() {
+    // T8.3 (9.13.5-9.13.12): two simple ports bound with
+    // `keep bind(p, q)` form a two-member bound set (the port itself
+    // included) and are connected; a port bound to nothing on purpose
+    // (`keep bind(r, empty)`) has only itself and is not connected.
+    let output = clean_output(
+        "extend sys {\n    \
+         p: inout simple_port of bit is instance;\n    \
+         q: inout simple_port of bit is instance;\n    \
+         r: inout simple_port of bit is instance;\n    \
+         keep bind(p, q);\n    keep bind(r, empty);\n    \
+         run() is also {\n        \
+         out(p.get_bound_set().size(), \"\\n\");\n        \
+         out(p.is_connected(), \"\\n\");\n        \
+         out(r.get_bound_set().size(), \"\\n\");\n        \
+         out(r.is_connected(), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "2\nTRUE\n1\nFALSE\n");
+}
+
+#[test]
+fn port_disconnect_clears_the_bound_set() {
+    // T8.3: disconnect() drops every connection of the port (its bound
+    // set becomes the port itself, is_connected() FALSE) while the
+    // former partner also loses the edge.
+    let output = clean_output(
+        "extend sys {\n    \
+         p: inout simple_port of bit is instance;\n    \
+         q: inout simple_port of bit is instance;\n    \
+         keep bind(p, q);\n    \
+         run() is also {\n        \
+         p.disconnect();\n        \
+         out(p.get_bound_set().size(), \" \", p.is_connected(), \"\\n\");\n        \
+         out(q.get_bound_set().size(), \" \", q.is_connected(), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "1 FALSE\n1 FALSE\n");
+}
+
+#[test]
+fn port_connect_and_remap_hdl_path_are_e0419() {
+    // T8.3: the method-port connection and HDL-path remapping calls are
+    // recognised (9.13.5-9.13.12) but not implemented in this stage.
+    let result = run_source(
+        "extend sys {\n    \
+         p: inout simple_port of bit is instance;\n    \
+         run() is also { p.connect(p); };\n};\n",
+        1,
+    );
+    assert_eq!(result.diagnostics[0].code, "E0419");
+    assert!(result.diagnostics[0].render().contains("'connect()'"));
+    let result = run_source(
+        "extend sys {\n    \
+         p: inout simple_port of bit is instance;\n    \
+         run() is also { p.remap_hdl_path(\"sig\"); };\n};\n",
+        1,
+    );
+    assert_eq!(result.diagnostics[0].code, "E0419");
+    assert!(
+        result.diagnostics[0]
+            .render()
+            .contains("'remap_hdl_path()'")
+    );
+}
+
+#[test]
+fn get_children_lists_unit_instances_in_field_order() {
+    // T8.4 (7.4.4): get_children() returns the direct child unit
+    // instances in instance-field declaration order, lists flattened,
+    // NULLs skipped — here u1, u2[0], u2[1] (three children), whose
+    // e_path() spellings follow that order (7.4).
+    let output = clean_output(
+        "unit u {\n};\n\
+         extend sys {\n    u1: u;\n    u2: list of u;\n    keep u2.size() == 2;\n    \
+         run() is also {\n        \
+         out(sys.get_children().size(), \"\\n\");\n        \
+         for each (c) in sys.get_children() {\n            \
+         out(c.e_path(), \" \");\n        };\n        \
+         out(\"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "3\nsys.u1 sys.u2[0] sys.u2[1] \n");
+}
+
+#[test]
+fn get_ports_and_get_ports_recursively_return_port_handles() {
+    // T8.4 (7.4.5-7.4.7): get_ports() lists the unit's own ports;
+    // get_ports_recursively() adds every sub-instance's; a port handle
+    // (with_ports TRUE on get_children) is also iterable.
+    let output = clean_output(
+        "unit u {\n    q: inout simple_port of bit is instance;\n};\n\
+         extend sys {\n    sub: u;\n    p: inout simple_port of bit is instance;\n    \
+         run() is also {\n        \
+         out(sys.get_ports().size(), \"\\n\");\n        \
+         out(sys.get_ports_recursively().size(), \"\\n\");\n        \
+         out(sys.get_children(TRUE).size(), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "1\n2\n2\n");
+}
+
+#[test]
+fn set_check_accepts_name_and_effect_and_optional_root_unit() {
+    // T8.5 (16.3.6): set_check(name, severity|effect [, root_unit])
+    // parses and arity-checks; the check-effect model is a later
+    // milestone so the accepted call has no effect. set_check_by_name
+    // (16.3.7) is an E0419 stub.
+    let output = clean_output(
+        "extend sys {\n    \
+         run() is also {\n            \
+         set_check(\"chk\", LOW);\n            \
+         set_check(\"chk\", LOW, sys);\n            \
+         out(\"checked\\n\");\n        };\n};\n",
+        1,
+    );
+    assert_eq!(output, "checked\n");
+    let result = run_source(
+        "extend sys {\n    run() is also { set_check_by_name(\"c\", LOW); };\n};\n",
+        1,
+    );
+    assert_eq!(result.diagnostics[0].code, "E0419");
+    assert!(
+        result.diagnostics[0]
+            .render()
+            .contains("'set_check_by_name()' is recognised (clause 16.3.7)")
+    );
+}
+
+#[test]
+fn numeric_list_aggregates_accept_real_and_exp_forms() {
+    // T8.6 (27.4.17, 27.4.20, 27.5.4-27.5.6): sum/product/average/
+    // max_value/min_value take any numeric item expression (reals
+    // included) and return the expression's type; integer average
+    // truncates (keeps the int type); empty product is 1, empty sum 0.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        \
+         out({1.5; 2.5}.sum(it), \"\\n\");\n        \
+         out({1; 2; 4}.average(it), \"\\n\");\n        \
+         out({}.product(it), \"\\n\");\n        \
+         out({2; 3; 5}.product(it), \"\\n\");\n        \
+         out({}.sum(it), \"\\n\");\n        \
+         out({3; 1; 2}.max_value(it), \"\\n\");\n        \
+         out({3; 1; 2}.min_value(it), \"\\n\");\n        \
+         out({1.5; 2.0}.average(it), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "4.0\n2\n1\n30\n0\n3\n1\n1.75\n");
+}
+
+#[test]
+fn average_of_empty_list_is_an_honest_error() {
+    // T8.6: the standard's empty-list average is UNDEF, which the value
+    // model has no representation for — the run reports E0402 instead
+    // of inventing a value.
+    let result = run_source(
+        "extend sys {\n    run() is also { out({}.average(it)); };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0402");
+    assert!(
+        diagnostic.render().contains("average of an empty list"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn deep_copy_mints_a_fresh_list_and_copies_values() {
+    // T8.7 (29.2.2): a list deep copy returns a NEW list object whose
+    // items are deep copies — the original is untouched by later
+    // modifications of the copy; scalars copy as themselves.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        \
+         var l1: list of int = {1; 2; 3; 4};\n        \
+         var l2 := deep_copy(l1);\n        \
+         l2.add(9);\n        \
+         out(l1.size(), \" \", l2.size(), \"\\n\");\n        \
+         out(deep_copy(42), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "4 5\n42\n");
+}
+
+#[test]
+fn deep_copy_of_a_struct_is_a_fresh_instance() {
+    // T8.7: a struct deep copy is a new instance of the same type with
+    // deep-copied fields; the original is untouched (29.2.2).
+    let output = clean_output(
+        "struct cell {\n    v: int;\n};\n\
+         extend sys {\n    run() is also {\n        \
+         var c: cell;\n        c.v = 7;\n        \
+         var d := deep_copy(c);\n        \
+         d.v = 9;\n        \
+         out(c.v, \" \", d.v, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "7 9\n");
+}
+
+#[test]
+fn files_flush_log_file_is_e0419() {
+    // T8.8 (30.5.16): the files singleton is reachable as a method
+    // receiver; flush_log_file() is recognised but not implemented.
+    let result = run_source(
+        "extend sys {\n    run() is also { files.flush_log_file(); };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0419");
+    assert!(
+        diagnostic
+            .render()
+            .contains("'flush_log_file()' is recognised (clause 30.5.16)"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn covers_sample_cg_samples_without_emitting_the_event() {
+    // T8.9 (14.8.2.10): covers.sample_cg("type.group") samples the
+    // group procedurally — three calls after assigning 0, 1, 2, with
+    // the sampling event never emitted, hit 3 of the 4 buckets of the
+    // uint(bits: 2) item.
+    let result = run_source(
+        "extend sys {\n    \
+         event cg;\n    x: uint(bits: 2);\n    \
+         cover cg is {\n            item x: uint(bits: 2);\n    };\n    \
+         run() is also {\n        \
+         x = 0;\n        covers.sample_cg(\"sys.cg\");\n        \
+         x = 1;\n        covers.sample_cg(\"sys.cg\");\n        \
+         x = 2;\n        covers.sample_cg(\"sys.cg\");\n    };\n};\n",
+        1,
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    let entry = result
+        .coverage
+        .iter()
+        .find(|entry| entry.type_name == "sys")
+        .expect("sys coverage");
+    let group = &entry.groups[0];
+    assert_eq!(group.samples, 3, "three procedural samples");
+    let item = &group.items[0];
+    assert_eq!(item.buckets.len(), 4, "uint(bits: 2) has four buckets");
+    let hit = item
+        .buckets
+        .iter()
+        .filter(|bucket| bucket.hits >= bucket.goal)
+        .count();
+    assert_eq!(hit, 3, "buckets 0, 1, 2 hit");
+    assert_eq!(item.buckets[3].hits, 0, "bucket 3 untouched");
+}
+
+#[test]
+fn covers_sample_cg_is_not_permitted_before_post_generate() {
+    // T8.9: the procedural sampling is not permitted before the
+    // post_generate() sub-phase ran (14.8.2.10) — the setup phase runs
+    // earlier, so a call there reports.
+    let result = run_source(
+        "extend sys {\n    \
+         event cg;\n    cover cg is { item n: uint; };\n    \
+         setup() is also { covers.sample_cg(\"sys.cg\"); };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0402");
+    assert!(
+        diagnostic
+            .render()
+            .contains("not permitted before the post_generate() sub-phase"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn covers_compute_and_read_the_overall_grade() {
+    // T8.9 (14.9.6): compute_overall_grade() computes and stores the
+    // normalised grade (the covered-bucket fraction over the collected
+    // groups, 0.0-1.0); get_overall_grade() reads the last computed
+    // value. get_ucd_path() (14.9.15-14.9.17) is the empty string — no
+    // coverage database is written in this stage.
+    let result = run_source(
+        "extend sys {\n    \
+         event cg;\n    ok: bool;\n    cover cg is { item ok: bool; };\n    \
+         run() is also {\n            \
+         ok = TRUE;\n            emit cg;\n            \
+         ok = FALSE;\n            emit cg;\n            \
+         out(covers.compute_overall_grade(), \"\\n\");\n            \
+         out(covers.get_overall_grade(), \"\\n\");\n            \
+         out(covers.get_ucd_path() == \"\", \"\\n\");\n        };\n};\n",
+        1,
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(result.output, "1.0\n1.0\nTRUE\n");
+}
+
+#[test]
+fn covers_configuration_calls_are_e0419() {
+    // T8.9 (14.9.15-14.9.17): the coverage-configuration calls are
+    // recognised stubs.
+    for call in [
+        "covers.set_per_inst_for_struct(sys, sys)",
+        "covers.set_unicov_hier(sys, \"u0\")",
+        "covers.set_cross_instance_collection(n, \"p\", TRUE)",
+        "covers.get_top_size_items(3)",
+    ] {
+        let source =
+            format!("extend sys {{\n    n: uint;\n    run() is also {{ {call}; }};\n}};\n");
+        let result = run_source(&source, 1);
+        assert_eq!(result.diagnostics[0].code, "E0419", "call: {call}");
+    }
+}
+
+#[test]
+fn message_path_calls_the_user_message_handler_hook() {
+    // T8.10 (24.9.2.14): user_message_handler() is an empty extendable
+    // hook on any_unit; the message path calls it once on the receiving
+    // instance before the message text prints.
+    let output = clean_output(
+        "extend any_unit {\n    user_message_handler() is also { out(\"hook\\n\"); };\n};\n\
+         extend sys {\n    run() is also { message(LOW, \"x\"); };\n};\n",
+        1,
+    );
+    assert_eq!(output, "hook\nx\n");
+}
+
+#[test]
+fn user_transaction_handler_hooks_are_extendable_names() {
+    // T8.10: the transaction hooks parse as ordinary extendable methods
+    // on any_unit; nothing calls them (there is no transaction
+    // machinery), but an explicit call runs the extension.
+    let output = clean_output(
+        "extend any_unit {\n    \
+         user_transaction_handler() is also { out(\"txn hook\\n\"); };\n};\n\
+         extend sys {\n    run() is also { user_transaction_handler(); };\n};\n",
+        1,
+    );
+    assert_eq!(output, "txn hook\n");
+}
+
+#[test]
+fn for_each_over_an_enumerated_set_literal_iterates_the_enumerands() {
+    // T8.11 (20.2.5): `for each (c) in [red..blue]` iterates the set's
+    // items in order — the enumerands of the enumeral type.
+    let output = clean_output(
+        "type color: [red, green, blue];\n\
+         extend sys {\n    run() is also {\n        \
+         for each (c) in [red..blue] {\n            out(c, \" \");\n        };\n        \
+         out(\"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "red green blue \n");
+}
+
+#[test]
+fn for_each_over_an_integer_set_literal_and_a_set_value() {
+    // T8.11: the same iteration over an integer set literal and over a
+    // set value (set_of_values) — items in order.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        \
+         for each (n) in [2..4] {\n            out(n);\n        };\n        \
+         out(\"\\n\");\n        \
+         var s: set = set_of_values(color_t);\n        \
+         for each (n) in s {\n            out(n);\n        };\n        \
+         out(\"\\n\");\n    };\n};\n\
+         type color_t: [a, b, c];\n",
+        1,
+    );
+    assert_eq!(output, "234\n012\n");
+}
+
+#[test]
+fn rerun_is_e0419() {
+    // T8.1 (28.3.5.1): rerun() — deactivate at the end of the current
+    // tick, reactivate next cycle — has no per-tick struct activation
+    // in the coroutine model, so it is an honest E0419 stub.
+    let result = run_source("extend sys {\n    run() is also { sys.rerun(); };\n};\n", 1);
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0419");
+    assert!(
+        diagnostic
+            .render()
+            .contains("'rerun()' is recognised (clause 28.3.5.1)"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn swap_is_a_recognised_pack_tool_name() {
+    // T8.12 (19.1): swap() parses as a builtin pack tool call; the
+    // byte-order swap is not implemented, so the call reports E0419.
+    let result = run_source("extend sys {\n    run() is also { swap(5); };\n};\n", 1);
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0419");
+    assert!(
+        diagnostic
+            .render()
+            .contains("'swap()' is recognised (clause 19.1)"),
         "rendered: {}",
         diagnostic.render()
     );

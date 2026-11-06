@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-const USAGE: &str = "Usage: e1647 <command> <source.e> [--seed N] [--coverage]\nCommands:\n  tokens  tokenize the source (does not parse)\n  parse   parse the source and print the AST or diagnostics\n  elab    parse and fold like/extend into elaborated types\n  run     parse, elaborate and execute sys.run() (--seed N for reproducible gen)\n\n`run --coverage` prints the coverage groups' buckets and grades after\nthe run (clause 14; collection happens on every run).\n\n`import x.y;` members resolve to `x/y.e` (or `x.y.e`) next to the source\nfile; imported declarations are spliced before the importing file's own.";
+const USAGE: &str = "Usage: e1647 <command> <source.e> [--seed N] [--coverage]\nCommands:\n  tokens  tokenize the source (does not parse)\n  parse   parse the source and print the AST or diagnostics\n  elab    parse and fold like/extend into elaborated types\n  run     parse, elaborate and run the phases: sys.setup, generate,\n          run/extract/check/finalize over the field tree (Table 1,\n          28.3) and the 9.13 generation sub-phases (--seed N for\n          reproducible gen)\n\n`run --coverage` prints the coverage groups' buckets and grades after\nthe run (clause 14; collection happens on every run and on\ncovers.sample_cg calls).\n\n`import x.y;` members resolve to `x/y.e` (or `x.y.e`) next to the source\nfile; imported declarations are spliced before the importing file's own.";
 
 /// Parse `source` and splice in the files it imports (`import a.b;` →
 /// `a/b.e` or `a.b.e` beside the source), depth-first, one level wide.
@@ -404,6 +404,11 @@ fn print_elaborated_type(elaborated_type: &e1647::elab::ElaboratedType) {
     }
     for field in &elaborated_type.fields {
         println!("  field {}: {}", field.name, render_type(&field.ty));
+    }
+    // The recorded unit attribute constraints (7.3.4 pack_options,
+    // 7.3.5 per_inst_cover) print with their value as written.
+    for (field, attribute, value) in &elaborated_type.unit_attributes {
+        println!("  attribute {field}.{attribute} = {value}");
     }
     for constraint in &elaborated_type.constraints {
         println!(
