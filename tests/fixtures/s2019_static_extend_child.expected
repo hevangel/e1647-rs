@@ -1,0 +1,1 @@
+10:12: error[E0309]: static method 'g' can only be extended in the struct that declares it ('base') (clause 17.2.4)

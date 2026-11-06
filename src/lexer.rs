@@ -282,6 +282,10 @@ pub fn is_keyword(word: &str) -> bool {
 const OPERATORS: &[&str] = &[
     "===", "!==", "==", "!=", "!~", "<=", ">=", "=>", "&&", "||", "<<", ">>", "..", "+=", "-=",
     ":=",
+    // `Type::member` — the static access operator (clause 4.17.4; the
+    // 2019 static members). One glued token, so `T::f` lexes as
+    // identifier, `::`, identifier instead of two `:` tokens.
+    "::",
 ];
 
 struct Cursor<'a> {
