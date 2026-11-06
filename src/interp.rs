@@ -196,6 +196,17 @@ pub enum Value {
         owner: usize,
         name: String,
     },
+    /// A `table` value (32.3, T9.3): the shared storage behind the
+    /// procedural `table_manager`/`table` API. Cloning the value aliases
+    /// the same table; `copy()` mints a fresh writable one.
+    Table(Rc<RefCell<crate::tables::TableValue>>),
+    /// A `table_row` value (32.3): the shared row handle plus, when the
+    /// row came from a table, that table — the row-index pseudo-column
+    /// (column 0) and the read-only rule read through it.
+    TableRow {
+        table: Option<Rc<RefCell<crate::tables::TableValue>>>,
+        row: Rc<RefCell<crate::tables::TableRowValue>>,
+    },
     Void,
 }
 
@@ -589,6 +600,11 @@ struct Interp<'a> {
     /// `covers.compute_overall_grade()` (14.9.6), read back by
     /// `covers.get_overall_grade()`.
     overall_grade: Option<f64>,
+    /// The table read-cache (32.3, T9.3): a table read from a file is
+    /// cached and read-only — one shared value per (file, tag), so
+    /// modifying it is the copy-first runtime error. Keyed by the
+    /// resolved path and the tag.
+    table_cache: BTreeMap<(String, String), Rc<RefCell<crate::tables::TableValue>>>,
 }
 
 /// How many `wait` statements and scheduler cycles one run may consume
@@ -755,6 +771,7 @@ fn run_inner(
         post_generate_done: false,
         in_connect_ports: false,
         overall_grade: None,
+        table_cache: BTreeMap::new(),
     };
     // The static fields are created at declaration (clause 6.9.3):
     // every store entry exists before any instance does, initialised
@@ -1454,6 +1471,11 @@ impl<'a> Interp<'a> {
                 }
             }
             TypeExpr::Named { name, .. } => {
+                // The 32.3 table types have no default value: a table
+                // var's default is NULL, like an interface pointer.
+                if matches!(name.as_str(), "table" | "table_row" | "table_manager") {
+                    return Value::Void;
+                }
                 let types: &[crate::elab::ElaboratedType] = self.types;
                 if let Some(t) = types.iter().find(|t| t.name == name.as_str()) {
                     // Clause 5.2.9/5.4.4.4: an interface-typed value is a
@@ -4311,6 +4333,563 @@ impl<'a> Interp<'a> {
         ))
     }
 
+    // -----------------------------------------------------------------
+    // The 32.3 procedural table API (T9.3): the `table_manager`
+    // singleton, the methods on a `table` value and on a `table_row`
+    // value. Rows are numbered from 0, columns from 1 (column 0 is the
+    // row index). A table read from a file is cached per run and
+    // read-only — modifying it is the copy-first runtime error.
+    // -----------------------------------------------------------------
+
+    /// The `table_manager` singleton methods (32.3).
+    fn call_table_manager_method(
+        &mut self,
+        name: &str,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        match (name, values.as_slice()) {
+            ("create_table", [Value::List(list)]) => {
+                let items = list.items.borrow().clone();
+                let columns: Vec<String> =
+                    items.iter().map(|item| self.format_value(item)).collect();
+                let header = Rc::new(RefCell::new(crate::tables::TableRowValue {
+                    cells: columns.clone(),
+                    ..Default::default()
+                }));
+                Ok(Value::Table(Rc::new(RefCell::new(
+                    crate::tables::TableValue {
+                        columns,
+                        header: Some(header),
+                        ..Default::default()
+                    },
+                ))))
+            }
+            ("create_table", _) => Err(self.error(
+                "E0402",
+                "'table_manager.create_table' expects the column-name list",
+                span,
+            )),
+            ("create_table_without_column_names", [Value::Int(size)]) => {
+                if *size < 0 {
+                    return Err(self.error(
+                        "E0404",
+                        format!("table size {size} is negative"),
+                        span,
+                    ));
+                }
+                Ok(Value::Table(Rc::new(RefCell::new(
+                    crate::tables::TableValue {
+                        columns: vec![String::new(); *size as usize],
+                        ..Default::default()
+                    },
+                ))))
+            }
+            ("create_table_without_column_names", _) => Err(self.error(
+                "E0402",
+                "'table_manager.create_table_without_column_names' expects the column count",
+                span,
+            )),
+            ("create_empty_table", []) => Ok(Value::Table(Rc::new(RefCell::new(
+                crate::tables::TableValue::default(),
+            )))),
+            ("create_empty_table", _) => Err(self.error(
+                "E0402",
+                "'table_manager.create_empty_table' expects no arguments",
+                span,
+            )),
+            ("create_row", [Value::Int(size)]) => {
+                if *size < 0 {
+                    return Err(self.error("E0404", format!("row size {size} is negative"), span));
+                }
+                Ok(Value::TableRow {
+                    table: None,
+                    row: Rc::new(RefCell::new(crate::tables::TableRowValue {
+                        cells: vec![String::new(); *size as usize],
+                        ..Default::default()
+                    })),
+                })
+            }
+            ("create_row", _) => Err(self.error(
+                "E0402",
+                "'table_manager.create_row' expects the cell count",
+                span,
+            )),
+            ("create_row_with_data", [Value::List(list)]) => {
+                let items = list.items.borrow().clone();
+                Ok(Value::TableRow {
+                    table: None,
+                    row: Rc::new(RefCell::new(crate::tables::TableRowValue {
+                        cells: items.iter().map(|item| self.format_value(item)).collect(),
+                        ..Default::default()
+                    })),
+                })
+            }
+            ("create_row_with_data", _) => Err(self.error(
+                "E0402",
+                "'table_manager.create_row_with_data' expects the data list",
+                span,
+            )),
+            ("read_table_from_csv", [Value::Str(file), Value::Str(tag)])
+            | ("read_table_from_csv", [Value::Str(file), Value::Str(tag), Value::Bool(_)]) => {
+                let error_if_none = match values.last() {
+                    Some(Value::Bool(flag)) => *flag,
+                    _ => true,
+                };
+                self.read_table_from_csv_cached(file, tag, error_if_none, span)
+            }
+            ("read_table_from_csv", _) => Err(self.error(
+                "E0402",
+                "'table_manager.read_table_from_csv' expects (file-name, tag [, error_if_none])",
+                span,
+            )),
+            ("read_all_tables_from_csv", [Value::Str(file)]) => {
+                let key = crate::tables::with_csv_extension(file);
+                let tables = crate::tables::read_csv_tables(&key).map_err(|err| {
+                    self.error("E0401", format!("read_all_tables_from_csv: {err}"), span)
+                })?;
+                let items: Vec<Value> = tables
+                    .into_iter()
+                    .map(|entry| Value::Table(Rc::new(RefCell::new(entry.table))))
+                    .collect();
+                Ok(Value::List(ListValue {
+                    items: Rc::new(RefCell::new(items)),
+                    element: Some("table".to_owned()),
+                }))
+            }
+            ("read_all_tables_from_csv", _) => Err(self.error(
+                "E0402",
+                "'table_manager.read_all_tables_from_csv' expects the file name",
+                span,
+            )),
+            // The excel readers are the honest 32.3 stubs: no Excel
+            // reader exists in this stage.
+            ("read_table_from_excel", _) | ("read_all_tables_from_excel", _) => Err(self.error(
+                "E0419",
+                format!("'{name}()' is recognised (clause 32.3) but not implemented in this stage"),
+                span,
+            )),
+            ("is_empty_line", [Value::Str(line)]) | ("is_table_end", [Value::Str(line)]) => {
+                Ok(Value::Bool(crate::tables::is_empty_line(line)))
+            }
+            ("is_empty_line", _) | ("is_table_end", _) => Err(self.error(
+                "E0402",
+                "'table_manager.{name}' expects the csv line string",
+                span,
+            )),
+            ("skip_row", [Value::Str(line)]) => {
+                // The tag-complement reading: the line's text after the
+                // first comma (see the module-level design note).
+                Ok(Value::Str(
+                    line.split_once(',')
+                        .map(|(_, rest)| rest.trim().to_owned())
+                        .unwrap_or_default(),
+                ))
+            }
+            ("skip_row", _) => Err(self.error(
+                "E0402",
+                "'table_manager.skip_row' expects the csv line string",
+                span,
+            )),
+            ("get_table_tag_from_row", [Value::Str(line)]) => {
+                Ok(Value::Str(crate::tables::table_tag_from_row(line)))
+            }
+            ("get_table_tag_from_row", _) => Err(self.error(
+                "E0402",
+                "'table_manager.get_table_tag_from_row' expects the csv line string",
+                span,
+            )),
+            _ => Err(self.error(
+                "E0405",
+                format!("method 'table_manager.{name}' is not supported"),
+                span,
+            )),
+        }
+    }
+
+    /// `table_manager.read_table_from_csv(file, tag [, error_if_none])`
+    /// (32.3): the file-read table is cached per run and read-only —
+    /// one shared value per (resolved path, tag). With
+    /// `error_if_none` FALSE a missing table reads as NULL.
+    fn read_table_from_csv_cached(
+        &mut self,
+        file: &str,
+        tag: &str,
+        error_if_none: bool,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let key = crate::tables::with_csv_extension(file);
+        let cache_key = (key.clone(), tag.to_owned());
+        if let Some(cached) = self.table_cache.get(&cache_key) {
+            return Ok(Value::Table(cached.clone()));
+        }
+        let tables = crate::tables::read_csv_tables(&key)
+            .map_err(|err| self.error("E0401", format!("read_table_from_csv: {err}"), span))?;
+        let Some(entry) = tables.into_iter().find(|entry| entry.tag == tag) else {
+            if error_if_none {
+                return Err(self.error(
+                    "E0401",
+                    format!("read_table_from_csv: no table '{tag}' in '{key}'"),
+                    span,
+                ));
+            }
+            return Ok(Value::Void);
+        };
+        let handle = Rc::new(RefCell::new(entry.table));
+        self.table_cache.insert(cache_key, handle.clone());
+        Ok(Value::Table(handle))
+    }
+
+    /// The `table` value methods (32.3). Mutating methods report the
+    /// copy-first error on a file-read (read-only) table.
+    fn call_table_value_method(
+        &mut self,
+        table: Rc<RefCell<crate::tables::TableValue>>,
+        name: &str,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let read_only = table.borrow().read_only;
+        let source = table
+            .borrow()
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "the table".to_owned());
+        let mutate = |name: &str| -> Result<(), Diagnostic> {
+            if read_only {
+                return Err(Diagnostic::new(
+                    "E0402",
+                    format!(
+                        "'{name}' modifies a table read from '{source}', which is read-only; copy() it first (32.3)"
+                    ),
+                    span.0,
+                    span.1,
+                ));
+            }
+            Ok(())
+        };
+        match (name, values.as_slice()) {
+            ("get_csv_file_name", []) => Ok(Value::Str(
+                table.borrow().file_name.clone().unwrap_or_default(),
+            )),
+            ("get_excel_file_name", []) | ("get_excel_sheet_name", []) => {
+                // No Excel source exists in this stage: the empty
+                // answers (the csv readers never set one).
+                Ok(Value::Str(String::new()))
+            }
+            ("get_columns_num", []) => Ok(Value::Int(table.borrow().columns.len() as i128)),
+            ("get_column_name", [Value::Int(column)]) => {
+                let index = column_index(table.borrow().columns.len(), *column, span)?;
+                Ok(Value::Str(table.borrow().columns[index - 1].clone()))
+            }
+            ("set_column_name", [Value::Int(column), value]) => {
+                mutate(name)?;
+                let text = self.format_value(value);
+                let mut borrowed = table.borrow_mut();
+                let index = column_index(borrowed.columns.len(), *column, span)?;
+                borrowed.columns[index - 1] = text.clone();
+                if let Some(header) = &borrowed.header {
+                    let mut row = header.borrow_mut();
+                    while row.cells.len() < index {
+                        row.cells.push(String::new());
+                    }
+                    row.cells[index - 1] = text;
+                }
+                drop(borrowed);
+                Ok(Value::Void)
+            }
+            ("get_header_row", []) => match &table.borrow().header {
+                Some(header) => Ok(Value::TableRow {
+                    table: Some(table.clone()),
+                    row: header.clone(),
+                }),
+                None => Ok(Value::Void),
+            },
+            ("replace_header_row", [Value::TableRow { row, .. }]) => {
+                mutate(name)?;
+                let cells = row.borrow().cells.clone();
+                let mut borrowed = table.borrow_mut();
+                borrowed.header = Some(row.clone());
+                if !cells.is_empty() {
+                    borrowed.columns = cells;
+                }
+                drop(borrowed);
+                Ok(Value::Void)
+            }
+            ("get_rows_num", []) => Ok(Value::Int(table.borrow().rows.len() as i128)),
+            ("get_row", [Value::Int(index)]) => {
+                let rows_len = table.borrow().rows.len();
+                if *index < 0 || *index >= rows_len as i128 {
+                    return Err(self.error(
+                        "E0404",
+                        format!("table row index {index} out of range (size {rows_len})"),
+                        span,
+                    ));
+                }
+                let row = table.borrow().rows[*index as usize].clone();
+                Ok(Value::TableRow {
+                    table: Some(table.clone()),
+                    row,
+                })
+            }
+            ("get_column_index_by_name", [value]) => {
+                let column = self.format_value(value);
+                Ok(Value::Int(
+                    table
+                        .borrow()
+                        .columns
+                        .iter()
+                        .position(|name| *name == column)
+                        .map_or(0, |position| position as i128 + 1),
+                ))
+            }
+            ("add_row", []) => {
+                mutate(name)?;
+                let width = table.borrow().columns.len();
+                let row = Rc::new(RefCell::new(crate::tables::TableRowValue {
+                    cells: vec![String::new(); width],
+                    ..Default::default()
+                }));
+                table.borrow_mut().rows.push(row);
+                Ok(Value::Void)
+            }
+            ("add_row", [Value::TableRow { row, .. }]) => {
+                mutate(name)?;
+                table.borrow_mut().rows.push(row.clone());
+                Ok(Value::Void)
+            }
+            ("add_filled_row", [Value::List(list)]) => {
+                mutate(name)?;
+                let items = list.items.borrow().clone();
+                let row = Rc::new(RefCell::new(crate::tables::TableRowValue {
+                    cells: items.iter().map(|item| self.format_value(item)).collect(),
+                    ..Default::default()
+                }));
+                table.borrow_mut().rows.push(row);
+                Ok(Value::Void)
+            }
+            ("insert_row", [Value::Int(position)]) => {
+                mutate(name)?;
+                let width = table.borrow().columns.len();
+                let row = Rc::new(RefCell::new(crate::tables::TableRowValue {
+                    cells: vec![String::new(); width],
+                    ..Default::default()
+                }));
+                insert_row_at(&mut table.borrow_mut(), *position, row, span)?;
+                Ok(Value::Void)
+            }
+            ("insert_row", [Value::Int(position), Value::TableRow { row, .. }]) => {
+                mutate(name)?;
+                insert_row_at(&mut table.borrow_mut(), *position, row.clone(), span)?;
+                Ok(Value::Void)
+            }
+            ("insert_filled_row", [Value::Int(position), Value::List(list)]) => {
+                mutate(name)?;
+                let items = list.items.borrow().clone();
+                let row = Rc::new(RefCell::new(crate::tables::TableRowValue {
+                    cells: items.iter().map(|item| self.format_value(item)).collect(),
+                    ..Default::default()
+                }));
+                insert_row_at(&mut table.borrow_mut(), *position, row, span)?;
+                Ok(Value::Void)
+            }
+            ("replace_row", [Value::Int(position), Value::TableRow { row, .. }]) => {
+                mutate(name)?;
+                let rows_len = table.borrow().rows.len();
+                if *position < 0 || *position >= rows_len as i128 {
+                    return Err(self.error(
+                        "E0404",
+                        format!("table row index {position} out of range (size {rows_len})"),
+                        span,
+                    ));
+                }
+                table.borrow_mut().rows[*position as usize] = row.clone();
+                Ok(Value::Void)
+            }
+            ("delete_row", [Value::Int(position)]) => {
+                mutate(name)?;
+                let rows_len = table.borrow().rows.len();
+                if *position < 0 || *position >= rows_len as i128 {
+                    return Err(self.error(
+                        "E0404",
+                        format!("table row index {position} out of range (size {rows_len})"),
+                        span,
+                    ));
+                }
+                table.borrow_mut().rows.remove(*position as usize);
+                Ok(Value::Void)
+            }
+            ("delete_column", [Value::Int(column)]) => {
+                mutate(name)?;
+                let index = column_index(table.borrow().columns.len(), *column, span)?;
+                let mut borrowed = table.borrow_mut();
+                borrowed.columns.remove(index - 1);
+                for row in &borrowed.rows {
+                    let mut row = row.borrow_mut();
+                    if index - 1 < row.cells.len() {
+                        row.cells.remove(index - 1);
+                    }
+                }
+                if let Some(header) = &borrowed.header
+                    && index - 1 < header.borrow().cells.len()
+                {
+                    header.borrow_mut().cells.remove(index - 1);
+                }
+                drop(borrowed);
+                Ok(Value::Void)
+            }
+            ("copy", []) => Ok(Value::Table(Rc::new(RefCell::new(table.borrow().copied())))),
+            ("copy_with_rows", [Value::List(list)]) => {
+                // The copy restricted to the given rows (0-based row
+                // indexes, or table_row handles selected by identity).
+                let items = list.items.borrow().clone();
+                let mut selection: Vec<Option<usize>> = Vec::with_capacity(items.len());
+                for item in &items {
+                    match item {
+                        Value::Int(index) => {
+                            if *index < 0 {
+                                return Err(self.error(
+                                    "E0404",
+                                    format!("table row index {index} is negative"),
+                                    span,
+                                ));
+                            }
+                            selection.push(Some(*index as usize));
+                        }
+                        Value::TableRow { row, .. } => {
+                            selection.push(table.borrow().row_index(row));
+                        }
+                        _ => {
+                            return Err(self.error(
+                                "E0402",
+                                "'copy_with_rows' expects row indexes or table rows",
+                                span,
+                            ));
+                        }
+                    }
+                }
+                let borrowed = table.borrow();
+                let mut copy = borrowed.copied();
+                copy.rows.clear();
+                for index in selection {
+                    let Some(index) = index else {
+                        return Err(self.error(
+                            "E0404",
+                            "copy_with_rows: one of the given rows is not in this table",
+                            span,
+                        ));
+                    };
+                    let rows_len = borrowed.rows.len();
+                    if index >= rows_len {
+                        return Err(self.error(
+                            "E0404",
+                            format!("table row index {index} out of range (size {rows_len})"),
+                            span,
+                        ));
+                    }
+                    let row = Rc::new(RefCell::new(borrowed.rows[index].borrow().clone()));
+                    copy.rows.push(row);
+                }
+                drop(borrowed);
+                Ok(Value::Table(Rc::new(RefCell::new(copy))))
+            }
+            _ => Err(self.error(
+                "E0405",
+                format!("method 'table.{name}' is not supported"),
+                span,
+            )),
+        }
+    }
+
+    /// The `table_row` value methods (32.3). A row obtained from a
+    /// read-only table reports the copy-first error on `set_data`; a
+    /// standalone row (`create_row`/`create_row_with_data`) is writable.
+    fn call_table_row_value_method(
+        &mut self,
+        table: Option<Rc<RefCell<crate::tables::TableValue>>>,
+        row: Rc<RefCell<crate::tables::TableRowValue>>,
+        name: &str,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let read_only = table.as_ref().is_some_and(|t| t.borrow().read_only);
+        let source = table
+            .as_ref()
+            .and_then(|t| t.borrow().file_name.clone())
+            .unwrap_or_else(|| "the table".to_owned());
+        match (name, values.as_slice()) {
+            ("get_size", []) => Ok(Value::Int(row.borrow().cells.len() as i128)),
+            ("get_data", [Value::Int(column)]) => {
+                if *column == 0 {
+                    // Column 0 is the row index (32.3): read through the
+                    // owning table by row identity.
+                    let Some(t) = &table else {
+                        return Err(self.error(
+                            "E0402",
+                            "the row index (column 0) is only defined for a row of a table",
+                            span,
+                        ));
+                    };
+                    let index = t.borrow().row_index(&row);
+                    return Ok(Value::Str(
+                        index.map(|index| index.to_string()).unwrap_or_default(),
+                    ));
+                }
+                let index = column_index(row.borrow().cells.len(), *column, span)?;
+                Ok(Value::Str(row.borrow().cells[index - 1].clone()))
+            }
+            ("set_data", [Value::Int(column), value]) => {
+                if read_only {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "'set_data' modifies a row of the table read from '{source}', which is read-only; copy() the table first (32.3)"
+                        ),
+                        span,
+                    ));
+                }
+                if *column == 0 {
+                    return Err(self.error(
+                        "E0402",
+                        "the row index (column 0) is not writable",
+                        span,
+                    ));
+                }
+                let text = self.format_value(value);
+                let mut borrowed = row.borrow_mut();
+                let index = column_index(borrowed.cells.len(), *column, span)?;
+                while borrowed.cells.len() < index {
+                    borrowed.cells.push(String::new());
+                }
+                borrowed.cells[index - 1] = text;
+                drop(borrowed);
+                Ok(Value::Void)
+            }
+            ("get_csv_line_num", []) => Ok(Value::Int(row.borrow().line.unwrap_or(0) as i128)),
+            ("get_csv_file_name", []) => Ok(Value::Str(
+                row.borrow().file_name.clone().unwrap_or_default(),
+            )),
+            ("get_excel_file_name", []) | ("get_excel_sheet_name", []) => {
+                // No Excel source exists in this stage: the empty answers.
+                Ok(Value::Str(String::new()))
+            }
+            ("copy_source_info_from", [Value::TableRow { row: other, .. }]) => {
+                let other = other.borrow().clone();
+                row.borrow_mut().copy_source_info_from(&other);
+                Ok(Value::Void)
+            }
+            ("copy", []) => Ok(Value::TableRow {
+                table: None,
+                row: Rc::new(RefCell::new(row.borrow().clone())),
+            }),
+            _ => Err(self.error(
+                "E0405",
+                format!("method 'table_row.{name}' is not supported"),
+                span,
+            )),
+        }
+    }
+
     /// `deep_copy(<exp>)` (29.2.2): scalars, strings, enumerals and
     /// sets are values — returned as-is; a list deep copy mints a
     /// FRESH list object whose items are deep copies (`list_ptr==`
@@ -4336,6 +4915,13 @@ impl<'a> Interp<'a> {
             | Value::Set(_)
             | Value::Void
             | Value::Port { .. } => Ok(value.clone()),
+            // A table deep copy (32.3's `copy`): a fresh writable table
+            // with fresh row handles (see `TableValue::copied`).
+            Value::Table(table) => Ok(Value::Table(Rc::new(RefCell::new(table.borrow().copied())))),
+            Value::TableRow { row, .. } => Ok(Value::TableRow {
+                table: None,
+                row: Rc::new(RefCell::new(row.borrow().clone())),
+            }),
             Value::List(list) => {
                 let items = list.items.borrow().clone();
                 let mut copies = Vec::with_capacity(items.len());
@@ -6320,23 +6906,26 @@ impl<'a> Interp<'a> {
                         if crate::builtins::is_builtin_routine(name) {
                             return self.call_builtin(name, values, *span, me);
                         }
-                        // The predefined `covers` (14.9) and `files`
-                        // (30.5) singletons are method receivers only:
-                        // their member calls dispatch here without an
-                        // instance value behind the receiver. A local or
-                        // field of the same name wins.
+                        // The predefined `covers` (14.9), `files` (30.5)
+                        // and `table_manager` (32.3) singletons are
+                        // method receivers only: their member calls
+                        // dispatch here without an instance value behind
+                        // the receiver. A local or field of the same
+                        // name wins.
                         if let Expr::Ident {
                             name: singleton, ..
                         } = object.as_ref()
-                            && (singleton == "covers" || singleton == "files")
+                            && (singleton == "covers"
+                                || singleton == "files"
+                                || singleton == "table_manager")
                             && !frame.locals.contains_key(singleton)
                             && !me
                                 .is_some_and(|index| self.instances[index].get(singleton).is_some())
                         {
-                            return if singleton == "covers" {
-                                self.call_covers_method(name, values, *span)
-                            } else {
-                                self.call_files_method(name, values, *span)
+                            return match singleton.as_str() {
+                                "covers" => self.call_covers_method(name, values, *span),
+                                "files" => self.call_files_method(name, values, *span),
+                                _ => self.call_table_manager_method(name, values, *span),
                             };
                         }
                         // The 27.4.17/27.4.20/27.5.4-27.5.6 aggregates
@@ -6424,6 +7013,14 @@ impl<'a> Interp<'a> {
                                         *span,
                                     )),
                                 }
+                            }
+                            // The 32.3 table API (T9.3): methods on a
+                            // table value and on a table_row value.
+                            Value::Table(table) => {
+                                self.call_table_value_method(table, name, values, *span)
+                            }
+                            Value::TableRow { table, row } => {
+                                self.call_table_row_value_method(table, row, name, values, *span)
                             }
                             // `to_string()` on scalars (the DAC macro
                             // shapes: `set.min().to_string()`).
@@ -8012,6 +8609,21 @@ impl<'a> Interp<'a> {
             // A port handle renders by its member name (clause 9); the
             // port's value is the `name$` bridge access, not this.
             Value::Port { name, .. } => format!("port {name}"),
+            // A table (32.3) renders by its shape; the rows read through
+            // `get_row(i).get_data(c)`.
+            Value::Table(table) => {
+                let table = table.borrow();
+                format!(
+                    "table(columns: {}, rows: {})",
+                    table.columns.len(),
+                    table.rows.len()
+                )
+            }
+            Value::TableRow { row, .. } => {
+                let row = row.borrow();
+                let cells: Vec<String> = row.cells.clone();
+                format!("[{}]", cells.join(", "))
+            }
             // Clause 5.4.4.4: `Value::Void` doubles as the null
             // reference — an interface-typed variable with no instance
             // prints NULL (T3.5). A struct-typed interface value prints
@@ -8030,6 +8642,8 @@ impl<'a> Interp<'a> {
             Value::Set(_) => "a set",
             Value::Object(_) => "an object",
             Value::Port { .. } => "a port",
+            Value::Table(_) => "a table",
+            Value::TableRow { .. } => "a table row",
             Value::Void => "void",
         }
     }
@@ -8046,6 +8660,42 @@ impl<'a> Interp<'a> {
 
 /// Bits of a width specification: the literal value, or the given default
 /// when the width is absent or not a literal. Capped at 64.
+/// A 1-based table column index against a width (the number of columns
+/// or cells): validated per 32.3's numbering — columns start at 1,
+/// column 0 is the row-index pseudo-column and is never a cell here.
+fn column_index(width: usize, column: i128, span: crate::ast::Span) -> Result<usize, Diagnostic> {
+    if column < 1 || column > width as i128 {
+        return Err(Diagnostic::new(
+            "E0404",
+            format!("table column index {column} out of range (1..{width})"),
+            span.0,
+            span.1,
+        ));
+    }
+    Ok(column as usize)
+}
+
+/// Insert a row handle at the 0-based position (shifting the rest down;
+/// `position == rows.len()` appends).
+fn insert_row_at(
+    table: &mut crate::tables::TableValue,
+    position: i128,
+    row: Rc<RefCell<crate::tables::TableRowValue>>,
+    span: crate::ast::Span,
+) -> Result<(), Diagnostic> {
+    let rows_len = table.rows.len();
+    if position < 0 || position > rows_len as i128 {
+        return Err(Diagnostic::new(
+            "E0404",
+            format!("table row insert position {position} out of range (0..={rows_len})"),
+            span.0,
+            span.1,
+        ));
+    }
+    table.rows.insert(position as usize, row);
+    Ok(())
+}
+
 fn width_bits(width: &Option<Box<Expr>>, default_bits: u32) -> u32 {
     match width.as_deref() {
         Some(Expr::IntLiteral { text, .. }) => parse_int_literal(text)

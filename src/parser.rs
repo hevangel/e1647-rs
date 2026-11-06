@@ -82,6 +82,7 @@ use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Position, Token, TokenKind};
 use crate::macros;
 use crate::preproc;
+use crate::tables;
 use std::collections::BTreeSet;
 
 /// Predefined e names that lex as keywords but appear as bare values or
@@ -219,10 +220,17 @@ pub struct ParseResult {
 pub fn parse(source: &str) -> ParseResult {
     let mut diagnostics = Vec::new();
     let tokens = match lexer::tokenize(source) {
-        // The clause 21 preprocessor (replacement rules) runs before the
-        // clause 15 macro expansion: preprocessor directives execute in
-        // a separate, earlier phase (Annex B.5.1's include order).
-        Ok(tokens) => macros::expand_macros(preproc::substitute_defines(tokens)),
+        // The pre-passes run in phase order: the clause 21 preprocessor
+        // (replacement rules) first, then the clause 26 table expansion
+        // (its row data may use defined names), then the clause 15
+        // macro expansion (a table body may invoke macros).
+        Ok(tokens) => {
+            let mut table_diagnostics = Vec::new();
+            let tokens =
+                tables::expand_tables(preproc::substitute_defines(tokens), &mut table_diagnostics);
+            diagnostics.extend(table_diagnostics);
+            macros::expand_macros(tokens)
+        }
         Err(err) => {
             let end = Position {
                 byte: err.position.byte + 1,
@@ -256,7 +264,14 @@ pub fn parse(source: &str) -> ParseResult {
 pub fn parse_unchecked(source: &str) -> ParseResult {
     let mut diagnostics = Vec::new();
     let tokens = match lexer::tokenize(source) {
-        Ok(tokens) => macros::expand_macros(preproc::substitute_defines(tokens)),
+        // The pre-passes run in phase order (see `parse`).
+        Ok(tokens) => {
+            let mut table_diagnostics = Vec::new();
+            let tokens =
+                tables::expand_tables(preproc::substitute_defines(tokens), &mut table_diagnostics);
+            diagnostics.extend(table_diagnostics);
+            macros::expand_macros(tokens)
+        }
         Err(err) => {
             let end = Position {
                 byte: err.position.byte + 1,
@@ -3449,6 +3464,22 @@ impl Parser {
                 if let Some(hash_statements) = self.parse_hash_statements() {
                     statements.extend(hash_statements);
                 }
+                continue;
+            }
+            // Clause 4.3.2's pure-syntax brace group in an action
+            // position: the group's statements splice into the enclosing
+            // list, the same rule the member list applies at 4.3.3 and
+            // the module level at 4.3.2. The table expansion (26.2)
+            // emits exactly this shape.
+            if self.at_punct("{") {
+                self.bump();
+                statements.extend(self.parse_statements());
+                if self.at_punct("}") {
+                    self.bump();
+                } else {
+                    self.error_here("E0107", "expected '}' to close the brace group");
+                }
+                self.eat_punct(";");
                 continue;
             }
             if let Some(statement) = self.parse_statement() {

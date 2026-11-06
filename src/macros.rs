@@ -468,6 +468,13 @@ pub fn expand_macros(tokens: Vec<Token>) -> Vec<Token> {
     current
 }
 
+/// The token-index end of the `define … ;` definition starting at
+/// `start['define']`, for the other pre-passes that must copy
+/// definitions verbatim. `None` when the shape is not a definition.
+pub(crate) fn definition_end_at(tokens: &[Token], start: usize) -> Option<usize> {
+    scan_one_definition(tokens, start).map(|definition| definition.end)
+}
+
 /// Scan for the definition token shape: `define` `<` name [`'` category]
 /// `>` "pattern" `as` [computed] `{` body `}` `;`.
 fn scan_definitions(tokens: &[Token]) -> Vec<ScannedMacro> {

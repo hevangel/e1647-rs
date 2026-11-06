@@ -13,7 +13,9 @@
 //! started TCMs concurrently (round-robin turns suspending at
 //! `wait`/`sync`), and quit-time `expect`/`assume` monitoring. The
 //! clause 21 preprocessor applies `#define` replacement rules as a
-//! token pre-pass ([`preproc`]). See docs/ROADMAP.md for what is
+//! token pre-pass ([`preproc`]), and the clause 26 `table … with { … }`
+//! construct expands as the pre-pass between it and the macro engine
+//! ([`tables`]). See docs/ROADMAP.md for what is
 //! deliberately not implemented yet.
 
 pub mod ast;
@@ -29,4 +31,5 @@ pub mod macros;
 pub mod parser;
 pub mod preproc;
 pub mod solve;
+pub mod tables;
 pub mod temporal;
