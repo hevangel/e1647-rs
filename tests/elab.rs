@@ -427,7 +427,11 @@ fn template_extension_arity_mismatch_is_reported_once() {
     assert_eq!(
         rendered,
         vec![
-            "4:17: error[E0304]: template extension 'box' declares 2 parameter(s) but template 'box' declares 1"
+            // E0304 is the static-members stage's code ("static member in
+            // when subtype"); this template-arity diagnostic takes the
+            // next free elaboration code (E0318) per the migration plan's
+            // collision rule.
+            "4:17: error[E0318]: template extension 'box' declares 2 parameter(s) but template 'box' declares 1"
         ]
     );
     // The instance still materializes without the extension's members.

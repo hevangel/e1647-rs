@@ -1,0 +1,1 @@
+3:18: error[E0212]: static const field 'c' requires an initial value (clause 6.9.4)

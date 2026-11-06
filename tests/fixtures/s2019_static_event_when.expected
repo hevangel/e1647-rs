@@ -1,0 +1,1 @@
+5:22: error[E0310]: static event 'ev' in when subtype (clause 11.1.4.1)

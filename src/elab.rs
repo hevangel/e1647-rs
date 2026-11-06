@@ -53,10 +53,20 @@
 //! conformance check (E0312) run in `check.rs` — the well-formedness pass,
 //! which the fixture contract sees; this module records what the checks
 //! and the interpreter consume.
+//! - `E0318` a template extension's parameter count differs from the
+//!   template declaration's (8.2; reported once per extension)
+//!
+//! The elaboration-range static-member codes of the 2019 migration
+//! (`E0304`–`E0309`, `E0310`) are raised from the well-formedness pass
+//! ([`crate::check`]) in this stage: the fixture harness and the CLI's
+//! `parse` command stop at parse + check, so the diagnostics must be
+//! visible there; the codes keep their plan allocation. The static
+//! member registries this module produces ([`Elaborated::static_fields`]
+//! and siblings) are the interpreter's static-storage keyspace.
 
 use crate::ast::{
-    Declaration, DeclarationKind, Enumeral, Expr, Field, KeepConstraint, Member, MethodDecl, Stmt,
-    WhenDecl,
+    Declaration, DeclarationKind, Enumeral, EventDecl, Expr, Field, KeepConstraint, Member,
+    MethodDecl, Stmt, WhenDecl,
 };
 use crate::diagnostic::Diagnostic;
 use std::collections::{BTreeMap, BTreeSet};
@@ -150,20 +160,43 @@ pub struct Elaborated {
     /// markers.
     pub sequences: Vec<SequenceInfo>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The static members (2019 static-members stage: clauses 6.9.3
+    /// fields, 17.2.2 methods, 11.1.4.1 events, 11.2 `on` blocks) by the
+    /// canonical name of the type that declares them — the base
+    /// declaration's name, or the extend target for an `extend T {
+    /// static ... }` member, so an extension adds to the same store the
+    /// declaration owns. Template-extension members are not folded in:
+    /// they apply per instance (8.2/8.3-NOTE-3), which a per-type
+    /// singleton contradicts (a documented gap). `when` blocks never
+    /// contribute — a static member there is rejected before elaboration
+    /// (E0304/E0310 at the well-formedness pass). The interpreter keys
+    /// its static store and its `Type::member` resolution by these names;
+    /// the well-formedness pass builds its own view of the same
+    /// namespace straight from the declarations.
+    pub static_fields: BTreeMap<String, Vec<Field>>,
+    pub static_methods: BTreeMap<String, Vec<MethodDecl>>,
+    pub static_events: BTreeMap<String, Vec<EventDecl>>,
+    /// Every static-context `on` block: `static on <event>` keyed by its
+    /// declaring type, and `on Type::event` keyed by the type that
+    /// declares the block (the interpreter matches the latter by the
+    /// block's `type_qualified` target instead).
+    pub static_ons: BTreeMap<String, Vec<crate::ast::OnDecl>>,
 }
 
 /// One type's members, tagged with the declaration or extend block that
-/// contributed them (its index in the declaration slice).
+/// contributed them (its index in the declaration slice). Events and
+/// `on` blocks carry the block index too — the static-member
+/// registries need the declaring type.
 #[derive(Debug, Default)]
 struct Composed<'a> {
     fields: Vec<(&'a Field, usize)>,
     constraints: Vec<&'a KeepConstraint>,
     methods: Vec<(&'a MethodDecl, usize)>,
     whens: Vec<&'a WhenDecl>,
-    ons: Vec<&'a crate::ast::OnDecl>,
+    ons: Vec<(&'a crate::ast::OnDecl, usize)>,
     covers: Vec<&'a crate::ast::CoverGroupDecl>,
     expects: Vec<&'a crate::ast::ExpectDecl>,
-    events: Vec<&'a crate::ast::EventDecl>,
+    events: Vec<(&'a crate::ast::EventDecl, usize)>,
     ports: Vec<(&'a crate::ast::PortDecl, usize)>,
     /// The `implementing` clause composed across the like chain and the
     /// extend blocks (clause 6.3), deduped in written order.
@@ -245,11 +278,15 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                         .map(|(method, _)| method.clone())
                         .collect(),
                     whens: composed.whens.into_iter().cloned().collect(),
-                    ons: composed.ons.into_iter().cloned().collect(),
+                    ons: composed.ons.into_iter().map(|(on, _)| on.clone()).collect(),
                     covers: composed.covers.into_iter().cloned().collect(),
                     expects: composed.expects.into_iter().cloned().collect(),
                     when_of: Vec::new(),
-                    events: composed.events.into_iter().cloned().collect(),
+                    events: composed
+                        .events
+                        .into_iter()
+                        .map(|(event, _)| event.clone())
+                        .collect(),
                     underlying: None,
                     enumerals: Vec::new(),
                     ports: composed
@@ -503,7 +540,8 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         for (method, _) in composed.methods {
             methods.push(substitute_method(method.clone(), &bindings, &mut queue));
         }
-        let mut ons: Vec<crate::ast::OnDecl> = composed.ons.into_iter().cloned().collect();
+        let mut ons: Vec<crate::ast::OnDecl> =
+            composed.ons.into_iter().map(|(on, _)| on.clone()).collect();
         for on in &mut ons {
             substitute_statements(&mut on.body, &bindings, &mut queue);
         }
@@ -527,7 +565,12 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 if reported_extension_arity.insert(extension_index) {
                     let (start, end) = extension.name_span;
                     elaborator.diagnostics.push(Diagnostic::new(
-                        "E0304",
+                        // E0304 is allocated to the static-members stage
+                        // ("static member in when subtype"); this
+                        // template-arity mismatch predates that
+                        // allocation and takes the next free elaboration
+                        // code (the migration plan's collision rule).
+                        "E0318",
                         format!(
                             "template extension '{}' declares {} parameter(s) but template '{}' declares {}",
                             extension.name,
@@ -675,6 +718,84 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         defines,
         sequences,
         diagnostics: elaborator.diagnostics,
+        static_fields: static_registry(declarations),
+        static_methods: static_registry(declarations),
+        static_events: static_registry(declarations),
+        static_ons: static_registry(declarations),
+    }
+}
+
+/// The static-member registries (see [`Elaborated`]'s fields): one
+/// shared collection walk keyed by the declaring type's canonical name.
+/// Members are collected in declaration order — base declaration first,
+/// then each extend block in source order — which is the order the
+/// interpreter composes static `on` blocks and static method bodies in.
+fn static_registry<K: RegistryKind>(declarations: &[Declaration]) -> BTreeMap<String, Vec<K>> {
+    let mut registry: BTreeMap<String, Vec<K>> = BTreeMap::new();
+    for declaration in declarations {
+        // Only struct/unit declarations and the extend blocks that
+        // target them contribute; a `type` declaration has no members of
+        // these kinds, and a template extension applies per instance
+        // (8.2/8.3-NOTE-3), never to the type's static store.
+        if !matches!(
+            declaration.kind,
+            DeclarationKind::Struct | DeclarationKind::Unit | DeclarationKind::Extend
+        ) || declaration.template_extend
+        {
+            continue;
+        }
+        for member in &declaration.members {
+            if let Some(entry) = K::from_member(member) {
+                registry
+                    .entry(declaration.name.clone())
+                    .or_default()
+                    .push(entry);
+            }
+        }
+    }
+    registry
+}
+
+/// One static-registry value kind extracted from a member.
+trait RegistryKind: Sized {
+    fn from_member(member: &Member) -> Option<Self>;
+}
+
+impl RegistryKind for Field {
+    fn from_member(member: &Member) -> Option<Self> {
+        match member {
+            Member::Field(field) if field.is_static => Some(field.clone()),
+            _ => None,
+        }
+    }
+}
+
+impl RegistryKind for MethodDecl {
+    fn from_member(member: &Member) -> Option<Self> {
+        match member {
+            Member::Method(method) if method.is_static => Some(method.clone()),
+            _ => None,
+        }
+    }
+}
+
+impl RegistryKind for crate::ast::EventDecl {
+    fn from_member(member: &Member) -> Option<Self> {
+        match member {
+            Member::Event(event) if event.is_static => Some(event.clone()),
+            _ => None,
+        }
+    }
+}
+
+impl RegistryKind for crate::ast::OnDecl {
+    fn from_member(member: &Member) -> Option<Self> {
+        match member {
+            // Both static forms of clause 11.2 are static-context blocks:
+            // `static on <event>` and the type-qualified `on Type::event`.
+            Member::On(on) if on.is_static || on.type_qualified.is_some() => Some(on.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -759,11 +880,15 @@ impl<'a> Elaborator<'a> {
                     .map(|(method, _)| method.clone())
                     .collect(),
                 whens: composed.whens.into_iter().cloned().collect(),
-                ons: composed.ons.into_iter().cloned().collect(),
+                ons: composed.ons.into_iter().map(|(on, _)| on.clone()).collect(),
                 covers: composed.covers.into_iter().cloned().collect(),
                 expects: composed.expects.into_iter().cloned().collect(),
                 when_of: Vec::new(),
-                events: composed.events.into_iter().cloned().collect(),
+                events: composed
+                    .events
+                    .into_iter()
+                    .map(|(event, _)| event.clone())
+                    .collect(),
                 underlying: None,
                 enumerals: Vec::new(),
                 ports: composed
@@ -902,11 +1027,11 @@ impl<'a> Elaborator<'a> {
                 Member::Constraint(constraint) => composed.constraints.push(constraint),
                 Member::Method(method) => composed.methods.push((method, block)),
                 Member::When(when) => composed.whens.push(when),
-                Member::On(on) => composed.ons.push(on),
+                Member::On(on) => composed.ons.push((on, block)),
                 Member::Cover(cover) => composed.covers.push(cover),
                 Member::Expect(expect) => composed.expects.push(expect),
                 Member::Port(port) => composed.ports.push((port, block)),
-                Member::Event(event) => composed.events.push(event),
+                Member::Event(event) => composed.events.push((event, block)),
                 Member::Import { .. } | Member::Define { .. } | Member::Macro(_) => {}
                 Member::Enumeral(_) => {}
             }

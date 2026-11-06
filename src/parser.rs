@@ -3,12 +3,13 @@
 //! Supported: `struct` / `unit` / `extend` / `type` declarations with
 //! optional `like` inheritance, field declarations (single names and `a, b:`
 //! name groups) with the clause 6.9.1 prefix set (`package`/`protected`/
-//! `private` visibility, `const`, `!`, `~`, `%` — the contextual `static`
-//! prefix is a later stage), scalar (`uint(bits: 8)`-style widths included),
-//! `list of`, and named types, field init values (`= init-value`, clause
-//! 6.9.1/6.9.2), enumeral type declarations, `keep` and `keep soft`
-//! constraint expressions, `when` subtype members (`value'id` modifiers per
-//! the reference grammar's `struct_type_modifier`), and method members with
+//! `private` visibility, `const`, `!`, `~`, `%` and the contextual `static`
+//! prefix — clause 6.9.3 fields, 17.2.2 methods, 11.1.4.1 events, 11.2 `on`
+//! blocks), scalar (`uint(bits: 8)`-style widths included), `list of`, and
+//! named types, field init values (`= init-value`, clause 6.9.1/6.9.2),
+//! enumeral type declarations, `keep` and `keep soft` constraint
+//! expressions, `when` subtype members (`value'id` modifiers per the
+//! reference grammar's `struct_type_modifier`), and method members with
 //! parameter lists and statement bodies (local `var` declarations,
 //! assignments, expression statements including calls and indexing,
 //! `return`, braced `if`/`else`, `while` with `break`/`continue`, `print`
@@ -16,11 +17,13 @@
 //! whose members are body-less method signatures, and the `implementing
 //! I1, I2, ...` clause on structs, units and extends (clause 6.3) — both
 //! recorded on the AST; the interface well-formedness rules are checked
-//! in [`crate::check`]. Brace grouping is pure syntax (clause 4.3.2 module
-//! level, 4.3.3 member lists): a bare `{ ... }` splices its contents into
-//! the enclosing list, and groups nest. A statement (or member) may also
-//! span code segments (clause 4.2.3): the lexer skips prose between `'>`
-//! and `<'`, so the parser sees one continuous token stream.
+//! in [`crate::check`]. The static access `Type::member` (clause 4.17.4)
+//! parses in expression position and in `on`/`emit` targets. Brace
+//! grouping is pure syntax (clause 4.3.2 module level, 4.3.3 member
+//! lists): a bare `{ ... }` splices its contents into the enclosing
+//! list, and groups nest. A statement (or member) may also span code
+//! segments (clause 4.2.3): the lexer skips prose between `'>` and `<'`,
+//! so the parser sees one continuous token stream.
 //!
 //! Everything else (events, temporal expressions, coverage, the
 //! single-statement `if ... do` form, `for`/`repeat` loops) is a later
@@ -119,7 +122,8 @@ fn is_predefined_name(word: &str) -> bool {
 /// Binary operator rows of IEEE 1647-2019 Table 12 (clause 4.6), loosest
 /// first to match the parse order. The full table, tightest binding
 /// first: `[]`/`[..]`/`[:]` indexing, slicing and bit slicing · `f()`
-/// calls · `::` static access (a later phase) · `.` dot · unary `~ ! not` ·
+/// calls · `::` static access (clause 4.17.4; a prefix-level construct
+/// parsed in [`Parser::parse_primary`], not a binary row) · `.` dot · unary `~ ! not` ·
 /// `{...;...}` list concatenation · `%{...}` bit concatenation · unary
 /// `+ -` · `* / %` · binary `+ -` · `>> <<` · `< <= > >=` ·
 /// `is [not] a` · `== != list_ptr== !list_ptr=` · `=== !==` · `~ !~`
@@ -305,6 +309,13 @@ struct Parser {
     /// `package` / `private` visibility prefix of the member being
     /// parsed (clause 22), recorded on the field, not enforced.
     member_visibility: Option<String>,
+    /// Whether the member being parsed carries the contextual `static`
+    /// prefix (clause 6.9.3 fields, 17.2.2 methods, 11.1.4.1 events,
+    /// 11.2 `on` blocks). Set by the `static` dispatch arm of
+    /// [`Parser::parse_member`], read by the member parsers, cleared
+    /// after the member completes — the same flow as
+    /// `member_visibility`.
+    member_static: bool,
     /// Nesting depth of bare `{ ... }` statement groups at module level
     /// (clause 4.3.2). A group is pure syntax — its contents splice into
     /// the enclosing top-level list — so the group's braces are consumed
@@ -339,6 +350,7 @@ impl Parser {
             diagnostics: Vec::new(),
             defined: BTreeSet::new(),
             member_visibility: None,
+            member_static: false,
             module_group_depth: 0,
             interface_body: false,
         }
@@ -831,6 +843,7 @@ impl Parser {
                         name: "item_done".to_owned(),
                         name_span: (start, start),
                         trigger: None,
+                        is_static: false,
                         span: (start, end),
                     }),
                     Member::Method(crate::ast::MethodDecl {
@@ -843,6 +856,7 @@ impl Parser {
                         }),
                         tcm_event: None,
                         modifier: None,
+                        is_static: false,
                         body: Vec::new(),
                         span: (start, end),
                     }),
@@ -1478,24 +1492,18 @@ impl Parser {
             self.member_visibility = None;
             return members;
         }
-        // The contextual `static` member prefix (clause 6.9.3) is not
-        // parsed into the AST yet: static fields are per-type singletons
-        // with their own storage and access rules, which the
-        // static-members stage (plan T2.1) owns. A `static`-prefixed
-        // member shape (`static x: uint;`, `static const n: int = 0;`,
-        // `static !l: string;`) is therefore rejected here with an
-        // explicit not-supported diagnostic instead of the misleading
-        // "expected ':'" that would follow otherwise. A field or method
-        // genuinely named `static` (`static: uint;`, `static() is { … }`,
-        // the name group `static, x: uint;`) keeps its existing handling:
-        // the prefix trigger requires a prefix token or a following name.
+        // The contextual `static` member prefix (clause 6.9.3 fields,
+        // 17.2.2 methods, 11.1.4.1 events, 11.2 `on` blocks): `static`
+        // followed by a member declarator prefixes that member —
+        // `static x: uint;`, `static const n: int = 0;`, `static !l:
+        // string = "x";`, `static f() is { ... };`, `static event e;`,
+        // `static on e { ... };`. A field or method genuinely named
+        // `static` (`static: uint;`, `static() is { … }`, the name group
+        // `static, x: uint;`) keeps its existing handling: the prefix
+        // trigger requires a prefix token or a following name.
         if self.peek_word_is("static") && self.peek_second_starts_member_declarator() {
-            self.error_here(
-                "E0113",
-                "static member declarations are not supported yet (clause 6.9.3; static fields and methods are a planned stage)",
-            );
-            self.recover_to_member_boundary();
-            return None;
+            self.bump(); // 'static'
+            return self.parse_static_prefixed_member();
         }
         match self.peek_kind() {
             Some(TokenKind::Keyword(k)) if k == "import" => self.parse_import(),
@@ -1679,15 +1687,57 @@ impl Parser {
     }
 
     /// Whether the token after the current one can start the declarator
-    /// of a `static`-prefixed member: the `const` prefix or one of the
-    /// `!` / `~` / `%` field prefixes, or the member name itself. A
-    /// following `:`, `,`, `(` or `is` leaves the member to the regular
-    /// field/method paths (a member genuinely named `static`).
+    /// of a `static`-prefixed member: the `const` prefix, the `event` /
+    /// `on` / `method` member keywords, one of the `!` / `~` / `%` field
+    /// prefixes, or the member name itself. A following `:`, `,`, `(` or
+    /// `is` leaves the member to the regular field/method paths (a
+    /// member genuinely named `static`).
     fn peek_second_starts_member_declarator(&self) -> bool {
         matches!(
             self.peek_second_kind(),
             Some(TokenKind::Punctuation(p)) if p == "!" || p == "~" || p == "%"
         ) || matches!(self.peek_second_kind(), Some(TokenKind::Identifier(_)))
+            || matches!(
+                self.peek_second_kind(),
+                Some(TokenKind::Keyword(k))
+                    if k == "const" || k == "event" || k == "on" || k == "method"
+            )
+    }
+
+    /// The member after a consumed contextual `static` prefix (called
+    /// with the cursor at the declarator). The member kind follows the
+    /// declarator: `on`/`event`/`method` keywords keep their member
+    /// parsers (now static-flagged), an identifier followed by `(` is a
+    /// static method, and everything else is a field declaration (the
+    /// `const`/`!`/`~`/`%` prefixes included).
+    fn parse_static_prefixed_member(&mut self) -> Option<Vec<Member>> {
+        self.member_static = true;
+        let members = if self.at_keyword("on") {
+            self.parse_on().map(|o| vec![Member::On(o)])
+        } else if self.at_keyword("event") {
+            self.parse_event().map(|e| vec![e])
+        } else if self.at_keyword("method") {
+            self.parse_method().map(|m| vec![m])
+        } else if matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == "(")
+            && self.at_identifier()
+        {
+            self.parse_method().map(|m| vec![m])
+        } else if self.at_identifier()
+            || self.at_keyword("const")
+            || matches!(self.peek_kind(), Some(TokenKind::Punctuation(p)) if p == "!" || p == "~" || p == "%" || p == "!~")
+        {
+            self.parse_fields()
+        } else {
+            self.error_here(
+                "E0104",
+                "expected a field, method, event or 'on' declaration after 'static'",
+            );
+            self.member_static = false;
+            self.recover_to_member_boundary();
+            return None;
+        };
+        self.member_static = false;
+        members
     }
 
     /// Collect the raw tokens up to and including the `}` matching the
@@ -2116,12 +2166,23 @@ impl Parser {
         let start = self.current_span().0;
         self.bump(); // 'on'
         let (segment, _) = self.expect_identifier("E0102", "expected an event name after 'on'")?;
-        let mut path = vec![segment];
-        while self.eat_punct(".") {
-            let (segment, _) =
-                self.expect_identifier("E0102", "expected a path segment after '.'")?;
-            path.push(segment);
-        }
+        // `on Type::event { ... }` — the type-qualified form (clause
+        // 11.2) naming a static event of another struct; the block is
+        // static context (no `me`), like the `static on` form.
+        let (type_qualified, path) = if self.at_punct("::") {
+            self.bump();
+            let (event, _) =
+                self.expect_identifier("E0102", "expected an event name after '::'")?;
+            (Some(segment), vec![event])
+        } else {
+            let mut path = vec![segment];
+            while self.eat_punct(".") {
+                let (segment, _) =
+                    self.expect_identifier("E0102", "expected a path segment after '.'")?;
+                path.push(segment);
+            }
+            (None, path)
+        };
         self.expect_punct("{", "E0106", "expected '{' to open the 'on' body")?;
         let body = self.parse_statements();
         self.expect_punct("}", "E0107", "expected '}' to close the 'on' body")?;
@@ -2129,6 +2190,8 @@ impl Parser {
         let end = self.last_end();
         Some(OnDecl {
             path,
+            is_static: self.member_static,
+            type_qualified,
             body,
             span: (start, end),
         })
@@ -2390,8 +2453,9 @@ impl Parser {
     /// `name, name: type [= init];` — a name group declares one field per
     /// name, with the shared prefixes, type and init value (clause 6.9.1:
     /// `[package|protected|private] [static] [const] [!|~] [%] name[: type]
-    /// [[lo..hi]] [((bits|bytes): n)] [= init-value]`; `static` is
-    /// rejected earlier in `parse_member`).
+    /// [[lo..hi]] [((bits|bytes): n)] [= init-value]`; the contextual
+    /// `static` prefix (clause 6.9.3) is consumed by `parse_member` and
+    /// reaches the fields through `member_static`).
     fn parse_fields(&mut self) -> Option<Vec<Member>> {
         // `const` prefix (clause 6.9.4). The word is contextual, so it is
         // only a prefix when a prefix token or the name follows it — a
@@ -2468,6 +2532,7 @@ impl Parser {
                             no_gen: false,
                             range_gen: false,
                             is_const: false,
+                            is_static: self.member_static,
                             init: None,
                             visibility: self.member_visibility.clone(),
                         })
@@ -2510,6 +2575,7 @@ impl Parser {
                         no_gen,
                         range_gen,
                         is_const,
+                        is_static: self.member_static,
                         init: init.clone(),
                         visibility: self.member_visibility.clone(),
                     })
@@ -2519,6 +2585,12 @@ impl Parser {
     }
 
     /// `name(params): return_type is [also|first|only] { statements };`
+    /// — or, after a consumed contextual `static` prefix, the static
+    /// form `static name(params) ...` (clause 17.2.2): the flag comes
+    /// from `member_static`. The static method's restrictions (`me`
+    /// and the generation/check/message actions are not usable; not a
+    /// TCM; extension only in the declaring struct) are the
+    /// well-formedness pass's and elaboration's business.
     fn parse_method(&mut self) -> Option<Member> {
         let start = self.current_span().0;
         // Optional explicit `method` keyword (`method name() is { .. }`).
@@ -2616,6 +2688,7 @@ impl Parser {
                 return_type,
                 tcm_event,
                 modifier,
+                is_static: self.member_static,
                 body: Vec::new(),
                 span: (start, end),
             }));
@@ -2636,6 +2709,7 @@ impl Parser {
             return_type,
             tcm_event,
             modifier,
+            is_static: self.member_static,
             body,
             span: (start, end),
         }))
@@ -2774,6 +2848,9 @@ impl Parser {
             name,
             name_span,
             trigger,
+            // `static event name;` (clause 11.1.4.1): the event of the
+            // type itself, emitted as `Type::name`.
+            is_static: self.member_static,
             span: (start, end),
         }))
     }
@@ -4529,6 +4606,26 @@ impl Parser {
             }
             Some(TokenKind::Identifier(_)) => {
                 let (name, _) = self.take_identifier();
+                // `Type::member` — the static access (clause 4.17.4):
+                // `::` after a type name in expression position. One
+                // construct covers the static field value, the static
+                // method call (the access in a call's callee position)
+                // and the static event (`emit`/`on` targets). A path may
+                // start here and continue through non-static fields, so
+                // the access joins the postfix chain.
+                if self.at_punct("::") {
+                    self.bump();
+                    let (member, member_span) =
+                        self.expect_identifier("E0102", "expected a member name after '::'")?;
+                    let end = self.last_end();
+                    let access = Expr::StaticAccess {
+                        type_name: name,
+                        member,
+                        member_span,
+                        span: (start, end),
+                    };
+                    return self.parse_postfix_chain(access, start);
+                }
                 let expr = Expr::Ident {
                     name,
                     span: (start, end),

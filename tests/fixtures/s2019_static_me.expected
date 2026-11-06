@@ -1,0 +1,1 @@
+4:13: error[E0215]: 'me' cannot be used in a static context — static method 'f' has no instance (clause 17.2.2)

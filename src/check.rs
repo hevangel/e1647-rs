@@ -25,8 +25,11 @@
 //!   method parameter or a literal)
 //! - `E0209` `typeof_item()` of a type that is not a list (clause 5.9)
 //! - `E0211` a field init value on a generated field (clause 6.9.1: an
-//!   init value requires `!`, `const`, or — in the later static-members
-//!   stage — `static`)
+//!   init value requires `!`, `const`, or `static` — a static field's
+//!   value is created at declaration, not generated)
+//! - `E0212` a `static const` field without an init value (clause
+//!   6.9.4: a const field is initialised once; a static field's one
+//!   initialisation is the declaration's init value)
 //! - `E0213` the `!` and `~` field prefixes combined (clause 6.9.1: a
 //!   field is either do-not-generate or range-generated, never both)
 //! - `E0214` a range-generated (`~`) field declared `const` (clause
@@ -46,11 +49,48 @@
 //!   struct does not implement (clause 5.4.4.4: the automatic cast
 //!   requires conformance) — checked for the `var x: I = new S;` and
 //!   `x = new S;` shapes, the ones whose static types this pass knows
+//! - `E0215` `me`/`self` used inside a static method (clause 17.2.2: a
+//!   static method has no instance; the same rule covers the static
+//!   `on` forms of clause 11.2)
+//! - `E0216` a generation/check/message action (`gen`, `check that`,
+//!   `dut_error`/`dut_errorf`, `message`/`messagef`) inside a static
+//!   method (clauses 10.6.2, 16.3.2.1, 16.3.3, 16.3.4, 24.4.1; the
+//!   same restriction applies in the static `on` forms)
+//! - `E0217` reserved ("static method 'f' can only be extended in the
+//!   struct that declares it" is reported as `E0309`, see below)
+//! - `E0218` a keyed-list key that is a static field or of list/set
+//!   type (clause 5.2.11; a struct-typed key may contain static
+//!   fields)
 //!
-//! `E0212` ("a `static const` field requires an init value", clause
-//! 6.9.4) is reserved for the static-members stage, which owns the
-//! contextual `static` prefix; static-prefixed members are rejected
-//! earlier, by the parser.
+//! Further static-member restrictions of the 2019 static-members stage
+//! (IEEE 1647-2019 clauses 4.17.4, 6.9.3, 7.2.2, 7.2.4, 17.2.4) are
+//! raised from this pass under their elaboration-range codes — the
+//! check range `E0207`–`E0219` was exhausted when they were allocated —
+//! and the fixture harness and the CLI's `parse` command stop at parse
+//! + check, so the diagnostics must be visible from this pass; the
+//!   codes keep their plan allocation:
+//!
+//! - `E0304` a static field, static method or static-context `on`
+//!   block declared inside a `when` subtype (clauses 6.9.3, 17.2.2,
+//!   11.2: a static member belongs to the type itself, and a `when`
+//!   subtype is not a type of its own)
+//! - `E0305` a static field declared physical (`%`) or
+//!   range-generated (`~`) (clause 6.9.3: a static field's one value
+//!   is neither packed nor generated per instance)
+//! - `E0306` a static field of unit-instance type, or a list of unit
+//!   instances (clauses 6.9.3, 7.2.2, 7.2.4: a unit instance belongs
+//!   to its parent instance)
+//! - `E0307` `Type::member` where `member` is not a static member
+//!   declared in exactly `Type` (clause 4.17.4: not a parent's, and a
+//!   plain instance member does not qualify either)
+//! - `E0309` a static method extended (`is also`/`is first`/`is
+//!   only`) outside the struct that declares it (clause 17.2.4)
+//! - `E0310` a static event declared inside a `when` subtype (clause
+//!   11.1.4.1; the dedicated code the plan reserves for it)
+//!
+//! `E0308` ("static member cannot be added to 'global'") stays
+//! reserved and is unreachable in this implementation: `extend global`
+//! is rejected earlier, by the parser (`E0116`, clause 4.4.2.2).
 //!
 //! Fields, methods and constraints are collected through `when` subtype
 //! members as well. A `keep` constraint sees every field of the enclosing
@@ -129,6 +169,17 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             }
         });
     }
+    // The declaration-kind map of the unit-instance-type restriction
+    // (E0306): which named types are `unit` declarations.
+    let kinds: BTreeMap<&str, DeclarationKind> = declarations
+        .iter()
+        .filter(|declaration| declaration.kind != DeclarationKind::Extend)
+        .map(|declaration| (declaration.name.as_str(), declaration.kind))
+        .collect();
+    // The static-member namespace a `Type::member` access resolves
+    // against (T2.1–T2.3): per type name, the static fields, methods
+    // and events its base declaration and `extend` blocks declare.
+    let static_members = static_member_names(declarations);
     // The `typeof()` resolution scope (5.9): every declaration's fields
     // by name, so a member path (`typeof(x.n)`) resolves through the
     // named type's field table. `when`-declared fields contribute too.
@@ -158,15 +209,26 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
                 &mut diagnostics,
             );
         }
-        check_fields(declaration, &declared, &struct_fields, &mut diagnostics);
+        check_fields(
+            declaration,
+            &declared,
+            &struct_fields,
+            declarations,
+            &kinds,
+            &static_members,
+            &mut diagnostics,
+        );
         check_enumerals(declaration, &mut diagnostics);
         check_methods(
             declaration,
             &declared,
             &struct_fields,
             &iface,
+            &static_members,
             &mut diagnostics,
         );
+        check_static_members_in_whens(declaration, &mut diagnostics);
+        check_static_method_extensions(declaration, declarations, &mut diagnostics);
         for_each_on(&declaration.members, &mut |on| {
             let mut seen: BTreeSet<&str> = BTreeSet::new();
             let mut own_fields: BTreeMap<&str, &TypeExpr> = BTreeMap::new();
@@ -192,6 +254,14 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             // time-consuming actions or TCMs" — wait/sync/start/compute
             // at any depth of the block are rejected.
             check_on_body_time_consumption(&on.body, &on.path.join("."), &mut diagnostics);
+            // The static `on` forms (`static on <event>`, `on
+            // Type::event`) run with no instance: the static-context
+            // restrictions of T2.2 apply, and every `Type::member`
+            // access is validated.
+            if on.is_static || on.type_qualified.is_some() {
+                check_static_context_rules(&on.body, "a static 'on' block", &mut diagnostics);
+            }
+            check_body_static_accesses(&on.body, &static_members, &mut diagnostics);
         });
         if declaration.kind != DeclarationKind::Extend {
             let mut field_names: BTreeSet<&str> = BTreeSet::new();
@@ -200,6 +270,7 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             });
             for_each_constraint(&declaration.members, &mut |constraint| {
                 check_constraint_fields(constraint, &field_names, &enumerals, &mut diagnostics);
+                check_expr_static_accesses(&constraint.expr, &static_members, &mut diagnostics);
             });
         }
     }
@@ -569,6 +640,9 @@ fn check_fields(
     declaration: &Declaration,
     declared: &BTreeSet<&str>,
     struct_fields: &BTreeMap<&str, Vec<(&str, &TypeExpr)>>,
+    declarations: &[Declaration],
+    kinds: &BTreeMap<&str, DeclarationKind>,
+    static_members: &BTreeMap<&str, StaticNames>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     // Field names may repeat across `when` branches (each subtype variant
@@ -613,6 +687,11 @@ fn check_fields(
             check_width(width, diagnostics);
         }
         check_field_prefixes(field, diagnostics);
+        check_unit_instance_static_field(field, kinds, diagnostics);
+        check_keyed_list_key(&field.ty, declarations, diagnostics);
+        if let Some(init) = &field.init {
+            check_expr_static_accesses(init, static_members, diagnostics);
+        }
     });
 }
 
@@ -626,11 +705,17 @@ fn check_fields(
 ///   `~` field's reduced set is produced per generation (clause 6.9.4,
 ///   6.9.7).
 /// - An init value is not allowed on a generated field (`E0211`): a
-///   field without `!` (and without `const`; `static` is the later
-///   static-members stage) has its value produced by `gen`, so a
-///   written initial value would never survive. The diagnostic points
-///   at the init expression. A `~` field is generated too, so the same
-///   rule covers it.
+///   field without `!`, `const` or `static` has its value produced by
+///   `gen`, so a written initial value would never survive. The
+///   diagnostic points at the init expression. A `~` field is generated
+///   too, so the same rule covers it. A `static` field is exempt: its
+///   one shared value is created at the declaration (clause 6.9.3).
+/// - A `static const` field requires that init value (`E0212`, clause
+///   6.9.4): a const field is initialised once, and for a static field
+///   that one initialisation is the declaration's.
+/// - A static field is neither physical nor range-generated (`E0305`,
+///   clause 6.9.3): there is one shared value, not one per instance to
+///   pack or generate.
 fn check_field_prefixes(field: &Field, diagnostics: &mut Vec<Diagnostic>) {
     if field.no_gen && field.range_gen {
         diagnostics.push(Diagnostic::new(
@@ -657,6 +742,7 @@ fn check_field_prefixes(field: &Field, diagnostics: &mut Vec<Diagnostic>) {
     if let Some(init) = &field.init
         && !field.no_gen
         && !field.is_const
+        && !field.is_static
     {
         let span = init.span();
         diagnostics.push(Diagnostic::new(
@@ -668,6 +754,70 @@ fn check_field_prefixes(field: &Field, diagnostics: &mut Vec<Diagnostic>) {
             span.0,
             span.1,
         ));
+    }
+    if field.is_static && field.is_const && field.init.is_none() {
+        diagnostics.push(Diagnostic::new(
+            "E0212",
+            format!(
+                "static const field '{}' requires an initial value (clause 6.9.4)",
+                field.name
+            ),
+            field.name_span.0,
+            field.name_span.1,
+        ));
+    }
+    if field.is_static && (field.physical || field.range_gen) {
+        diagnostics.push(Diagnostic::new(
+            "E0305",
+            format!(
+                "static field '{}' cannot be physical or generated (clause 6.9.3)",
+                field.name
+            ),
+            field.name_span.0,
+            field.name_span.1,
+        ));
+    }
+}
+
+/// A static field is not a unit instance and not a list of unit
+/// instances (clauses 6.9.3, 7.2.2, 7.2.4): a unit instance belongs to
+/// its parent instance, while a static field's one occurrence belongs
+/// to the type and exists with zero instances (`E0306`).
+fn check_unit_instance_static_field(
+    field: &Field,
+    kinds: &BTreeMap<&str, DeclarationKind>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !field.is_static {
+        return;
+    }
+    if let Some(unit_name) = unit_instance_type(&field.ty, kinds) {
+        diagnostics.push(Diagnostic::new(
+            "E0306",
+            format!(
+                "static field '{}' of unit-instance type '{}' is not allowed (clause 6.9.3; 7.2.2, 7.2.4)",
+                field.name, unit_name
+            ),
+            field.name_span.0,
+            field.name_span.1,
+        ));
+    }
+}
+
+/// The unit-instance type a type expression denotes, if any: a named
+/// `unit` (or a builtin unit such as `sys`), through a when-qualified
+/// spelling, or as a list element.
+fn unit_instance_type(ty: &TypeExpr, kinds: &BTreeMap<&str, DeclarationKind>) -> Option<String> {
+    match ty {
+        TypeExpr::Named { name, .. }
+            if kinds.get(name.as_str()) == Some(&DeclarationKind::Unit)
+                || crate::builtins::is_builtin_unit(name) =>
+        {
+            Some(name.clone())
+        }
+        TypeExpr::WhenQualified { base, .. } => unit_instance_type(base, kinds),
+        TypeExpr::List { element, .. } => unit_instance_type(element, kinds),
+        _ => None,
     }
 }
 
@@ -700,6 +850,7 @@ fn check_methods(
     declared: &BTreeSet<&str>,
     struct_fields: &BTreeMap<&str, Vec<(&str, &TypeExpr)>>,
     iface: &IfaceCtx,
+    static_members: &BTreeMap<&str, StaticNames>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     // The declaration's own fields join every method's `typeof()` scope
@@ -754,7 +905,465 @@ fn check_methods(
             &method.name,
             diagnostics,
         );
+        // T2.2: a static method has no instance — `me`/`self` and the
+        // generation/check/message actions are not usable in it — and
+        // every `Type::member` access is validated (T2.1).
+        if method.is_static {
+            check_static_context_rules(
+                &method.body,
+                &format!("static method '{}'", method.name),
+                diagnostics,
+            );
+        }
+        check_body_static_accesses(&method.body, static_members, diagnostics);
     });
+}
+
+/// The static-context restrictions (T2.2, T2.3): `me`/`self` (E0215)
+/// and the generation/check/message actions (E0216) are not usable
+/// where there is no instance — a static method, or the static `on`
+/// forms of clause 11.2. `context` names the enclosing static context
+/// for the messages.
+fn check_static_context_rules(
+    statements: &[Stmt],
+    context: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // `gen` and `check that` are statements; the rest are routine
+    // calls found in the expression walk below.
+    check_static_context_statements(statements, context, diagnostics);
+    for_each_stmt_exprs(statements, &mut |expr| match expr {
+        Expr::Ident { name, span } if name == "me" || name == "self" => {
+            diagnostics.push(Diagnostic::new(
+                "E0215",
+                format!(
+                    "'me' cannot be used in a static context — {context} has no instance (clause 17.2.2)"
+                ),
+                span.0,
+                span.1,
+            ));
+        }
+        Expr::Call { callee, .. } => {
+            if let Expr::Ident { name, span } = callee.as_ref() {
+                let action = match name.as_str() {
+                    "dut_error" => Some(("dut_error", "16.3.3")),
+                    "dut_errorf" => Some(("dut_errorf", "16.3.4")),
+                    "message" => Some(("message", "24.4.1")),
+                    "messagef" => Some(("messagef", "24.4.1")),
+                    _ => None,
+                };
+                if let Some((action, clause)) = action {
+                    diagnostics.push(Diagnostic::new(
+                        "E0216",
+                        format!(
+                            "'{action}' is not allowed in a static context — {context} (clause {clause})"
+                        ),
+                        span.0,
+                        span.1,
+                    ));
+                }
+            }
+        }
+        _ => {}
+    });
+}
+
+/// The statement-shaped forbidden actions of a static context, at every
+/// nesting level: `gen` (clause 10.6.2) and `check that` (clause
+/// 16.3.2.1).
+fn check_static_context_statements(
+    statements: &[Stmt],
+    context: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for statement in statements {
+        let forbidden = match statement {
+            Stmt::Gen { .. } => Some(("gen", "10.6.2")),
+            Stmt::Check { .. } => Some(("check that", "16.3.2.1")),
+            _ => None,
+        };
+        if let Some((action, clause)) = forbidden {
+            let span = statement.span();
+            diagnostics.push(Diagnostic::new(
+                "E0216",
+                format!(
+                    "'{action}' is not allowed in a static context — {context} (clause {clause})"
+                ),
+                span.0,
+                span.1,
+            ));
+        }
+        match statement {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                check_static_context_statements(then_body, context, diagnostics);
+                if let Some(else_body) = else_body {
+                    check_static_context_statements(else_body, context, diagnostics);
+                }
+            }
+            Stmt::Check { else_body, .. } => {
+                check_static_context_statements(else_body, context, diagnostics);
+            }
+            Stmt::While { body, .. }
+            | Stmt::RepeatUntil { body, .. }
+            | Stmt::ForEach { body, .. }
+            | Stmt::ForTo { body, .. } => {
+                check_static_context_statements(body, context, diagnostics);
+            }
+            Stmt::Case { arms, default, .. } => {
+                for (_, body) in arms {
+                    check_static_context_statements(body, context, diagnostics);
+                }
+                if let Some(default) = default {
+                    check_static_context_statements(default, context, diagnostics);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Validate every `Type::member` access the statement list evaluates
+/// (T2.1/T2.2/T2.3): the member must be a static member declared in
+/// exactly `Type` (E0307). One pass: every expression the statements
+/// reach is visited exactly once.
+fn check_body_static_accesses(
+    statements: &[Stmt],
+    static_members: &BTreeMap<&str, StaticNames>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for_each_stmt_exprs(statements, &mut |expr| {
+        if let Expr::StaticAccess {
+            type_name,
+            member,
+            span,
+            ..
+        } = expr
+        {
+            check_static_access(type_name, member, *span, static_members, diagnostics);
+        }
+    });
+}
+
+/// Validate the `Type::member` accesses of one expression.
+fn check_expr_static_accesses(
+    expr: &Expr,
+    static_members: &BTreeMap<&str, StaticNames>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for_each_sub_expr(expr, &mut |expr| {
+        if let Expr::StaticAccess {
+            type_name,
+            member,
+            span,
+            ..
+        } = expr
+        {
+            check_static_access(type_name, member, *span, static_members, diagnostics);
+        }
+    });
+}
+
+/// `Type::member` (clause 4.17.4): the member must be a static member
+/// declared in exactly `Type` — not a `like` parent's, not an instance
+/// member (E0307). A type with no static-member namespace entry in this
+/// file is not checked here: the unknown-type diagnostic is the
+/// named-type check's business, and an undeclared target would make
+/// every spelling a false positive.
+fn check_static_access(
+    type_name: &str,
+    member: &str,
+    span: crate::ast::Span,
+    static_members: &BTreeMap<&str, StaticNames>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(names) = static_members.get(type_name) else {
+        return;
+    };
+    if !names.contains(member) {
+        diagnostics.push(Diagnostic::new(
+            "E0307",
+            format!(
+                "'{type_name}::{member}': '{member}' is not a static member declared in '{type_name}' (clause 4.17.4)"
+            ),
+            span.0,
+            span.1,
+        ));
+    }
+}
+
+/// A static member belongs to the type itself; a `when` subtype is a
+/// view of instances, not a type of its own, so the static member forms
+/// are not legal inside a `when` block (clauses 6.9.3, 17.2.2,
+/// 11.1.4.1, 11.2). Codes per the migration plan's allocation: the
+/// field/method/`on` forms share **`E0304`** ("static member in `when`
+/// subtype" — T2.2's and T2.3's `on` forms reuse it), and a static
+/// event has the dedicated **`E0310`**. One diagnostic per offending
+/// member.
+fn check_static_members_in_whens(declaration: &Declaration, diagnostics: &mut Vec<Diagnostic>) {
+    fn walk(members: &[Member], in_when: bool, diagnostics: &mut Vec<Diagnostic>) {
+        for member in members {
+            match member {
+                Member::Field(field) if in_when && field.is_static => {
+                    diagnostics.push(Diagnostic::new(
+                        "E0304",
+                        format!(
+                            "static field '{}' in when subtype (clause 6.9.3)",
+                            field.name
+                        ),
+                        field.name_span.0,
+                        field.name_span.1,
+                    ));
+                }
+                Member::Method(method) if in_when && method.is_static => {
+                    diagnostics.push(Diagnostic::new(
+                        "E0304",
+                        format!(
+                            "static method '{}' in when subtype (clause 17.2.2)",
+                            method.name
+                        ),
+                        method.name_span.0,
+                        method.name_span.1,
+                    ));
+                }
+                Member::Event(event) if in_when && event.is_static => {
+                    diagnostics.push(Diagnostic::new(
+                        "E0310",
+                        format!(
+                            "static event '{}' in when subtype (clause 11.1.4.1)",
+                            event.name
+                        ),
+                        event.name_span.0,
+                        event.name_span.1,
+                    ));
+                }
+                Member::On(on) if in_when && (on.is_static || on.type_qualified.is_some()) => {
+                    diagnostics.push(Diagnostic::new(
+                        "E0304",
+                        "static 'on' block in when subtype (clause 11.2)".to_owned(),
+                        on.span.0,
+                        on.span.1,
+                    ));
+                }
+                Member::When(inner) => walk(&inner.members, true, diagnostics),
+                _ => {}
+            }
+        }
+    }
+    walk(&declaration.members, false, diagnostics);
+}
+
+/// A static method can be extended (`is also`/`is first`/`is only`)
+/// only in the struct that declares it — the root-most type of the
+/// `like` chain that declares the method without an extension modifier
+/// (clause 17.2.4). An extension in a derived struct is reported
+/// (`E0309`) once per offending block.
+fn check_static_method_extensions(
+    declaration: &Declaration,
+    declarations: &[Declaration],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for member in &declaration.members {
+        let Member::Method(method) = member else {
+            continue;
+        };
+        if !method.is_static || method.modifier.is_none() {
+            continue;
+        }
+        let chain = like_chain(declarations, &declaration.name);
+        let declares_static = |ty: &str| {
+            declarations
+                .iter()
+                .filter(|d| d.name == ty && !is_global_pseudo(d))
+                .any(|d| {
+                    d.members.iter().any(|member| {
+                        matches!(
+                            member,
+                            Member::Method(m)
+                                if m.is_static && m.name == method.name && m.modifier.is_none()
+                        )
+                    })
+                })
+        };
+        let declaring = chain.into_iter().find(|ty| declares_static(ty));
+        if let Some(owner) = declaring
+            && owner != declaration.name.as_str()
+        {
+            diagnostics.push(Diagnostic::new(
+                "E0309",
+                format!(
+                    "static method '{}' can only be extended in the struct that declares it ('{}') (clause 17.2.4)",
+                    method.name, owner
+                ),
+                method.name_span.0,
+                method.name_span.1,
+            ));
+        }
+    }
+}
+
+/// The parser's file-level `define`/`import` pseudo-declaration: scope,
+/// not an `extend global` member source (user `extend global` is
+/// rejected at parse, E0116).
+fn is_global_pseudo(declaration: &Declaration) -> bool {
+    declaration.kind == DeclarationKind::Extend
+        && declaration.name == "global"
+        && declaration.like.is_none()
+}
+
+/// The `like` chain of a type: `[type, parent, grandparent, ...]`
+/// reversed to root-most first, cycle-safe (a cycle is elaboration's
+/// E0301, not this walk's business).
+fn like_chain<'a>(declarations: &'a [Declaration], type_name: &'a str) -> Vec<&'a str> {
+    let mut chain = vec![type_name];
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    seen.insert(type_name);
+    let mut cursor = type_name;
+    while let Some(base) = declarations
+        .iter()
+        .find(|d| d.name == cursor && d.kind != DeclarationKind::Extend)
+        .and_then(|d| d.like.as_deref())
+    {
+        if !seen.insert(base) {
+            break;
+        }
+        chain.push(base);
+        cursor = base;
+    }
+    chain.reverse();
+    chain
+}
+
+/// The static-member namespace one `Type::member` access resolves
+/// against (T2.1–T2.3): per type name, the static fields, methods and
+/// events that the type's base declaration and its `extend` blocks
+/// declare — the extend target is the declaring type. Only top-level
+/// members count: static members inside `when` blocks are rejected
+/// separately (E0304/E0310) and never join the namespace.
+#[derive(Default)]
+struct StaticNames<'a> {
+    fields: BTreeSet<&'a str>,
+    methods: BTreeSet<&'a str>,
+    events: BTreeSet<&'a str>,
+}
+
+impl<'a> StaticNames<'a> {
+    fn contains(&self, name: &str) -> bool {
+        self.fields.contains(name) || self.methods.contains(name) || self.events.contains(name)
+    }
+}
+
+fn static_member_names<'a>(declarations: &'a [Declaration]) -> BTreeMap<&'a str, StaticNames<'a>> {
+    let mut names: BTreeMap<&'a str, StaticNames<'a>> = BTreeMap::new();
+    for declaration in declarations {
+        if is_global_pseudo(declaration) {
+            continue;
+        }
+        let entry = names.entry(declaration.name.as_str()).or_default();
+        for member in &declaration.members {
+            match member {
+                Member::Field(field) if field.is_static => {
+                    entry.fields.insert(field.name.as_str());
+                }
+                Member::Method(method) if method.is_static => {
+                    entry.methods.insert(method.name.as_str());
+                }
+                Member::Event(event) if event.is_static => {
+                    entry.events.insert(event.name.as_str());
+                }
+                _ => {}
+            }
+        }
+    }
+    names
+}
+
+/// The keyed-list key restrictions (clause 5.2.11): the key may not be
+/// a static field and its type may not be a list or set; a
+/// struct-typed key may contain static fields. The key expression
+/// names a field of the element type (`list (key:it.field) of T`) —
+/// resolved against T's declaration and its extend blocks; a
+/// whole-element key (`key:it`) is a struct key and stays legal. This
+/// subset's type grammar has no set type spelling, so the list shape
+/// is the one this check can see.
+fn check_keyed_list_key(
+    ty: &TypeExpr,
+    declarations: &[Declaration],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let TypeExpr::List {
+        element,
+        key: Some(key),
+        ..
+    } = ty
+    else {
+        return;
+    };
+    let Some(field_name) = keyed_list_key_field(key) else {
+        return;
+    };
+    let TypeExpr::Named {
+        name: element_name, ..
+    } = element.as_ref()
+    else {
+        return;
+    };
+    let element_field = declarations
+        .iter()
+        .filter(|d| d.name == element_name.as_str())
+        .flat_map(|d| {
+            d.members.iter().filter_map(|member| match member {
+                Member::Field(field) => Some(field),
+                _ => None,
+            })
+        })
+        .find(|field| field.name == field_name);
+    let Some(element_field) = element_field else {
+        return;
+    };
+    if element_field.is_static {
+        let span = key.span();
+        diagnostics.push(Diagnostic::new(
+            "E0218",
+            format!(
+                "keyed list key cannot be a static field: '{element_name}.{}' (clause 5.2.11)",
+                element_field.name
+            ),
+            span.0,
+            span.1,
+        ));
+    } else if matches!(element_field.ty, TypeExpr::List { .. }) {
+        let span = key.span();
+        diagnostics.push(Diagnostic::new(
+            "E0218",
+            format!(
+                "keyed list key '{}.{}' is of list type; the key type must not be a list or set (clause 5.2.11)",
+                element_name, element_field.name
+            ),
+            span.0,
+            span.1,
+        ));
+    }
+}
+
+/// The field name a keyed-list key expression denotes: the last segment
+/// of an `it`-rooted member path (`it.k` → `k`). A bare `it` (the
+/// whole element as the key) names no field.
+fn keyed_list_key_field(key: &Expr) -> Option<&str> {
+    fn rooted_at_it(expr: &Expr) -> bool {
+        match expr {
+            Expr::Ident { name, .. } => name == "it",
+            Expr::MemberAccess { object, .. } => rooted_at_it(object),
+            _ => false,
+        }
+    }
+    match key {
+        Expr::MemberAccess { object, name, .. } if rooted_at_it(object) => Some(name),
+        _ => None,
+    }
 }
 
 /// Walk a statement list. `seen` accumulates local variable names across
@@ -1242,6 +1851,208 @@ fn check_long_subtype(ty: &TypeExpr, ranged: bool, diagnostics: &mut Vec<Diagnos
     ));
 }
 
+/// Visit every expression reachable from the statement, nested bodies
+/// included (`if`/`while`/`for`/`case`/`check`-else). Each expression is
+/// visited exactly once. The temporal expressions of `wait`/`sync` are
+/// not walked (their engine is a separate stage); an `evaluate` block's
+/// statements are.
+fn for_each_stmt_exprs<'a>(statements: &'a [Stmt], f: &mut impl FnMut(&'a Expr)) {
+    for statement in statements {
+        for_each_stmt_expr(statement, f);
+    }
+}
+
+fn for_each_stmt_expr<'a>(statement: &'a Stmt, f: &mut impl FnMut(&'a Expr)) {
+    match statement {
+        Stmt::VarDecl {
+            init: Some(init), ..
+        } => for_each_sub_expr(init, f),
+        Stmt::Assign { target, value, .. } => {
+            for_each_sub_expr(target, f);
+            for_each_sub_expr(value, f);
+        }
+        Stmt::ExprStmt { expr, .. } => for_each_sub_expr(expr, f),
+        Stmt::Return {
+            value: Some(value), ..
+        } => for_each_sub_expr(value, f),
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            for_each_sub_expr(cond, f);
+            for_each_stmt_exprs(then_body, f);
+            if let Some(else_body) = else_body {
+                for_each_stmt_exprs(else_body, f);
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            for_each_sub_expr(cond, f);
+            for_each_stmt_exprs(body, f);
+        }
+        Stmt::RepeatUntil { body, cond, .. } => {
+            for_each_stmt_exprs(body, f);
+            for_each_sub_expr(cond, f);
+        }
+        Stmt::Print { exprs, .. } => {
+            for expr in exprs {
+                for_each_sub_expr(expr, f);
+            }
+        }
+        Stmt::Gen { expr, .. } => for_each_sub_expr(expr, f),
+        Stmt::Check {
+            condition,
+            else_body,
+            ..
+        } => {
+            for_each_sub_expr(condition, f);
+            for_each_stmt_exprs(else_body, f);
+        }
+        Stmt::ForEach {
+            using, list, body, ..
+        } => {
+            if let Some(using) = using {
+                for_each_sub_expr(using, f);
+            }
+            for_each_sub_expr(list, f);
+            for_each_stmt_exprs(body, f);
+        }
+        Stmt::ForTo { from, to, body, .. } => {
+            for_each_sub_expr(from, f);
+            for_each_sub_expr(to, f);
+            for_each_stmt_exprs(body, f);
+        }
+        Stmt::Wait { cycles, .. } => for_each_sub_expr(cycles, f),
+        Stmt::Emit { target, .. } => for_each_sub_expr(target, f),
+        Stmt::Start { call, .. } | Stmt::Compute { call, .. } => for_each_sub_expr(call, f),
+        Stmt::Case {
+            scrutinee,
+            arms,
+            default,
+            ..
+        } => {
+            for_each_sub_expr(scrutinee, f);
+            for (alternatives, body) in arms {
+                for alternative in alternatives {
+                    for_each_sub_expr(alternative, f);
+                }
+                for_each_stmt_exprs(body, f);
+            }
+            if let Some(default) = default {
+                for_each_stmt_exprs(default, f);
+            }
+        }
+        // `break`/`continue`/`stop_run`/`do` carry no expression; the
+        // temporal forms of `wait`/`sync` are the temporal engine's
+        // grammar, not walked here.
+        _ => {}
+    }
+}
+
+/// Visit the expression and every sub-expression exactly once — the
+/// full recursive walk over the expression grammar. Type positions
+/// embedded in expressions (`new`'s type, casts, `typeof` arguments'
+/// type grammar) contribute their expression children only where the
+/// grammar stores one (`typeof`/`typeof_item` arguments).
+fn for_each_sub_expr<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
+    f(expr);
+    match expr {
+        Expr::IntLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::BitLiteral { .. }
+        | Expr::BoolLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::Ident { .. }
+        | Expr::HdlPath { .. }
+        | Expr::SetOfValues { .. }
+        // The `Type` of a static access is a name, not an expression.
+        | Expr::StaticAccess { .. } => {}
+        Expr::MemberAccess { object, .. } => for_each_sub_expr(object, f),
+        Expr::Call { callee, args, .. } => {
+            for_each_sub_expr(callee, f);
+            for arg in args {
+                for_each_sub_expr(arg, f);
+            }
+        }
+        Expr::Index { base, index, .. } => {
+            for_each_sub_expr(base, f);
+            for_each_sub_expr(index, f);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            for_each_sub_expr(lhs, f);
+            for_each_sub_expr(rhs, f);
+        }
+        Expr::Unary { expr, .. } | Expr::Paren { expr, .. } => for_each_sub_expr(expr, f),
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            for_each_sub_expr(cond, f);
+            for_each_sub_expr(then_expr, f);
+            for_each_sub_expr(else_expr, f);
+        }
+        Expr::New { inits, .. } => for_each_stmt_exprs(inits, f),
+        Expr::Select { arms, .. } => {
+            for arm in arms {
+                for_each_sub_expr(&arm.weight, f);
+            }
+        }
+        Expr::CastAs { expr, .. } => for_each_sub_expr(expr, f),
+        Expr::BitSlice { base, high, low, .. } => {
+            for_each_sub_expr(base, f);
+            for_each_sub_expr(high, f);
+            for_each_sub_expr(low, f);
+        }
+        Expr::InSet { element, set, .. } => {
+            for_each_sub_expr(element, f);
+            match set {
+                crate::ast::InSetExpr::Items(items) => {
+                    for item in items {
+                        for_each_sub_expr(item, f);
+                    }
+                }
+                crate::ast::InSetExpr::Range(low, high) => {
+                    for_each_sub_expr(low, f);
+                    for_each_sub_expr(high, f);
+                }
+            }
+        }
+        Expr::IsA { expr, .. } => for_each_sub_expr(expr, f),
+        Expr::InTable { tuple, rows, .. } => {
+            for element in tuple {
+                for_each_sub_expr(element, f);
+            }
+            for row in rows {
+                for element in row {
+                    match element {
+                        crate::ast::TableElem::Scalar(expr) => for_each_sub_expr(expr, f),
+                        crate::ast::TableElem::Set(crate::ast::InSetExpr::Items(items)) => {
+                            for item in items {
+                                for_each_sub_expr(item, f);
+                            }
+                        }
+                        crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
+                            for_each_sub_expr(low, f);
+                            for_each_sub_expr(high, f);
+                        }
+                        crate::ast::TableElem::TypeSet { .. } => {}
+                    }
+                }
+            }
+        }
+        Expr::Evaluate { body, .. } => for_each_stmt_exprs(body, f),
+        Expr::QualifiedField { base, .. } => for_each_sub_expr(base, f),
+        Expr::ListConcat { items, .. } => {
+            for item in items {
+                for_each_sub_expr(item, f);
+            }
+        }
+    }
+}
+
 /// Report root identifiers of the constraint expression that are neither
 /// fields of the enclosing declaration nor declared enumerals. A call's
 /// callee names a method rather than a field, so only its arguments
@@ -1277,6 +2088,9 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
     match expr {
         Expr::Ident { name, span } => roots.push((name.clone(), *span)),
         Expr::MemberAccess { object, .. } => collect_root_identifiers(object, roots),
+        // `Type::member` names a static member of a type — a legal
+        // constraint reference, not an unknown root (clause 4.17.4).
+        Expr::StaticAccess { .. } => {}
         Expr::Call { args, .. } => {
             for arg in args {
                 collect_root_identifiers(arg, roots);
