@@ -3629,3 +3629,52 @@ fn interface_default_and_generated_fields_are_null() {
     );
     assert_eq!(output, "TRUE\n");
 }
+
+#[test]
+fn template_value_parameter_substitutes_in_method_bodies() {
+    // 8.5.2 (the migration's T4.1): a value parameter's constant
+    // substitutes where a constant expression of that type is expected
+    // — a method body's return, a condition, a call argument — and the
+    // defaults-omitted spelling instantiates the same instance as the
+    // explicit one.
+    let output = clean_output(
+        "template struct fifo of (<t'type>, <depth'exp>: uint = 4) {\n    \
+         !items: list of <t'type>;\n    \
+         capacity(): uint is { return <depth'exp>; };\n    \
+         push(x: <t'type>): bool is {\n        \
+         if items.size() >= <depth'exp> then { return FALSE };\n        \
+         items.add(x); return TRUE;\n    };\n};\n\
+         extend sys {\n    run() is also {\n        \
+         var f8: fifo of (byte, 8) = new;\n        \
+         var f4: fifo of (int) = new;\n        \
+         out(f8.capacity()); out(f4.capacity());\n        \
+         for i from 1 to 5 { compute f4.push(i) };\n        \
+         out(f4.items.size());\n    };\n};\n",
+        1,
+    );
+    // capacity 8 and 4; the fifth push of 5 against capacity 4 is
+    // rejected, so the list holds 4.
+    assert_eq!(output, "844");
+}
+
+#[test]
+fn template_extend_members_apply_by_bounding_criteria() {
+    // 8.6 (the migration's T4.4): an extension's members apply to the
+    // instances whose actuals match the entries and satisfy the
+    // conditions — `wide()` exists only on the 8 instance, `narrow()`
+    // only on the 4 one.
+    let output = clean_output(
+        "type color_t: [red, green];\n\
+         template struct packet of (<k'type>, <w'exp>: uint) { !kind: <k'type>; };\n\
+         template extend packet of (<e'type>: enum, <n'exp>: uint) conditions { <n'exp> >= 8 } {\n    \
+         wide(): bool is { return TRUE; };\n};\n\
+         template extend packet of (color_t, 4) {\n    \
+         narrow(): bool is { return TRUE; };\n};\n\
+         extend sys {\n    run() is also {\n        \
+         var a: packet of (color_t, 8) = new;\n        \
+         var b: packet of (color_t, 4) = new;\n        \
+         out(a.wide()); out(b.narrow());\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUETRUE");
+}

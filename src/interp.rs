@@ -1523,9 +1523,13 @@ impl<'a> Interp<'a> {
             }
             // `typeof()`/`typeof_item()` placeholders resolve during
             // elaboration (5.9); reaching the interpreter with one means
-            // the static type was undetermined — no value.
+            // the static type was undetermined — no value. A value
+            // actual and a width-qualified formal are template shapes
+            // that never reach the interpreter as types.
             TypeExpr::TypeOf { .. } | TypeExpr::TypeOfItem { .. } => Value::Void,
-            TypeExpr::Formal { .. } => Value::Void,
+            TypeExpr::Formal { .. } | TypeExpr::FormalWidth { .. } | TypeExpr::Value { .. } => {
+                Value::Void
+            }
         }
     }
 
@@ -3400,9 +3404,13 @@ impl<'a> Interp<'a> {
             }
             // `typeof()`/`typeof_item()` placeholders resolve during
             // elaboration (5.9); reaching the sampler with one means the
-            // static type was undetermined — nothing to generate.
+            // static type was undetermined — nothing to generate. The
+            // template shapes (a formal, a width-qualified formal, a
+            // value actual) never sample.
             TypeExpr::TypeOf { .. } | TypeExpr::TypeOfItem { .. } => Ok(Value::Void),
-            TypeExpr::Formal { .. } => Ok(Value::Void),
+            TypeExpr::Formal { .. } | TypeExpr::FormalWidth { .. } | TypeExpr::Value { .. } => {
+                Ok(Value::Void)
+            }
         }
     }
 
@@ -6096,6 +6104,14 @@ impl<'a> Interp<'a> {
             }
             Expr::BoolLiteral { value, .. } => Ok(Value::Bool(*value)),
             Expr::StringLiteral { value, .. } => Ok(Value::Str(unescape(value))),
+            // A template value formal substitutes to a constant at
+            // instantiation (8.5.2); reaching the evaluator with one
+            // means the substitution never bound it — no value.
+            Expr::Formal { name, span } => Err(self.error(
+                "E0402",
+                format!("template value parameter <{name}> is not substituted"),
+                *span,
+            )),
             Expr::Ident { name, span } => {
                 if name == "me" || name == "self" {
                     return match me {
@@ -7020,7 +7036,11 @@ impl<'a> Interp<'a> {
                 "'is a' against an unresolved typeof() type is not supported",
                 *span,
             )),
-            TypeExpr::Formal { .. } => Ok(false),
+            // A formal, a width-qualified formal or a value actual never
+            // reaches a resolved `is a` check.
+            TypeExpr::Formal { .. } | TypeExpr::FormalWidth { .. } | TypeExpr::Value { .. } => {
+                Ok(false)
+            }
             TypeExpr::InlineEnum { .. } => Err(self.error(
                 "E0402",
                 "'is a' with an inline enumeral type is not supported",

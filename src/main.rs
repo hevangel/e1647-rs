@@ -228,6 +228,12 @@ fn render_type(ty: &e1647::ast::TypeExpr) -> String {
         }
         TypeExpr::InlineEnum { names, .. } => format!("[{}]", names.join(", ")),
         TypeExpr::Formal { name, .. } => format!("<{name}>"),
+        // A width-qualified formal and a value actual are template
+        // shapes (8.5.4, 8.5.2); they render compactly.
+        TypeExpr::FormalWidth { name, width, .. } => {
+            format!("{name}(bits: {})", e1647::ast::render_expr_compact(width))
+        }
+        TypeExpr::Value { expr, .. } => e1647::ast::render_expr_compact(expr),
         TypeExpr::TemplateRef { name, args, .. } => {
             let args = args.iter().map(render_type).collect::<Vec<_>>().join(", ");
             format!("{name} of {args}")
@@ -379,6 +385,7 @@ fn print_elaborated_type(elaborated_type: &e1647::elab::ElaboratedType) {
         DeclarationKind::Type => "type",
         DeclarationKind::Extend => "extend",
         DeclarationKind::Interface => "interface",
+        DeclarationKind::NumericType => "numeric_type",
     };
     match &elaborated_type.base {
         Some(base) => println!("{kind} {} like {base}", elaborated_type.name),
