@@ -1697,6 +1697,7 @@ fn substitute_in_set_expr(
             substitute_expr(low, bindings, queue);
             substitute_expr(high, bindings, queue);
         }
+        crate::ast::InSetExpr::Expr(expr) => substitute_expr(expr, bindings, queue),
     }
 }
 
@@ -1988,6 +1989,7 @@ fn collect_expression_refs(
                     collect_expression_refs(low, queue);
                     collect_expression_refs(high, queue);
                 }
+                crate::ast::InSetExpr::Expr(expr) => collect_expression_refs(expr, queue),
             }
         }
         // A subtype-qualified access's type positions live in its base.

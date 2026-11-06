@@ -61,6 +61,11 @@
 //! - `E0218` a keyed-list key that is a static field or of list/set
 //!   type (clause 5.2.11; a struct-typed key may contain static
 //!   fields)
+//! - `E0130` an `rgf=` target, or a clause 29.13 rgf routine's field
+//!   argument, that is not a range-generated field (clause 18.6); an
+//!   unresolvable target path is left to the run time
+//! - `E0316` a range-generated (`~`) field of non-scalar type — the
+//!   type must be numeric, `bool`, or an enumeral (clause 6.9.7)
 //!
 //! Further static-member restrictions of the 2019 static-members stage
 //! (IEEE 1647-2019 clauses 4.17.4, 6.9.3, 7.2.2, 7.2.4, 17.2.4) are
@@ -193,6 +198,14 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             (declaration.name.as_str(), fields)
         })
         .collect();
+    // The range-generated-field tables (18.6, 29.13): per declaration
+    // name, the set of its `~` fields — the `rgf=` target rule (E0130)
+    // and the rgf routines' field argument resolve member paths against
+    // these.
+    let rgf_fields: BTreeMap<&str, BTreeSet<&str>> = declarations
+        .iter()
+        .map(|declaration| (declaration.name.as_str(), own_rgf_names(declaration)))
+        .collect();
     for declaration in declarations {
         check_extend_target(declaration, &declared, &interfaces, &mut diagnostics);
         check_like_target(declaration, &declared, &interfaces, &mut diagnostics);
@@ -223,6 +236,7 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             declaration,
             &declared,
             &struct_fields,
+            &rgf_fields,
             &iface,
             &static_members,
             &mut diagnostics,
@@ -235,12 +249,15 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             for_each_field(&declaration.members, &mut |field| {
                 own_fields.insert(field.name.as_str(), &field.ty);
             });
+            let own_rgf = own_rgf_names(declaration);
             let mut locals: BTreeMap<&str, &TypeExpr> = own_fields.clone();
             let scope = StatementScope {
                 declared: &declared,
                 struct_fields: &struct_fields,
                 own_fields: &own_fields,
                 iface: &iface,
+                rgf_fields: &rgf_fields,
+                own_rgf: &own_rgf,
             };
             check_statements(
                 &on.body,
@@ -250,6 +267,7 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
                 &on.path.join("."),
                 &mut diagnostics,
             );
+            check_rgf_routine_args(&on.body, &locals, &scope, &mut diagnostics);
             // 11.3: "The on action block shall not contain any
             // time-consuming actions or TCMs" — wait/sync/start/compute
             // at any depth of the block are rejected.
@@ -692,6 +710,7 @@ fn check_fields(
             check_width(width, diagnostics);
         }
         check_field_prefixes(field, diagnostics);
+        check_range_gen_field(field, kinds, diagnostics);
         check_unit_instance_static_field(field, kinds, diagnostics);
         check_keyed_list_key(&field.ty, declarations, diagnostics);
         if let Some(init) = &field.init {
@@ -784,6 +803,57 @@ fn check_field_prefixes(field: &Field, diagnostics: &mut Vec<Diagnostic>) {
     }
 }
 
+/// A range-generated (`~`) field is scalar (clause 6.9.7): its reduced
+/// set (10.3.13) is a set of scalar values, so the field's type must be
+/// numeric (the integer bases of Table 17), `bool`, or an enumeral type
+/// (a clause-5 `type` declaration). A `list`, struct, unit, interface,
+/// or a `real`/`string`/`time` field cannot carry a reduced set here —
+/// `E0316`. (`real`/`string`/`time` are rejected with the non-scalars:
+/// the v1 reduced-set model is integer-interval based, and none of the
+/// three has a representable full value set in it.)
+fn check_range_gen_field(
+    field: &Field,
+    kinds: &BTreeMap<&str, DeclarationKind>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !field.range_gen || rgf_scalar_type(&field.ty, kinds) {
+        return;
+    }
+    diagnostics.push(Diagnostic::new(
+        "E0316",
+        format!(
+            "range-generated field '{}' must be scalar (numeric, enum or bool; clause 6.9.7)",
+            field.name
+        ),
+        field.name_span.0,
+        field.name_span.1,
+    ));
+}
+
+/// Whether the type expression denotes a scalar type a reduced set can
+/// range over: an integer base, `bool`, an inline enumeral list, a
+/// when-qualified spelling of one of those, or a named clause-5 `type`
+/// declaration (enumeral or numeric-subtype).
+fn rgf_scalar_type(ty: &TypeExpr, kinds: &BTreeMap<&str, DeclarationKind>) -> bool {
+    match ty {
+        TypeExpr::Scalar { base, .. } => matches!(
+            base,
+            ScalarBase::Uint
+                | ScalarBase::Int
+                | ScalarBase::Longint
+                | ScalarBase::Longuint
+                | ScalarBase::Bit
+                | ScalarBase::Byte
+                | ScalarBase::Nibble
+                | ScalarBase::Bool
+        ),
+        TypeExpr::InlineEnum { .. } => true,
+        TypeExpr::Named { name, .. } => kinds.get(name.as_str()) == Some(&DeclarationKind::Type),
+        TypeExpr::WhenQualified { base, .. } => rgf_scalar_type(base, kinds),
+        _ => false,
+    }
+}
+
 /// A static field is not a unit instance and not a list of unit
 /// instances (clauses 6.9.3, 7.2.2, 7.2.4): a unit instance belongs to
 /// its parent instance, while a static field's one occurrence belongs
@@ -854,6 +924,7 @@ fn check_methods(
     declaration: &Declaration,
     declared: &BTreeSet<&str>,
     struct_fields: &BTreeMap<&str, Vec<(&str, &TypeExpr)>>,
+    rgf_fields: &BTreeMap<&str, BTreeSet<&str>>,
     iface: &IfaceCtx,
     static_members: &BTreeMap<&str, StaticNames>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -864,6 +935,10 @@ fn check_methods(
     for_each_field(&declaration.members, &mut |field| {
         own_fields.insert(field.name.as_str(), &field.ty);
     });
+    // The declaration's own range-generated fields: the `rgf=` target
+    // rule (E0130) and the clause 29.13 rgf routines' field argument
+    // resolve bare names against this set.
+    let own_rgf: BTreeSet<&str> = own_rgf_names(declaration);
     for_each_method(&declaration.members, &mut |method| {
         // Parameters and local variables share one namespace in this subset;
         // block scoping is a later milestone.
@@ -905,9 +980,26 @@ fn check_methods(
                 struct_fields,
                 own_fields: &own_fields,
                 iface,
+                rgf_fields,
+                own_rgf: &own_rgf,
             },
             &mut locals,
             &method.name,
+            diagnostics,
+        );
+        // The clause 29.13 rgf routines' field argument names a
+        // range-generated field (E0130 otherwise).
+        check_rgf_routine_args(
+            &method.body,
+            &locals,
+            &StatementScope {
+                declared,
+                struct_fields,
+                own_fields: &own_fields,
+                iface,
+                rgf_fields,
+                own_rgf: &own_rgf,
+            },
             diagnostics,
         );
         // T2.2: a static method has no instance — `me`/`self` and the
@@ -1430,13 +1522,17 @@ fn check_on_body_time_consumption(
 /// The scope tables a statement walk checks against: the file's declared
 /// type names, the per-declaration field tables (`typeof()` member-path
 /// resolution, 5.9), the enclosing declaration's own fields
-/// (`me.field`), and the interface tables of the interface-assignment
-/// rule (5.4.4.4).
+/// (`me.field`), the interface tables of the interface-assignment
+/// rule (5.4.4.4), and the range-generated-field tables of the `rgf=`
+/// target rule (18.6, E0130): per declaration name, the set of its
+/// range-generated field names, plus the enclosing declaration's own.
 struct StatementScope<'a> {
     declared: &'a BTreeSet<&'a str>,
     struct_fields: &'a BTreeMap<&'a str, Vec<(&'a str, &'a TypeExpr)>>,
     own_fields: &'a BTreeMap<&'a str, &'a TypeExpr>,
     iface: &'a IfaceCtx<'a>,
+    rgf_fields: &'a BTreeMap<&'a str, BTreeSet<&'a str>>,
+    own_rgf: &'a BTreeSet<&'a str>,
 }
 
 /// The interface tables the statement walk consults for the
@@ -1584,6 +1680,20 @@ fn check_statements<'a>(
                     ));
                 }
             }
+            Stmt::RgfAssign { target, span, .. } => {
+                // Clause 18.6: the `rgf=` target must be a range-generated
+                // field (E0130). The target is resolved against the same
+                // static tables as the clause 29.13 rgf routines' field
+                // argument; an unresolvable target is left to the run time.
+                if rgf_target_is_rgf(target, locals, scope) == Some(false) {
+                    diagnostics.push(Diagnostic::new(
+                        "E0130",
+                        "rgf= target is not a range-generated field",
+                        span.0,
+                        span.1,
+                    ));
+                }
+            }
             Stmt::ExprStmt { .. }
             | Stmt::Return { .. }
             | Stmt::While { .. }
@@ -1682,6 +1792,140 @@ fn scalar_type(base: ScalarBase) -> TypeExpr {
             },
         ),
     }
+}
+
+/// The range-generated field names of one declaration, in no particular
+/// order (set semantics): the `~`-prefixed fields, `when` members
+/// included.
+fn own_rgf_names(declaration: &Declaration) -> BTreeSet<&str> {
+    let mut names = BTreeSet::new();
+    for_each_field(&declaration.members, &mut |field| {
+        if field.range_gen {
+            names.insert(field.name.as_str());
+        }
+    });
+    names
+}
+
+/// Whether the rgf-target expression (`rgf=` target, clause 18.6; the
+/// clause 29.13 rgf routines' field argument) statically names a
+/// range-generated field. `Some(false)` — the target resolves and is
+/// not range-generated (the E0130 trigger); `Some(true)` — it resolves
+/// to a `~` field; `None` — the path's types are not statically known
+/// here (a call result, an unresolvable root), left to the run time.
+fn rgf_target_is_rgf(
+    expr: &Expr,
+    locals: &BTreeMap<&str, &TypeExpr>,
+    scope: &StatementScope,
+) -> Option<bool> {
+    // The path's segments, root first.
+    let mut segments: Vec<&str> = Vec::new();
+    let mut cursor = expr;
+    loop {
+        match cursor {
+            Expr::Ident { name, .. } => {
+                segments.push(name.as_str());
+                break;
+            }
+            Expr::MemberAccess { object, name, .. } => {
+                segments.push(name.as_str());
+                cursor = object;
+            }
+            _ => return None,
+        }
+    }
+    segments.reverse();
+    // A `me`/`self` root is transparent: the walk then starts at the
+    // enclosing declaration's own fields.
+    let mut position = 0usize;
+    if segments[0] == "me" || segments[0] == "self" {
+        position = 1;
+        if position == segments.len() {
+            return None;
+        }
+        let ty = scope.own_fields.get(segments[position])?;
+        return rgf_target_through_type(ty, &segments[position + 1..], scope);
+    }
+    let first = segments[position];
+    // A field of the enclosing declaration: the last segment decides
+    // against the declaration's own `~` set; deeper segments resolve
+    // through the field's type.
+    if let Some(ty) = scope.own_fields.get(first) {
+        if position + 1 == segments.len() {
+            return Some(scope.own_rgf.contains(first));
+        }
+        return rgf_target_through_type(ty, &segments[position + 1..], scope);
+    }
+    // A local variable or parameter: a bare local is never a
+    // range-generated field; a deeper path resolves through its type.
+    if let Some(ty) = locals.get(first) {
+        if position + 1 == segments.len() {
+            return Some(false);
+        }
+        return rgf_target_through_type(ty, &segments[position + 1..], scope);
+    }
+    None
+}
+
+/// Continue the rgf-target resolution through a struct-like type's
+/// field table: `rest`'s last segment must be a range-generated field
+/// of the type it is reached through.
+fn rgf_target_through_type(ty: &TypeExpr, rest: &[&str], scope: &StatementScope) -> Option<bool> {
+    if rest.is_empty() {
+        // The path ended one segment short of a field: the target is the
+        // object itself, which is not a range-generated field.
+        return Some(false);
+    }
+    let type_name = struct_like_name(ty)?;
+    let fields = scope.struct_fields.get(type_name.as_str())?;
+    let (_, field_ty) = fields.iter().find(|(field, _)| *field == rest[0])?;
+    if rest.len() == 1 {
+        return Some(
+            scope
+                .rgf_fields
+                .get(type_name.as_str())
+                .is_some_and(|set| set.contains(rest[0])),
+        );
+    }
+    rgf_target_through_type(field_ty, &rest[1..], scope)
+}
+
+/// The clause 29.13 rgf routines: the field argument of
+/// `rgf_was_generated`/`rgf_get_range`/`rgf_was_reduced` must name a
+/// range-generated field (E0130, clause 18.6's target rule applied to
+/// the routines). Wrong arity is the run-time call check's business.
+fn check_rgf_routine_args<'a>(
+    statements: &'a [Stmt],
+    locals: &BTreeMap<&'a str, &'a TypeExpr>,
+    scope: &StatementScope<'a>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for_each_stmt_exprs(statements, &mut |expr| {
+        let Expr::Call { callee, args, .. } = expr else {
+            return;
+        };
+        let Expr::Ident { name, .. } = callee.as_ref() else {
+            return;
+        };
+        if !matches!(
+            name.as_str(),
+            "rgf_was_generated" | "rgf_get_range" | "rgf_was_reduced"
+        ) {
+            return;
+        }
+        let Some(arg) = args.first() else {
+            return;
+        };
+        if rgf_target_is_rgf(arg, locals, scope) == Some(false) {
+            let span = arg.span();
+            diagnostics.push(Diagnostic::new(
+                "E0130",
+                format!("'{name}' target is not a range-generated field"),
+                span.0,
+                span.1,
+            ));
+        }
+    });
 }
 
 /// Check the `typeof()`/`typeof_item()` leaves of a type position (5.9):
@@ -1876,6 +2120,10 @@ fn for_each_stmt_expr<'a>(statement: &'a Stmt, f: &mut impl FnMut(&'a Expr)) {
             for_each_sub_expr(target, f);
             for_each_sub_expr(value, f);
         }
+        Stmt::RgfAssign { target, value, .. } => {
+            for_each_sub_expr(target, f);
+            for_each_sub_expr(value, f);
+        }
         Stmt::ExprStmt { expr, .. } => for_each_sub_expr(expr, f),
         Stmt::Return {
             value: Some(value), ..
@@ -2025,6 +2273,7 @@ fn for_each_sub_expr<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
                     for_each_sub_expr(low, f);
                     for_each_sub_expr(high, f);
                 }
+                crate::ast::InSetExpr::Expr(expr) => for_each_sub_expr(expr, f),
             }
         }
         Expr::IsA { expr, .. } => for_each_sub_expr(expr, f),
@@ -2044,6 +2293,9 @@ fn for_each_sub_expr<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
                         crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
                             for_each_sub_expr(low, f);
                             for_each_sub_expr(high, f);
+                        }
+                        crate::ast::TableElem::Set(crate::ast::InSetExpr::Expr(expr)) => {
+                            for_each_sub_expr(expr, f)
                         }
                         crate::ast::TableElem::TypeSet { .. } => {}
                     }
@@ -2162,6 +2414,14 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
             collect_root_identifiers(low, roots);
             collect_root_identifiers(high, roots);
         }
+        Expr::InSet {
+            element,
+            set: crate::ast::InSetExpr::Expr(expr),
+            ..
+        } => {
+            collect_root_identifiers(element, roots);
+            collect_root_identifiers(expr, roots);
+        }
         Expr::IsA { expr, .. } => collect_root_identifiers(expr, roots),
         // An `in_table` test's tuple elements and row elements all name
         // values (a type-set element names a type, not a variable).
@@ -2183,6 +2443,9 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
                         crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
                             collect_root_identifiers(low, roots);
                             collect_root_identifiers(high, roots);
+                        }
+                        crate::ast::TableElem::Set(crate::ast::InSetExpr::Expr(expr)) => {
+                            collect_root_identifiers(expr, roots)
                         }
                         crate::ast::TableElem::TypeSet { .. } => {}
                     }
@@ -2235,6 +2498,12 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
             collect_root_identifiers(low, roots);
             collect_root_identifiers(high, roots);
         }
+        // A general set expression inside a set literal (recorded by the
+        // parser only for bracket literals; walked for completeness).
+        Expr::SetLiteral {
+            items: crate::ast::InSetExpr::Expr(expr),
+            ..
+        } => collect_root_identifiers(expr, roots),
         // A list concat's elements are ordinary sub-expressions.
         Expr::ListConcat { items, .. } => {
             for item in items {

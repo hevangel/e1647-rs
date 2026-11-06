@@ -455,6 +455,18 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    /// `field rgf= exp;` (clause 18.6): assign a concrete value to an
+    /// already-generated range-generated (`~`) field (clause 6.9.7). The
+    /// value must belong to the field's generated reduced set (10.3.13),
+    /// else a run-time diagnostic; the target must be a range-generated
+    /// field at all, else the well-formedness pass reports `E0130`. No
+    /// automatic width cast: a value that does not fit the field is
+    /// simply outside the set.
+    RgfAssign {
+        target: Expr,
+        value: Expr,
+        span: Span,
+    },
     ExprStmt {
         expr: Expr,
         span: Span,
@@ -598,6 +610,7 @@ impl Stmt {
         match self {
             Stmt::VarDecl { span, .. }
             | Stmt::Assign { span, .. }
+            | Stmt::RgfAssign { span, .. }
             | Stmt::ExprStmt { span, .. }
             | Stmt::Return { span, .. }
             | Stmt::If { span, .. }
@@ -1074,6 +1087,10 @@ pub enum InSetExpr {
     Items(Vec<Expr>),
     /// `[low .. high]` — inclusive numeric range.
     Range(Box<Expr>, Box<Expr>),
+    /// Any other set expression (clause 4.11.6's set-exp): a value that
+    /// evaluates to a set (or a list — membership by item equality).
+    /// The bracket-literal forms above keep their dedicated evaluation.
+    Expr(Box<Expr>),
 }
 
 /// One element of an `in_table` row (clause 4.11.8): a scalar expression

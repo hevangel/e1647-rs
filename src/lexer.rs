@@ -679,6 +679,17 @@ impl<'a> Cursor<'a> {
                 self.bump();
                 self.bump();
                 TokenKind::Punctuation("list_ptr==".to_owned())
+            } else if word == "rgf"
+                && self.source[self.byte..].starts_with('=')
+                && !self.source[self.byte..].starts_with("==")
+            {
+                // `rgf=` (clause 18.6, the range-generated-field assign)
+                // is one glued operator token: the word `rgf` immediately
+                // followed by one `=` (not `==`, which keeps `rgf == x`
+                // readable as a comparison). `rgf` alone — or before
+                // anything but `=` — stays an identifier.
+                self.bump();
+                TokenKind::Punctuation("rgf=".to_owned())
             } else if is_keyword(&word) {
                 TokenKind::Keyword(word)
             } else {
