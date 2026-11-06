@@ -1298,6 +1298,21 @@ pub enum Expr {
         member_span: Span,
         span: Span,
     },
+    /// `target chosen_from read_only(list)` — the `keep` constraint form
+    /// of clause 10.5.8: the target (a simple generative struct/unit
+    /// path) is assigned a pointer to one of the elements of the read-only
+    /// list, chosen so the other constraints on paths through the target
+    /// hold. The mandatory `read_only(...)` wrapper is checked and
+    /// unwrapped at parse time (`E0131` otherwise); `list` records the
+    /// wrapped expression as written. The node is not an evaluatable
+    /// expression: it is applied by the `gen` chosen_from protocol
+    /// ([`crate::interp`]) when its target is generated, and evaluating
+    /// it anywhere else reports `E0402`.
+    ChosenFrom {
+        target: Box<Expr>,
+        list: Box<Expr>,
+        span: Span,
+    },
 }
 
 /// The right-hand side of an `in` membership expression.
@@ -1432,6 +1447,7 @@ impl Expr {
             | Expr::StaticAccess { span, .. }
             | Expr::New { span, .. }
             | Expr::Select { span, .. }
+            | Expr::ChosenFrom { span, .. }
             | Expr::HdlPath { span, .. } => *span,
         }
     }

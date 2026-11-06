@@ -318,6 +318,11 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
                 check_expr_static_accesses(&constraint.expr, &static_members, &mut diagnostics);
             });
         }
+        // 10.5.8: a `chosen_from` constraint is not allowed under a
+        // `when` subtype — reported here, where the when nesting is
+        // still visible (elaboration folds the block into a synthesized
+        // subtype view).
+        check_chosen_from_placement(&declaration.members, false, &mut diagnostics);
     }
     diagnostics
 }
@@ -2541,6 +2546,13 @@ fn for_each_sub_expr<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
                 for_each_sub_expr(item, f);
             }
         }
+        // The 10.5.8 chosen_from form: both the target path and the
+        // read-only list expression name fields of the enclosing
+        // declaration.
+        Expr::ChosenFrom { target, list, .. } => {
+            for_each_sub_expr(target, f);
+            for_each_sub_expr(list, f);
+        }
     }
 }
 
@@ -2658,6 +2670,12 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
             collect_root_identifiers(expr, roots);
         }
         Expr::IsA { expr, .. } => collect_root_identifiers(expr, roots),
+        // A 10.5.8 chosen_from constraint names its target path and the
+        // read-only list expression — both e fields.
+        Expr::ChosenFrom { target, list, .. } => {
+            collect_root_identifiers(target, roots);
+            collect_root_identifiers(list, roots);
+        }
         // An `in_table` test's tuple elements and row elements all name
         // values (a type-set element names a type, not a variable).
         Expr::InTable { tuple, rows, .. } => {
@@ -2876,6 +2894,36 @@ fn for_each_constraint<'a>(members: &'a [Member], f: &mut impl FnMut(&'a KeepCon
         match member {
             Member::Constraint(constraint) => f(constraint),
             Member::When(when) => for_each_constraint(&when.members, f),
+            _ => {}
+        }
+    }
+}
+
+/// 10.5.8: a `chosen_from` constraint is not allowed under a `when`
+/// subtype. The when nesting is still visible at well-formedness time
+/// (elaboration folds each when block into a synthesized subtype view),
+/// so the misplaced constraint is reported here — E0402 keeps its
+/// plan allocation for the unsupported chosen_from shapes.
+fn check_chosen_from_placement(
+    members: &[Member],
+    in_when: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for member in members {
+        match member {
+            Member::Constraint(constraint) => {
+                if in_when && matches!(constraint.expr, Expr::ChosenFrom { .. }) {
+                    diagnostics.push(Diagnostic::new(
+                        "E0402",
+                        "chosen_from is not allowed under a when subtype (10.5.8)",
+                        constraint.span.0,
+                        constraint.span.1,
+                    ));
+                }
+            }
+            Member::When(when) => {
+                check_chosen_from_placement(&when.members, true, diagnostics);
+            }
             _ => {}
         }
     }

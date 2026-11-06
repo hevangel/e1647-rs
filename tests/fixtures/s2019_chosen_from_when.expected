@@ -1,0 +1,1 @@
+8:9: error[E0402]: chosen_from is not allowed under a when subtype (10.5.8)
