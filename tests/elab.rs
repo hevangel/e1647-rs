@@ -630,3 +630,54 @@ fn spelled_when_types_materialize_as_views() {
     assert_eq!(field_names(view), vec!["color", "good"]);
     assert!(!view.fields.iter().any(|f| f.name == "x"));
 }
+
+#[test]
+fn interface_decl_composes_inherited_signatures() {
+    // 6.13 (the migration's T3.1): an interface includes all of its
+    // `like` bases' members — the elaborated `both` lists the bases'
+    // signatures first (printable's to_text, sized's size_of), then its
+    // own describe.
+    let result = elaborated(
+        "interface printable { to_text(): string; };\n\
+         interface sized { size_of(): uint; };\n\
+         interface both like printable, sized { describe(prefix: string): string; };\n",
+    );
+    let both = find(&result, "both");
+    assert_eq!(both.kind, DeclarationKind::Interface);
+    assert_eq!(both.interface_bases, vec!["printable", "sized"]);
+    let methods: Vec<&str> = both.methods.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(methods, vec!["to_text", "size_of", "describe"]);
+    // The base interfaces elaborate on their own.
+    assert_eq!(
+        find(&result, "printable")
+            .methods
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["to_text"]
+    );
+}
+
+#[test]
+fn implementing_composes_across_like_chains_and_extends() {
+    // 6.3 (the migration's T3.2): the implemented-interface set composes
+    // per type — the like-chain bases' sets first, then the declaration's
+    // own, then each extend block's — and `when` subtype views inherit
+    // the base's set (subtypes implement the base's interfaces).
+    let result = elaborated(
+        "interface i1 { f(): uint; };\n\
+         interface i2 { g(): uint; };\n\
+         interface i3 { h(): uint; };\n\
+         struct base_s implementing i1 { };\n\
+         struct s like base_s implementing i2 { };\n\
+         extend s implementing i3 { };\n\
+         extend s {\n    when BUSY'kind_s { };\n};\n",
+    );
+    let s = find(&result, "s");
+    assert_eq!(s.implements, vec!["i1", "i2", "i3"]);
+    let base = find(&result, "base_s");
+    assert_eq!(base.implements, vec!["i1"]);
+    // The synthesized when view carries the base's interfaces.
+    let view = find(&result, "BUSY s");
+    assert_eq!(view.implements, vec!["i1", "i2", "i3"]);
+}

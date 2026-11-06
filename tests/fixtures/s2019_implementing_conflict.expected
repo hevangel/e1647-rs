@@ -1,0 +1,1 @@
+4:8: error[E0311]: 's' implements 'a' and 'b' which declare 'f' with different signatures (clause 6.3)

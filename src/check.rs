@@ -35,6 +35,20 @@
 //! - `E0214` a range-generated (`~`) field declared `const` (clause
 //!   6.9.4: a const field is initialised once; a `~` field's reduced set
 //!   is produced per generation)
+//! - `E0124` `extend` of an interface (clause 6.13: only the declaration
+//!   form exists; interfaces are not extensible here)
+//! - `E0125` a non-method member inside an `interface` body (clause
+//!   6.13: the members are method signatures)
+//! - `E0219` an interface inheriting conflicting signatures for one
+//!   method from two of its `like` bases (clause 6.13)
+//! - `E0311` a struct implementing two interfaces that declare one
+//!   method with different signatures (clause 6.3, 31.4) — reported once
+//!   per (type, method); the check runs here rather than in `elab.rs`
+//!   because the fixture contract observes the well-formedness pass
+//! - `E0312` a `new S` value assigned to an interface-typed target the
+//!   struct does not implement (clause 5.4.4.4: the automatic cast
+//!   requires conformance) — checked for the `var x: I = new S;` and
+//!   `x = new S;` shapes, the ones whose static types this pass knows
 //! - `E0215` `me`/`self` used inside a static method (clause 17.2.2: a
 //!   static method has no instance; the same rule covers the static
 //!   `on` forms of clause 11.2)
@@ -47,8 +61,6 @@
 //! - `E0218` a keyed-list key that is a static field or of list/set
 //!   type (clause 5.2.11; a struct-typed key may contain static
 //!   fields)
-//! - `E0219` reserved (the plan allocates it to the interfaces stage:
-//!   conflicting inherited interface signatures)
 //!
 //! Further static-member restrictions of the 2019 static-members stage
 //! (IEEE 1647-2019 clauses 4.17.4, 6.9.3, 7.2.2, 7.2.4, 17.2.4) are
@@ -112,6 +124,30 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             ));
         }
     }
+    // The interface tables (clause 6.13, 6.3): which names are
+    // interfaces, and the effective implemented-interface set per
+    // struct/unit type name (like-chain bases and extend blocks
+    // included). The E0312/E0311 checks and the statement walk's
+    // interface rules read these.
+    let interfaces: BTreeMap<&str, &Declaration> = declarations
+        .iter()
+        .filter(|declaration| declaration.kind == DeclarationKind::Interface)
+        .map(|declaration| (declaration.name.as_str(), declaration))
+        .collect();
+    let struct_impls = struct_interface_sets(declarations);
+    let iface = IfaceCtx {
+        interfaces: &interfaces,
+        struct_impls: &struct_impls,
+    };
+    let mut reported_implement_conflicts: BTreeSet<(String, String)> = BTreeSet::new();
+    check_implement_targets(declarations, &interfaces, &mut diagnostics);
+    check_implement_conflicts(
+        declarations,
+        &interfaces,
+        &struct_impls,
+        &mut reported_implement_conflicts,
+        &mut diagnostics,
+    );
     // Enumerals live in the file-global namespace once their `type` is
     // declared, so any `keep` constraint may reference them. Inline
     // enumerals (`kind : [imm, reg]`) contribute the same way.
@@ -158,8 +194,13 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
         })
         .collect();
     for declaration in declarations {
-        check_extend_target(declaration, &declared, &mut diagnostics);
-        check_like_target(declaration, &declared, &mut diagnostics);
+        check_extend_target(declaration, &declared, &interfaces, &mut diagnostics);
+        check_like_target(declaration, &declared, &interfaces, &mut diagnostics);
+        if declaration.kind == DeclarationKind::Interface {
+            check_interface_members(declaration, &mut diagnostics);
+            check_interface_bases(declaration, &interfaces, &mut diagnostics);
+            check_interface_inherited_conflicts(declaration, &interfaces, &mut diagnostics);
+        }
         if let Some(underlying) = &declaration.underlying {
             check_named_type(underlying, &declared, &mut diagnostics);
             check_long_subtype(
@@ -182,6 +223,7 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             declaration,
             &declared,
             &struct_fields,
+            &iface,
             &static_members,
             &mut diagnostics,
         );
@@ -198,6 +240,7 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
                 declared: &declared,
                 struct_fields: &struct_fields,
                 own_fields: &own_fields,
+                iface: &iface,
             };
             check_statements(
                 &on.body,
@@ -237,6 +280,7 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
 fn check_extend_target(
     declaration: &Declaration,
     declared: &BTreeSet<&str>,
+    interfaces: &BTreeMap<&str, &Declaration>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if declaration.kind != DeclarationKind::Extend {
@@ -245,6 +289,18 @@ fn check_extend_target(
     // The parser's pseudo-declaration holding file-level `define`/`import`
     // members is scope, not an extend of a real type.
     if declaration.name == "global" && declaration.like.is_none() {
+        return;
+    }
+    // Clause 6.13: only the interface declaration form exists here — an
+    // interface has no body to extend and no `is also` composition; the
+    // checker rejects `extend I` outright.
+    if interfaces.contains_key(declaration.name.as_str()) {
+        diagnostics.push(Diagnostic::new(
+            "E0124",
+            "extending an interface is not supported (clause 6.13)",
+            declaration.name_span.0,
+            declaration.name_span.1,
+        ));
         return;
     }
     if !declared.contains(declaration.name.as_str())
@@ -265,19 +321,318 @@ fn check_extend_target(
 fn check_like_target(
     declaration: &Declaration,
     declared: &BTreeSet<&str>,
+    interfaces: &BTreeMap<&str, &Declaration>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(like) = &declaration.like else {
         return;
     };
     let like_span = declaration.like_span.unwrap_or(declaration.name_span);
-    if !declared.contains(like.as_str()) && !crate::builtins::is_builtin_base(like) {
+    if interfaces.contains_key(like.as_str()) {
+        // A struct/unit cannot `like` an interface (clause 6.3: `like`
+        // bases are structs and units; interfaces attach through
+        // `implementing`, clause 6.13/31.4). Interfaces never enter the
+        // struct composition tables, so the clause would silently
+        // contribute nothing — reported instead of ignored.
+        diagnostics.push(Diagnostic::new(
+            "E0203",
+            format!(
+                "'{like}' is an interface and cannot be a 'like' base (clause 6.13: use 'implementing')"
+            ),
+            like_span.0,
+            like_span.1,
+        ));
+    } else if !declared.contains(like.as_str()) && !crate::builtins::is_builtin_base(like) {
         diagnostics.push(Diagnostic::new(
             "E0203",
             format!("unknown type '{like}' in like clause"),
             like_span.0,
             like_span.1,
         ));
+    }
+}
+
+/// Clause 6.13: an interface body's members are method signatures — no
+/// bodies, no fields, constraints, events or subtypes. A signature parses
+/// as a body-less method; every other member is `E0125` at its own span.
+fn check_interface_members(declaration: &Declaration, diagnostics: &mut Vec<Diagnostic>) {
+    for member in &declaration.members {
+        if matches!(member, Member::Method(_)) {
+            continue;
+        }
+        let span = interface_member_span(member);
+        diagnostics.push(Diagnostic::new(
+            "E0125",
+            "interface member must be a method signature (clause 6.13)",
+            span.0,
+            span.1,
+        ));
+    }
+}
+
+/// The span a non-method interface member is diagnosed at (E0125): the
+/// member's name or keyword span.
+fn interface_member_span(member: &Member) -> crate::ast::Span {
+    match member {
+        Member::Field(field) => field.name_span,
+        Member::Constraint(constraint) => constraint.span,
+        Member::When(when) => when.span,
+        Member::Event(event) => event.span,
+        Member::On(on) => on.span,
+        Member::Cover(cover) => cover.span,
+        Member::Expect(expect) => expect.span,
+        Member::Port(port) => port.span,
+        Member::Import { span, .. } | Member::Define { span, .. } => *span,
+        Member::Macro(macro_decl) => macro_decl.span,
+        Member::Enumeral(enumeral) => enumeral.name_span,
+        Member::Method(_) => unreachable!("the caller filters method members"),
+    }
+}
+
+/// Every `like` base of an interface must itself be an interface (clause
+/// 6.13). The declaration name is already known (E0201 dedupes); the base
+/// is what can be wrong here.
+fn check_interface_bases(
+    declaration: &Declaration,
+    interfaces: &BTreeMap<&str, &Declaration>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (base, base_span) in &declaration.bases {
+        if !interfaces.contains_key(base.as_str()) {
+            diagnostics.push(Diagnostic::new(
+                "E0203",
+                format!("unknown interface '{base}' in like clause"),
+                base_span.0,
+                base_span.1,
+            ));
+        }
+    }
+}
+
+/// The comparable form of a method signature (clause 6.13): the parameter
+/// types and the return type, rendered canonically. Parameter names are
+/// not part of the signature — `f(x: int)` and `f(y: int)` are the same;
+/// an untyped parameter is its own kind and differs from a typed one.
+type MethodSignature = (Vec<String>, Option<String>);
+
+/// One method name's signatures across every interface that provides it,
+/// paired with each declaring interface's name.
+type SignatureSources<'d> = BTreeMap<String, Vec<(&'d str, MethodSignature)>>;
+
+fn method_signature(method: &MethodDecl) -> MethodSignature {
+    (
+        method
+            .params
+            .iter()
+            .map(|param| match &param.ty {
+                Some(ty) => ty.render(),
+                None => String::new(),
+            })
+            .collect(),
+        method.return_type.as_ref().map(|ty| ty.render()),
+    )
+}
+
+/// Every method signature `name` provides (clause 6.13), with the
+/// interface that declares it: the transitive `like` bases' signatures
+/// first (recursively, in base order), then the interface's own. A
+/// repeated method name collects one entry per declaring interface;
+/// cycles stop the walk (the elaborator reports them as E0301).
+fn interface_signature_sources<'d>(
+    name: &'d str,
+    interfaces: &BTreeMap<&'d str, &'d Declaration>,
+    stack: &mut Vec<&'d str>,
+    out: &mut SignatureSources<'d>,
+) {
+    if stack.contains(&name) {
+        return;
+    }
+    let Some(declaration) = interfaces.get(name) else {
+        return;
+    };
+    stack.push(name);
+    for (base, _) in &declaration.bases {
+        interface_signature_sources(base.as_str(), interfaces, stack, out);
+    }
+    for member in &declaration.members {
+        let Member::Method(method) = member else {
+            continue;
+        };
+        out.entry(method.name.clone())
+            .or_default()
+            .push((name, method_signature(method)));
+    }
+    stack.pop();
+}
+
+/// The first pair of distinct interfaces that declare `sources`' method
+/// with different signatures.
+fn conflicting_signature_sources<'s>(
+    sources: &'s [(&'s str, MethodSignature)],
+) -> Option<(&'s str, &'s str)> {
+    for i in 0..sources.len() {
+        for j in i + 1..sources.len() {
+            if sources[i].1 != sources[j].1 {
+                return Some((sources[i].0, sources[j].0));
+            }
+        }
+    }
+    None
+}
+
+/// Clause 6.13: an interface includes all of its `like` bases' members;
+/// two of them declaring one method with different signatures is a
+/// conflict — the composed signature set is ambiguous. Reported once per
+/// (interface, method), at the interface's own name.
+fn check_interface_inherited_conflicts(
+    declaration: &Declaration,
+    interfaces: &BTreeMap<&str, &Declaration>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if declaration.bases.is_empty() {
+        return;
+    }
+    let mut sources: SignatureSources = BTreeMap::new();
+    let mut stack = Vec::new();
+    for (base, _) in &declaration.bases {
+        interface_signature_sources(base.as_str(), interfaces, &mut stack, &mut sources);
+    }
+    for (method_name, entries) in &sources {
+        if conflicting_signature_sources(entries).is_some() {
+            diagnostics.push(Diagnostic::new(
+                "E0219",
+                format!(
+                    "interface '{}' inherits conflicting signatures for '{method_name}' (clause 6.13)",
+                    declaration.name
+                ),
+                declaration.name_span.0,
+                declaration.name_span.1,
+            ));
+        }
+    }
+}
+
+/// The effective implemented-interface set per struct/unit type name
+/// (clause 6.3): like-chain bases' sets first, then the declaration's
+/// own `implementing`, then each non-template extend block's, deduped in
+/// written order. Order-independent on declarations (an extend may
+/// precede its target): the sets only ever grow, so the scan iterates to
+/// a fixpoint.
+fn struct_interface_sets(declarations: &[Declaration]) -> BTreeMap<&str, Vec<String>> {
+    let mut sets: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for declaration in declarations {
+            let contributes = match declaration.kind {
+                DeclarationKind::Struct | DeclarationKind::Unit => true,
+                DeclarationKind::Extend => !declaration.template_extend,
+                DeclarationKind::Type | DeclarationKind::Interface => false,
+            };
+            if !contributes {
+                continue;
+            }
+            let like_set: Vec<String> = match (&declaration.like, declaration.kind) {
+                (Some(base), DeclarationKind::Struct | DeclarationKind::Unit) => {
+                    sets.get(base.as_str()).cloned().unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+            let target = sets.entry(declaration.name.as_str()).or_default();
+            let before = target.len();
+            for name in like_set
+                .into_iter()
+                .chain(declaration.implements.iter().cloned())
+            {
+                if !target.contains(&name) {
+                    target.push(name);
+                }
+            }
+            changed |= target.len() != before;
+        }
+    }
+    sets
+}
+
+/// Every name in an `implementing` clause must declare an interface
+/// (clause 6.3/31.4). A name that is not an interface would silently
+/// contribute nothing to the composed set — reported instead of ignored.
+fn check_implement_targets(
+    declarations: &[Declaration],
+    interfaces: &BTreeMap<&str, &Declaration>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for declaration in declarations {
+        if declaration.implements.is_empty() {
+            continue;
+        }
+        for interface_name in &declaration.implements {
+            if !interfaces.contains_key(interface_name.as_str()) {
+                diagnostics.push(Diagnostic::new(
+                    "E0203",
+                    format!("unknown interface '{interface_name}' in implementing clause"),
+                    declaration.name_span.0,
+                    declaration.name_span.1,
+                ));
+            }
+        }
+    }
+}
+
+/// Clause 6.3/31.4: a struct implementing two interfaces that declare one
+/// method with different signatures is a conflict — no single signature
+/// satisfies both. Checked over the EFFECTIVE interface set (the
+/// declaration's own `implementing` plus what its like-chain bases and
+/// extend blocks contribute), once per (type, method). Reported at the
+/// contributing declaration's name — the fixture contract observes this
+/// pass, so the check lives here rather than in `elab.rs`'s composition.
+fn check_implement_conflicts(
+    declarations: &[Declaration],
+    interfaces: &BTreeMap<&str, &Declaration>,
+    struct_impls: &BTreeMap<&str, Vec<String>>,
+    reported: &mut BTreeSet<(String, String)>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for declaration in declarations {
+        if declaration.implements.is_empty() {
+            continue;
+        }
+        if !matches!(
+            declaration.kind,
+            DeclarationKind::Struct | DeclarationKind::Unit | DeclarationKind::Extend
+        ) || (declaration.kind == DeclarationKind::Extend && declaration.template_extend)
+        {
+            continue;
+        }
+        let Some(set) = struct_impls.get(declaration.name.as_str()) else {
+            continue;
+        };
+        let mut sources: SignatureSources = BTreeMap::new();
+        let mut stack = Vec::new();
+        for interface_name in set {
+            interface_signature_sources(
+                interface_name.as_str(),
+                interfaces,
+                &mut stack,
+                &mut sources,
+            );
+        }
+        for (method_name, entries) in &sources {
+            let Some((a, b)) = conflicting_signature_sources(entries) else {
+                continue;
+            };
+            if reported.insert((declaration.name.clone(), method_name.clone())) {
+                diagnostics.push(Diagnostic::new(
+                    "E0311",
+                    format!(
+                        "'{}' implements '{a}' and '{b}' which declare '{method_name}' with different signatures (clause 6.3)",
+                        declaration.name
+                    ),
+                    declaration.name_span.0,
+                    declaration.name_span.1,
+                ));
+            }
+        }
     }
 }
 
@@ -494,6 +849,7 @@ fn check_methods(
     declaration: &Declaration,
     declared: &BTreeSet<&str>,
     struct_fields: &BTreeMap<&str, Vec<(&str, &TypeExpr)>>,
+    iface: &IfaceCtx,
     static_members: &BTreeMap<&str, StaticNames>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -543,6 +899,7 @@ fn check_methods(
                 declared,
                 struct_fields,
                 own_fields: &own_fields,
+                iface,
             },
             &mut locals,
             &method.name,
@@ -1067,12 +1424,61 @@ fn check_on_body_time_consumption(
 
 /// The scope tables a statement walk checks against: the file's declared
 /// type names, the per-declaration field tables (`typeof()` member-path
-/// resolution, 5.9) and the enclosing declaration's own fields
-/// (`me.field`).
+/// resolution, 5.9), the enclosing declaration's own fields
+/// (`me.field`), and the interface tables of the interface-assignment
+/// rule (5.4.4.4).
 struct StatementScope<'a> {
     declared: &'a BTreeSet<&'a str>,
     struct_fields: &'a BTreeMap<&'a str, Vec<(&'a str, &'a TypeExpr)>>,
     own_fields: &'a BTreeMap<&'a str, &'a TypeExpr>,
+    iface: &'a IfaceCtx<'a>,
+}
+
+/// The interface tables the statement walk consults for the
+/// interface-assignment rule (clause 5.4.4.4): which names are
+/// interfaces, and whether a struct type implements one.
+struct IfaceCtx<'a> {
+    interfaces: &'a BTreeMap<&'a str, &'a Declaration>,
+    struct_impls: &'a BTreeMap<&'a str, Vec<String>>,
+}
+
+impl<'a> IfaceCtx<'a> {
+    fn is_interface(&self, name: &str) -> bool {
+        self.interfaces.contains_key(name)
+    }
+
+    /// Whether struct type `struct_name` implements interface `iface`:
+    /// directly (its composed `implementing` set), or through an
+    /// implemented interface that inherits it (clause 6.13: an interface
+    /// includes all of its bases' members, so implementing a descendant
+    /// implements the ancestor).
+    fn type_implements(&self, struct_name: &str, iface: &str) -> bool {
+        let Some(set) = self.struct_impls.get(struct_name) else {
+            return false;
+        };
+        set.iter()
+            .any(|implemented| *implemented == iface || self.interface_is_a(implemented, iface))
+    }
+
+    /// Whether interface `name` is `target` or inherits from it.
+    fn interface_is_a(&self, name: &str, target: &str) -> bool {
+        let mut stack = vec![name.to_owned()];
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if current == target {
+                return true;
+            }
+            if let Some(declaration) = self.interfaces.get(current.as_str()) {
+                for (base, _) in &declaration.bases {
+                    stack.push(base.clone());
+                }
+            }
+        }
+        false
+    }
 }
 
 fn check_statements<'a>(
@@ -1089,6 +1495,7 @@ fn check_statements<'a>(
                 name,
                 name_span,
                 ty,
+                init,
                 ..
             } => {
                 if !seen.insert(name.as_str()) {
@@ -1108,6 +1515,7 @@ fn check_statements<'a>(
                         struct_fields: scope.struct_fields,
                     };
                     check_type_static_types(ty, &type_scope, diagnostics);
+                    check_interface_var_initializer(ty, init, scope, diagnostics);
                     // A later `typeof(x)` sees this variable's declared
                     // type; an inferred type (`var x := e`) contributes
                     // nothing and its typeofs stay undetermined (5.9's
@@ -1139,8 +1547,39 @@ fn check_statements<'a>(
                     ));
                 }
             }
-            Stmt::Assign { .. }
-            | Stmt::ExprStmt { .. }
+            Stmt::Assign { target, value, .. } => {
+                // Clause 5.4.4.4: the automatic struct→interface cast
+                // requires the struct's type to implement the interface.
+                // Checked for the `x = new S;` shape, where the target's
+                // declared type (an interface) and the value's type are
+                // both statically known; arbitrary expression values are
+                // beyond this pass's expression typing.
+                if let Expr::Ident { name, .. } = target
+                    && let Some(TypeExpr::Named {
+                        name: iface_name, ..
+                    }) = locals.get(name.as_str()).copied()
+                    && scope.iface.is_interface(iface_name)
+                    && let Expr::New {
+                        ty: Some(new_ty), ..
+                    } = value
+                    && let TypeExpr::Named {
+                        name: new_name,
+                        span: new_span,
+                    } = new_ty
+                    && !scope.iface.is_interface(new_name)
+                    && !scope.iface.type_implements(new_name, iface_name)
+                {
+                    diagnostics.push(Diagnostic::new(
+                        "E0312",
+                        format!(
+                            "cannot assign '{new_name}' to interface '{iface_name}': '{new_name}' does not implement '{iface_name}' (clause 5.4.4.4)"
+                        ),
+                        new_span.0,
+                        new_span.1,
+                    ));
+                }
+            }
+            Stmt::ExprStmt { .. }
             | Stmt::Return { .. }
             | Stmt::While { .. }
             | Stmt::RepeatUntil { .. }
@@ -1324,6 +1763,52 @@ fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut 
         TypeExpr::TypeOf { .. } | TypeExpr::TypeOfItem { .. } => {}
         TypeExpr::Scalar { .. } | TypeExpr::InlineEnum { .. } => {}
     }
+}
+
+/// Clause 5.4.4.4: assigning a struct value to an interface-typed target
+/// is an automatic cast only when the struct's type implements the
+/// interface (directly or through inheritance). Checked for the
+/// `var x: I = new S;` shape — the one value form whose static type this
+/// pass knows. The diagnostic points at the `new` type's name.
+fn check_interface_var_initializer(
+    ty: &TypeExpr,
+    init: &Option<Expr>,
+    scope: &StatementScope,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let TypeExpr::Named {
+        name: iface_name, ..
+    } = ty
+    else {
+        return;
+    };
+    if !scope.iface.is_interface(iface_name) {
+        return;
+    }
+    let Some(Expr::New {
+        ty: Some(new_ty), ..
+    }) = init
+    else {
+        return;
+    };
+    let TypeExpr::Named {
+        name: new_name,
+        span: new_span,
+    } = new_ty
+    else {
+        return;
+    };
+    if scope.iface.is_interface(new_name) || scope.iface.type_implements(new_name, iface_name) {
+        return;
+    }
+    diagnostics.push(Diagnostic::new(
+        "E0312",
+        format!(
+            "cannot assign '{new_name}' to interface '{iface_name}': '{new_name}' does not implement '{iface_name}' (clause 5.4.4.4)"
+        ),
+        new_span.0,
+        new_span.1,
+    ));
 }
 
 /// A literal-zero width is always wrong; non-literal widths are a later
