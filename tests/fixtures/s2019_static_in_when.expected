@@ -1,0 +1,1 @@
+5:16: error[E0304]: static field 'count' in when subtype (clause 6.9.3)

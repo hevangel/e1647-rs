@@ -1,0 +1,1 @@
+5:9: error[E0216]: 'gen' is not allowed in a static context — static method 'f' (clause 10.6.2)

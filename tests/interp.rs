@@ -1227,17 +1227,19 @@ fn const_field_keeps_its_init_value_through_gen() {
 }
 
 #[test]
-fn static_field_prefix_is_rejected_as_unsupported() {
-    // Clause 6.9.3: the contextual `static` prefix is not parsed yet;
-    // the static-members stage owns it. A member genuinely named
-    // `static` keeps parsing.
+fn static_prefix_is_a_contextual_word() {
+    // Clause 6.9.3: `static` prefixes a member only when a member
+    // declarator follows; a member genuinely named `static` keeps
+    // parsing as before.
     let result = parse("struct s {\n    static count: uint;\n};\n");
-    let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
-    assert_eq!(rendered.len(), 1);
     assert!(
-        rendered[0].contains("E0113") && rendered[0].contains("static"),
-        "expected the static not-supported diagnostic: {:?}",
-        rendered
+        result.diagnostics.is_empty(),
+        "a static-prefixed field parses (T2.1): {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
     );
     let named = parse("struct s {\n    static: uint;\n    m: uint;\n};\n");
     assert!(
@@ -1249,6 +1251,82 @@ fn static_field_prefix_is_rejected_as_unsupported() {
             .map(|d| d.render())
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn static_field_is_shared_per_type_and_created_at_declaration() {
+    // T2.1 (clause 6.9.3): one shared occurrence per type — zero
+    // instances still read the declaration-time value, every `init()`
+    // bumps the same counter, and the `!`-prefixed static string keeps
+    // its declaration value. Static fields are excluded from instance
+    // formatting (`print`/`to_string`).
+    let output = clean_output(
+        "<'\nstruct counter {\n    static count: uint;\n    static !label: string = \"ctr\";\n    id: uint;\n    init() is also { counter::count = counter::count + 1; };\n};\nextend sys {\n    run() is also {\n        out(counter::count, \"\\n\");\n        var a: counter = new; var b: counter = new; var c: counter = new;\n        out(counter::count, \"\\n\");\n        out(counter::label, \"\\n\");\n        out(a.id == b.id or TRUE, \"\\n\");\n        print a;\n    };\n};\n'>\n",
+        1,
+    );
+    assert_eq!(output, "0\n3\nctr\nTRUE\na = counter{id: 0}\n");
+}
+
+#[test]
+fn static_method_dispatches_without_an_instance() {
+    // T2.2 (clause 17.2.2): `Type::name(...)` calls without an
+    // instance; a static method may call a sibling static method
+    // through the type.
+    let output = clean_output(
+        "<'\nstruct math {\n    static sum(a: int, b: int): int is { return a + b; };\n    static twice(a: int): int is { return math::sum(a, a); };\n};\nextend sys {\n    run() is also { out(math::sum(2, 3), \"\\n\"); out(math::twice(21), \"\\n\"); };\n};\n'>\n",
+        1,
+    );
+    assert_eq!(output, "5\n42\n");
+}
+
+#[test]
+fn static_method_rejects_instance_dispatch() {
+    // T2.2 (clause 17.2.2): the instance call form has no static
+    // dispatch — a static method has no `me`, so the dot operator does
+    // not reach it.
+    let result = run_source(
+        "<'\nstruct sm {\n    static f(): uint is { return 3; };\n};\nextend sys {\n    run() is also {\n        var n: sm = new;\n        out(n.f());\n    };\n};\n'>\n",
+        1,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.render().contains("E0402") && d.render().contains("static method")),
+        "expected the static-dispatch diagnostic: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn static_event_fires_both_on_forms_with_no_instance() {
+    // T2.3 (clauses 11.1.4.1, 11.2): `emit Type::event` triggers the
+    // declaring type's `static on` blocks and every type-qualified
+    // `on Type::event` block, with no instance.
+    let output = clean_output(
+        "<'\nstruct bus {\n    static event reset;\n    static on reset { out(\"bus reset seen\\n\"); };\n};\nextend bus {\n    on bus::reset { out(\"qualified reset seen\\n\"); };\n};\nextend sys {\n    run() is also { emit bus::reset; emit bus::reset; };\n};\n'>\n",
+        1,
+    );
+    assert_eq!(
+        output,
+        "bus reset seen\nqualified reset seen\nbus reset seen\nqualified reset seen\n"
+    );
+}
+
+#[test]
+fn static_field_bare_name_resolves_inside_the_type() {
+    // T2.1 (clause 6.9.3): inside the type, the static field is
+    // reachable by its bare name — read and write — and a path may
+    // start at `Type::field` and continue through non-static fields.
+    let output = clean_output(
+        "<'\nstruct inner {\n    v: uint;\n};\nstruct holder {\n    static box: inner;\n    static tally: uint;\n    bump() is { tally = tally + 1; };\n    get_tally(): uint is { return tally; };\n};\nextend sys {\n    run() is also {\n        var n: holder = new;\n        n.bump();\n        out(n.get_tally(), \"\\n\");\n        out(holder::box.v == 0, \"\\n\");\n    };\n};\n'>\n",
+        1,
+    );
+    assert_eq!(output, "1\nTRUE\n");
 }
 
 #[test]
