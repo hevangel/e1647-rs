@@ -3507,24 +3507,23 @@ impl<'a> Interp<'a> {
         // path of this type, is an unsupported shape.
         let mut chosen_specs: Vec<(String, Expr)> = Vec::new();
         for constraint in &constraints {
-            if constraint.is_bind {
-                continue;
-            }
-            let Expr::ChosenFrom { target, list, .. } = &constraint.expr else {
+            // The bind constraints are filtered out at the collection
+            // site; every entry here is a plain constraint expression.
+            let Expr::ChosenFrom { target, list, .. } = constraint else {
                 continue;
             };
             if !ty.when_of.is_empty() {
                 return Err(self.error(
                     "E0402",
                     "chosen_from is not allowed under a when subtype (10.5.8)",
-                    constraint.span,
+                    constraint.span(),
                 ));
             }
             let Some(segments) = constraint_path_segments(target) else {
                 return Err(self.error(
                     "E0402",
                     "chosen_from target must be a simple field path (10.5.8)",
-                    constraint.span,
+                    constraint.span(),
                 ));
             };
             let [field] = segments.as_slice() else {
@@ -3534,7 +3533,7 @@ impl<'a> Interp<'a> {
                         "chosen_from target '{}' must be a field of '{type_name}' (10.5.8); deeper target paths are applied by generating the field path",
                         segments.join(".")
                     ),
-                    constraint.span,
+                    constraint.span(),
                 ));
             };
             chosen_specs.push((field.clone(), list.as_ref().clone()));
@@ -10146,6 +10145,7 @@ fn expr_extends_path(expr: &Expr, prefix: &[String]) -> bool {
                 crate::ast::InSetExpr::Range(low, high) => {
                     expr_extends_path(low, prefix) || expr_extends_path(high, prefix)
                 }
+                crate::ast::InSetExpr::Expr(expr) => expr_extends_path(expr, prefix),
             };
             expr_extends_path(element, prefix) || set_has
         }
