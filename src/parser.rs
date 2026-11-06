@@ -2657,6 +2657,7 @@ impl Parser {
                 return_type,
                 tcm_event,
                 modifier: None,
+                is_static: false,
                 body: Vec::new(),
                 span: (start, end),
             }));
