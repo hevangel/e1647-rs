@@ -1058,6 +1058,7 @@ fn check_methods(
                 iface,
                 rgf_fields,
                 own_rgf: &own_rgf,
+                templates,
             },
             diagnostics,
         );
