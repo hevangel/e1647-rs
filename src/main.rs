@@ -379,6 +379,10 @@ fn print_elaborated_type(elaborated_type: &e1647::elab::ElaboratedType) {
         DeclarationKind::Type => "type",
         DeclarationKind::Extend => "extend",
         DeclarationKind::Interface => "interface",
+        // An annotation type produces no elaborated type view (its
+        // attachments record in the clause 35.4 registry); this arm is
+        // defensive for the shared printer.
+        DeclarationKind::Annotation { .. } => "annotation",
     };
     match &elaborated_type.base {
         Some(base) => println!("{kind} {} like {base}", elaborated_type.name),

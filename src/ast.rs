@@ -27,6 +27,16 @@ pub enum DeclarationKind {
     /// is *of* an interface type; a value of interface type points at an
     /// instance whose type implements the interface, or is NULL.
     Interface,
+    /// `[package] [repeatable] annotation @name { member; ... }`
+    /// (clause 35.2): a struct-like type in the type namespace whose
+    /// members carry review/development metadata. Restrictions (only
+    /// fields and methods, scalar/string/set field types, no extension
+    /// or inheritance) are checked in [`crate::check`]; the `repeatable`
+    /// flag governs how many attachments of the type one entity may
+    /// carry (clause 35.3, checked in [`crate::check`] as `E0139`).
+    Annotation {
+        repeatable: bool,
+    },
 }
 
 /// One formal type parameter of a template declaration (clause 8.2):
@@ -93,7 +103,29 @@ pub struct Declaration {
     /// `value'id` pairs flattened to their modifier text. When-scoping of
     /// extensions is not modeled yet; the modifiers are recorded only.
     pub modifiers: Vec<String>,
+    /// `@name(attr = const-exp, ...)` attachments written immediately
+    /// before the declaration (clause 35.3), in written order. Recorded
+    /// only — annotations have no effect on semantics (clause 35.1's
+    /// intent: they are read by tooling, not by the language).
+    pub annotations: Vec<Annotation>,
     pub members: Vec<Member>,
+    pub span: Span,
+}
+
+/// One attached annotation `@name` or `@name(attr = const-exp, ...)`
+/// (clause 35.3). The attribute values are recorded as written; they
+/// are constant expressions whose evaluation belongs to the consumer,
+/// not to the language kernel. Recorded on the declaration or member it
+/// precedes; several annotations may precede one entity, and more than
+/// one of the same type only if that type is `repeatable` (`E0139`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Annotation {
+    /// The annotation type's name, without the `@`.
+    pub name: String,
+    /// `(attribute, value-as-written)` pairs, in written order.
+    pub attrs: Vec<(String, Expr)>,
+    /// From the `@` to the closing `)` (or the name's end when no
+    /// attribute list is written).
     pub span: Span,
 }
 
@@ -137,6 +169,40 @@ pub enum Member {
     /// the match-expression grammar (clause 15.4) and expansion are later
     /// milestones.
     Macro(MacroDecl),
+}
+
+impl Member {
+    /// Record clause 35.3 annotations on the members a declaration
+    /// produced. The attachment attaches to the DECLARATION (`a, b:
+    /// uint;` is one declaration), so a name group's every field carries
+    /// it. Members that cannot carry an annotation (the parser rejects
+    /// attachments before them) are left unchanged.
+    pub fn attach_annotations(&mut self, annotations: &[Annotation]) {
+        if annotations.is_empty() {
+            return;
+        }
+        let target = match self {
+            Member::Field(field) => &mut field.annotations,
+            Member::Constraint(constraint) => &mut constraint.annotations,
+            Member::Method(method) => &mut method.annotations,
+            Member::Event(event) => &mut event.annotations,
+            Member::On(on) => &mut on.annotations,
+            Member::Cover(cover) => &mut cover.annotations,
+            Member::Expect(expect) => &mut expect.annotations,
+            Member::Port(port) => &mut port.annotations,
+            Member::Macro(macro_decl) => &mut macro_decl.annotations,
+            Member::Enumeral(_)
+            | Member::When(_)
+            | Member::Import { .. }
+            | Member::Define { .. } => {
+                return;
+            }
+        };
+        // Written order: the annotations written outermost come first.
+        let existing = std::mem::take(target);
+        *target = annotations.to_vec();
+        target.extend(existing);
+    }
 }
 
 /// A `when` subtype member: one or more `value'id` (or bare `id`) modifiers
@@ -188,6 +254,9 @@ pub struct EventDecl {
     /// `static event name;` — the event of the type itself (clause
     /// 11.1.4.1), not of an instance.
     pub is_static: bool,
+    /// `@name(...)` attachments written immediately before the member
+    /// (clause 35.3), recorded only.
+    pub annotations: Vec<Annotation>,
     pub span: Span,
 }
 
@@ -231,6 +300,9 @@ pub struct PortDecl {
     pub name_span: Span,
     pub direction: PortDirection,
     pub element: TypeExpr,
+    /// `@name(...)` attachments written immediately before the member
+    /// (clause 35.3), recorded only.
+    pub annotations: Vec<Annotation>,
     pub span: Span,
 }
 
@@ -265,6 +337,10 @@ pub struct Field {
     /// `package name: ...;` / `protected name: ...;` / `private name:
     /// ...;` visibility prefix (clause 22), recorded only.
     pub visibility: Option<String>,
+    /// `@name(...)` attachments written immediately before the member
+    /// (clause 35.3), recorded only. A name group's every field carries
+    /// the attachment (the attachment precedes the declaration).
+    pub annotations: Vec<Annotation>,
 }
 
 /// A `keep <expr>;` or `keep soft <expr>;` constraint. The expression is
@@ -276,6 +352,9 @@ pub struct KeepConstraint {
     /// `keep bind (port, hdl_kind);` — hierarchical HDL binding recorded
     /// as a `bind(a, b)` call. Skipped by identifier checking and by `gen`.
     pub is_bind: bool,
+    /// `@name(...)` attachments written immediately before the member
+    /// (clause 35.3), recorded only.
+    pub annotations: Vec<Annotation>,
     pub span: Span,
 }
 
@@ -297,6 +376,10 @@ pub struct MethodDecl {
     /// E0216), and it can be extended only in the struct that declares
     /// it (E0309). A static method is not a TCM.
     pub is_static: bool,
+    /// `@name(...)` attachments written immediately before the member
+    /// (clause 35.3), recorded only. An interface body's signatures
+    /// carry them the same way.
+    pub annotations: Vec<Annotation>,
     pub body: Vec<Stmt>,
     pub span: Span,
 }
@@ -332,6 +415,9 @@ pub struct MacroDecl {
     pub pattern: String,
     /// `define ... as computed { ... };`
     pub computed: bool,
+    /// `@name(...)` attachments written immediately before the macro
+    /// definition (clause 35.3), recorded only.
+    pub annotations: Vec<Annotation>,
     /// The braced body's raw tokens, without the enclosing braces.
     pub body: Vec<crate::lexer::Token>,
     pub span: Span,
@@ -354,6 +440,9 @@ pub struct OnDecl {
     /// `on Type::event` — the type-qualified form: the struct the named
     /// static event belongs to.
     pub type_qualified: Option<String>,
+    /// `@name(...)` attachments written immediately before the member
+    /// (clause 35.3), recorded only.
+    pub annotations: Vec<Annotation>,
     pub body: Vec<Stmt>,
     pub span: Span,
 }
@@ -375,6 +464,9 @@ pub struct CoverGroupDecl {
     /// group defined for the same event.
     pub is_also: bool,
     pub items: Vec<CoverItemDecl>,
+    /// `@name(...)` attachments written immediately before the member
+    /// (clause 35.3), recorded only.
+    pub annotations: Vec<Annotation>,
     /// Group-level option entries that are not items, recorded as raw
     /// tokens (one entry per statement).
     pub options: Vec<Vec<crate::lexer::Token>>,
@@ -418,6 +510,9 @@ pub struct ExpectDecl {
     /// The `else` failure body (usually a `dut_error` call); empty when
     /// absent — the default failure reports the rule name.
     pub else_body: Vec<Stmt>,
+    /// `@name(...)` attachments written immediately before the member
+    /// (clause 35.3), recorded only.
+    pub annotations: Vec<Annotation>,
     pub span: Span,
 }
 
@@ -800,6 +895,7 @@ pub fn render_expr_compact(expr: &Expr) -> String {
         Expr::StaticAccess {
             type_name, member, ..
         } => format!("{type_name}::{member}"),
+        Expr::AnnotationTypeRef { name, .. } => format!("@{name}"),
         Expr::Paren { expr, .. } => format!("({})", render_expr_compact(expr)),
         _ => "...".to_owned(),
     }
@@ -1065,6 +1161,14 @@ pub enum Expr {
         member_span: Span,
         span: Span,
     },
+    /// `@name` in expression position — the annotation TYPE named
+    /// (clause 35.4): the receiver of the annotation API's static
+    /// methods (`@development.get_all_annotations()`). A bare `@name`
+    /// has no value; the postfix chain reads the member access.
+    AnnotationTypeRef {
+        name: String,
+        span: Span,
+    },
 }
 
 /// The right-hand side of an `in` membership expression.
@@ -1192,6 +1296,7 @@ impl Expr {
             | Expr::QualifiedField { span, .. }
             | Expr::SetLiteral { span, .. }
             | Expr::StaticAccess { span, .. }
+            | Expr::AnnotationTypeRef { span, .. }
             | Expr::New { span, .. }
             | Expr::Select { span, .. }
             | Expr::HdlPath { span, .. } => *span,

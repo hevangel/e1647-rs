@@ -3629,3 +3629,121 @@ fn interface_default_and_generated_fields_are_null() {
     );
     assert_eq!(output, "TRUE\n");
 }
+
+// The 2019 annotation API (IEEE 1647-2019 clause 35.4, task T10.3).
+// The two-module shape: the annotation type is declared in one module,
+// attached and queried from the next one (clause 35.2's same-module
+// rule) — the same composed file the CLI's import driver builds
+// (`parse_with_imports` in `main.rs`; the library surface has no import
+// driver of its own).
+
+/// [`run_source`] over the composed two-module file: `imported`'s
+/// declarations splice in first, the per-file module-scope pass has run
+/// inside each `parse_unchecked`, and the well-formedness pass runs
+/// once over the merged set.
+fn run_two_modules(imported: &str, source: &str, seed: u64) -> RunResult {
+    let imported = e1647::parser::parse_unchecked(imported);
+    let own = e1647::parser::parse_unchecked(source);
+    let mut declarations = imported.declarations;
+    declarations.extend(own.declarations);
+    let mut diagnostics = imported.diagnostics;
+    diagnostics.extend(own.diagnostics);
+    diagnostics.extend(e1647::check::check_declarations(&declarations));
+    assert!(
+        diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        diagnostics.iter().map(|d| d.render()).collect::<Vec<_>>()
+    );
+    let elaborated = elaborate(&declarations);
+    assert!(
+        elaborated.diagnostics.is_empty(),
+        "elaboration diagnostics: {:?}",
+        elaborated
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    run(&elaborated, seed)
+}
+
+#[test]
+fn annotation_api_get_all_annotations_lists_recorded_attachments() {
+    // `@T.get_all_annotations()` (clause 35.4) returns the type's
+    // recorded attachments as a list of source-like strings — the
+    // documented representation of the annotation's fields in this
+    // stage (attribute values rendered as written).
+    let imported = "<'\nannotation @development { developer: string; date: string; release: uint; };\n\
+                    repeatable annotation @reviewed { by: string; };\n'>";
+    let source = "<'\nimport ann;\n\
+                  @development(developer = \"jo\", release = 10) struct packet_s { x: uint; };\n\
+                  @reviewed(by = \"ann\") @reviewed(by = \"bob\") struct checker_u { };\n\
+                  extend sys {\n    run() is {\n        \
+                  out(@development.get_all_annotations().size(), \"\\n\");\n        \
+                  out(@development.get_all_annotations()[0], \"\\n\");\n        \
+                  out(@reviewed.get_all_annotations().size(), \"\\n\");\n    \
+                  };\n};\n'>";
+    let result = run_two_modules(imported, source, 1);
+    assert!(
+        result.diagnostics.is_empty(),
+        "run diagnostics: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        result.output,
+        "1\n@development(developer = \"jo\", release = 10)\n2\n"
+    );
+}
+
+#[test]
+fn annotation_api_element_surface_is_e0419_stubs() {
+    // The element-taking calls and the definition-element surface are
+    // recognised and arity-checked but report E0419 at run time: there
+    // is no rf_definition_element model in this stage.
+    let imported = "<'\nannotation @development { developer: string; };\n'>";
+    let source = "<'\nimport ann;\n\
+                  @development struct packet_s { x: uint; };\n\
+                  extend sys {\n    run() is {\n        \
+                  out(@development.get_attached_annotation(NULL));\n    \
+                  };\n};\n'>";
+    let result = run_two_modules(imported, source, 1);
+    let rendered = result
+        .diagnostics
+        .iter()
+        .map(|d| d.render())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec![
+            "6:13: error[E0419]: 'get_attached_annotation()' is recognised (clause 35.4) but not implemented in this stage"
+        ]
+    );
+}
+
+#[test]
+fn new_of_annotation_type_is_rejected() {
+    // Clause 35.2: `new` is not allowed for an annotation type — the
+    // annotation exists as recorded metadata, not as an instance.
+    let imported = "<'\nannotation @development { developer: string; };\n'>";
+    let source = "<'\nimport ann;\n\
+                  @development struct packet_s { x: uint; };\n\
+                  extend sys {\n    run() is {\n        \
+                  out(new development);\n    \
+                  };\n};\n'>";
+    let result = run_two_modules(imported, source, 1);
+    let rendered = result
+        .diagnostics
+        .iter()
+        .map(|d| d.render())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec![
+            "6:13: error[E0402]: cannot instantiate annotation type 'development' — 'new' is not allowed for annotations (clause 35.2)"
+        ]
+    );
+}

@@ -2077,3 +2077,222 @@ fn evaluate_parses_type_variable_and_body() {
     };
     assert_eq!(name, "evaluate");
 }
+
+// The 2019 annotation stage (IEEE 1647-2019 clause 35, tasks T10.1 and
+// T10.2). The two-module shapes splice the imported module's
+// declarations before the importing module's own — the same composed
+// file the CLI's import driver builds (`parse_with_imports` in
+// `main.rs`; the library surface has no import driver of its own).
+
+/// The composed two-module file: `imported`'s declarations splice in
+/// first (the CLI's load order), the per-file module-scope pass has run
+/// inside each `parse_unchecked`, and the well-formedness pass runs
+/// once over the merged set.
+fn parse_two_modules(imported: &str, source: &str) -> e1647::parser::ParseResult {
+    let imported = e1647::parser::parse_unchecked(imported);
+    let own = e1647::parser::parse_unchecked(source);
+    let mut declarations = imported.declarations;
+    declarations.extend(own.declarations);
+    let mut diagnostics = imported.diagnostics;
+    diagnostics.extend(own.diagnostics);
+    diagnostics.extend(e1647::check::check_declarations(&declarations));
+    e1647::parser::ParseResult {
+        declarations,
+        diagnostics,
+    }
+}
+
+#[test]
+fn annotation_declarations_parse_with_members() {
+    let declarations = expect_clean(
+        "<'\nannotation @development { developer: string; date: string; release: uint; };\n\
+         repeatable annotation @reviewed { by: string; };\n'>",
+    );
+    assert_eq!(declarations.len(), 2);
+    assert_eq!(
+        declarations[0].kind,
+        DeclarationKind::Annotation { repeatable: false }
+    );
+    assert_eq!(declarations[0].name, "development");
+    assert_eq!(declarations[0].members.len(), 3);
+    assert_eq!(
+        declarations[1].kind,
+        DeclarationKind::Annotation { repeatable: true }
+    );
+    assert_eq!(declarations[1].name, "reviewed");
+    let Member::Field(by) = &declarations[1].members[0] else {
+        panic!("expected the annotation's field");
+    };
+    assert_eq!(by.name, "by");
+}
+
+#[test]
+fn annotation_attachments_record_on_declaration_and_member() {
+    // Clause 35.2's same-module rule: the annotation type is declared
+    // in one module and attached from the next one (here via the
+    // composed import shape).
+    let imported = "<'\nannotation @development { developer: string; release: uint; };\n\
+                    repeatable annotation @reviewed { by: string; };\n'>";
+    let source = "<'\nimport ann;\n\
+                  @development(developer = \"jo\", release = 10) struct packet_s \
+                  { @reviewed(by = \"a\") @reviewed(by = \"b\") x: uint; };\n'>";
+    let result = parse_two_modules(imported, source);
+    assert!(
+        result.diagnostics.is_empty(),
+        "unexpected diagnostics: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    let packet = result
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "packet_s")
+        .expect("the packet struct is declared");
+    // The attachment precedes the declaration; the attribute values are
+    // recorded as written.
+    assert_eq!(packet.annotations.len(), 1);
+    assert_eq!(packet.annotations[0].name, "development");
+    assert_eq!(packet.annotations[0].attrs.len(), 2);
+    assert_eq!(packet.annotations[0].attrs[0].0, "developer");
+    assert_eq!(
+        packet.annotations[0].attrs[0].1,
+        Expr::StringLiteral {
+            value: "jo".to_owned(),
+            span: packet.annotations[0].attrs[0].1.span(),
+        }
+    );
+    assert_eq!(packet.annotations[0].attrs[1].0, "release");
+    // The field carries both @reviewed attachments in written order —
+    // `repeatable` licenses the double attachment (clause 35.3).
+    let Member::Field(field) = &packet.members[0] else {
+        panic!("expected the field");
+    };
+    assert_eq!(field.annotations.len(), 2);
+    assert_eq!(field.annotations[0].name, "reviewed");
+    assert_eq!(field.annotations[1].name, "reviewed");
+    assert_eq!(
+        field.annotations[0].attrs[0].1,
+        Expr::StringLiteral {
+            value: "a".to_owned(),
+            span: field.annotations[0].attrs[0].1.span(),
+        }
+    );
+    assert_eq!(
+        field.annotations[1].attrs[0].1,
+        Expr::StringLiteral {
+            value: "b".to_owned(),
+            span: field.annotations[1].attrs[0].1.span(),
+        }
+    );
+}
+
+#[test]
+fn annotation_repeatable_rule_composes_over_imports() {
+    // The same double attachment with a NON-repeatable type: the
+    // composed set reports E0139 at the second attachment (clause
+    // 35.3). The importer's module scope is clean — the type is
+    // declared in the other module — so no E0321 fires.
+    let imported = "<'\nannotation @reviewed { by: string; };\n'>";
+    let source = "<'\nimport ann;\n\
+                  struct s { @reviewed(by = \"a\") @reviewed(by = \"b\") x: uint; };\n'>";
+    let result = parse_two_modules(imported, source);
+    let rendered = result
+        .diagnostics
+        .iter()
+        .map(|d| d.render())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec!["3:32: error[E0139]: annotation '@reviewed' is not repeatable (clause 35.3)"]
+    );
+}
+
+#[test]
+fn annotation_type_cannot_be_extended_or_inherited() {
+    // `extend name` and the `like` form are E0320 (clause 35.2). The
+    // single-file extend shape is the s2019_annotation_extend fixture;
+    // the like form here.
+    let result = parse(
+        "<'\nannotation @development { developer: string; };\n\
+         struct s like development { x: uint; };\n'>",
+    );
+    let rendered = result
+        .diagnostics
+        .iter()
+        .map(|d| d.render())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec![
+            "3:15: error[E0320]: annotation type 'development' cannot be inherited from (clause 35.2)"
+        ]
+    );
+}
+
+#[test]
+fn annotation_type_is_not_usable_in_its_own_module() {
+    // Clause 35.2: a newly declared annotation type is usable only from
+    // the next module. Declaring and attaching in one file is E0321,
+    // once per type at its first use.
+    let result =
+        parse("<'\nannotation @dev { developer: string; };\n@dev struct s { x: uint; };\n'>");
+    let rendered = result
+        .diagnostics
+        .iter()
+        .map(|d| d.render())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec![
+            "3:1: error[E0321]: annotation type 'dev' is used in the module that declares it (clause 35.2)"
+        ]
+    );
+    // The same rule for a type-position use (the annotation type shares
+    // the type namespace, so a field of the type is spelled with the
+    // bare name).
+    let result = parse("<'\nannotation @dev { developer: string; };\nstruct s { d: dev; };\n'>");
+    let rendered = result
+        .diagnostics
+        .iter()
+        .map(|d| d.render())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec![
+            "3:15: error[E0321]: annotation type 'dev' is used in the module that declares it (clause 35.2)"
+        ]
+    );
+}
+
+#[test]
+fn annotation_body_takes_fields_and_methods_only() {
+    // Clause 35.2: only fields and methods (E0137); fields of
+    // scalar/string/set types only (E0138).
+    let result = parse(
+        "<'\nstruct base { };\ntype small_t: [A, B];\n\
+         annotation @mix {\n\
+         \x20   ok_scalar: uint(bits: 8);\n\
+         \x20   ok_string: string;\n\
+         \x20   ok_set: small_t;\n\
+         \x20   bad_list: list of uint;\n\
+         \x20   bad_struct: base;\n\
+         \x20   event ev;\n\
+         };\n'>",
+    );
+    let rendered = result
+        .diagnostics
+        .iter()
+        .map(|d| d.render())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec![
+            "8:5: error[E0138]: annotation field 'bad_list' must be scalar, string or set (clause 35.2)",
+            "9:5: error[E0138]: annotation field 'bad_struct' must be scalar, string or set (clause 35.2)",
+            "10:5: error[E0137]: an annotation member must be a field or method (clause 35.2)",
+        ]
+    );
+}

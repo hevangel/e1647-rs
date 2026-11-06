@@ -60,6 +60,15 @@ pub const BUILTIN_ROUTINES: &[&str] = &[
     // deep-copied items, a struct copy is a fresh instance with deep
     // copied fields (its `copy()` blocks run).
     "deep_copy",
+    // The clause 35.4 annotation API's element-taking calls and the
+    // definition-element surface (T10.3): recognised, arity-checked,
+    // E0419 at run time — only `@T.get_all_annotations()` is
+    // implemented, dispatched in the interpreter on the annotation-type
+    // receiver.
+    "get_attached_annotation",
+    "get_attached_annotations_list",
+    "get_definition_element",
+    "is_applicable",
 ];
 
 /// Predefined base units whose extends compose into every unit of the
