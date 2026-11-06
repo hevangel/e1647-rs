@@ -8,7 +8,10 @@
 //! blocks), scalar (`uint(bits: 8)`-style widths included), `list of`, and
 //! named types, field init values (`= init-value`, clause 6.9.1/6.9.2),
 //! enumeral type declarations, `keep` and `keep soft` constraint
-//! expressions, `when` subtype members (`value'id` modifiers per the
+//! expressions — including the clause 10.5.8 `target chosen_from
+//! read_only(list)` form, whose right side must be exactly a
+//! `read_only(exp)` call (`E0131` otherwise) — `when` subtype members
+//! (`value'id` modifiers per the
 //! reference grammar's `struct_type_modifier`), and method members with
 //! parameter lists and statement bodies (local `var` declarations,
 //! assignments, expression statements including calls and indexing,
@@ -65,6 +68,7 @@
 //!   interpreter, where the inference contexts (the declared type of the
 //!   assignment/`var` target or of the call's parameter) actually resolve
 //! - `E0123` `return`/`wait`/`sync` inside an `evaluate` block (clause 4.17.7)
+//! - `E0131` `chosen_from` right side is not `read_only(exp)` (clause 10.5.8)
 //! - `E0201` duplicate declaration name
 //! - `E0202` duplicate field name
 //! - `E0203` unknown type name
@@ -4227,34 +4231,90 @@ impl Parser {
     }
 
     /// `expr in [a, b]` / `expr in [low .. high]`, left-associative, at
-    /// [`IN_LEVEL`].
+    /// [`IN_LEVEL`]. The row's second binary keyword is `chosen_from`
+    /// (clause 10.5.8): `target chosen_from read_only(list)` — the right
+    /// side must be exactly a `read_only(exp)` call, whose argument is
+    /// recorded unwrapped on [`Expr::ChosenFrom`]; any other right side
+    /// reports `E0131`.
     fn parse_in_level(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_binary_level(IN_LEVEL + 1)?;
-        while self.at_keyword("in") {
-            self.bump();
-            self.expect_punct("[", "E0106", "expected '[' after 'in'")?;
-            let first_item = self.parse_expr()?;
-            let set = if self.eat_punct("..") {
-                let high = self.parse_expr()?;
-                self.expect_punct("]", "E0107", "expected ']' to close the range")?;
-                crate::ast::InSetExpr::Range(Box::new(first_item), Box::new(high))
-            } else {
-                let mut items = vec![first_item];
-                while self.eat_punct(",") {
-                    items.push(self.parse_expr()?);
-                }
-                self.expect_punct("]", "E0107", "expected ']' to close the set")?;
-                crate::ast::InSetExpr::Items(items)
-            };
-            let start = lhs.span().0;
-            let end = self.last_end();
-            lhs = Expr::InSet {
-                element: Box::new(lhs),
-                set,
-                span: (start, end),
-            };
+        loop {
+            if self.at_keyword("in") {
+                self.bump();
+                self.expect_punct("[", "E0106", "expected '[' after 'in'")?;
+                let first_item = self.parse_expr()?;
+                let set = if self.eat_punct("..") {
+                    let high = self.parse_expr()?;
+                    self.expect_punct("]", "E0107", "expected ']' to close the range")?;
+                    crate::ast::InSetExpr::Range(Box::new(first_item), Box::new(high))
+                } else {
+                    let mut items = vec![first_item];
+                    while self.eat_punct(",") {
+                        items.push(self.parse_expr()?);
+                    }
+                    self.expect_punct("]", "E0107", "expected ']' to close the set")?;
+                    crate::ast::InSetExpr::Items(items)
+                };
+                let start = lhs.span().0;
+                let end = self.last_end();
+                lhs = Expr::InSet {
+                    element: Box::new(lhs),
+                    set,
+                    span: (start, end),
+                };
+                continue;
+            }
+            if self.at_keyword("chosen_from") {
+                let start = lhs.span().0;
+                self.bump();
+                // 10.5.8: the list is read-only — the wrapper is part of
+                // the syntax, so a bare list expression (or anything else)
+                // on the right side is E0131. `read_only` is a predefined
+                // name, not a keyword: the exact identifier followed by
+                // the opening parenthesis is the accepted spelling.
+                let list = if self.at_identifier_named("read_only") && self.peek_punct_at(1, "(") {
+                    self.bump();
+                    self.bump();
+                    let inner = self.parse_expr()?;
+                    self.expect_punct(")", "E0110", "expected ')' to close the read_only list")?;
+                    inner
+                } else {
+                    self.error_here(
+                        "E0131",
+                        "expected 'read_only(exp)' as the right side of 'chosen_from' (10.5.8)",
+                    );
+                    // Best-effort recovery: parse the right side as a
+                    // plain expression so the constraint (and its `;`)
+                    // still parse and only E0131 is reported. The
+                    // diagnostics are authoritative.
+                    self.parse_expr()?
+                };
+                let end = self.last_end();
+                lhs = Expr::ChosenFrom {
+                    target: Box::new(lhs),
+                    list: Box::new(list),
+                    span: (start, end),
+                };
+                continue;
+            }
+            break;
         }
         Some(lhs)
+    }
+
+    /// Whether the current token is the identifier `name` (keywords and
+    /// punctuation do not match).
+    fn at_identifier_named(&self, name: &str) -> bool {
+        matches!(self.peek_kind(), Some(TokenKind::Identifier(id)) if id == name)
+    }
+
+    /// Whether the token `offset` positions past the current one is the
+    /// punctuation `symbol` (0 is the current token).
+    fn peek_punct_at(&self, offset: usize, symbol: &str) -> bool {
+        matches!(
+            self.tokens.get(self.pos + offset).map(|t| &t.kind),
+            Some(TokenKind::Punctuation(p)) if p == symbol
+        )
     }
 
     /// `lhs ~ pattern` / `lhs !~ pattern` string match (clause 4.12),

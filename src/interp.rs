@@ -34,6 +34,18 @@
 //! the enclosing type's when-block constraints stay unenforced. Every
 //! run takes an explicit seed and is fully deterministic per backend.
 //!
+//! The clause 10.5.8 `target chosen_from read_only(list)` keep form is
+//! applied when its target — a simple generative struct field path — is
+//! generated (`gen <path>;` or the field's turn inside `gen` of the
+//! enclosing instance): the list elements are substituted into the target
+//! slot one by one, the other constraints on paths through the target
+//! (declared in the structs along the path) are evaluated with each
+//! candidate bound, and one satisfying element is picked uniformly with
+//! the seeded RNG. An empty list, or no satisfying element, is a
+//! generation contradiction (`E0417`). Pointer-equality constraints on
+//! the target are an unsupported shape (`E0402`); there is no ICFS
+//! machinery in this stage for the target to participate in.
+//!
 //! ## Diagnostic codes
 //!
 //! - `E0401` unknown identifier, field or method at run time
@@ -53,6 +65,9 @@
 //! - `E0413` a subtype-qualified field access (4.17.3) on an instance
 //!   that does not currently match the qualifiers' subtype — the field
 //!   is not present on it
+//! - `E0417` `chosen_from` contradiction (10.5.8): the read-only list is
+//!   empty, or none of its elements satisfies the other constraints on
+//!   paths through the target
 //! - `E0419` a call to a recognised 2019 predefined-library name that
 //!   is not implemented in this stage (see [`UNIMPLEMENTED_2019`])
 //! - `E0420` `do_bind()` outside the connect_ports() generation
@@ -2539,11 +2554,21 @@ impl<'a> Interp<'a> {
         me: Option<usize>,
         span: crate::ast::Span,
     ) -> Result<Flow, Diagnostic> {
-        let Expr::Ident { name, .. } = expr else {
-            return Err(self.error("E0402", "gen target must be a variable", span));
-        };
         let Some(me_index) = me else {
             return Err(self.error("E0402", "gen requires an enclosing instance", span));
+        };
+        // A simple member path (`h.p`) — the clause 10.5.8 chosen_from
+        // target spelling among others.
+        if let Expr::MemberAccess { .. } = expr {
+            self.exec_gen_field_path(expr, frame, me_index, span)?;
+            return Ok(Flow::Normal);
+        }
+        let Expr::Ident { name, .. } = expr else {
+            return Err(self.error(
+                "E0402",
+                "gen target must be a variable or a simple field path",
+                span,
+            ));
         };
         let slot_is_local = frame.locals.contains_key(name);
         let current = if slot_is_local {
@@ -2554,6 +2579,29 @@ impl<'a> Interp<'a> {
         let Some(current) = current else {
             return Err(self.error("E0401", format!("unknown variable '{name}' in gen"), span));
         };
+        // A clause 10.5.8 chosen_from whose target is exactly this field
+        // governs the generation: the field is assigned a pointer to a
+        // list element instead of being sampled. Only a field can be
+        // governed — a constraint's identifiers are checked against the
+        // type's fields, so a local variable is never a constraint
+        // target.
+        if !slot_is_local
+            && let Some((instance, remaining, list)) =
+                self.find_governing_chosen_from(me_index, std::slice::from_ref(name))?
+        {
+            let Value::Object(_) = current else {
+                return Err(self.error(
+                    "E0402",
+                    format!(
+                        "chosen_from target '{name}' must be a generative struct field (10.5.8)"
+                    ),
+                    span,
+                ));
+            };
+            let other = self.chosen_from_other_constraints(instance, &remaining);
+            self.gen_chosen_from(instance, &remaining, &list, &other, span)?;
+            return Ok(Flow::Normal);
+        }
         // A struct instance is randomized in place, recursively — under
         // the enclosing instance's constraints that reference it
         // (10.3.6-10.3.7's connected field sets, v1: depth-2 paths).
@@ -2597,7 +2645,10 @@ impl<'a> Interp<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        // Solver-backed path (feature `solver-pumpkin`).
+        // Solver-backed path (feature `solver-pumpkin`). A chosen_from
+        // constraint assigns its own target when that is generated; it is
+        // not a predicate over this scalar, so it stays out of the
+        // translated problem.
         #[cfg(feature = "solver-pumpkin")]
         {
             let bounds: std::collections::BTreeMap<String, (i64, i64)> =
@@ -2605,8 +2656,13 @@ impl<'a> Interp<'a> {
                     .map(|b| (name.clone(), b))
                     .into_iter()
                     .collect();
+            let solver_constraints: Vec<Expr> = constraints
+                .iter()
+                .filter(|constraint| !matches!(**constraint, Expr::ChosenFrom { .. }))
+                .cloned()
+                .collect();
             if !bounds.is_empty()
-                && let Ok(problem) = crate::solve::translate(&constraints, &bounds)
+                && let Ok(problem) = crate::solve::translate(&solver_constraints, &bounds)
             {
                 match crate::solve::solve(&problem, self.seed) {
                     crate::solve::SolveOutcome::Solved(mut assignment) => {
@@ -2638,6 +2694,11 @@ impl<'a> Interp<'a> {
             self.store(slot_is_local, name, candidate, frame, me_index, span)?;
             let mut pass = true;
             for constraint in &constraints {
+                // A chosen_from constraint is not a predicate here: it
+                // assigns its own target when that field is generated.
+                if matches!(constraint, Expr::ChosenFrom { .. }) {
+                    continue;
+                }
                 match self.eval(constraint, frame, Some(me_index))? {
                     Value::Bool(true) => {}
                     Value::Bool(false) => {
@@ -2668,6 +2729,378 @@ impl<'a> Interp<'a> {
             ));
         }
         Ok(Flow::Normal)
+    }
+
+    /// `gen <path>;` — the target is a simple member path: a bare
+    /// identifier root (the enclosing instance, one of its fields, or a
+    /// local) followed by field names. A clause 10.5.8 chosen_from
+    /// governing the path assigns a list element to the target slot;
+    /// without one, a struct-typed final field is randomized in place
+    /// under the parent type's constraints that reference it (10.3.6 to
+    /// 10.3.7's connected field sets, v1: depth-2 paths).
+    fn exec_gen_field_path(
+        &mut self,
+        expr: &Expr,
+        frame: &mut Frame,
+        me_index: usize,
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        let Some(segments) = expr_path_segments(expr) else {
+            return Err(self.error("E0402", "gen target must be a simple field path", span));
+        };
+        let [root, rest @ ..] = segments.as_slice() else {
+            return Err(self.error("E0402", "gen target must be a simple field path", span));
+        };
+        enum Root {
+            /// `gen me.p` — the path starts at the enclosing instance.
+            Me,
+            /// `gen h.p` with `h` a local variable holding the instance.
+            Local,
+            /// `gen h.p` with `h` a field of the enclosing instance — the
+            /// path may be referenced by the enclosing type's constraints.
+            Field,
+        }
+        let root_kind = if root == "me" || root == "self" {
+            Root::Me
+        } else if frame.locals.contains_key(root.as_str()) {
+            Root::Local
+        } else if self.instances[me_index].get(root).is_some() {
+            Root::Field
+        } else {
+            return Err(self.error("E0401", format!("unknown variable '{root}' in gen"), span));
+        };
+        let base = match root_kind {
+            Root::Me => me_index,
+            Root::Local | Root::Field => {
+                let root_value = if matches!(root_kind, Root::Local) {
+                    frame.locals.get(root.as_str()).cloned()
+                } else {
+                    self.instances[me_index].get(root).cloned()
+                };
+                let Some(Value::Object(base)) = root_value else {
+                    return Err(self.error(
+                        "E0402",
+                        format!("gen target root '{root}' is not a struct instance"),
+                        span,
+                    ));
+                };
+                base
+            }
+        };
+        // Where the constraint walk starts: a field root extends the
+        // written path one level up (the enclosing type may declare the
+        // governing chosen_from and constraints on the full path); `me`
+        // and a local root start at the root object itself.
+        let (walk_instance, walk_remaining) = match root_kind {
+            Root::Field => (me_index, segments.clone()),
+            Root::Me => (base, rest.to_vec()),
+            Root::Local => (base, rest.to_vec()),
+        };
+        if let Some((instance, remaining, list)) =
+            self.find_governing_chosen_from(walk_instance, &walk_remaining)?
+        {
+            let other = self.chosen_from_other_constraints(walk_instance, &walk_remaining);
+            self.gen_chosen_from(instance, &remaining, &list, &other, span)?;
+            return Ok(());
+        }
+        // Plain generation of the final field: single-segment paths only —
+        // the deeper enclosing-constraint scoping needs full CFS support.
+        let [field] = rest else {
+            return Err(self.error(
+                "E0402",
+                "gen of a field path deeper than one segment is only supported for a chosen_from target (10.5.8)",
+                span,
+            ));
+        };
+        let Some(Value::Object(target_index)) = self.instances[base].get(field).cloned() else {
+            return Err(self.error(
+                "E0402",
+                format!("gen of field '{field}' requires a struct-typed field"),
+                span,
+            ));
+        };
+        let parent_type_name = self.instances[base].type_name.clone();
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let enclosing: Vec<Expr> = types
+            .iter()
+            .find(|t| t.name == parent_type_name)
+            .map(|t| {
+                t.constraints
+                    .iter()
+                    .filter(|c| !c.is_bind)
+                    .map(|c| c.expr.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rebased = rebase_constraints(&enclosing, field);
+        self.gen_object(target_index, &rebased)?;
+        Ok(())
+    }
+
+    /// Walk a gen target path outermost-first, looking for the clause
+    /// 10.5.8 chosen_from constraint that governs it: at each instance
+    /// along the path the remaining segments name the target relative to
+    /// that instance's type, and a non-bind chosen_from whose target path
+    /// is exactly those segments governs. The constraint may live in the
+    /// target's own struct or in any struct enclosing it along the path.
+    /// Returns the slot (instance and remaining segments), where the
+    /// element is assigned, and the chosen_from's list expression.
+    fn find_governing_chosen_from(
+        &self,
+        start_instance: usize,
+        start_remaining: &[String],
+    ) -> Result<Option<(usize, Vec<String>, Expr)>, Diagnostic> {
+        let mut instance = start_instance;
+        let mut remaining: Vec<String> = start_remaining.to_vec();
+        loop {
+            let type_name = self.instances[instance].type_name.clone();
+            let Some(ty) = self.types.iter().find(|t| t.name == type_name) else {
+                return Ok(None);
+            };
+            for constraint in &ty.constraints {
+                if constraint.is_bind {
+                    continue;
+                }
+                let Expr::ChosenFrom { target, list, .. } = &constraint.expr else {
+                    continue;
+                };
+                // 10.5.8: a chosen_from constraint is not allowed under a
+                // `when` subtype; the declaring type of the governing
+                // constraint is where that is visible.
+                if !ty.when_of.is_empty() {
+                    return Err(self.error(
+                        "E0402",
+                        "chosen_from is not allowed under a when subtype (10.5.8)",
+                        constraint.span,
+                    ));
+                }
+                if constraint_path_segments(target).as_deref() == Some(remaining.as_slice()) {
+                    return Ok(Some((instance, remaining, list.as_ref().clone())));
+                }
+            }
+            if remaining.len() <= 1 {
+                return Ok(None);
+            }
+            let Some(Value::Object(next)) = self.instances[instance].get(&remaining[0]).cloned()
+            else {
+                return Ok(None);
+            };
+            instance = next;
+            remaining.remove(0);
+        }
+    }
+
+    /// The constraints that gate a clause 10.5.8 chosen_from choice: every
+    /// non-bind, non-chosen_from constraint declared in the types along
+    /// the target path — the declaring struct and the structs it reaches
+    /// through — that constrains a path extending the target path,
+    /// evaluated in each declaring instance's context. Constraints in
+    /// descendants of the target are never collected (10.5.8).
+    fn chosen_from_other_constraints(
+        &self,
+        start_instance: usize,
+        start_remaining: &[String],
+    ) -> Vec<(usize, Expr)> {
+        let mut other: Vec<(usize, Expr)> = Vec::new();
+        let mut instance = start_instance;
+        let mut remaining: Vec<String> = start_remaining.to_vec();
+        loop {
+            let type_name = self.instances[instance].type_name.clone();
+            if let Some(ty) = self.types.iter().find(|t| t.name == type_name) {
+                for constraint in &ty.constraints {
+                    if constraint.is_bind || matches!(constraint.expr, Expr::ChosenFrom { .. }) {
+                        continue;
+                    }
+                    if expr_extends_path(&constraint.expr, &remaining) {
+                        other.push((instance, constraint.expr.clone()));
+                    }
+                }
+            }
+            if remaining.len() <= 1 {
+                return other;
+            }
+            let Some(Value::Object(next)) = self.instances[instance].get(&remaining[0]).cloned()
+            else {
+                return other;
+            };
+            instance = next;
+            remaining.remove(0);
+        }
+    }
+
+    /// Apply one clause 10.5.8 `target chosen_from read_only(list)`
+    /// constraint: the list elements are substituted into the target slot
+    /// (`slot_instance.slot_remaining`) one by one, the other constraints
+    /// on paths through the target (`(instance, constraint)` pairs, each
+    /// evaluated in its declaring instance's context) must all hold with
+    /// the candidate bound, and one satisfying element is picked uniformly
+    /// with the seeded RNG. An empty list, or no satisfying element, is a
+    /// generation contradiction (`E0417`).
+    fn gen_chosen_from(
+        &mut self,
+        slot_instance: usize,
+        slot_remaining: &[String],
+        list_expr: &Expr,
+        other: &[(usize, Expr)],
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        let target_text = slot_remaining.join(".");
+        self.check_chosen_from_target(slot_instance, slot_remaining, &target_text, span)?;
+        let list_text = expr_text(list_expr);
+        let list_value = self.eval(list_expr, &mut Frame::default(), Some(slot_instance))?;
+        let Value::List(list) = list_value else {
+            return Err(self.error(
+                "E0402",
+                format!("chosen_from list '{list_text}' does not denote a list"),
+                span,
+            ));
+        };
+        let items = list.items.borrow().clone();
+        // Pointer-equality (and the other whole-object identity and
+        // type-narrowing comparisons) on the target are unsupported
+        // 10.5.8 shapes — reported instead of silently ignored.
+        for (_, constraint) in other {
+            if let Some(shape) = constraint_compares_target_whole(constraint, slot_remaining) {
+                return Err(self.error(
+                    "E0402",
+                    format!(
+                        "chosen_from: a {shape} constraint on the target '{target_text}' is not supported (10.5.8)"
+                    ),
+                    span,
+                ));
+            }
+        }
+        let mut satisfying: Vec<Value> = Vec::new();
+        for candidate in &items {
+            if !self.set_field_path(slot_instance, slot_remaining, candidate.clone()) {
+                return Err(self.error("E0401", format!("unknown field '{target_text}'"), span));
+            }
+            let mut pass = true;
+            for (instance, constraint) in other {
+                match self.eval(constraint, &mut Frame::default(), Some(*instance))? {
+                    Value::Bool(true) => {}
+                    Value::Bool(false) => {
+                        pass = false;
+                        break;
+                    }
+                    _ => {
+                        return Err(self.error(
+                            "E0402",
+                            "constraint did not evaluate to a boolean",
+                            span,
+                        ));
+                    }
+                }
+            }
+            if pass {
+                satisfying.push(candidate.clone());
+            }
+        }
+        if satisfying.is_empty() {
+            return Err(self.error(
+                "E0417",
+                format!(
+                    "chosen_from: no element of '{list_text}' satisfies the constraints on '{target_text}'"
+                ),
+                span,
+            ));
+        }
+        // 10.5.8: one of the satisfying elements, chosen uniformly.
+        let pick = self.rng.below(satisfying.len() as u128) as usize;
+        let chosen = satisfying[pick].clone();
+        if !self.set_field_path(slot_instance, slot_remaining, chosen) {
+            return Err(self.error("E0401", format!("unknown field '{target_text}'"), span));
+        }
+        Ok(())
+    }
+
+    /// The 10.5.8 target-shape rules checked where the type information
+    /// lives: every segment names a field, no `!` field on the path, and
+    /// the target itself is a generative struct field (not `!`, `%`,
+    /// `const`, `static` or unit-typed — units are instantiated, never
+    /// generated).
+    fn check_chosen_from_target(
+        &self,
+        slot_instance: usize,
+        slot_remaining: &[String],
+        target_text: &str,
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        let mut instance = slot_instance;
+        let last = slot_remaining.len() - 1;
+        for (position, segment) in slot_remaining.iter().enumerate() {
+            let type_name = self.instances[instance].type_name.clone();
+            let Some(ty) = self.types.iter().find(|t| t.name == type_name) else {
+                return Err(self.error(
+                    "E0401",
+                    format!("unknown type '{type_name}' in chosen_from target '{target_text}'"),
+                    span,
+                ));
+            };
+            let Some(field) = ty.fields.iter().find(|field| &field.name == segment) else {
+                return Err(self.error(
+                    "E0401",
+                    format!("unknown field '{segment}' in chosen_from target '{target_text}'"),
+                    span,
+                ));
+            };
+            if position < last {
+                if field.no_gen {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "chosen_from target '{target_text}' goes through a '!' field (10.5.8)"
+                        ),
+                        span,
+                    ));
+                }
+                let Some(Value::Object(next)) = self.instances[instance].get(segment).cloned()
+                else {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "chosen_from target '{target_text}' must go through struct instances"
+                        ),
+                        span,
+                    ));
+                };
+                instance = next;
+            } else {
+                let not_generative = field.no_gen
+                    || field.physical
+                    || field.is_const
+                    || field.is_static
+                    || self.is_unit_typed(&field.ty)
+                    || matches!(field.ty, TypeExpr::List { .. });
+                if not_generative {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "chosen_from target '{target_text}' must be a generative struct field (10.5.8)"
+                        ),
+                        span,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Assign `value` to the slot named by a dotted field path: every
+    /// segment except the last must currently hold a struct instance.
+    fn set_field_path(&mut self, instance: usize, remaining: &[String], value: Value) -> bool {
+        let mut instance = instance;
+        let last = remaining.len() - 1;
+        for (position, segment) in remaining.iter().enumerate() {
+            if position == last {
+                return self.instances[instance].set(segment, value);
+            }
+            let Some(Value::Object(next)) = self.instances[instance].get(segment).cloned() else {
+                return false;
+            };
+            instance = next;
+        }
+        false
     }
 
     fn declared_type_of(
@@ -2816,6 +3249,51 @@ impl<'a> Interp<'a> {
             .map(|constraint| constraint.expr.clone())
             .collect();
         constraints.extend(enclosing.iter().cloned());
+        // The clause 10.5.8 chosen_from constraints of this type: each
+        // must target one of the type's own generative fields (a deeper
+        // target path is applied by generating the field path explicitly,
+        // `gen h.p`; there is no ICFS machinery in this stage for the
+        // target to participate in). A chosen_from declared under a
+        // `when` subtype, or with a target that is not a simple field
+        // path of this type, is an unsupported shape.
+        let mut chosen_specs: Vec<(String, Expr)> = Vec::new();
+        for constraint in &ty.constraints {
+            if constraint.is_bind {
+                continue;
+            }
+            let Expr::ChosenFrom { target, list, .. } = &constraint.expr else {
+                continue;
+            };
+            if !ty.when_of.is_empty() {
+                return Err(self.error(
+                    "E0402",
+                    "chosen_from is not allowed under a when subtype (10.5.8)",
+                    constraint.span,
+                ));
+            }
+            let Some(segments) = constraint_path_segments(target) else {
+                return Err(self.error(
+                    "E0402",
+                    "chosen_from target must be a simple field path (10.5.8)",
+                    constraint.span,
+                ));
+            };
+            let [field] = segments.as_slice() else {
+                return Err(self.error(
+                    "E0402",
+                    format!(
+                        "chosen_from target '{}' must be a field of '{type_name}' (10.5.8); deeper target paths are applied by generating the field path",
+                        segments.join(".")
+                    ),
+                    constraint.span,
+                ));
+            };
+            chosen_specs.push((field.clone(), list.as_ref().clone()));
+        }
+        let chosen_names: std::collections::BTreeSet<String> = chosen_specs
+            .iter()
+            .map(|(field, _)| field.clone())
+            .collect();
         // Simple range/equality constraints narrow the per-field sampling
         // domains; everything else is enforced by the rejection predicate.
         let domains = self.constraint_domains(&constraints, &field_types);
@@ -2831,15 +3309,43 @@ impl<'a> Interp<'a> {
                         self.instances[index].set(name, Value::Int(*value));
                     }
                     None => {
+                        // A chosen_from target is assigned a list element
+                        // below, not sampled.
+                        if chosen_names.contains(name) {
+                            continue;
+                        }
                         let value = self.sample_type(field_ty)?;
                         self.instances[index].set(name, value);
                     }
                 }
             }
+            for (field, list_expr) in &chosen_specs {
+                let other = self.chosen_from_other_constraints(index, std::slice::from_ref(field));
+                let mut other = other;
+                other.extend(
+                    enclosing
+                        .iter()
+                        .filter(|expr| expr_extends_path(expr, std::slice::from_ref(field)))
+                        .map(|expr| (index, expr.clone())),
+                );
+                self.gen_chosen_from(
+                    index,
+                    std::slice::from_ref(field),
+                    list_expr,
+                    &other,
+                    type_span,
+                )?;
+            }
             return Ok(());
         }
         for _ in 0..1000 {
             for (name, field_ty) in &field_types {
+                // A chosen_from target is assigned a list element after
+                // the other fields are sampled (so co-constraints see
+                // their values), not sampled here.
+                if chosen_names.contains(name) {
+                    continue;
+                }
                 let value = match domains.get(name) {
                     Some(domain) => self.sample_int_in(field_ty, *domain),
                     None => self.sample_type(field_ty)?,
@@ -2869,6 +3375,27 @@ impl<'a> Interp<'a> {
                     *list.items.borrow_mut() = filled;
                 }
             }
+            // Clause 10.5.8: assign each chosen_from target now — the
+            // other fields carry their sampled values, so the constraints
+            // co-constraining paths through the target and another field
+            // evaluate meaningfully.
+            for (field, list_expr) in &chosen_specs {
+                let other = self.chosen_from_other_constraints(index, std::slice::from_ref(field));
+                let mut other = other;
+                other.extend(
+                    enclosing
+                        .iter()
+                        .filter(|expr| expr_extends_path(expr, std::slice::from_ref(field)))
+                        .map(|expr| (index, expr.clone())),
+                );
+                self.gen_chosen_from(
+                    index,
+                    std::slice::from_ref(field),
+                    list_expr,
+                    &other,
+                    type_span,
+                )?;
+            }
             let mut pass = true;
             for constraint in &constraints {
                 // HDL-binding constraints (`keep x.hdl_path() == "…"`,
@@ -2890,6 +3417,11 @@ impl<'a> Interp<'a> {
                         "per_inst_cover",
                     ],
                 ) {
+                    continue;
+                }
+                // A chosen_from constraint assigns its target above; it
+                // is not itself a predicate.
+                if matches!(constraint, Expr::ChosenFrom { .. }) {
                     continue;
                 }
                 match self.eval(constraint, &mut Frame::default(), Some(index))? {
@@ -2937,7 +3469,15 @@ impl<'a> Interp<'a> {
         if bounds.is_empty() {
             return Ok(None);
         }
-        let problem = match crate::solve::translate(constraints, &bounds) {
+        // A chosen_from constraint assigns its own target when that is
+        // generated; it is not a linear predicate, and its presence must
+        // not push the type's other fields off the solver.
+        let solver_constraints: Vec<Expr> = constraints
+            .iter()
+            .filter(|constraint| !matches!(**constraint, Expr::ChosenFrom { .. }))
+            .cloned()
+            .collect();
+        let problem = match crate::solve::translate(&solver_constraints, &bounds) {
             Ok(problem) => problem,
             Err(_) => return Ok(None),
         };
@@ -6937,6 +7477,15 @@ impl<'a> Interp<'a> {
                 // member is a static method used as a value.
                 self.read_static_field(type_name, member, *span)
             }
+            // A 10.5.8 chosen_from constraint is not an evaluatable
+            // expression: it is applied by `gen` when its target is
+            // generated. Reaching evaluation means it fired outside that
+            // protocol (an unsupported shape, or outside a keep).
+            Expr::ChosenFrom { span, .. } => Err(self.error(
+                "E0402",
+                "chosen_from is only a keep-constraint form (10.5.8); it is applied when its target is generated",
+                *span,
+            )),
         }
     }
 
@@ -8277,6 +8826,165 @@ fn render_set(intervals: &[(i128, i128)]) -> String {
 /// Rebase an enclosing instance's constraints onto a generated
 /// object's own field names (10.3.6-10.3.7's connected field sets, v1):
 /// `p.v == select { .. }` gating `gen p` becomes `v == select { .. }`.
+/// The dotted path an expression spells, when it is one: a bare
+/// identifier or a chain of member accesses rooted at one. Anything else
+/// (indexing, calls, literals, …) is not a simple path — `None`.
+fn expr_path_segments(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::Ident { name, .. } => Some(vec![name.clone()]),
+        Expr::MemberAccess { object, name, .. } => {
+            let mut segments = expr_path_segments(object)?;
+            segments.push(name.clone());
+            Some(segments)
+        }
+        _ => None,
+    }
+}
+
+/// The path a constraint spells, with a leading `me`/`self` segment
+/// stripped (constraint paths may be written me-relative).
+fn constraint_path_segments(expr: &Expr) -> Option<Vec<String>> {
+    let mut segments = expr_path_segments(expr)?;
+    if segments
+        .first()
+        .is_some_and(|name| name == "me" || name == "self")
+    {
+        segments.remove(0);
+    }
+    Some(segments)
+}
+
+/// Whether the expression contains a member path whose segments extend
+/// `prefix` (a chosen_from target path, `me`/`self`-normalized): the
+/// constraint then constrains a path through the target, so it gates the
+/// 10.5.8 element choice.
+fn expr_extends_path(expr: &Expr, prefix: &[String]) -> bool {
+    if let Some(segments) = constraint_path_segments(expr)
+        && segments.len() >= prefix.len()
+        && segments[..prefix.len()] == *prefix
+    {
+        return true;
+    }
+    match expr {
+        Expr::MemberAccess { object, .. } => expr_extends_path(object, prefix),
+        Expr::Call { callee, args, .. } => {
+            expr_extends_path(callee, prefix)
+                || args.iter().any(|arg| expr_extends_path(arg, prefix))
+        }
+        Expr::Index { base, index, .. } => {
+            expr_extends_path(base, prefix) || expr_extends_path(index, prefix)
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_extends_path(lhs, prefix) || expr_extends_path(rhs, prefix)
+        }
+        Expr::Unary { expr: inner, .. } | Expr::Paren { expr: inner, .. } => {
+            expr_extends_path(inner, prefix)
+        }
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            expr_extends_path(cond, prefix)
+                || expr_extends_path(then_expr, prefix)
+                || expr_extends_path(else_expr, prefix)
+        }
+        Expr::BitSlice {
+            base, high, low, ..
+        } => {
+            expr_extends_path(base, prefix)
+                || expr_extends_path(high, prefix)
+                || expr_extends_path(low, prefix)
+        }
+        Expr::CastAs { expr: inner, .. } => expr_extends_path(inner, prefix),
+        Expr::InSet { element, set, .. } => {
+            let set_has = match set {
+                crate::ast::InSetExpr::Items(items) => {
+                    items.iter().any(|item| expr_extends_path(item, prefix))
+                }
+                crate::ast::InSetExpr::Range(low, high) => {
+                    expr_extends_path(low, prefix) || expr_extends_path(high, prefix)
+                }
+            };
+            expr_extends_path(element, prefix) || set_has
+        }
+        Expr::IsA { expr: inner, .. } => expr_extends_path(inner, prefix),
+        Expr::QualifiedField { base, .. } => expr_extends_path(base, prefix),
+        Expr::ListConcat { items, .. } => items.iter().any(|item| expr_extends_path(item, prefix)),
+        _ => false,
+    }
+}
+
+/// Whether the constraint compares the chosen_from target as a whole
+/// object — either operand of an equality, identity or list-identity
+/// comparison, or the tested expression of an `is a` — a
+/// pointer-equality or like-narrowing constraint on the target, which
+/// the 10.5.8 protocol of this stage does not support (E0402). Returns
+/// the unsupported family's name for the diagnostic; `None` when the
+/// constraint does not touch the target whole (paths *through* it,
+/// `p.x == q.y`, are ordinary constraints).
+fn constraint_compares_target_whole(expr: &Expr, target: &[String]) -> Option<&'static str> {
+    let whole_path =
+        |expr: &Expr| constraint_path_segments(expr).is_some_and(|segments| segments == target);
+    match expr {
+        Expr::Binary { op, lhs, rhs, .. } => {
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::IdentityEq
+                    | BinaryOp::IdentityNe
+                    | BinaryOp::ListPtrEq
+                    | BinaryOp::ListPtrNe
+            ) && (whole_path(lhs) || whole_path(rhs))
+            {
+                return Some("pointer-equality");
+            }
+            constraint_compares_target_whole(lhs, target)
+                .or_else(|| constraint_compares_target_whole(rhs, target))
+        }
+        Expr::IsA { expr: inner, .. } => {
+            if whole_path(inner) {
+                return Some("type-narrowing");
+            }
+            constraint_compares_target_whole(inner, target)
+        }
+        Expr::Unary { expr: inner, .. } | Expr::Paren { expr: inner, .. } => {
+            constraint_compares_target_whole(inner, target)
+        }
+        _ => None,
+    }
+}
+
+/// Render an expression for a diagnostic message: the common
+/// constraint shapes verbatim, a placeholder for anything else.
+fn expr_text(expr: &Expr) -> String {
+    match expr {
+        Expr::Ident { name, .. } => name.clone(),
+        Expr::MemberAccess { object, name, .. } => format!("{}.{}", expr_text(object), name),
+        Expr::Call { callee, args, .. } => format!(
+            "{}({})",
+            expr_text(callee),
+            args.iter().map(expr_text).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Paren { expr: inner, .. } => format!("({})", expr_text(inner)),
+        Expr::Index { base, index, .. } => format!("{}[{}]", expr_text(base), expr_text(index)),
+        Expr::IntLiteral { text, .. }
+        | Expr::RealLiteral { text, .. }
+        | Expr::BitLiteral { text, .. } => text.clone(),
+        Expr::BoolLiteral { value, .. } => {
+            if *value {
+                "TRUE".to_owned()
+            } else {
+                "FALSE".to_owned()
+            }
+        }
+        Expr::StringLiteral { value, .. } => format!("\"{value}\""),
+        _ => "list".to_owned(),
+    }
+}
+
 /// A constraint rebases only when every path it references is rooted
 /// at the generated object (depth two — `prefix.field`); anything else
 /// (other roots, deeper paths, whole-object equalities) drops, because
@@ -8714,6 +9422,9 @@ pub(crate) fn expr_calls_any(expr: &Expr, names: &[&str]) -> bool {
                 }
             };
             expr_calls_any(element, names) || set_has
+        }
+        Expr::ChosenFrom { target, list, .. } => {
+            expr_calls_any(target, names) || expr_calls_any(list, names)
         }
         _ => false,
     }

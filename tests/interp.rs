@@ -3629,3 +3629,189 @@ fn interface_default_and_generated_fields_are_null() {
     );
     assert_eq!(output, "TRUE\n");
 }
+
+#[test]
+fn gen_chosen_from_picks_satisfying_elements_deterministically() {
+    // T6.1 (10.5.8): `keep p chosen_from read_only(lps)` assigns p a
+    // pointer to one of the read-only list's elements, chosen so the
+    // other constraints on paths through the target hold (p.x > 5);
+    // 20 generations print 20 TRUE lines, and the choice is uniform over
+    // the satisfying elements under the seeded RNG (across fixed seeds
+    // every satisfying value is reached).
+    let source = "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    !lps: list of packet_s;\n    p: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n    keep p.x > 5;\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         for i from 0 to 9 { var q: packet_s = new; q.x = i; h.lps.add(q); };\n        \
+         for k from 1 to 20 { gen h.p; out(h.p.x > 5, \" \", h.p.x, \"\\n\"); };\n    };\n};\n";
+    let first = clean_output(source, 1);
+    let lines: Vec<&str> = first.lines().collect();
+    assert_eq!(lines.len(), 20);
+    assert!(
+        lines.iter().all(|line| line.starts_with("TRUE ")),
+        "every generation must satisfy p.x > 5: {first:?}"
+    );
+    let second = clean_output(source, 1);
+    assert_eq!(first, second, "the same seed must reproduce the run");
+    let mut seen = std::collections::BTreeSet::new();
+    for seed in 1..=5u64 {
+        let output = clean_output(source, seed);
+        for line in output.lines() {
+            let value: i128 = line["TRUE ".len()..]
+                .trim()
+                .parse()
+                .expect("integer output");
+            assert!((6..=9).contains(&value), "constraint violated: x = {value}");
+            seen.insert(value);
+        }
+    }
+    assert_eq!(
+        seen,
+        std::collections::BTreeSet::from([6, 7, 8, 9]),
+        "the uniform choice must reach every satisfying element across seeds"
+    );
+}
+
+#[test]
+fn gen_chosen_from_target_is_an_alias_of_one_list_element() {
+    // T6.1: pointer semantics — the target holds one of the list's
+    // elements (object identity), not a copy. `has(it list_ptr== ...)`
+    // is not in the runtime subset, so the alias is found by comparing
+    // object equality against each element.
+    let output = clean_output(
+        "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    !lps: list of packet_s;\n    p: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         for i from 0 to 9 { var q: packet_s = new; q.x = i + 3; h.lps.add(q); };\n        \
+         gen h.p;\n        var hit: int = -1;\n        \
+         for i from 0 to 9 { if h.p == h.lps[i] { hit = i; }; };\n        \
+         out(hit >= 0, \"\\n\");\n        \
+         out(h.p.x == h.lps[hit].x, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUE\nTRUE\n");
+}
+
+#[test]
+fn gen_whole_object_applies_chosen_from_to_the_target_field() {
+    // T6.1: `gen h` (the whole enclosing instance) also applies the
+    // chosen_from constraint to its target field instead of sampling a
+    // fresh packet, and the other constraints on paths through the
+    // target hold.
+    let output = clean_output(
+        "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    !lps: list of packet_s;\n    p: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n    keep p.x > 5;\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         for i from 0 to 9 { var q: packet_s = new; q.x = i; h.lps.add(q); };\n        \
+         gen h;\n        out(h.p.x > 5, \"\\n\");\n        \
+         var hit: int = -1;\n        \
+         for i from 0 to 9 { if h.p == h.lps[i] { hit = i; }; };\n        \
+         out(hit >= 0, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUE\nTRUE\n");
+}
+
+#[test]
+fn gen_chosen_from_no_satisfying_element_reports_e0417() {
+    // T6.1: after every element's x drops to 1, no element satisfies
+    // p.x > 5 — the generation contradiction is E0417.
+    let result = run_source(
+        "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    !lps: list of packet_s;\n    p: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n    keep p.x > 5;\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         for i from 0 to 9 { var q: packet_s = new; q.x = i; h.lps.add(q); };\n        \
+         for each (e) in h.lps { e.x = 1; };\n        \
+         gen h.p;\n    };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0417");
+    assert!(
+        diagnostic
+            .render()
+            .contains("chosen_from: no element of 'lps' satisfies the constraints on 'p'"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn gen_chosen_from_empty_list_reports_e0417() {
+    // T6.1: an empty read-only list is a generation contradiction too.
+    let result = run_source(
+        "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    !lps: list of packet_s;\n    p: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         gen h.p;\n    };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0417");
+    assert!(
+        diagnostic
+            .render()
+            .contains("chosen_from: no element of 'lps' satisfies the constraints on 'p'"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn gen_chosen_from_pointer_equality_constraint_is_e0402() {
+    // T6.1: a pointer-equality constraint on the chosen_from target is
+    // an unsupported shape, reported instead of silently ignored.
+    let result = run_source(
+        "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    lps: list of packet_s;\n    p: packet_s;\n    q: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n    keep p == q;\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         var q: packet_s = new; h.lps.add(q);\n        \
+         gen h.p;\n    };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0402");
+    assert!(
+        diagnostic
+            .render()
+            .contains("pointer-equality constraint on the target 'p' is not supported"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn gen_chosen_from_nongenerative_target_is_e0402() {
+    // T6.1: the target must be a generative struct field — a `!` field
+    // keeps its value and is never assigned by gen.
+    let result = run_source(
+        "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    !lps: list of packet_s;\n    !p: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         var q: packet_s = new; h.lps.add(q);\n        \
+         gen h.p;\n    };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0402");
+    assert!(
+        diagnostic
+            .render()
+            .contains("chosen_from target 'p' must be a generative struct field"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}

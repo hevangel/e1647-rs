@@ -1,0 +1,1 @@
+6:24: error[E0131]: expected 'read_only(exp)' as the right side of 'chosen_from' (10.5.8)
