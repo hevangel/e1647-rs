@@ -60,6 +60,12 @@ pub const BUILTIN_ROUTINES: &[&str] = &[
     // deep-copied items, a struct copy is a fresh instance with deep
     // copied fields (its `copy()` blocks run).
     "deep_copy",
+    // The clause 29.13 range-generation routines over a `~` field
+    // (clause 6.9.7): `rgf_was_generated(f)`, `rgf_get_range(f)` (the
+    // generated reduced set of 10.3.13) and `rgf_was_reduced(f)`.
+    "rgf_was_generated",
+    "rgf_get_range",
+    "rgf_was_reduced",
 ];
 
 /// Predefined base units whose extends compose into every unit of the

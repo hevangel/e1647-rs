@@ -2470,6 +2470,7 @@ fn substitute_in_set_expr(set: &mut crate::ast::InSetExpr, ctx: &mut Subst) {
             substitute_expr(low, ctx);
             substitute_expr(high, ctx);
         }
+        crate::ast::InSetExpr::Expr(expr) => substitute_expr(expr, ctx),
     }
 }
 

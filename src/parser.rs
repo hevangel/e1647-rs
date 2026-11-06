@@ -1980,6 +1980,11 @@ impl Parser {
         matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == symbol)
     }
 
+    /// Whether the token after the current one is the given keyword.
+    fn peek_second_is_keyword(&self, word: &str) -> bool {
+        matches!(self.peek_second_kind(), Some(TokenKind::Keyword(w)) if w == word)
+    }
+
     /// Whether the token after the current one is the given word, as a
     /// keyword or an identifier.
     fn peek_second_is_word(&self, word: &str) -> bool {
@@ -3990,6 +3995,24 @@ impl Parser {
             }
             _ => {
                 let expr = self.parse_expr()?;
+                // `field rgf= exp;` (clause 18.6): the `rgf=` operator
+                // assigns a concrete value to an already-generated
+                // range-generated field. The target's field-ness is the
+                // well-formedness pass's business (E0130 there).
+                if self.at_punct("rgf=") {
+                    self.bump();
+                    let value = self.parse_expr()?;
+                    // The last statement of a block may omit the `;`.
+                    if !self.eat_punct(";") && !self.at_punct("}") {
+                        self.expect_punct(";", "E0105", "expected ';' after assignment")?;
+                    }
+                    let end = self.last_end();
+                    return Some(Stmt::RgfAssign {
+                        target: expr,
+                        value,
+                        span: (start, end),
+                    });
+                }
                 if self.eat_punct("=") {
                     let value = self.parse_expr()?;
                     // The last statement of a block may omit the `;`.
@@ -4547,31 +4570,60 @@ impl Parser {
     }
 
     /// `expr in [a, b]` / `expr in [low .. high]`, left-associative, at
-    /// [`IN_LEVEL`].
+    /// [`IN_LEVEL`]. The `not in` negation (Table 12's row) wraps the
+    /// membership in a unary `not`, and a non-bracket right operand is a
+    /// general set expression ([`crate::ast::InSetExpr::Expr`], clause
+    /// 4.11.6): a value evaluating to a set (or a list).
     fn parse_in_level(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_binary_level(IN_LEVEL + 1)?;
-        while self.at_keyword("in") {
-            self.bump();
-            self.expect_punct("[", "E0106", "expected '[' after 'in'")?;
-            let first_item = self.parse_expr()?;
-            let set = if self.eat_punct("..") {
-                let high = self.parse_expr()?;
-                self.expect_punct("]", "E0107", "expected ']' to close the range")?;
-                crate::ast::InSetExpr::Range(Box::new(first_item), Box::new(high))
-            } else {
-                let mut items = vec![first_item];
-                while self.eat_punct(",") {
-                    items.push(self.parse_expr()?);
+        loop {
+            // `not in` — the negated membership, one operator per Table 12.
+            let negated = self.at_keyword("not") && self.peek_second_is_keyword("in");
+            if !negated && !self.at_keyword("in") {
+                break;
+            }
+            self.bump(); // 'in', or 'not' before it
+            if negated {
+                self.bump(); // 'in'
+            }
+            let set = if self.at_punct("[") {
+                self.bump();
+                let first_item = self.parse_expr()?;
+                if self.eat_punct("..") {
+                    let high = self.parse_expr()?;
+                    self.expect_punct("]", "E0107", "expected ']' to close the range")?;
+                    crate::ast::InSetExpr::Range(Box::new(first_item), Box::new(high))
+                } else {
+                    let mut items = vec![first_item];
+                    while self.eat_punct(",") {
+                        items.push(self.parse_expr()?);
+                    }
+                    self.expect_punct("]", "E0107", "expected ']' to close the set")?;
+                    crate::ast::InSetExpr::Items(items)
                 }
-                self.expect_punct("]", "E0107", "expected ']' to close the set")?;
-                crate::ast::InSetExpr::Items(items)
+            } else {
+                // A general set expression (`x in rgf_get_range(f.a)`,
+                // 4.11.6's set-exp) — evaluated to a set value. It parses
+                // at the `in` row's operand level, so a looser operator
+                // (`a in s && b in t`) splits at the row, not inside the
+                // set expression.
+                crate::ast::InSetExpr::Expr(Box::new(self.parse_binary_level(IN_LEVEL + 1)?))
             };
             let start = lhs.span().0;
             let end = self.last_end();
-            lhs = Expr::InSet {
+            let membership = Expr::InSet {
                 element: Box::new(lhs),
                 set,
                 span: (start, end),
+            };
+            lhs = if negated {
+                Expr::Unary {
+                    op: crate::ast::UnaryOp::Not,
+                    expr: Box::new(membership),
+                    span: (start, end),
+                }
+            } else {
+                membership
             };
         }
         Some(lhs)

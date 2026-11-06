@@ -3630,6 +3630,300 @@ fn interface_default_and_generated_fields_are_null() {
     assert_eq!(output, "TRUE\n");
 }
 
+// --- Range-generated fields (clause 6.9.7, 10.3.13, 18.6, 29.13) ---
+
+#[test]
+fn rgf_reduced_set_satisfies_the_constraints_per_branch() {
+    // The migration plan T5.2's worked example: `c => a < 10` and
+    // `!c => b < 10` produce complementary reduced sets, and each
+    // field's concrete value stays inside its set — 30 lines, all TRUE.
+    let output = clean_output(
+        "struct rg {\n\
+         \x20   c: bool;\n\
+         \x20   ~b: uint;\n\
+         \x20   ~a: uint;\n\
+         \x20   keep c => a < 10;\n\
+         \x20   keep !c => b < 10;\n\
+         };\n\
+         extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var r: rg;\n\
+         \x20       for i from 1 to 10 {\n\
+         \x20           gen r;\n\
+         \x20           if r.c then {\n\
+         \x20               out(rgf_get_range(r.a) == [0..9]);\n\
+         \x20               out(rgf_get_range(r.b) == [0..MAX_UINT]);\n\
+         \x20           } else {\n\
+         \x20               out(rgf_get_range(r.b) == [0..9]);\n\
+         \x20               out(rgf_get_range(r.a) == [0..MAX_UINT]);\n\
+         \x20           };\n\
+         \x20           out(r.a in rgf_get_range(r.a) and r.b in rgf_get_range(r.b));\n\
+         \x20       };\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "TRUE".repeat(30));
+}
+
+#[test]
+fn rgf_set_is_the_intersection_of_the_constraint_intervals() {
+    // Supported shapes: `in` with a range, `!=` (complement within the
+    // type range), a mirrored comparison, and a same-field `||` union.
+    // The concrete value is the set's minimum.
+    let output = clean_output(
+        "struct bounded_s {\n\
+         \x20   ~a: uint;\n\
+         \x20   keep a in [2..6];\n\
+         \x20   keep a != 5;\n\
+         };\n\
+         struct mirrored_s {\n\
+         \x20   ~a: uint;\n\
+         \x20   keep 10 > a;\n\
+         };\n\
+         struct union_s {\n\
+         \x20   ~a: uint;\n\
+         \x20   keep a == 3 || a == 7;\n\
+         };\n\
+         struct excluded_s {\n\
+         \x20   ~a: uint;\n\
+         \x20   keep a not in [0..4];\n\
+         };\n\
+         extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var bounded: bounded_s;\n\
+         \x20       gen bounded;\n\
+         \x20       out(bounded.a, \" \", rgf_get_range(bounded.a), \"\\n\");\n\
+         \x20       var mirrored: mirrored_s;\n\
+         \x20       gen mirrored;\n\
+         \x20       out(mirrored.a, \" \", rgf_get_range(mirrored.a), \"\\n\");\n\
+         \x20       var unioned: union_s;\n\
+         \x20       gen unioned;\n\
+         \x20       out(unioned.a, \" \", rgf_get_range(unioned.a), \"\\n\");\n\
+         \x20       var excluded: excluded_s;\n\
+         \x20       gen excluded;\n\
+         \x20       out(excluded.a, \" \", rgf_get_range(excluded.a), \"\\n\");\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(
+        output,
+        "2 [2..4,6]\n\
+         0 [0..9]\n\
+         3 [3,7]\n\
+         5 [5..4294967295]\n"
+    );
+}
+
+#[test]
+fn rgf_was_reduced_flags_whether_constraints_narrowed_the_type_range() {
+    // T5.4: reduced TRUE where the constraints narrowed the set, FALSE
+    // for a field whose set is the type's full range.
+    let output = clean_output(
+        "struct pair_s {\n\
+         \x20   c: bool;\n\
+         \x20   ~a: uint;\n\
+         \x20   ~b: uint;\n\
+         \x20   keep c == TRUE;\n\
+         \x20   keep a < 10;\n\
+         };\n\
+         extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var r: pair_s;\n\
+         \x20       gen r;\n\
+         \x20       out(rgf_was_reduced(r.a), \" \", rgf_was_reduced(r.b), \"\\n\");\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "TRUE FALSE\n");
+}
+
+#[test]
+fn rgf_assign_within_and_outside_the_generated_set() {
+    // T5.3: `rgf=` assigns a value of the generated set; outside it the
+    // run reports E0415 with the set rendered as written. No automatic
+    // width cast — the membership test is the whole check.
+    let source = "struct sized_s {\n\
+                  \x20   c: bool;\n\
+                  \x20   ~a: uint;\n\
+                  \x20   keep c == TRUE;\n\
+                  \x20   keep a < 10;\n\
+                  };\n\
+                  extend sys {\n\
+                  \x20   run() is also {\n\
+                  \x20       var r: sized_s;\n\
+                  \x20       gen r;\n\
+                  \x20       r.a rgf= 7;\n\
+                  \x20       out(r.a);\n\
+                  \x20       r.a rgf= 12;\n\
+                  \x20       out(r.a);\n\
+                  \x20   };\n\
+                  };\n";
+    let result = run_source(source, 1);
+    assert_eq!(result.output, "7");
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0415");
+    assert!(
+        diagnostic
+            .message
+            .contains("value 12 is outside the generated range [0..9] of 'a'"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn rgf_queries_before_generation() {
+    // T5.4: `rgf_was_generated` is FALSE before any `gen`; the range
+    // queries report E0416 until the field was generated.
+    let source = "struct lone_s {\n\
+                  \x20   ~a: uint;\n\
+                  };\n\
+                  extend sys {\n\
+                  \x20   run() is also {\n\
+                  \x20       var r: lone_s;\n\
+                  \x20       out(rgf_was_generated(r.a));\n\
+                  \x20       out(rgf_get_range(r.a));\n\
+                  \x20   };\n\
+                  };\n";
+    let result = run_source(source, 1);
+    assert_eq!(result.output, "FALSE");
+    let codes: Vec<&str> = result
+        .diagnostics
+        .iter()
+        .map(|d| d.code)
+        .collect::<Vec<_>>();
+    assert_eq!(codes, vec!["E0416"]);
+    assert!(
+        result.diagnostics[0]
+            .message
+            .contains("rgf query/assign before generation"),
+        "{}",
+        result.diagnostics[0].message
+    );
+}
+
+#[test]
+fn rgf_unsupported_constraint_shapes_report_e0317() {
+    // T5.2: arithmetic over the rgf field, a comparison between two rgf
+    // fields, a negation over an rgf atom, and two atoms naming
+    // different fields are outside the supported shapes.
+    let shapes = [
+        ("arith_s", "keep a + 1 < 5;"),
+        ("coupled_s", "keep a < b;"),
+        ("negated_s", "keep !(a > 3);"),
+        ("two_field_s", "keep a > 3 && b < 10;"),
+    ];
+    for (name, constraint) in shapes {
+        let source = format!(
+            "struct {name} {{\n\
+             \x20   ~a: uint;\n\
+             \x20   ~b: uint;\n\
+             \x20   {constraint}\n\
+             }};\n\
+             extend sys {{\n\
+             \x20   run() is also {{\n\
+             \x20       var r: {name};\n\
+             \x20       gen r;\n\
+             \x20   }};\n\
+             }};\n"
+        );
+        let result = run_source(&source, 1);
+        let codes: Vec<&str> = result
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>();
+        assert_eq!(codes, vec!["E0317"], "{name}: {source}");
+        assert!(
+            result.diagnostics[0]
+                .message
+                .contains("unsupported constraint shape for range-generated field"),
+            "{name}: {}",
+            result.diagnostics[0].message
+        );
+    }
+}
+
+#[test]
+fn rgf_implication_with_false_antecedent_keeps_the_full_range() {
+    // The implication rule: a FALSE antecedent contributes the field
+    // type's full range, so the set is unreduced and the minimum is the
+    // type's bottom.
+    let output = clean_output(
+        "struct branch_s {\n\
+         \x20   c: bool;\n\
+         \x20   ~a: uint;\n\
+         \x20   ~b: uint;\n\
+         \x20   keep c == FALSE;\n\
+         \x20   keep c => a < 3;\n\
+         \x20   keep !c => b < 4;\n\
+         };\n\
+         extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var r: branch_s;\n\
+         \x20       gen r;\n\
+         \x20       out(r.a, \" \", rgf_get_range(r.a) == [0..MAX_UINT], \" \");\n\
+         \x20       out(r.b, \" \", rgf_get_range(r.b) == [0..3], \"\\n\");\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "0 TRUE 0 TRUE\n");
+}
+
+#[test]
+fn rgf_enum_and_bool_fields_carry_index_sets() {
+    // The value model keeps integer intervals, so an enumeral field's
+    // generated set is its enumerand indices (the set model's numbering)
+    // and a bool field's is {0, 1}; the concrete value maps back to the
+    // enumerand or the boolean.
+    let output = clean_output(
+        "type color_e: [RED, GREEN, BLUE];\n\
+         struct colored_s {\n\
+         \x20   ~c: color_e;\n\
+         \x20   keep c != GREEN;\n\
+         };\n\
+         struct flagged_s {\n\
+         \x20   ~f: bool;\n\
+         \x20   keep f == TRUE;\n\
+         };\n\
+         extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var colored: colored_s;\n\
+         \x20       gen colored;\n\
+         \x20       out(colored.c, \" \", rgf_get_range(colored.c), \"\\n\");\n\
+         \x20       var flagged: flagged_s;\n\
+         \x20       gen flagged;\n\
+         \x20       out(flagged.f, \" \", rgf_get_range(flagged.f), \"\\n\");\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "RED [0,2]\nTRUE [1]\n");
+}
+
+#[test]
+fn in_accepts_a_general_set_or_list_expression() {
+    // The `in` right operand is a set expression (4.11.6's set-exp):
+    // a set value is tested by interval membership, a list by item
+    // equality.
+    let output = clean_output(
+        "extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var l: list of uint = {1; 2; 3};\n\
+         \x20       out(2 in l, \" \", 9 in l, \" \");\n\
+         \x20       var s: set = [1..5];\n\
+         \x20       out(4 in s, \" \", 9 in s, \"\\n\");\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "TRUE FALSE TRUE FALSE\n");
+}
+
 #[test]
 fn template_value_parameter_substitutes_in_method_bodies() {
     // 8.5.2 (the migration's T4.1): a value parameter's constant
