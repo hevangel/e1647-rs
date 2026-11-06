@@ -106,6 +106,8 @@ const PREDEFINED_NAMES: &[&str] = &[
     "LOW",
     "MEDIUM",
     "HIGH",
+    // The predefined any_unit instance-path query (7.4): `e_path()`.
+    "e_path",
 ];
 
 fn is_predefined_name(word: &str) -> bool {
@@ -2935,6 +2937,21 @@ impl Parser {
         )
     }
 
+    /// One `keep bind` operand: the keyword `empty` (9.13 — the port is
+    /// bound to nothing) records as a literal `empty` identifier; any
+    /// other operand parses as an expression.
+    fn parse_bind_operand(&mut self) -> Option<Expr> {
+        if self.eat_keyword("empty") {
+            let end = self.last_end();
+            Some(Expr::Ident {
+                name: "empty".to_owned(),
+                span: (end, end),
+            })
+        } else {
+            self.parse_expr()
+        }
+    }
+
     fn parse_keep(&mut self) -> Option<KeepConstraint> {
         let start = self.current_span().0;
         self.bump(); // 'keep'
@@ -2946,15 +2963,18 @@ impl Parser {
         let is_bind = self.eat_keyword("bind");
         let expr = if is_bind {
             // Both corpus shapes: `keep bind (port, kind);` and the UVM-e
-            // `keep bind bfm to hdl_instance;`.
+            // `keep bind bfm to hdl_instance;`. The `empty` operand of
+            // `keep bind(p, empty)` (9.13: the port is bound to nothing)
+            // is a keyword, not an expression — recorded as a literal
+            // `empty` identifier the interpreter resolves per position.
             let first = if self.eat_punct("(") {
-                let first = self.parse_expr()?;
+                let first = self.parse_bind_operand()?;
                 self.expect_punct(",", "E0108", "expected ',' between the bind operands")?;
-                let second = self.parse_expr()?;
+                let second = self.parse_bind_operand()?;
                 self.expect_punct(")", "E0108", "expected ')' after the bind operands")?;
                 vec![first, second]
             } else {
-                let first = self.parse_expr()?;
+                let first = self.parse_bind_operand()?;
                 self.expect_keyword_word("to")?;
                 // The bind target is an HDL instance path (`~/dut/u0`);
                 // store it as written rather than forcing it into the e
@@ -4253,6 +4273,35 @@ impl Parser {
             return self.parse_postfix_chain(ident, start);
         }
         match self.peek_kind() {
+            // `[a, b, c]` / `[lo..hi]` / `[]` — a set literal (5.2.12) in
+            // expression position (the same shape `in` and `in_table`
+            // take). Index and bit-slice brackets are postfix: they only
+            // follow an expression, so a leading `[` is always a set.
+            Some(TokenKind::Punctuation(p)) if p == "[" => {
+                self.bump();
+                let items = if self.at_punct("]") {
+                    crate::ast::InSetExpr::Items(Vec::new())
+                } else {
+                    let first = self.parse_expr()?;
+                    if self.eat_punct("..") {
+                        let high = self.parse_expr()?;
+                        crate::ast::InSetExpr::Range(Box::new(first), Box::new(high))
+                    } else {
+                        let mut items = vec![first];
+                        while self.eat_punct(",") {
+                            items.push(self.parse_expr()?);
+                        }
+                        crate::ast::InSetExpr::Items(items)
+                    }
+                };
+                self.expect_punct("]", "E0107", "expected ']' to close the set literal")?;
+                let end = self.last_end();
+                let set = Expr::SetLiteral {
+                    items,
+                    span: (start, end),
+                };
+                self.parse_postfix_chain(set, start)
+            }
             // `{ e1; e2; ... }` — the list-concat operand (clause 4.6,
             // Table 12): each `;`-separated element expression contributes
             // itself to a fresh list (a list element contributes its items

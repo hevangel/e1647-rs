@@ -67,6 +67,14 @@ pub struct ElaboratedType {
     /// `simple_port` members with the HDL location resolved from their
     /// `keep name.hdl_path() == "path"` constraints.
     pub ports: Vec<PortInfo>,
+    /// Unit attribute constraints (clause 7.3.4 `pack_options()`, 7.3.5
+    /// `per_inst_cover()`), recorded like the port HDL paths:
+    /// (field, attribute, value as written) — `("u1", "pack_options",
+    /// "packing.low_big_endian")`. The packing and
+    /// per-instance-coverage engines they configure are later
+    /// milestones; the recording keeps the constraint out of gen and
+    /// makes the setting visible.
+    pub unit_attributes: Vec<(String, String, String)>,
     pub span: crate::ast::Span,
 }
 
@@ -108,7 +116,7 @@ pub struct Elaborated {
 
 /// One type's members, tagged with the declaration or extend block that
 /// contributed them (its index in the declaration slice).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Composed<'a> {
     fields: Vec<(&'a Field, usize)>,
     constraints: Vec<&'a KeepConstraint>,
@@ -119,6 +127,36 @@ struct Composed<'a> {
     expects: Vec<&'a crate::ast::ExpectDecl>,
     events: Vec<&'a crate::ast::EventDecl>,
     ports: Vec<(&'a crate::ast::PortDecl, usize)>,
+}
+
+impl<'a> Composed<'a> {
+    /// Move `other`'s members in front of this set (base-first
+    /// composition order — the `any_unit` hooks precede the unit's own).
+    fn prepend(&mut self, other: Composed<'a>) {
+        let Composed {
+            fields,
+            constraints,
+            methods,
+            whens,
+            ons,
+            covers,
+            expects,
+            events,
+            ports,
+        } = other;
+        let own = std::mem::take(self);
+        *self = Composed {
+            fields: fields.into_iter().chain(own.fields).collect(),
+            constraints: constraints.into_iter().chain(own.constraints).collect(),
+            methods: methods.into_iter().chain(own.methods).collect(),
+            whens: whens.into_iter().chain(own.whens).collect(),
+            ons: ons.into_iter().chain(own.ons).collect(),
+            covers: covers.into_iter().chain(own.covers).collect(),
+            expects: expects.into_iter().chain(own.expects).collect(),
+            events: events.into_iter().chain(own.events).collect(),
+            ports: ports.into_iter().chain(own.ports).collect(),
+        };
+    }
 }
 
 struct Elaborator<'a> {
@@ -170,12 +208,24 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         reported_cycles: BTreeSet::new(),
     };
     let mut types = Vec::new();
+    // `extend any_unit { ... }` members (24.9.2.14's extendable message
+    // hooks): composed once and injected into every unit type, base-first.
+    let any_unit = elaborator.compose_any_unit();
     for declaration in declarations {
         match declaration.kind {
             DeclarationKind::Struct | DeclarationKind::Unit => {
                 let mut stack = Vec::new();
-                let composed = elaborator.compose(declaration.name.as_str(), &mut stack);
+                let mut composed = elaborator.compose(declaration.name.as_str(), &mut stack);
+                if declaration.kind == DeclarationKind::Unit {
+                    composed.prepend(any_unit.clone());
+                    // Field duplicates between the injected any_unit
+                    // members and the type's own are cross-set pairs the
+                    // per-block checks above cannot see (the reported
+                    // sets keep the within-set pairs from re-reporting).
+                    elaborator.check_duplicate_fields(declaration.name.as_str(), &composed);
+                }
                 let port_paths = elaborator.extract_port_paths(declaration);
+                let unit_attributes = elaborator.extract_unit_attributes(declaration);
                 types.push(ElaboratedType {
                     kind: declaration.kind,
                     name: declaration.name.clone(),
@@ -211,6 +261,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                             ),
                         })
                         .collect(),
+                    unit_attributes,
                     span: declaration.span,
                 });
             }
@@ -229,6 +280,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 events: Vec::new(),
                 underlying: declaration.underlying.clone(),
                 ports: Vec::new(),
+                unit_attributes: Vec::new(),
                 enumerals: declaration
                     .members
                     .iter()
@@ -508,6 +560,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             underlying: None,
             enumerals: Vec::new(),
             ports: Vec::new(),
+            unit_attributes: Vec::new(),
             span: template.span,
         });
     }
@@ -592,6 +645,10 @@ impl<'a> Elaborator<'a> {
                 Self::push_members(extend, *extend_index, &mut composed);
                 port_paths.extend(self.extract_port_paths(extend));
             }
+            // `sys` is a unit: the injected any_unit hooks (24.9.2.14)
+            // apply to it as well, base-first.
+            let any_unit = self.compose_any_unit();
+            composed.prepend(any_unit);
             self.check_duplicate_fields(builtin, &composed);
             self.check_method_redefinitions(builtin, &composed);
             types.push(ElaboratedType {
@@ -629,9 +686,26 @@ impl<'a> Elaborator<'a> {
                         ),
                     })
                     .collect(),
+                unit_attributes: extend_indices
+                    .iter()
+                    .flat_map(|index| self.extract_unit_attributes(&self.declarations[*index]))
+                    .collect(),
                 span: self.declarations[extend_indices[0]].span,
             });
         }
+    }
+
+    /// `extend any_unit { ... }` members (the 24.9.2.14 message hooks):
+    /// composed once and injected into every unit type by [`elaborate`].
+    fn compose_any_unit(&self) -> Composed<'a> {
+        let mut composed = Composed::default();
+        if let Some(extend_indices) = self.extends_by_target.get("any_unit") {
+            for extend_index in extend_indices {
+                let extend = &self.declarations[*extend_index];
+                Self::push_members(extend, *extend_index, &mut composed);
+            }
+        }
+        composed
     }
 
     /// Resolve `keep <port>.hdl_path() == "path"` constraints of one
@@ -691,6 +765,77 @@ impl<'a> Elaborator<'a> {
             }
         }
         paths
+    }
+
+    /// Record unit attribute constraints (7.3.4 `pack_options()`, 7.3.5
+    /// `per_inst_cover()`) of one declaration: (field, attribute, value
+    /// as written). Both orientations of
+    /// `keep <field>.<attribute>() == <value>` are read, the value
+    /// rendered verbatim (`packing.low_big_endian`, `DEFAULT`); a later
+    /// declaration of the same field's attribute wins, like a re-set
+    /// hdl path.
+    fn extract_unit_attributes(
+        &self,
+        declaration: &'a Declaration,
+    ) -> Vec<(String, String, String)> {
+        use crate::ast::{BinaryOp, Expr};
+        const ATTRIBUTES: &[&str] = &["pack_options", "per_inst_cover"];
+        let field_names: Vec<&str> = declaration
+            .members
+            .iter()
+            .filter_map(|member| match member {
+                Member::Field(field) => Some(field.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        if field_names.is_empty() {
+            return Vec::new();
+        }
+        let mut attributes: Vec<(String, String, String)> = Vec::new();
+        for member in &declaration.members {
+            let Member::Constraint(constraint) = member else {
+                continue;
+            };
+            let Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs,
+                rhs,
+                ..
+            } = &constraint.expr
+            else {
+                continue;
+            };
+            for (call, literal) in [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())] {
+                let Expr::Call { callee, args, .. } = call else {
+                    continue;
+                };
+                if !args.is_empty() {
+                    continue;
+                }
+                let Expr::MemberAccess {
+                    object,
+                    name: attribute,
+                    ..
+                } = callee.as_ref()
+                else {
+                    continue;
+                };
+                let Expr::Ident { name: field, .. } = object.as_ref() else {
+                    continue;
+                };
+                if !ATTRIBUTES.contains(&attribute.as_str())
+                    || !field_names.contains(&field.as_str())
+                {
+                    continue;
+                }
+                let value = crate::ast::render_expr_compact(literal);
+                attributes.retain(|(recorded_field, recorded_attribute, _)| {
+                    !(recorded_field == field && recorded_attribute == attribute)
+                });
+                attributes.push((field.clone(), attribute.clone(), value));
+            }
+        }
+        attributes
     }
 
     fn compose(&mut self, name: &'a str, stack: &mut Vec<&'a str>) -> Composed<'a> {
@@ -1239,21 +1384,32 @@ fn substitute_expr(
         }
         Expr::InSet { element, set, .. } => {
             substitute_expr(element, bindings, queue);
-            match set {
-                crate::ast::InSetExpr::Items(items) => {
-                    for item in items {
-                        substitute_expr(item, bindings, queue);
-                    }
-                }
-                crate::ast::InSetExpr::Range(low, high) => {
-                    substitute_expr(low, bindings, queue);
-                    substitute_expr(high, bindings, queue);
-                }
-            }
+            substitute_in_set_expr(set, bindings, queue);
         }
+        Expr::SetLiteral { items, .. } => substitute_in_set_expr(items, bindings, queue),
         // Literals, identifiers, HDL paths and select distributions
         // (choices are raw tokens) carry no type positions.
         _ => {}
+    }
+}
+
+/// The type positions of one `[...]` set shape (the `in` right-hand
+/// side and the set literal), shared by [`substitute_expr`].
+fn substitute_in_set_expr(
+    set: &mut crate::ast::InSetExpr,
+    bindings: &BTreeMap<String, crate::ast::TypeExpr>,
+    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
+) {
+    match set {
+        crate::ast::InSetExpr::Items(items) => {
+            for item in items {
+                substitute_expr(item, bindings, queue);
+            }
+        }
+        crate::ast::InSetExpr::Range(low, high) => {
+            substitute_expr(low, bindings, queue);
+            substitute_expr(high, bindings, queue);
+        }
     }
 }
 

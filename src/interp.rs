@@ -53,6 +53,30 @@
 //! - `E0413` a subtype-qualified field access (4.17.3) on an instance
 //!   that does not currently match the qualifiers' subtype — the field
 //!   is not present on it
+//! - `E0419` a call to a recognised 2019 predefined-library name that
+//!   is not implemented in this stage (see [`UNIMPLEMENTED_2019`])
+//! - `E0420` `do_bind()` outside the connect_ports() generation
+//!   sub-phase (9.13.3)
+//!
+//! ## Execution phases (Table 1, 28.3; generation sub-phases 9.13)
+//!
+//! A run walks the full phase order: setup (`sys.setup()`, before
+//! generation) → generate (the implicit gen, then
+//! `pre_generate()` and `post_generate()` depth-first over the field
+//! tree, then the binding passes `connect_pointers()` →
+//! `connect_ports()` → `check_generation()`, 9.13.2-9.13.4) → run
+//! (sys's `run()` blocks as the main coroutine; after the scheduler
+//! drains, `run()` on every other live field-tree instance, depth-first
+//! in field order) → extract (`extract()`, 28.3.3.6) → check
+//! (`check()`, 28.3.3.7, then the 11.4 expect/assume rule pass) →
+//! finalize (`quit()` then `finalize()`, 28.3.3.8). The field tree is
+//! the instance fields under `sys` (lists flattened, NULLs skipped);
+//! structs created outside it (a local `var`'s `gen`/`new`) take no
+//! phase calls. All the hooks are initially empty — a type that does
+//! not define one contributes nothing. A `stop_run()` skips the
+//! remaining phases. Coverage grading needs no move: collection is
+//! emit-driven (14.2) and the grade is computed lazily (the report, or
+//! `covers.compute_overall_grade()`).
 //!
 //! The parser's `E0122` (an untyped `evaluate { ... }` whose result type
 //! cannot be inferred, clause 4.17.7) is also raised here: the inference
@@ -92,11 +116,14 @@
 //! (27.4.6/27.4.13), `first_index`/`last_index` (27.4.7/27.4.14),
 //! `all_different` (27.4.1), `unique` (27.4.28), `split` (27.4.25), the
 //! `exp`-parameter forms of `min`/`max`/`min_index`/`max_index`
-//! (27.4.15-27.4.19) and of the 27.5 aggregates, and `max_value`/
-//! `min_value` (27.4.17/27.4.20 — their empty-list return is Table 54,
-//! keyed by an element type the value model does not carry). Also not
-//! modeled: `average` (27.5.3 — the empty-list result is UNDEF, which the
-//! value model has no representation for), `resize` (27.3.16 — the
+//! (27.4.15-27.4.19) and of the boolean 27.5 aggregates
+//! `and_all`/`or_all`. The 27.4.17/27.4.20/27.5.4-27.5.6 aggregates
+//! (`max_value`, `min_value`, `product`, `sum`, `average`) DO take a
+//! per-item expression — they intercept before the argument evaluation
+//! ([`Interp::call_list_aggregate`]); their empty-list `average` and
+//! `max_value`/`min_value` results are the honest `E0402` (UNDEF and
+//! Table 54 are not in the value model). Also not
+//! modeled: `resize` (27.3.16 — the
 //! `filler`/`keep_old` parameters are expressions and new items need the
 //! element type's default value), `get_indices` (27.4.9 — the prose does
 //! not state the out-of-range index behavior; element access is the `[i]`
@@ -129,6 +156,7 @@ use crate::lexer::Token;
 use crate::lexer::TokenKind;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 /// Outcome of one run: the text produced by `out`/`print`, any run-time
@@ -157,6 +185,16 @@ pub enum Value {
     /// non-overlapping, non-neighboring.
     Set(Vec<(i128, i128)>),
     Object(usize),
+    /// A `simple_port`/`event_port` member reference (clause 9): the
+    /// owning instance and the port name. Ports are not fields — a port
+    /// member read produces this value, and the 9.13 binding methods
+    /// (`get_bound_set()`, `is_connected()`, `disconnect()`, ...) dispatch
+    /// on it. The port's *value* is the `name$` access through the HDL
+    /// bridge, not this handle.
+    Port {
+        owner: usize,
+        name: String,
+    },
     Void,
 }
 
@@ -483,6 +521,30 @@ struct Interp<'a> {
     /// returns an index, not a `Result`. Drained into the run's
     /// diagnostics; the affected fields keep their type default.
     pending_diagnostics: Vec<Diagnostic>,
+    /// Type-level port bindings from `keep bind(p, q)` constraints
+    /// (9.13): type name → the (port, port) edges among the type's own
+    /// ports. Every instance of the type carries the same edges between
+    /// its own ports.
+    type_port_binds: BTreeMap<String, Vec<(String, String)>>,
+    /// Type-level `keep bind(p, empty)` spellings (9.13): ports bound to
+    /// nothing on purpose — `is_connected()` is FALSE for them even when
+    /// an HDL path exists.
+    type_port_unbound: BTreeMap<String, Vec<String>>,
+    /// The dynamic disconnect state: ports that lost their bindings to
+    /// `disconnect()` / `disconnect_bound_set()` (9.13) since run start,
+    /// as (instance, port) pairs.
+    disconnected_ports: BTreeSet<(usize, String)>,
+    /// Whether the generate phases have completed (`post_generate()`
+    /// has run): `covers.sample_cg()` is not permitted before it
+    /// (14.8.2.10).
+    post_generate_done: bool,
+    /// TRUE while the `connect_ports()` sub-phase pass runs (9.13.3):
+    /// `do_bind()` is legal only inside it (`E0420` elsewhere).
+    in_connect_ports: bool,
+    /// The last overall coverage grade computed by
+    /// `covers.compute_overall_grade()` (14.9.6), read back by
+    /// `covers.get_overall_grade()`.
+    overall_grade: Option<f64>,
 }
 
 /// How many `wait` statements and scheduler cycles one run may consume
@@ -494,6 +556,39 @@ const WAIT_BUDGET: u64 = 5_000;
 /// reports `E0409` — the temporal twin of the runaway guard, bounded
 /// low because the success scan walks the whole log each cycle.
 const TEMPORAL_WAIT_CYCLES: u64 = 1_000;
+
+/// The recognised 2019 predefined-library names this stage does not
+/// implement (T8): a call resolves to the table (so the parser accepts
+/// it), the arity is checked where the migration plan states a
+/// signature, and the call then reports `E0419` "'name()' is recognised
+/// (clause X) but not implemented in this stage" at run time. A
+/// user-defined method of the same name always wins — the table is
+/// consulted only when nothing else resolves.
+/// `(name, clause, arity (min, max))`.
+const UNIMPLEMENTED_2019: &[(&str, &str, (usize, usize))] = &[
+    // 28.3.5.1: deactivate a struct at the end of the current tick and
+    // reactivate it next cycle — the coroutine model has no per-tick
+    // struct activation to suspend.
+    ("rerun", "28.3.5.1", (0, 0)),
+    // 9.13.5-9.13.12 port-binding surface beyond the `keep bind`
+    // simple_port model: unit-level binding, directed method-port
+    // connection and HDL-path remapping.
+    ("do_bind_unit", "9.13.5-9.13.12", (2, 2)),
+    ("connect", "9.13.5-9.13.12", (1, 1)),
+    ("remap_hdl_path", "9.13.5-9.13.12", (1, 1)),
+    // 16.3.7: set a named check's severity/effect, rooted at a unit.
+    ("set_check_by_name", "16.3.7", (2, 3)),
+    // 14.9.15-14.9.17 coverage-configuration calls.
+    ("set_per_inst_for_struct", "14.9.15-14.9.17", (2, 2)),
+    ("set_unicov_hier", "14.9.15-14.9.17", (2, 2)),
+    ("set_cross_instance_collection", "14.9.15-14.9.17", (3, 3)),
+    ("get_top_size_items", "14.9.15-14.9.17", (1, 1)),
+    // 30.5.16: the log-file flush of the predefined files struct.
+    ("flush_log_file", "30.5.16", (0, 0)),
+    // 19.1: `swap` is a predefined pack tool name; the byte-order swap
+    // itself is not implemented.
+    ("swap", "19.1", (1, 1)),
+];
 
 /// Instantiate the built-in `sys` unit and execute its `run()` methods.
 pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
@@ -604,6 +699,12 @@ fn run_inner(
         expected_type: None,
         new_type_hint: None,
         pending_diagnostics: Vec::new(),
+        type_port_binds: collect_type_port_binds(elaborated),
+        type_port_unbound: collect_type_port_unbound(elaborated),
+        disconnected_ports: BTreeSet::new(),
+        post_generate_done: false,
+        in_connect_ports: false,
+        overall_grade: None,
     };
     let types: &[crate::elab::ElaboratedType] = interp.types;
     let Some(sys) = types
@@ -624,6 +725,10 @@ fn run_inner(
         .filter(|method| method.name == "run")
         .collect();
     let sys_index = interp.instantiate("sys");
+    let mut diagnostics = Vec::new();
+    // Table 1's setup phase (28.3): `sys.setup()` runs before any
+    // generation — the root unit's own setup blocks.
+    interp.call_phase_method(sys_index, "setup", &mut diagnostics);
     // Specman generates the root unit's data fields before run() starts
     // (respecting `keep` constraints and skipping `!` fields); mirror
     // that so corpus testbenches see generated lists/scalars. Both this
@@ -633,6 +738,20 @@ fn run_inner(
             .output
             .push_str(&format!("implicit gen: {}\n", diagnostic.render()));
     }
+    // The generation sub-phases of 9.13: after the tree is generated,
+    // `pre_generate()` and `post_generate()` run over the field tree
+    // (depth-first, field order), then the three binding passes
+    // `connect_pointers()` (9.13.2), `connect_ports()` (9.13.3 — the
+    // only sub-phase `do_bind()` may run in) and `check_generation()`
+    // (9.13.4).
+    interp.run_phase_on_tree(sys_index, "pre_generate", &mut diagnostics);
+    interp.run_phase_on_tree(sys_index, "post_generate", &mut diagnostics);
+    interp.post_generate_done = true;
+    interp.run_phase_on_tree(sys_index, "connect_pointers", &mut diagnostics);
+    interp.in_connect_ports = true;
+    interp.run_phase_on_tree(sys_index, "connect_ports", &mut diagnostics);
+    interp.in_connect_ports = false;
+    interp.run_phase_on_tree(sys_index, "check_generation", &mut diagnostics);
     // Start each declared sequence's MAIN body inline: Specman's
     // sequencer launches MAIN during test start; the inline subset runs
     // it synchronously with `driver` bound to the driver instance.
@@ -689,7 +808,6 @@ fn run_inner(
         span: origin_span(),
         wait_start: None,
     });
-    let mut diagnostics = Vec::new();
     // Cycle 0's sample only establishes the monitored values' baseline —
     // no previous value, so no edge can fire on it.
     interp.sample_sim_events();
@@ -767,6 +885,22 @@ fn run_inner(
             }
         }
     }
+    // The Table 1 run phase on the rest of the field tree: sys's own
+    // run() blocks ran as the main coroutine above; after the scheduler
+    // drains, run() is called on every other live instance, depth-first
+    // in field order (28.3). The extract, check and finalize phases
+    // follow the same order. A `stop_run()` skips the remaining phases.
+    if !interp.stop_requested {
+        for index in interp.field_tree(sys_index).into_iter().skip(1) {
+            interp.call_phase_method(index, "run", &mut diagnostics);
+        }
+        // The extract phase (28.3.3.6).
+        interp.run_phase_on_tree(sys_index, "extract", &mut diagnostics);
+        // The check phase (28.3.3.7): the per-struct check() hooks, then
+        // the expect/assume rule pass (11.4) — the rules are monitored
+        // once the run log is complete, which is the check phase's job.
+        interp.run_phase_on_tree(sys_index, "check", &mut diagnostics);
+    }
     // 11.4: at quit, report the expect/assume rules that failed over
     // the run log (12.3.3 — the rule fails where all possibilities to
     // satisfy it are exhausted). The `else` body (usually a
@@ -807,6 +941,14 @@ fn run_inner(
             )),
         }
     }
+    // The finalize phase (28.3.3.8): `quit()` then `finalize()` on every
+    // live instance, depth-first, sys first.
+    if !interp.stop_requested {
+        for index in interp.field_tree(sys_index) {
+            interp.call_phase_method(index, "quit", &mut diagnostics);
+            interp.call_phase_method(index, "finalize", &mut diagnostics);
+        }
+    }
     // Specman closes every run with a DUT-error count; mirror it.
     if interp.dut_errors > 0 {
         interp.output.push_str(&format!(
@@ -834,6 +976,163 @@ fn origin() -> Position {
 
 fn origin_span() -> crate::ast::Span {
     (origin(), origin())
+}
+
+impl<'a> Interp<'a> {
+    /// The struct/unit instances of the field tree under `root`, in
+    /// depth-first field order — the order the Table 1 phase methods
+    /// (28.3: `setup`, `run`, `extract`, `check`, `quit`, `finalize`)
+    /// and the generation sub-phases (9.13) are called: the root first,
+    /// then each instance-typed field's own tree in declaration order,
+    /// list items flattened in index order, NULL fields skipped.
+    /// Struct instances created outside the field tree (a local `var`
+    /// initialized with `gen` or `new`) are not part of it.
+    fn field_tree(&self, root: usize) -> Vec<usize> {
+        let mut order = Vec::new();
+        let mut visited = BTreeSet::new();
+        self.collect_field_tree(root, &mut order, &mut visited, 0);
+        order
+    }
+
+    fn collect_field_tree(
+        &self,
+        index: usize,
+        order: &mut Vec<usize>,
+        visited: &mut BTreeSet<usize>,
+        depth: u32,
+    ) {
+        if depth > 64 || !visited.insert(index) {
+            return;
+        }
+        order.push(index);
+        // Snapshot the field values: the walk never holds a borrow (a
+        // list's shared storage may be mutated inside a deeper visit).
+        let fields: Vec<Value> = self.instances[index]
+            .fields
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+        for value in fields {
+            match value {
+                Value::Object(child) => {
+                    self.collect_field_tree(child, order, visited, depth + 1);
+                }
+                Value::List(list) => {
+                    let items = list.items.borrow().clone();
+                    for item in items {
+                        if let Value::Object(child) = item {
+                            self.collect_field_tree(child, order, visited, depth + 1);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Call one Table 1 phase method (28.3) or generation sub-phase
+    /// (9.13) on every field-tree instance under `root`, in the same
+    /// depth-first field order as `run()`. A type that does not define
+    /// the method contributes nothing — all the hooks are initially
+    /// empty (any struct may declare or extend them); a run-time error
+    /// inside a hook is reported and the phase continues with the next
+    /// instance.
+    fn run_phase_on_tree(&mut self, root: usize, name: &str, diagnostics: &mut Vec<Diagnostic>) {
+        for index in self.field_tree(root) {
+            self.call_phase_method(index, name, diagnostics);
+        }
+    }
+
+    /// Run every composed block of the phase method `name` on one
+    /// instance, if the instance's type defines any.
+    fn call_phase_method(&mut self, index: usize, name: &str, diagnostics: &mut Vec<Diagnostic>) {
+        let type_name = self.instances[index].type_name.clone();
+        let defined = resolve_method_blocks(self.types, &type_name, name, origin_span()).is_ok();
+        if !defined {
+            return;
+        }
+        if let Err(diagnostic) = self.call_method(index, name, Vec::new(), origin_span()) {
+            diagnostics.push(diagnostic);
+        }
+    }
+}
+
+/// The type-level `keep bind(p, q)` port-port bindings (9.13): type
+/// name → (port, port) edges between the type's own ports, read from
+/// the recorded bind constraints (`bind(a, b)` calls where both
+/// operands name ports of the same declaration). Every instance of the
+/// type carries the same edges between its own ports.
+fn collect_type_port_binds(elaborated: &Elaborated) -> BTreeMap<String, Vec<(String, String)>> {
+    let mut binds: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for ty in &elaborated.types {
+        let port_names: BTreeSet<&str> = ty.ports.iter().map(|p| p.name.as_str()).collect();
+        for constraint in &ty.constraints {
+            if !constraint.is_bind {
+                continue;
+            }
+            let Expr::Call { callee, args, .. } = &constraint.expr else {
+                continue;
+            };
+            let Expr::Ident { name, .. } = callee.as_ref() else {
+                continue;
+            };
+            if name != "bind" || args.len() != 2 {
+                continue;
+            }
+            let (Expr::Ident { name: first, .. }, Expr::Ident { name: second, .. }) =
+                (&args[0], &args[1])
+            else {
+                continue;
+            };
+            if first == "empty"
+                || second == "empty"
+                || !port_names.contains(first.as_str())
+                || !port_names.contains(second.as_str())
+            {
+                continue;
+            }
+            binds
+                .entry(ty.name.clone())
+                .or_default()
+                .push((first.clone(), second.clone()));
+        }
+    }
+    binds
+}
+
+/// The type-level `keep bind(p, empty)` spellings (9.13): ports bound
+/// to nothing on purpose, per type.
+fn collect_type_port_unbound(elaborated: &Elaborated) -> BTreeMap<String, Vec<String>> {
+    let mut unbound: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for ty in &elaborated.types {
+        let port_names: BTreeSet<&str> = ty.ports.iter().map(|p| p.name.as_str()).collect();
+        for constraint in &ty.constraints {
+            if !constraint.is_bind {
+                continue;
+            }
+            let Expr::Call { callee, args, .. } = &constraint.expr else {
+                continue;
+            };
+            let Expr::Ident { name, .. } = callee.as_ref() else {
+                continue;
+            };
+            if name != "bind" || args.len() != 2 {
+                continue;
+            }
+            let (Expr::Ident { name: first, .. }, Expr::Ident { name: second, .. }) =
+                (&args[0], &args[1])
+            else {
+                continue;
+            };
+            if second == "empty" && port_names.contains(first.as_str()) {
+                unbound
+                    .entry(ty.name.clone())
+                    .or_default()
+                    .push(first.clone());
+            }
+        }
+    }
+    unbound
 }
 
 /// Pre-evaluated temporal propositions and bounds, keyed by expression
@@ -1774,33 +2073,53 @@ impl<'a> Interp<'a> {
                 // The element type filter is recorded, not enforced.
                 let _ = type_filter;
                 let _ = using;
-                let list_value = self.eval(list, frame, me)?;
-                match list_value {
-                    Value::List(list) => {
-                        let binding = var.clone().unwrap_or_else(|| "it".to_owned());
-                        // Iterate a snapshot of the items; the loop body
-                        // may modify the shared list object.
-                        let mut items = list.items.borrow().clone();
-                        if *reversed {
-                            items.reverse();
+                // 20.2.5: `for each` iterates a list or a set — the
+                // items in order. A set literal with enumeral bounds
+                // iterates the enumerands (`for each (c) in [red..blue]`
+                // runs red, green, blue); any other set iterates its
+                // integer elements in order (the value model keeps
+                // intervals, so a set that did not come from a literal
+                // with enumeral bounds carries indices, not enumerands).
+                let binding = var.clone().unwrap_or_else(|| "it".to_owned());
+                let mut items: Vec<Value> = match list {
+                    Expr::SetLiteral {
+                        items: set_items, ..
+                    } => self.set_literal_iteration_items(set_items, frame, me, *span)?,
+                    _ => match self.eval(list, frame, me)? {
+                        Value::List(list) => {
+                            // Iterate a snapshot of the items; the loop
+                            // body may modify the shared list object.
+                            list.items.borrow().clone()
                         }
-                        self.for_each_loop(
-                            &binding,
-                            index_var.as_deref(),
-                            &items,
-                            body,
-                            frame,
-                            me,
-                            0,
-                            None,
-                        )
-                    }
-                    other => Err(self.error(
-                        "E0402",
-                        format!("for-each expects a list, got {}", self.value_kind(&other)),
-                        *span,
-                    )),
+                        Value::Set(intervals) => intervals
+                            .iter()
+                            .flat_map(|(lo, hi)| (*lo..=*hi).map(Value::Int))
+                            .collect(),
+                        other => {
+                            return Err(self.error(
+                                "E0402",
+                                format!(
+                                    "for-each expects a list or set, got {}",
+                                    self.value_kind(&other)
+                                ),
+                                *span,
+                            ));
+                        }
+                    },
+                };
+                if *reversed {
+                    items.reverse();
                 }
+                self.for_each_loop(
+                    &binding,
+                    index_var.as_deref(),
+                    &items,
+                    body,
+                    frame,
+                    me,
+                    0,
+                    None,
+                )
             }
             Stmt::ForTo {
                 var,
@@ -2383,12 +2702,22 @@ impl<'a> Interp<'a> {
             for constraint in &constraints {
                 // HDL-binding constraints (`keep x.hdl_path() == "…"`,
                 // `keep x.delayed() == FALSE`, the event-port
-                // `keep x.edge() == …` attribute of 9.7.3) record
-                // simulator-side facts, not data constraints; they never
+                // `keep x.edge() == …` attribute of 9.7.3) and the unit
+                // attribute constraints (7.3.4 `pack_options()`, 7.3.5
+                // `per_inst_cover()` — recorded by elaboration) record
+                // simulator/tool facts, not data constraints; they never
                 // gate gen.
                 if expr_calls_any(
                     constraint,
-                    &["hdl_path", "delayed", "soft", "select", "edge"],
+                    &[
+                        "hdl_path",
+                        "delayed",
+                        "soft",
+                        "select",
+                        "edge",
+                        "pack_options",
+                        "per_inst_cover",
+                    ],
                 ) {
                     continue;
                 }
@@ -2924,7 +3253,34 @@ impl<'a> Interp<'a> {
     ) -> Result<Value, Diagnostic> {
         let type_name = self.instances[object_index].type_name.clone();
         let types: &[crate::elab::ElaboratedType] = self.types;
-        let blocks = resolve_method_blocks(types, &type_name, name, span)?;
+        let blocks = match resolve_method_blocks(types, &type_name, name, span) {
+            Ok(blocks) => blocks,
+            Err(diagnostic) => {
+                // No user method of the name: the predefined any_unit
+                // queries (7.4) dispatch here (a user definition of the
+                // same name wins, having resolved above).
+                match (name, args.as_slice()) {
+                    ("e_path", []) => return self.instance_e_path(object_index, span),
+                    ("get_children", []) => {
+                        return Ok(self.instance_children(object_index, false));
+                    }
+                    ("get_children", [Value::Bool(with_ports)]) => {
+                        return Ok(self.instance_children(object_index, *with_ports));
+                    }
+                    ("get_ports", []) => return Ok(self.instance_ports(object_index)),
+                    ("get_ports_recursively", []) => {
+                        return Ok(self.instance_ports_recursively(object_index));
+                    }
+                    _ => {}
+                }
+                // The recognised-but-unimplemented 2019 surface (E0419)
+                // reports instead of the unknown-method error.
+                if let Some(stub) = self.unimplemented_2019(name, &args, span) {
+                    return Err(stub);
+                }
+                return Err(diagnostic);
+            }
+        };
         if self.depth > 200 {
             return Err(self.error("E0406", "recursion too deep", span));
         }
@@ -2978,6 +3334,7 @@ impl<'a> Interp<'a> {
         name: &str,
         values: Vec<Value>,
         span: crate::ast::Span,
+        me: Option<usize>,
     ) -> Result<Value, Diagnostic> {
         if name == "out" {
             let text: String = values.iter().map(|v| self.format_value(v)).collect();
@@ -2994,8 +3351,20 @@ impl<'a> Interp<'a> {
             return Ok(Value::Void);
         }
         if name == "message" {
-            // message(severity, ...): the severity argument is skipped in
-            // this subset (verbosity filtering is not modeled).
+            // 24.9.2.14: the message path first calls the receiving
+            // instance's user_message_handler() when its type defines
+            // one (an empty hook by default; `extend any_unit` refines
+            // it for every unit), then the message text prints — the
+            // severity argument is skipped in this subset (verbosity
+            // filtering is not modeled).
+            if let Some(index) = me {
+                let type_name = self.instances[index].type_name.clone();
+                if resolve_method_blocks(self.types, &type_name, "user_message_handler", span)
+                    .is_ok()
+                {
+                    self.call_method(index, "user_message_handler", Vec::new(), span)?;
+                }
+            }
             let text: String = values
                 .iter()
                 .skip(1)
@@ -3034,7 +3403,103 @@ impl<'a> Interp<'a> {
         if name.starts_with("hdl_") {
             return self.call_hdl(name, values, span);
         }
+        if name == "set_check" {
+            // 16.3.6: `set_check(name, severity|effect [, root_unit])`
+            // sets a named check's reporting effect. The check-effect
+            // model is a later milestone; the call is accepted (the
+            // name carries, the root unit is ignored) and has no
+            // effect in this stage.
+            if values.len() < 2 || values.len() > 3 {
+                return Err(self.error(
+                    "E0402",
+                    format!("'set_check' expects 2 or 3 arguments, got {}", values.len()),
+                    span,
+                ));
+            }
+            if !matches!(&values[0], Value::Str(_)) {
+                return Err(self.error(
+                    "E0402",
+                    "'set_check' expects the check name as a string first",
+                    span,
+                ));
+            }
+            return Ok(Value::Void);
+        }
+        if name == "do_bind" {
+            // 9.13.3.2: perform the declarative port bindings — legal
+            // only in the connect_ports() generation sub-phase (E0420
+            // elsewhere). No procedural bindings are pending in the
+            // `keep bind` model: the recorded edges apply statically.
+            if !values.is_empty() {
+                return Err(self.error(
+                    "E0402",
+                    format!("'do_bind' expects no arguments, got {}", values.len()),
+                    span,
+                ));
+            }
+            if !self.in_connect_ports {
+                return Err(self.error(
+                    "E0420",
+                    "do_bind() may only be called in the connect_ports() sub-phase (9.13.3)",
+                    span,
+                ));
+            }
+            return Ok(Value::Void);
+        }
+        if name == "deep_copy" {
+            // 29.2.2: the general deep copy (scalars, strings, sets,
+            // lists, structs).
+            let [value] = values.as_slice() else {
+                return Err(self.error(
+                    "E0402",
+                    format!("'deep_copy' expects one argument, got {}", values.len()),
+                    span,
+                ));
+            };
+            return self.deep_copy_value(value, 0, span);
+        }
+        // The recognised-but-unimplemented 2019 surface (E0419) sits
+        // between the implemented builtins and the unknown-routine error.
+        if let Some(diagnostic) = self.unimplemented_2019(name, &values, span) {
+            return Err(diagnostic);
+        }
         Err(self.error("E0405", format!("routine '{name}' is not supported"), span))
+    }
+
+    /// The E0419 stub dispatch ([`UNIMPLEMENTED_2019`]): a recognised
+    /// name with a compatible arity reports "'name()' is recognised
+    /// (clause X) but not implemented in this stage"; a recognised name
+    /// with the wrong arity reports the arity mismatch (the stubs parse
+    /// and arity-check). `None` when the name is not in the table.
+    fn unimplemented_2019(
+        &self,
+        name: &str,
+        values: &[Value],
+        span: crate::ast::Span,
+    ) -> Option<Diagnostic> {
+        let (_, clause, (min, max)) = UNIMPLEMENTED_2019
+            .iter()
+            .find(|(candidate, _, _)| *candidate == name)?;
+        if values.len() < *min || values.len() > *max {
+            let expected = if min == max {
+                format!("{min}")
+            } else {
+                format!("{min}-{max}")
+            };
+            return Some(self.error(
+                "E0402",
+                format!(
+                    "'{name}' expects {expected} argument(s), got {}",
+                    values.len()
+                ),
+                span,
+            ));
+        }
+        Some(self.error(
+            "E0419",
+            format!("'{name}()' is recognised (clause {clause}) but not implemented in this stage"),
+            span,
+        ))
     }
 
     /// `pack(NULL, obj)` — concatenate the object's physical fields
@@ -3065,6 +3530,853 @@ impl<'a> Interp<'a> {
             packed = (packed << width) | (bits & ((1i128 << width) - 1));
         }
         Ok(Value::Int(packed))
+    }
+
+    /// Whether the instance's type declares a `simple_port`/`event_port`
+    /// member of the name (clause 9). The declared list drives the
+    /// lookup, not the instance's HDL-bound subset — every declared
+    /// port is a member, bound or not.
+    fn instance_has_port(&self, index: usize, name: &str) -> bool {
+        let type_name = self.instances[index].type_name.clone();
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        types
+            .iter()
+            .find(|t| t.name == type_name)
+            .is_some_and(|ty| ty.ports.iter().any(|port| port.name == name))
+    }
+
+    /// The predefined any_unit instance-path query (7.4): the dotted
+    /// field path from `sys` (`sys.u1`, `sys.u2[0]`), following the
+    /// same field order the field tree walks. `E0402` for an instance
+    /// outside the tree under sys (a local `var`'s struct).
+    fn instance_e_path(&self, target: usize, span: crate::ast::Span) -> Result<Value, Diagnostic> {
+        let Some(sys_index) = self
+            .instances
+            .iter()
+            .position(|instance| instance.type_name == "sys")
+        else {
+            return Err(self.error("E0402", "e_path() has no root sys instance", span));
+        };
+        fn walk(interp: &Interp, index: usize, path: &str, target: usize) -> Option<String> {
+            if index == target {
+                return Some(path.to_owned());
+            }
+            let fields: Vec<(String, Value)> = interp.instances[index]
+                .fields
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            for (field_name, value) in fields {
+                match value {
+                    Value::Object(child) => {
+                        let child_path = format!("{path}.{field_name}");
+                        if let Some(found) = walk(interp, child, &child_path, target) {
+                            return Some(found);
+                        }
+                    }
+                    Value::List(list) => {
+                        let items = list.items.borrow().clone();
+                        for (position, item) in items.iter().enumerate() {
+                            let Value::Object(child) = item else {
+                                continue;
+                            };
+                            let child_path = format!("{path}.{field_name}[{position}]");
+                            if let Some(found) = walk(interp, *child, &child_path, target) {
+                                return Some(found);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        match walk(self, sys_index, "sys", target) {
+            Some(path) => Ok(Value::Str(path)),
+            None => Err(self.error(
+                "E0402",
+                "e_path() has no instance path: the struct is not in the field tree under sys",
+                span,
+            )),
+        }
+    }
+
+    /// `get_children([with_ports])` (7.4.4): the direct child unit
+    /// instances in instance-field declaration order — lists flatten in
+    /// index order, NULL fields are skipped — plus, with the argument
+    /// TRUE, the unit's own ports (the `any_port` children).
+    fn instance_children(&self, index: usize, with_ports: bool) -> Value {
+        let type_name = self.instances[index].type_name.clone();
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let mut children: Vec<Value> = Vec::new();
+        if let Some(ty) = types.iter().find(|t| t.name == type_name) {
+            for field in &ty.fields {
+                let Some(value) = self.instances[index].get(&field.name) else {
+                    continue;
+                };
+                match value {
+                    Value::Object(_) if self.field_type_is_unit(&field.ty) => {
+                        if !matches!(value, Value::Void) {
+                            children.push(value.clone());
+                        }
+                    }
+                    Value::List(list) => {
+                        let element = match &field.ty {
+                            TypeExpr::List { element, .. } => element.as_ref(),
+                            _ => continue,
+                        };
+                        if !self.field_type_is_unit(element) {
+                            continue;
+                        }
+                        let items = list.items.borrow().clone();
+                        for item in items {
+                            if matches!(item, Value::Object(_)) {
+                                children.push(item);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if with_ports && let Some(ty) = types.iter().find(|t| t.name == type_name) {
+            for port in &ty.ports {
+                children.push(Value::Port {
+                    owner: index,
+                    name: port.name.clone(),
+                });
+            }
+        }
+        Value::List(ListValue {
+            items: Rc::new(RefCell::new(children)),
+            element: Some("any_unit".to_owned()),
+        })
+    }
+
+    /// `get_ports()` (7.4.5): the unit's own ports as `any_port`
+    /// handles, in declaration order.
+    fn instance_ports(&self, index: usize) -> Value {
+        let type_name = self.instances[index].type_name.clone();
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let ports: Vec<Value> = types
+            .iter()
+            .find(|t| t.name == type_name)
+            .map(|ty| {
+                ty.ports
+                    .iter()
+                    .map(|port| Value::Port {
+                        owner: index,
+                        name: port.name.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Value::List(ListValue {
+            items: Rc::new(RefCell::new(ports)),
+            element: Some("any_port".to_owned()),
+        })
+    }
+
+    /// `get_ports_recursively()` (7.4.6): the unit's ports followed by
+    /// every sub-instance's, in field-tree order.
+    fn instance_ports_recursively(&self, index: usize) -> Value {
+        let mut ports: Vec<Value> = Vec::new();
+        for member in self.field_tree(index) {
+            let type_name = self.instances[member].type_name.clone();
+            let types: &[crate::elab::ElaboratedType] = self.types;
+            if let Some(ty) = types.iter().find(|t| t.name == type_name) {
+                for port in &ty.ports {
+                    ports.push(Value::Port {
+                        owner: member,
+                        name: port.name.clone(),
+                    });
+                }
+            }
+        }
+        Value::List(ListValue {
+            items: Rc::new(RefCell::new(ports)),
+            element: Some("any_port".to_owned()),
+        })
+    }
+
+    /// Whether the type expression names a unit type (directly or
+    /// through a when-qualified spelling).
+    fn field_type_is_unit(&self, ty: &TypeExpr) -> bool {
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        match ty {
+            TypeExpr::Named { name, .. } => types
+                .iter()
+                .any(|t| t.name == *name && t.kind == DeclarationKind::Unit),
+            TypeExpr::WhenQualified { base, .. } => self.field_type_is_unit(base),
+            _ => false,
+        }
+    }
+
+    /// The 9.13 port binding methods over the `keep bind` simple_port
+    /// model: `get_bound_set()` (9.13.9), `is_connected()` (9.13.10),
+    /// `disconnect()` (9.13.11) and `disconnect_bound_set()`
+    /// (9.13.12) are implemented; `connect()` and `remap_hdl_path()`
+    /// fall to the E0419 table (no method-port model).
+    fn call_port_method(
+        &mut self,
+        owner: usize,
+        port: &str,
+        name: &str,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        match (name, values.as_slice()) {
+            ("get_bound_set", []) => {
+                // 9.13.9: the bound set contains the port itself; a
+                // disconnected port's set is the port alone. The set's
+                // members are the port handles of the owner instance —
+                // the `keep bind` model binds a type's own ports to
+                // each other.
+                let members = self.port_bound_set(owner, port);
+                let items = members
+                    .into_iter()
+                    .map(|(member_owner, member_name)| Value::Port {
+                        owner: member_owner,
+                        name: member_name,
+                    })
+                    .collect();
+                Ok(Value::List(ListValue {
+                    items: Rc::new(RefCell::new(items)),
+                    element: Some("any_port".to_owned()),
+                }))
+            }
+            ("is_connected", []) => Ok(Value::Bool(self.port_is_connected(owner, port))),
+            ("disconnect", []) => {
+                // 9.13.11: remove every connection of the port; its
+                // bound set becomes the port itself.
+                self.disconnected_ports.insert((owner, port.to_owned()));
+                Ok(Value::Void)
+            }
+            ("disconnect_bound_set", []) => {
+                // 9.13.12: disconnect every port of the bound set.
+                let members = self.port_bound_set(owner, port);
+                for (member_owner, member_name) in members {
+                    self.disconnected_ports.insert((member_owner, member_name));
+                }
+                Ok(Value::Void)
+            }
+            _ => {
+                if let Some(diagnostic) = self.unimplemented_2019(name, &values, span) {
+                    return Err(diagnostic);
+                }
+                Err(self.error(
+                    "E0401",
+                    format!("unknown method '{name}' on port '{port}'"),
+                    span,
+                ))
+            }
+        }
+    }
+
+    /// The port's bound set (9.13.9): the connected component of the
+    /// type's `keep bind(p, q)` edges that contains the port, the port
+    /// itself included — over the owning instance's ports (the model's
+    /// binds are intra-instance). Edges touching a port disconnected
+    /// since run start drop out.
+    fn port_bound_set(&self, owner: usize, port: &str) -> Vec<(usize, String)> {
+        if self.disconnected_ports.contains(&(owner, port.to_owned())) {
+            return vec![(owner, port.to_owned())];
+        }
+        let type_name = self.instances[owner].type_name.clone();
+        let Some(edges) = self.type_port_binds.get(&type_name) else {
+            return vec![(owner, port.to_owned())];
+        };
+        let mut visited: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::from([port.to_owned()]);
+        let mut queue = vec![port.to_owned()];
+        while let Some(current) = queue.pop() {
+            for (first, second) in edges {
+                let partner = if *first == current {
+                    second
+                } else if *second == current {
+                    first
+                } else {
+                    continue;
+                };
+                // An edge to (or from) a port disconnected on this
+                // instance no longer connects.
+                if self.disconnected_ports.contains(&(owner, partner.clone())) {
+                    continue;
+                }
+                if visited.insert(partner.clone()) {
+                    queue.push(partner.clone());
+                }
+            }
+        }
+        visited.into_iter().map(|name| (owner, name)).collect()
+    }
+
+    /// 9.13.10: TRUE when the port is connected — a bound set larger
+    /// than the port itself, or an HDL path on the port. A port bound
+    /// to nothing on purpose (`keep bind(p, empty)`) and a
+    /// disconnected port are FALSE either way.
+    fn port_is_connected(&self, owner: usize, port: &str) -> bool {
+        let type_name = self.instances[owner].type_name.clone();
+        if self
+            .type_port_unbound
+            .get(&type_name)
+            .is_some_and(|ports| ports.iter().any(|name| name == port))
+        {
+            return false;
+        }
+        if self.disconnected_ports.contains(&(owner, port.to_owned())) {
+            return false;
+        }
+        if self.port_bound_set(owner, port).len() > 1 {
+            return true;
+        }
+        self.instances[owner].port_path(port).is_some()
+    }
+
+    /// The `covers` singleton methods (14.9): the procedural cover
+    /// group sampling (14.8.2.10), the overall grade compute/read pair
+    /// (14.9.6), the coverage-database path query, and the
+    /// configuration calls that fall to the E0419 table.
+    fn call_covers_method(
+        &mut self,
+        name: &str,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        match (name, values.as_slice()) {
+            ("sample_cg", [Value::Str(spec)]) => {
+                // 14.8.2.10: sample a cover group (all its instances)
+                // by name, without emitting its sampling event — not
+                // permitted before the post_generate() sub-phase ran.
+                if !self.post_generate_done {
+                    return Err(self.error(
+                        "E0402",
+                        "covers.sample_cg() is not permitted before the post_generate() sub-phase (14.8.2.10)",
+                        span,
+                    ));
+                }
+                self.sample_cover_group_by_name(spec, span)?;
+                Ok(Value::Void)
+            }
+            ("sample_cg", _) => Err(self.error(
+                "E0402",
+                "'covers.sample_cg' expects the cover group name string (\"type.group\")",
+                span,
+            )),
+            ("compute_overall_grade", []) => Ok(Value::Real(self.compute_overall_grade_value())),
+            ("get_overall_grade", []) => {
+                // 14.9.6: reads the last computed value; a run that
+                // never computed one computes it once here (the read
+                // cannot fail, so the split keeps the compute/write
+                // pairing observable without a stale-zero state).
+                if self.overall_grade.is_none() {
+                    self.compute_overall_grade_value();
+                }
+                Ok(Value::Real(self.overall_grade.unwrap_or(0.0)))
+            }
+            ("get_ucd_path", []) => {
+                // 14.9.15-14.9.17: the coverage-database file path —
+                // coverage-database files are out of scope for this
+                // stage (no coverage database is written), so the path
+                // is the empty string.
+                Ok(Value::Str(String::new()))
+            }
+            _ => {
+                if let Some(diagnostic) = self.unimplemented_2019(name, &values, span) {
+                    return Err(diagnostic);
+                }
+                Err(self.error(
+                    "E0405",
+                    format!("method 'covers.{name}' is not supported"),
+                    span,
+                ))
+            }
+        }
+    }
+
+    /// The normalised overall coverage grade (14.9.6): the mean grade
+    /// over every collected group that has one, 0.0-1.0 (the grade
+    /// model is the covered-bucket fraction; the 1M-100M raw scale the
+    /// prose normalises is Specman-internal). Stores the value for
+    /// `get_overall_grade()`.
+    fn compute_overall_grade_value(&mut self) -> f64 {
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for entry in &self.coverage {
+            for group in &entry.groups {
+                if let Some(grade) = group.grade() {
+                    sum += grade;
+                    count += 1;
+                }
+            }
+        }
+        let grade = if count == 0 { 0.0 } else { sum / count as f64 };
+        self.overall_grade = Some(grade);
+        grade
+    }
+
+    /// `covers.sample_cg("type.group")` (14.8.2.10): sample every live
+    /// instance of the type that owns a group of the name, once per
+    /// instance, without emitting the group's sampling event. Cover
+    /// groups identify by their recorded name here — the sampling
+    /// event's path as written (the parser's group naming).
+    fn sample_cover_group_by_name(
+        &mut self,
+        spec: &str,
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        let Some((type_name, group_name)) = spec.rsplit_once('.') else {
+            return Err(self.error("E0402", "covers.sample_cg expects \"type.group\"", span));
+        };
+        let Some(entry_index) = self
+            .coverage
+            .iter()
+            .position(|entry| entry.type_name == type_name)
+        else {
+            return Err(self.error(
+                "E0401",
+                format!("no cover group '{spec}': type '{type_name}' has no coverage"),
+                span,
+            ));
+        };
+        let group_indices: Vec<usize> = self.coverage[entry_index]
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| group.name == group_name)
+            .map(|(index, _)| index)
+            .collect();
+        if group_indices.is_empty() {
+            return Err(self.error(
+                "E0401",
+                format!("no cover group named '{group_name}' on type '{type_name}'"),
+                span,
+            ));
+        }
+        let instance_indices: Vec<usize> = self
+            .instances
+            .iter()
+            .enumerate()
+            .filter(|(_, instance)| instance.type_name == type_name)
+            .map(|(index, _)| index)
+            .collect();
+        let mut frame = Frame::default();
+        for owner in instance_indices {
+            for group_index in &group_indices {
+                self.sample_group_on_instance(entry_index, *group_index, owner, &mut frame);
+            }
+        }
+        Ok(())
+    }
+
+    /// The `files` singleton methods (30.5): `flush_log_file()` falls
+    /// to the E0419 table; every other member is unsupported.
+    fn call_files_method(
+        &mut self,
+        name: &str,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        if let Some(diagnostic) = self.unimplemented_2019(name, &values, span) {
+            return Err(diagnostic);
+        }
+        Err(self.error(
+            "E0405",
+            format!("method 'files.{name}' is not supported"),
+            span,
+        ))
+    }
+
+    /// `deep_copy(<exp>)` (29.2.2): scalars, strings, enumerals and
+    /// sets are values — returned as-is; a list deep copy mints a
+    /// FRESH list object whose items are deep copies (`list_ptr==`
+    /// FALSE against the original, 4.11.4); a struct deep copy is a
+    /// new instance of the same type whose fields are deep copies,
+    /// followed by the struct's own `copy()` blocks (29.2.2: copy() of
+    /// every copied struct is called) when the type defines any.
+    fn deep_copy_value(
+        &mut self,
+        value: &Value,
+        depth: u32,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        if depth > 32 {
+            return Err(self.error("E0406", "deep_copy nesting too deep", span));
+        }
+        match value {
+            Value::Int(_)
+            | Value::Real(_)
+            | Value::Bool(_)
+            | Value::Str(_)
+            | Value::Enum { .. }
+            | Value::Set(_)
+            | Value::Void
+            | Value::Port { .. } => Ok(value.clone()),
+            Value::List(list) => {
+                let items = list.items.borrow().clone();
+                let mut copies = Vec::with_capacity(items.len());
+                for item in &items {
+                    copies.push(self.deep_copy_value(item, depth + 1, span)?);
+                }
+                Ok(Value::List(ListValue {
+                    items: Rc::new(RefCell::new(copies)),
+                    element: list.element.clone(),
+                }))
+            }
+            Value::Object(index) => {
+                let index = *index;
+                let type_name = self.instances[index].type_name.clone();
+                let new_index = self.instantiate(&type_name);
+                let fields: Vec<(String, Value)> = self.instances[index]
+                    .fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                for (field_name, field_value) in fields {
+                    let copied = self.deep_copy_value(&field_value, depth + 1, span)?;
+                    self.instances[new_index].set(&field_name, copied);
+                }
+                if resolve_method_blocks(self.types, &type_name, "copy", span).is_ok() {
+                    self.call_method(new_index, "copy", Vec::new(), span)?;
+                }
+                Ok(Value::Object(new_index))
+            }
+        }
+    }
+
+    /// The 27.4.17/27.4.20/27.5.4-27.5.6 aggregate pseudo-methods with
+    /// a per-item expression: `l.sum(it)`, `l.product(it * it)`,
+    /// `l.average(it)`, `l.max_value(it)`, `l.min_value(it)` — and
+    /// their no-argument forms over the items themselves. The per-item
+    /// expression evaluates with `it` bound to the item. Numeric items
+    /// only; the result carries the item expression's type (Int over
+    /// integers, Real over reals; `average` of integers truncates —
+    /// integer division keeps the int type). Empty list: `sum` is 0
+    /// and `product` is 1 (the prose's stated empty results);
+    /// `average` reports `E0402` — the standard's UNDEF result has no
+    /// value-model representation here; `max_value`/`min_value`
+    /// likewise report `E0402` (Table 54's element-type-keyed empty
+    /// results are not modeled).
+    fn call_list_aggregate(
+        &mut self,
+        items: &[Value],
+        name: &str,
+        args: &[Expr],
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        if args.len() > 1 {
+            return Err(self.error(
+                "E0402",
+                format!("'{name}' expects at most one item expression"),
+                span,
+            ));
+        }
+        let mut int_result: i128 = match name {
+            "product" => 1,
+            _ => 0,
+        };
+        let mut real_result = 0.0f64;
+        let mut is_real = false;
+        let mut count = 0usize;
+        // The extreme trackers (max_value/min_value) start at nothing.
+        let mut extreme: Option<Value> = None;
+        for item in items {
+            let value = if args.is_empty() {
+                item.clone()
+            } else {
+                // `it` shadows any outer binding for the item
+                // expression's evaluation, then the outer state
+                // returns.
+                let previous = frame.locals.insert("it".to_owned(), item.clone());
+                let result = self.eval(&args[0], frame, me);
+                match previous {
+                    Some(outer) => {
+                        frame.locals.insert("it".to_owned(), outer);
+                    }
+                    None => {
+                        frame.locals.remove("it");
+                    }
+                }
+                result?
+            };
+            count += 1;
+            if matches!(name, "max_value" | "min_value") {
+                let takes_over = match &extreme {
+                    None => true,
+                    Some(best) => {
+                        let ordering = compare_values(&value, best).ok_or_else(|| {
+                            self.error("E0402", format!("{name}() items are not comparable"), span)
+                        })?;
+                        use std::cmp::Ordering::*;
+                        if name == "max_value" {
+                            ordering != Less
+                        } else {
+                            ordering != Greater
+                        }
+                    }
+                };
+                if takes_over {
+                    extreme = Some(value);
+                }
+                continue;
+            }
+            match value {
+                Value::Int(v) => {
+                    if is_real {
+                        return Err(self.error(
+                            "E0402",
+                            format!("{name}() items must all be of one numeric type (reals seen, integer found)"),
+                            span,
+                        ));
+                    }
+                    match name {
+                        "sum" | "average" => int_result = int_result.wrapping_add(v),
+                        "product" => int_result = int_result.wrapping_mul(v),
+                        _ => {}
+                    }
+                }
+                Value::Real(v) => {
+                    if !is_real && count > 1 {
+                        return Err(self.error(
+                            "E0402",
+                            format!("{name}() items must all be of one numeric type (integers seen, real found)"),
+                            span,
+                        ));
+                    }
+                    is_real = true;
+                    match name {
+                        "sum" | "average" => real_result += v,
+                        "product" => real_result *= v,
+                        _ => {}
+                    }
+                }
+                _ => {
+                    return Err(self.error(
+                        "E0402",
+                        format!("{name}() expects a numeric item expression"),
+                        span,
+                    ));
+                }
+            }
+        }
+        match name {
+            "sum" => Ok(if is_real {
+                Value::Real(real_result)
+            } else {
+                Value::Int(int_result)
+            }),
+            "product" => Ok(if is_real {
+                Value::Real(real_result)
+            } else {
+                Value::Int(int_result)
+            }),
+            "average" => {
+                if count == 0 {
+                    return Err(self.error(
+                        "E0402",
+                        "average of an empty list (the standard's UNDEF result is not modeled)",
+                        span,
+                    ));
+                }
+                Ok(if is_real {
+                    Value::Real(real_result / count as f64)
+                } else {
+                    Value::Int(int_result / count as i128)
+                })
+            }
+            "max_value" | "min_value" => match extreme {
+                Some(extreme) => Ok(extreme),
+                None => Err(self.error(
+                    "E0402",
+                    format!("{name} of an empty list (the Table 54 empty results are not modeled)"),
+                    span,
+                )),
+            },
+            _ => Err(self.error("E0402", format!("unknown aggregate '{name}'"), span)),
+        }
+    }
+
+    /// A set literal's value (5.2.12): the canonical interval set of
+    /// its items. Enumeral items contribute their indices — the value
+    /// model keeps intervals only (the `for each` path re-derives the
+    /// enumerands from the literal's bounds, see
+    /// [`Interp::set_literal_iteration_items`]).
+    fn eval_set_literal(
+        &mut self,
+        items: &crate::ast::InSetExpr,
+        span: crate::ast::Span,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Value, Diagnostic> {
+        let mut intervals: Vec<(i128, i128)> = Vec::new();
+        match items {
+            crate::ast::InSetExpr::Items(exprs) => {
+                for expr in exprs {
+                    let value = self.eval(expr, frame, me)?;
+                    let as_int = match &value {
+                        Value::Int(v) => Some(*v),
+                        Value::Bool(b) => Some(*b as i128),
+                        Value::Enum { type_name, name } => self.enumeral_index(type_name, name),
+                        _ => {
+                            return Err(self.error(
+                                "E0402",
+                                "set literal items must be integers, booleans or enumerals",
+                                span,
+                            ));
+                        }
+                    };
+                    match as_int {
+                        Some(v) => intervals.push((v, v)),
+                        None => {
+                            return Err(self.error(
+                                "E0402",
+                                "set literal item is not an enumerand of a declared type",
+                                span,
+                            ));
+                        }
+                    }
+                }
+            }
+            crate::ast::InSetExpr::Range(low, high) => {
+                let low = self.set_literal_bound(low, frame, me, span)?;
+                let high = self.set_literal_bound(high, frame, me, span)?;
+                intervals.push((low, high));
+            }
+        }
+        Ok(Value::Set(canonical_set(intervals)))
+    }
+
+    /// One set-literal bound: an integer, boolean or enumerand index.
+    fn set_literal_bound(
+        &mut self,
+        expr: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<i128, Diagnostic> {
+        let value = self.eval(expr, frame, me)?;
+        match &value {
+            Value::Int(v) => Ok(*v),
+            Value::Bool(b) => Ok(*b as i128),
+            Value::Enum { type_name, name } => {
+                self.enumeral_index(type_name, name).ok_or_else(|| {
+                    self.error(
+                        "E0402",
+                        format!("'{name}' is not an enumerand of '{type_name}'"),
+                        span,
+                    )
+                })
+            }
+            _ => Err(self.error(
+                "E0402",
+                "set literal bounds must be integers, booleans or enumerals",
+                span,
+            )),
+        }
+    }
+
+    /// The `for each in <set literal>` iteration items (20.2.5): the
+    /// values in order, with enumeral bounds iterating the enumerands
+    /// of their type (`for each (c) in [red..blue]` runs red, green,
+    /// blue) and integer bounds the integers.
+    fn set_literal_iteration_items(
+        &mut self,
+        items: &crate::ast::InSetExpr,
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<Vec<Value>, Diagnostic> {
+        match items {
+            crate::ast::InSetExpr::Items(exprs) => {
+                let mut values = Vec::with_capacity(exprs.len());
+                for expr in exprs {
+                    values.push(self.eval(expr, frame, me)?);
+                }
+                Ok(values)
+            }
+            crate::ast::InSetExpr::Range(low, high) => {
+                let low_value = self.eval(low, frame, me)?;
+                let high_value = self.eval(high, frame, me)?;
+                if let (
+                    Value::Enum {
+                        type_name: low_type,
+                        name: low_name,
+                    },
+                    Value::Enum {
+                        type_name: high_type,
+                        name: high_name,
+                    },
+                ) = (&low_value, &high_value)
+                {
+                    if low_type == high_type
+                        && let (Some(low_index), Some(high_index)) = (
+                            self.enumeral_index(low_type, low_name),
+                            self.enumeral_index(high_type, high_name),
+                        )
+                        && low_index <= high_index
+                    {
+                        let enumerals: Vec<String> = self
+                            .enumeral_values(low_type)
+                            .into_iter()
+                            .skip(low_index as usize)
+                            .take((high_index - low_index + 1) as usize)
+                            .collect();
+                        return Ok(enumerals
+                            .into_iter()
+                            .map(|name| Value::Enum {
+                                type_name: low_type.clone(),
+                                name,
+                            })
+                            .collect());
+                    }
+                    return Err(self.error(
+                        "E0402",
+                        "set range bounds must be enumerals of one type or integers",
+                        span,
+                    ));
+                }
+                let (Value::Int(low), Value::Int(high)) = (low_value, high_value) else {
+                    return Err(self.error(
+                        "E0402",
+                        "set range bounds must be enumerals of one type or integers",
+                        span,
+                    ));
+                };
+                if low > high || high - low > 1_000_000 {
+                    return Err(self.error(
+                        "E0402",
+                        "set range is empty or unreasonably large",
+                        span,
+                    ));
+                }
+                Ok((low..=high).map(Value::Int).collect())
+            }
+        }
+    }
+
+    /// The index of an enumerand within its declared type, by
+    /// declaration order (the set model's enumerand numbering).
+    fn enumeral_index(&self, type_name: &str, name: &str) -> Option<i128> {
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        types
+            .iter()
+            .find(|t| t.name == type_name && t.kind == DeclarationKind::Type)?
+            .enumerals
+            .iter()
+            .position(|enumeral| enumeral.name == name)
+            .map(|position| position as i128)
+    }
+
+    /// The enumerand names of a declared type, in declaration order.
+    fn enumeral_values(&self, type_name: &str) -> Vec<String> {
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        types
+            .iter()
+            .find(|t| t.name == type_name && t.kind == DeclarationKind::Type)
+            .map(|ty| ty.enumerals.iter().map(|e| e.name.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// `outf("format %x", args)` — printf-style output; specs `%x`/`%X`
@@ -3351,9 +4663,25 @@ impl<'a> Interp<'a> {
             .filter(|(_, group)| group.event_path.as_deref() == Some(path))
             .map(|(index, _)| index)
             .collect();
-        if group_indices.is_empty() {
-            return;
+        for group_index in group_indices {
+            self.sample_group_on_instance(entry_index, group_index, owner, frame);
         }
+    }
+
+    /// One sampling event of one group on one instance: the group's
+    /// sample count advances once, each item's recorded expression (or
+    /// field) evaluates against the instance, the buckets record, and
+    /// the cross items read the round's labels afterwards (14.4). The
+    /// shared path of the emit-driven sampling (14.2) and the
+    /// procedural `covers.sample_cg()` sampling (14.8.2.10).
+    fn sample_group_on_instance(
+        &mut self,
+        entry_index: usize,
+        group_index: usize,
+        owner: usize,
+        frame: &mut Frame,
+    ) {
+        let type_name = self.instances[owner].type_name.clone();
         // The items' recorded declarations (expression or field name),
         // looked up in the elaborated type's cover groups by name.
         let types: &[crate::elab::ElaboratedType] = self.types;
@@ -3372,33 +4700,30 @@ impl<'a> Interp<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        for group_index in group_indices {
-            // One sampling event: the group's sample count advances once.
-            self.coverage[entry_index].groups[group_index].samples += 1;
-            let item_names: Vec<String> = self.coverage[entry_index].groups[group_index]
-                .items
+        self.coverage[entry_index].groups[group_index].samples += 1;
+        let item_names: Vec<String> = self.coverage[entry_index].groups[group_index]
+            .items
+            .iter()
+            .map(|item| item.name.clone())
+            .collect();
+        for name in item_names {
+            let Some((_, expr)) = item_sources
                 .iter()
-                .map(|item| item.name.clone())
-                .collect();
-            for name in item_names {
-                let Some((_, expr)) = item_sources
-                    .iter()
-                    .find(|(source_name, _)| *source_name == name)
-                else {
-                    continue;
-                };
-                let value = match expr {
-                    Some(expr) => self.eval(expr, frame, Some(owner)).ok(),
-                    None => self.instances[owner].get(&name).cloned(),
-                };
-                if let Some(value) = value {
-                    self.coverage[entry_index].groups[group_index].sample(&name, &value);
-                }
+                .find(|(source_name, _)| *source_name == name)
+            else {
+                continue;
+            };
+            let value = match expr {
+                Some(expr) => self.eval(expr, frame, Some(owner)).ok(),
+                None => self.instances[owner].get(&name).cloned(),
+            };
+            if let Some(value) = value {
+                self.coverage[entry_index].groups[group_index].sample(&name, &value);
             }
-            // The cross items record after all of their sources have
-            // this round's labels (14.4).
-            self.coverage[entry_index].groups[group_index].record_crosses();
         }
+        // The cross items record after all of their sources have
+        // this round's labels (14.4).
+        self.coverage[entry_index].groups[group_index].record_crosses();
     }
 
     /// Whether the running statement may suspend to the scheduler: a
@@ -4385,6 +5710,18 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(value.clone());
                 }
+                // A simple_port/event_port member read is the port
+                // handle (clause 9): the 9.13 binding methods dispatch on
+                // it; the port's *value* is the `name$` bridge access,
+                // not this handle.
+                if let Some(index) = me
+                    && self.instance_has_port(index, name)
+                {
+                    return Ok(Value::Port {
+                        owner: index,
+                        name: name.clone(),
+                    });
+                }
                 // The root unit instance is addressable by name from any
                 // method (`for each in sys.ops`).
                 if name == "sys" {
@@ -4458,9 +5795,17 @@ impl<'a> Interp<'a> {
                             let port = port.to_owned();
                             return self.read_port_value(&port, Some(index), *span);
                         }
-                        self.instances[index].get(name).cloned().ok_or_else(|| {
-                            self.error("E0401", format!("unknown field '{name}'"), *span)
-                        })
+                        if let Some(value) = self.instances[index].get(name) {
+                            return Ok(value.clone());
+                        }
+                        // `unit.port` — the port handle (clause 9).
+                        if self.instance_has_port(index, name) {
+                            return Ok(Value::Port {
+                                owner: index,
+                                name: name.clone(),
+                            });
+                        }
+                        Err(self.error("E0401", format!("unknown field '{name}'"), *span))
                     }
                     other => Err(self.error(
                         "E0402",
@@ -4492,6 +5837,23 @@ impl<'a> Interp<'a> {
                 self.read_qualified_field(index, qualifiers, field, *field_span, *span)
             }
             Expr::Call { callee, args, span } => {
+                // The 27.4.17/27.4.20/27.5.4-27.5.6 aggregates read their
+                // receiver before the arguments: the per-item expression
+                // (`l.sum(it)`) names `it`, which is not a value outside
+                // the per-item evaluation, so the arguments cannot be
+                // pre-evaluated for this dispatch. A non-list receiver
+                // (a struct with a same-named method) falls through to
+                // the ordinary dispatch below, which re-evaluates it.
+                if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
+                    && matches!(
+                        name.as_str(),
+                        "sum" | "product" | "average" | "max_value" | "min_value"
+                    )
+                    && let Value::List(list) = self.eval(object, frame, me)?
+                {
+                    let items = list.items.borrow().clone();
+                    return self.call_list_aggregate(&items, name, args, frame, me, *span);
+                }
                 // A call argument's parameter type is the inference
                 // context for an untyped `evaluate { ... }` in the
                 // argument (4.17.7). Looked up only when an argument can
@@ -4511,7 +5873,7 @@ impl<'a> Interp<'a> {
                 match callee.as_ref() {
                     Expr::Ident { name, .. } => {
                         if crate::builtins::is_builtin_routine(name) {
-                            return self.call_builtin(name, values, *span);
+                            return self.call_builtin(name, values, *span, me);
                         }
                         let Some(index) = me else {
                             return Err(self.error(
@@ -4527,11 +5889,38 @@ impl<'a> Interp<'a> {
                         // instance (`driver.raise_objection(...)`) route
                         // to the builtin table first.
                         if crate::builtins::is_builtin_routine(name) {
-                            return self.call_builtin(name, values, *span);
+                            return self.call_builtin(name, values, *span, me);
                         }
+                        // The predefined `covers` (14.9) and `files`
+                        // (30.5) singletons are method receivers only:
+                        // their member calls dispatch here without an
+                        // instance value behind the receiver. A local or
+                        // field of the same name wins.
+                        if let Expr::Ident {
+                            name: singleton, ..
+                        } = object.as_ref()
+                            && (singleton == "covers" || singleton == "files")
+                            && !frame.locals.contains_key(singleton)
+                            && !me
+                                .is_some_and(|index| self.instances[index].get(singleton).is_some())
+                        {
+                            return if singleton == "covers" {
+                                self.call_covers_method(name, values, *span)
+                            } else {
+                                self.call_files_method(name, values, *span)
+                            };
+                        }
+                        // The 27.4.17/27.4.20/27.5.4-27.5.6 aggregates
+                        // dispatched before the argument evaluation
+                        // above; every other member call evaluates its
+                        // arguments to values first.
                         let object_value = self.eval(object, frame, me)?;
                         match object_value {
                             Value::Object(index) => self.call_method(index, name, values, *span),
+                            Value::Port {
+                                owner,
+                                name: port_name,
+                            } => self.call_port_method(owner, &port_name, name, values, *span),
                             Value::List(list) => {
                                 // The modifying pseudo-methods mutate the
                                 // shared storage through the handle; the
@@ -4817,6 +6206,7 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Value::Bool(contained))
             }
+            Expr::SetLiteral { items, span } => self.eval_set_literal(items, *span, frame, me),
             Expr::IsA {
                 expr,
                 ty,
@@ -5965,6 +7355,9 @@ impl<'a> Interp<'a> {
                     .collect();
                 format!("{}{{{}}}", instance.type_name, parts.join(", "))
             }
+            // A port handle renders by its member name (clause 9); the
+            // port's value is the `name$` bridge access, not this.
+            Value::Port { name, .. } => format!("port {name}"),
             Value::Void => "void".to_owned(),
         }
     }
@@ -5978,6 +7371,7 @@ impl<'a> Interp<'a> {
             Value::List(_) => "a list",
             Value::Set(_) => "a set",
             Value::Object(_) => "an object",
+            Value::Port { .. } => "a port",
             Value::Void => "void",
         }
     }
@@ -6615,7 +8009,7 @@ fn collect_port_edge_attributes(elaborated: &Elaborated) -> BTreeMap<(String, St
 
 /// Whether the expression calls any of the named routines anywhere in its
 /// tree (including as a member call like `x.hdl_path()`).
-fn expr_calls_any(expr: &Expr, names: &[&str]) -> bool {
+pub(crate) fn expr_calls_any(expr: &Expr, names: &[&str]) -> bool {
     match expr {
         Expr::Call { callee, args, .. } => {
             let callee_name = match callee.as_ref() {

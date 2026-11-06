@@ -626,3 +626,34 @@ fn spelled_when_types_materialize_as_views() {
     assert_eq!(field_names(view), vec!["color", "good"]);
     assert!(!view.fields.iter().any(|f| f.name == "x"));
 }
+
+#[test]
+fn unit_attribute_constraints_record_with_their_field() {
+    // T8.4 (7.3.4, 7.3.5): `keep <field>.pack_options() == …` and
+    // `keep <field>.per_inst_cover() == …` record on the declaring
+    // type like the port hdl paths do — (field, attribute, value as
+    // written) — and stay out of gen (the attribute names are not
+    // fields, and the values are predefined settings).
+    let result = elaborated(
+        "unit u {\n};\n\
+         extend sys {\n    u1: u;\n    \
+         keep u1.pack_options() == packing.low_big_endian;\n    \
+         keep u1.per_inst_cover() == DEFAULT;\n};\n",
+    );
+    let sys = find(&result, "sys");
+    assert_eq!(
+        sys.unit_attributes,
+        vec![
+            (
+                "u1".to_owned(),
+                "pack_options".to_owned(),
+                "packing.low_big_endian".to_owned()
+            ),
+            (
+                "u1".to_owned(),
+                "per_inst_cover".to_owned(),
+                "DEFAULT".to_owned()
+            ),
+        ]
+    );
+}
