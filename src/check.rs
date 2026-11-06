@@ -977,6 +977,7 @@ fn check_enumerals(declaration: &Declaration, diagnostics: &mut Vec<Diagnostic>)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_methods(
     declaration: &Declaration,
     declared: &BTreeSet<&str>,
