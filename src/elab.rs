@@ -53,8 +53,19 @@
 //! conformance check (E0312) run in `check.rs` — the well-formedness pass,
 //! which the fixture contract sees; this module records what the checks
 //! and the interpreter consume.
-//! - `E0318` a template extension's parameter count differs from the
-//!   template declaration's (8.2; reported once per extension)
+//! - `E0127` a `template extend`'s parameter count differs from the
+//!   template declaration's (8.6; reported once per extension; the
+//!   pre-plan E0318 allocation is retired by T4.4)
+//!
+//! The template bounding diagnostics of the 2019 migration — `E0313` a
+//! value actual not a constant of the parameter's scalar type, `E0314`
+//! an instance violating the template's `conditions`, `E0315` a type
+//! actual not in the parameter's category (clauses 8.5.2, 8.5.3) — are
+//! raised from the well-formedness pass ([`crate::check`]) like
+//! E0311/E0312 before them: the fixture harness and the CLI's `parse`
+//! command stop at parse + check, so the diagnostics must be visible
+//! there. The monomorphizer reads the same declarations and binding
+//! rules; a non-matching `template extend` simply does not apply (8.6).
 //!
 //! The elaboration-range static-member codes of the 2019 migration
 //! (`E0304`–`E0309`, `E0310`) are raised from the well-formedness pass
@@ -66,10 +77,453 @@
 
 use crate::ast::{
     Declaration, DeclarationKind, Enumeral, EventDecl, Expr, Field, KeepConstraint, Member,
-    MethodDecl, Stmt, WhenDecl,
+    MethodDecl, Stmt, TypeExpr, WhenDecl,
 };
 use crate::diagnostic::Diagnostic;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// A compile-time constant (clause 8.5.2: a value parameter's actual is
+/// a constant expression; 8.5.3: a condition is a constant expression).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Const {
+    Int(i128),
+    Real(f64),
+    Bool(bool),
+    Str(String),
+}
+
+impl Const {
+    /// The constant as a literal expression — the normalized form a
+    /// value parameter's actual substitutes as and canonical instance
+    /// names render.
+    pub(crate) fn as_expr(&self) -> Expr {
+        let zero = crate::lexer::Position {
+            byte: 0,
+            line: 0,
+            column: 0,
+        };
+        match self {
+            Const::Int(value) => Expr::IntLiteral {
+                text: value.to_string(),
+                span: (zero, zero),
+            },
+            Const::Real(value) => Expr::RealLiteral {
+                text: format!("{value}"),
+                span: (zero, zero),
+            },
+            Const::Bool(value) => Expr::BoolLiteral {
+                value: *value,
+                span: (zero, zero),
+            },
+            Const::Str(value) => Expr::StringLiteral {
+                value: value.clone(),
+                span: (zero, zero),
+            },
+        }
+    }
+}
+
+/// Evaluate a constant expression (clauses 8.5.2, 8.5.3): literals, the
+/// arithmetic / comparison / logical operators, `?:`, and the names a
+/// constant may reference — an enclosing value parameter's constant
+/// (`values`) or a `define` constant (`defines`, recursively,
+/// depth-capped). `None` for anything else (the condition or actual is
+/// then not constant).
+pub(crate) fn eval_const_expr(
+    expr: &Expr,
+    values: &BTreeMap<String, Expr>,
+    defines: &BTreeMap<String, Expr>,
+    depth: usize,
+) -> Option<Const> {
+    if depth > 16 {
+        return None;
+    }
+    match expr {
+        Expr::IntLiteral { text, .. } => crate::interp::parse_int_literal(text).map(Const::Int),
+        Expr::RealLiteral { text, .. } => text.parse::<f64>().ok().map(Const::Real),
+        Expr::BoolLiteral { value, .. } => Some(Const::Bool(*value)),
+        Expr::StringLiteral { value, .. } => Some(Const::Str(value.clone())),
+        Expr::Formal { name, .. } => eval_const_expr(values.get(name)?, values, defines, depth + 1),
+        Expr::Ident { name, .. } => eval_const_expr(defines.get(name)?, values, defines, depth + 1),
+        Expr::Paren { expr, .. } => eval_const_expr(expr, values, defines, depth + 1),
+        Expr::Unary { op, expr, .. } => {
+            let inner = eval_const_expr(expr, values, defines, depth + 1)?;
+            match (op, inner) {
+                (crate::ast::UnaryOp::Negate, Const::Int(v)) => Some(Const::Int(-v)),
+                (crate::ast::UnaryOp::Negate, Const::Real(v)) => Some(Const::Real(-v)),
+                (crate::ast::UnaryOp::Plus, inner) => Some(inner),
+                (crate::ast::UnaryOp::Not, Const::Bool(v)) => Some(Const::Bool(!v)),
+                (crate::ast::UnaryOp::BitNot, Const::Int(v)) => Some(Const::Int(!v)),
+                _ => None,
+            }
+        }
+        Expr::Binary { op, lhs, rhs, .. } => {
+            let l = eval_const_expr(lhs, values, defines, depth + 1)?;
+            let r = eval_const_expr(rhs, values, defines, depth + 1)?;
+            eval_const_binary(*op, l, r)
+        }
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            let branch = match eval_const_expr(cond, values, defines, depth + 1)? {
+                Const::Bool(true) => then_expr,
+                Const::Bool(false) => else_expr,
+                _ => return None,
+            };
+            eval_const_expr(branch, values, defines, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// One binary operator of the constant evaluator.
+fn eval_const_binary(op: crate::ast::BinaryOp, l: Const, r: Const) -> Option<Const> {
+    use crate::ast::BinaryOp as Op;
+    // The logical and comparison operators accept booleans or integers;
+    // the arithmetic ones integers (reals where both are real).
+    if let (Const::Bool(a), Const::Bool(b)) = (&l, &r) {
+        return match op {
+            Op::LogicalAnd => Some(Const::Bool(*a && *b)),
+            Op::LogicalOr => Some(Const::Bool(*a || *b)),
+            Op::Imply => Some(Const::Bool(!*a || *b)),
+            Op::Eq => Some(Const::Bool(a == b)),
+            Op::NotEq => Some(Const::Bool(a != b)),
+            _ => None,
+        };
+    }
+    if let (Const::Str(a), Const::Str(b)) = (&l, &r) {
+        return match op {
+            Op::Eq => Some(Const::Bool(a == b)),
+            Op::NotEq => Some(Const::Bool(a != b)),
+            _ => None,
+        };
+    }
+    // Numeric level: mixed int/real promotes to real.
+    match (l, r) {
+        (Const::Int(a), Const::Int(b)) => match op {
+            Op::Add => Some(Const::Int(a.checked_add(b)?)),
+            Op::Sub => Some(Const::Int(a.checked_sub(b)?)),
+            Op::Mul => Some(Const::Int(a.checked_mul(b)?)),
+            Op::Div => Some(Const::Int(a.checked_div(b)?)),
+            Op::Mod => Some(Const::Int(a.checked_rem(b)?)),
+            Op::ShiftLeft => Some(Const::Int(a.checked_shl(b.try_into().ok()?)?)),
+            Op::ShiftRight => Some(Const::Int(a.checked_shr(b.try_into().ok()?)?)),
+            Op::BitAnd => Some(Const::Int(a & b)),
+            Op::BitOr => Some(Const::Int(a | b)),
+            Op::BitXor => Some(Const::Int(a ^ b)),
+            Op::Eq => Some(Const::Bool(a == b)),
+            Op::NotEq => Some(Const::Bool(a != b)),
+            Op::Lt => Some(Const::Bool(a < b)),
+            Op::Le => Some(Const::Bool(a <= b)),
+            Op::Gt => Some(Const::Bool(a > b)),
+            Op::Ge => Some(Const::Bool(a >= b)),
+            Op::LogicalAnd => Some(Const::Bool(a != 0 && b != 0)),
+            Op::LogicalOr => Some(Const::Bool(a != 0 || b != 0)),
+            _ => None,
+        },
+        (l, r) => {
+            let a = match l {
+                Const::Int(v) => v as f64,
+                Const::Real(v) => v,
+                _ => return None,
+            };
+            let b = match r {
+                Const::Int(v) => v as f64,
+                Const::Real(v) => v,
+                _ => return None,
+            };
+            match op {
+                Op::Add => Some(Const::Real(a + b)),
+                Op::Sub => Some(Const::Real(a - b)),
+                Op::Mul => Some(Const::Real(a * b)),
+                Op::Div => Some(Const::Real(a / b)),
+                Op::Eq => Some(Const::Bool(a == b)),
+                Op::NotEq => Some(Const::Bool(a != b)),
+                Op::Lt => Some(Const::Bool(a < b)),
+                Op::Le => Some(Const::Bool(a <= b)),
+                Op::Gt => Some(Const::Bool(a > b)),
+                Op::Ge => Some(Const::Bool(a >= b)),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// The file's `define` constants (literal values only, like the
+/// interpreter's table): the name space a constant expression may
+/// reference.
+pub(crate) fn collect_defines(declarations: &[Declaration]) -> BTreeMap<String, Expr> {
+    let mut defines = BTreeMap::new();
+    for declaration in declarations {
+        for member in &declaration.members {
+            if let Member::Define {
+                name,
+                value: Some(value),
+                ..
+            } = member
+            {
+                defines.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    defines
+}
+
+/// The binding of one template instance: the full positional actuals
+/// (written actuals with the trailing defaults filled and value actuals
+/// normalized to their evaluated constants), the type-formal map, and
+/// the value-formal map of evaluated constants (clauses 8.3, 8.5.4).
+pub(crate) struct TemplateBinding {
+    pub actuals: Vec<TypeExpr>,
+    pub types: BTreeMap<String, TypeExpr>,
+    pub values: BTreeMap<String, Expr>,
+}
+
+/// Bind a template's parameters against written actuals (8.3's
+/// positional rule with 8.5.4's trailing defaults). A parameter with
+/// neither an actual nor a default leaves the instance unsatisfied
+/// (`None`); a default referencing earlier parameters substitutes
+/// through the bindings built so far, a value default evaluating to its
+/// constant. Every template reference the defaults uncover joins the
+/// queue.
+pub(crate) fn bind_template_actuals(
+    declarations: &[Declaration],
+    template: &Declaration,
+    args: &[TypeExpr],
+    defines: &BTreeMap<String, Expr>,
+    queue: &mut Vec<(String, Vec<TypeExpr>)>,
+) -> Option<TemplateBinding> {
+    let mut binding = TemplateBinding {
+        actuals: Vec::new(),
+        types: BTreeMap::new(),
+        values: BTreeMap::new(),
+    };
+    for (index, param) in template.template_params.iter().enumerate() {
+        if let Some(actual) = args.get(index) {
+            // 8.5.2: a value parameter's actual is a constant
+            // expression — an argument naming a `define` constant
+            // (spelled as an identifier, the type grammar's shape) is
+            // the constant's reference, not a type.
+            let actual = match (&param.kind, actual) {
+                (crate::ast::TemplateParamKind::Value { .. }, TypeExpr::Named { name, span })
+                    if defines.contains_key(name) =>
+                {
+                    TypeExpr::Value {
+                        expr: Box::new(Expr::Ident {
+                            name: name.clone(),
+                            span: *span,
+                        }),
+                        span: *span,
+                    }
+                }
+                _ => actual.clone(),
+            };
+            record_actual(param, &actual, &mut binding, defines);
+        } else {
+            let default = param.default.as_ref()?;
+            // The default substitutes through the bindings built so far
+            // (an 8.5.4 default may reference earlier parameters of
+            // either kind).
+            let mut ctx = Subst {
+                declarations,
+                types: binding.types.clone(),
+                values: binding.values.clone(),
+                defines,
+                queue,
+            };
+            match default {
+                crate::ast::TemplateDefault::Type(default_type) => {
+                    let substituted = substitute_type(default_type, &mut ctx);
+                    binding.types = ctx.types.clone();
+                    binding.values = ctx.values.clone();
+                    record_actual(param, &substituted, &mut binding, defines);
+                }
+                crate::ast::TemplateDefault::Value(default_expr) => {
+                    let mut substituted = default_expr.clone();
+                    substitute_expr(&mut substituted, &mut ctx);
+                    let substituted = match eval_const_expr(&substituted, &ctx.values, defines, 0) {
+                        Some(constant) => constant.as_expr(),
+                        None => substituted,
+                    };
+                    ctx.values.insert(param.name.clone(), substituted.clone());
+                    let actual = TypeExpr::Value {
+                        expr: Box::new(substituted),
+                        span: default_expr.span(),
+                    };
+                    binding.types = ctx.types;
+                    binding.values = ctx.values;
+                    binding.types.insert(param.name.clone(), actual.clone());
+                    binding.actuals.push(actual);
+                }
+            }
+        }
+    }
+    if binding.actuals.is_empty() {
+        return None;
+    }
+    Some(binding)
+}
+
+/// Record one bound actual for its parameter: the type map gains every
+/// actual (a value actual rides as a [`TypeExpr::Value`]), the value map
+/// only a value parameter's evaluated constant.
+fn record_actual(
+    param: &crate::ast::TemplateParam,
+    actual: &TypeExpr,
+    binding: &mut TemplateBinding,
+    defines: &BTreeMap<String, Expr>,
+) {
+    // A value actual normalizes to its evaluated constant — the form
+    // the canonical instance name renders (8.3: same actuals, one
+    // instance) and the value map carries.
+    let actual = match (&param.kind, actual) {
+        (crate::ast::TemplateParamKind::Value { .. }, TypeExpr::Value { expr, span }) => {
+            match eval_const_expr(expr, &binding.values, defines, 0) {
+                Some(constant) => TypeExpr::Value {
+                    expr: Box::new(constant.as_expr()),
+                    span: *span,
+                },
+                None => actual.clone(),
+            }
+        }
+        _ => actual.clone(),
+    };
+    binding.types.insert(param.name.clone(), actual.clone());
+    if let crate::ast::TemplateParamKind::Value { .. } = param.kind
+        && let TypeExpr::Value { expr, .. } = &actual
+        && let Some(constant) = eval_const_expr(expr, &binding.values, defines, 0)
+    {
+        binding
+            .values
+            .insert(param.name.clone(), constant.as_expr());
+    }
+    binding.actuals.push(actual);
+}
+
+/// Whether a type actual complies with a type parameter's category
+/// (clause 8.5.3's bounding criteria, 8.2's NOTE 3 application rule).
+/// The recognized categories are the extractable ones — `type` (any),
+/// `scalar`, `numeric`, `enumerated`/`enum`, `bool`, `string`,
+/// `struct`, `unit`; any other spelling reads as a specific type name
+/// the actual must render to exactly (8.2's specific-type form; the
+/// full category table of 8.1.2 is an image in the local redline copy).
+pub(crate) fn actual_in_category(
+    actual: &TypeExpr,
+    category: &str,
+    declarations: &[Declaration],
+) -> bool {
+    match category {
+        "type" => true,
+        "scalar" => actual_is_scalar(actual, declarations),
+        "numeric" => actual_is_numeric(actual, declarations),
+        "enumerated" | "enum" => actual_is_enumerated(actual, declarations),
+        "bool" => actual_is_base(actual, ScalarBaseKind::Bool, declarations),
+        "string" => actual_is_base(actual, ScalarBaseKind::String, declarations),
+        "struct" => actual_is_kind(actual, true, declarations),
+        "unit" => actual_is_kind(actual, false, declarations),
+        specific => actual.render() == specific,
+    }
+}
+
+/// The predefined scalar bases a category check reads through.
+enum ScalarBaseKind {
+    Bool,
+    String,
+    /// The integral and real bases (the `numeric` category).
+    Numeric,
+}
+
+/// Category compliance over declarations: a predefined scalar base of
+/// the kind, an inline enumeral list, or a declared `type` whose
+/// underlying representation matches (5.1's reading: scalar types are
+/// the numeric, Boolean and enumerated types).
+fn actual_is_scalar(actual: &TypeExpr, declarations: &[Declaration]) -> bool {
+    match actual {
+        TypeExpr::Scalar { base, .. } => !matches!(base, crate::ast::ScalarBase::String),
+        TypeExpr::InlineEnum { .. } => true,
+        TypeExpr::Named { name, .. } => {
+            named_type_underlying(name, declarations).is_some_and(|underlying| {
+                matches!(
+                    underlying,
+                    TypeExpr::Scalar { .. } | TypeExpr::InlineEnum { .. }
+                )
+            })
+        }
+        _ => false,
+    }
+}
+
+/// The `numeric` category: the integral and real bases, or a declared
+/// type over them.
+fn actual_is_numeric(actual: &TypeExpr, declarations: &[Declaration]) -> bool {
+    actual_is_base(actual, ScalarBaseKind::Numeric, declarations)
+}
+
+/// The `enumerated` category: an inline enumeral list or a declared
+/// type with enumerals (8.2.1's enumerated-type reading).
+fn actual_is_enumerated(actual: &TypeExpr, declarations: &[Declaration]) -> bool {
+    match actual {
+        TypeExpr::InlineEnum { .. } => true,
+        TypeExpr::Named { name, .. } => declarations.iter().any(|declaration| {
+            declaration.kind == DeclarationKind::Type
+                && declaration.name == *name
+                && declaration
+                    .members
+                    .iter()
+                    .any(|member| matches!(member, Member::Enumeral(_)))
+        }),
+        _ => false,
+    }
+}
+
+/// One scalar-base category check (`bool`, `string`, `numeric`).
+fn actual_is_base(actual: &TypeExpr, kind: ScalarBaseKind, declarations: &[Declaration]) -> bool {
+    let base_matches = |base: &crate::ast::ScalarBase| match kind {
+        ScalarBaseKind::Bool => *base == crate::ast::ScalarBase::Bool,
+        ScalarBaseKind::String => *base == crate::ast::ScalarBase::String,
+        ScalarBaseKind::Numeric => !matches!(
+            base,
+            crate::ast::ScalarBase::Bool | crate::ast::ScalarBase::String
+        ),
+    };
+    match actual {
+        TypeExpr::Scalar { base, .. } => base_matches(base),
+        TypeExpr::Named { name, .. } => named_type_underlying(name, declarations).is_some_and(
+            |underlying| matches!(&underlying, TypeExpr::Scalar { base, .. } if base_matches(base)),
+        ),
+        _ => false,
+    }
+}
+
+/// The `struct`/`unit` categories: a declared struct (or unit) type.
+fn actual_is_kind(actual: &TypeExpr, is_struct: bool, declarations: &[Declaration]) -> bool {
+    let TypeExpr::Named { name, .. } = actual else {
+        return false;
+    };
+    declarations.iter().any(|declaration| {
+        declaration.name == *name
+            && if is_struct {
+                matches!(
+                    declaration.kind,
+                    DeclarationKind::Struct | DeclarationKind::Unit
+                )
+            } else {
+                declaration.kind == DeclarationKind::Unit
+            }
+    })
+}
+
+/// The underlying representation of a declared scalar/list `type` (the
+/// record-only clause 5 form), by name.
+fn named_type_underlying<'d>(name: &str, declarations: &'d [Declaration]) -> Option<&'d TypeExpr> {
+    declarations
+        .iter()
+        .find(|declaration| declaration.kind == DeclarationKind::Type && declaration.name == name)
+        .and_then(|declaration| declaration.underlying.as_ref())
+}
 
 /// One elaborated type: a `struct`/`unit` with its composed member lists,
 /// or a `type` declaration with its enumerals.
@@ -207,8 +661,10 @@ struct Composed<'a> {
     events: Vec<(&'a crate::ast::EventDecl, usize)>,
     ports: Vec<(&'a crate::ast::PortDecl, usize)>,
     /// The `implementing` clause composed across the like chain and the
-    /// extend blocks (clause 6.3), deduped in written order.
-    implements: Vec<&'a str>,
+    /// extend blocks (clause 6.3), deduped in written order — as
+    /// written: a template's parameterised entries substitute at
+    /// instantiation (8.7).
+    implements: Vec<crate::ast::TypeExpr>,
 }
 
 impl<'a> Composed<'a> {
@@ -265,7 +721,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 // monomorphization (8.3's NOTE 3) — the template's own
                 // composed members stay extension-free, and a
                 // non-matching instance does not get the extension.
-                if declaration.template_extend {
+                if declaration.template_extend.is_some() {
                     template_extends_by_target
                         .entry(declaration.name.as_str())
                         .or_default()
@@ -277,7 +733,10 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                         .push(index);
                 }
             }
-            DeclarationKind::Struct | DeclarationKind::Unit | DeclarationKind::Type => {
+            DeclarationKind::Struct
+            | DeclarationKind::Unit
+            | DeclarationKind::Type
+            | DeclarationKind::NumericType => {
                 base_by_name.insert(declaration.name.as_str(), index);
             }
             // An interface is not a `like`-composable struct base (the
@@ -296,6 +755,14 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         reported_cycles: BTreeSet::new(),
     };
     let mut types = Vec::new();
+    // The `define` constants (literal values only): the name space a
+    // constant expression (8.5.2's actuals, 8.5.3's conditions and
+    // 8.5.4's defaults) may reference, shared by every stage below.
+    let defines = collect_defines(declarations);
+    // The monomorphization worklist (8.3), seeded by the composed
+    // declarations' `implementing` entries and grown by the
+    // substitution passes.
+    let mut queue: Vec<(String, Vec<crate::ast::TypeExpr>)> = Vec::new();
     // `extend any_unit { ... }` members (24.9.2.14's extendable message
     // hooks): composed once and injected into every unit type, base-first.
     let any_unit = elaborator.compose_any_unit();
@@ -314,6 +781,11 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 }
                 let port_paths = elaborator.extract_port_paths(declaration);
                 let unit_attributes = elaborator.extract_unit_attributes(declaration);
+                // The `implementing` entries render to the canonical
+                // names the conformance checks and the interpreter read;
+                // a parameterised entry's instance joins the worklist.
+                let implements =
+                    render_implements(&composed.implements, declarations, &defines, &mut queue);
                 types.push(ElaboratedType {
                     kind: declaration.kind,
                     name: declaration.name.clone(),
@@ -354,7 +826,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                         })
                         .collect(),
                     unit_attributes,
-                    implements: composed.implements.into_iter().map(str::to_owned).collect(),
+                    implements,
                     interface_bases: Vec::new(),
                     span: declaration.span,
                 });
@@ -387,12 +859,40 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                     .collect(),
                 span: declaration.span,
             }),
+            // Clause 8.4: a template numeric_type records its
+            // declaration view (the impl-struct reference as written);
+            // instances materialize at monomorphization with their
+            // parameters substituted.
+            DeclarationKind::NumericType => types.push(ElaboratedType {
+                kind: DeclarationKind::NumericType,
+                name: declaration.name.clone(),
+                base: None,
+                fields: Vec::new(),
+                constraints: Vec::new(),
+                methods: Vec::new(),
+                whens: Vec::new(),
+                ons: Vec::new(),
+                covers: Vec::new(),
+                expects: Vec::new(),
+                when_of: Vec::new(),
+                events: Vec::new(),
+                underlying: declaration.underlying.clone(),
+                ports: Vec::new(),
+                unit_attributes: Vec::new(),
+                implements: Vec::new(),
+                interface_bases: Vec::new(),
+                enumerals: Vec::new(),
+                span: declaration.span,
+            }),
             // Clause 6.13: an interface composes to its transitive
             // signatures — the `like` bases' members folded first (in
             // base order, recursively), then its own; a repeated method
             // name keeps its first entry (exact duplicates collapse;
             // conflicting signatures are E0219 in `check.rs`). No
-            // `extend` folding — extending an interface is rejected.
+            // `extend` folding — extending an interface is rejected. A
+            // parameterised base (`J of <t'type>`, clause 8.3) folds by
+            // the template's name in the declaration view; the
+            // substituted bases compose in the instance view.
             DeclarationKind::Interface => {
                 let mut methods: Vec<MethodDecl> = Vec::new();
                 let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -425,7 +925,10 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                     interface_bases: declaration
                         .bases
                         .iter()
-                        .map(|(base, _)| base.clone())
+                        .filter_map(|(base, _)| match base {
+                            TypeExpr::Named { name, .. } => Some(name.clone()),
+                            _ => None,
+                        })
                         .collect(),
                     enumerals: Vec::new(),
                     span: declaration.span,
@@ -434,7 +937,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             DeclarationKind::Extend => {}
         }
     }
-    elaborator.compose_builtin_units(&mut types);
+    elaborator.compose_builtin_units(&mut types, &defines, &mut queue);
     // 6.7: synthesize one subtype view per `when` block (`when
     // BUSY'kind { .. }` on type `kind`'s owner): the base's composed
     // members with the when block's members appended, under the
@@ -522,16 +1025,17 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
     // 8.3: monomorphize the template instances the code uses. "A
     // template instance creates a new struct, by substituting an
     // actual parameter for the corresponding template parameter within
-    // the template body" — and within the parameterized base and the
-    // bodies of any applicable template extensions (8.2). Trailing
-    // parameters may be omitted when defaults exist; two instances
-    // with the same actuals are the same instance (the canonical
-    // name). The worklist seeds from every type's member types and
-    // method bodies, and grows with the references substitution
-    // uncovers.
-    let mut queue: Vec<(String, Vec<crate::ast::TypeExpr>)> = Vec::new();
-    for entry in &types {
-        enqueue_member_refs(entry, &mut queue);
+    // the template body" — and within the parameterized base, the
+    // `implementing` entries and the bodies of any applicable template
+    // extensions (8.2, 8.6). Trailing parameters may be omitted when
+    // defaults exist (8.5.4); two instances with the same actuals are
+    // the same instance — the canonical name renders the
+    // defaults-filled actuals, value actuals as their evaluated
+    // constants. The worklist seeds from every type's member types,
+    // method bodies and `implementing` entries, and grows with the
+    // references substitution uncovers.
+    for entry in &mut types {
+        substitute_entry(entry, declarations, &defines, &mut queue);
     }
     let mut done: BTreeSet<String> = types.iter().map(|t| t.name.clone()).collect();
     let mut reported_extension_arity: BTreeSet<usize> = BTreeSet::new();
@@ -541,148 +1045,312 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         if budget == 0 {
             break;
         }
-        let canonical = crate::ast::template_instance_name(&template_name, &args);
+        let Some(template) = declarations.iter().find(|declaration| {
+            declaration.name == template_name
+                && !declaration.template_params.is_empty()
+                && declaration.template_extend.is_none()
+        }) else {
+            // Not a template (or the reference targets a template
+            // extension's name): mark the written spelling done so the
+            // same occurrence does not retry.
+            done.insert(crate::ast::template_instance_name(&template_name, &args));
+            continue;
+        };
+        // Bind formals: positional actuals, then the trailing defaults
+        // (8.3's trailing-omission rule with 8.5.4's derived defaults).
+        // A parameter with neither is not provided for — the instance
+        // is skipped, honestly.
+        let Some(binding) =
+            bind_template_actuals(declarations, template, &args, &defines, &mut queue)
+        else {
+            continue;
+        };
+        let canonical = crate::ast::template_instance_name(&template_name, &binding.actuals);
         if done.contains(&canonical) {
             continue;
         }
         done.insert(canonical.clone());
-        let Some(template) = declarations.iter().find(|declaration| {
-            declaration.name == template_name && !declaration.template_params.is_empty()
-        }) else {
-            continue;
-        };
-        // Bind formals: positional actuals, then defaults (8.3's
-        // trailing-omission rule). A parameter with neither is not
-        // provided for — the instance is skipped, honestly. The full
-        // positional actual set (defaults filled) also drives the
-        // 8.3-NOTE-3 extension compliance below.
-        let mut bindings: BTreeMap<String, crate::ast::TypeExpr> = BTreeMap::new();
-        let mut actuals: Vec<crate::ast::TypeExpr> = Vec::new();
-        let mut satisfied = true;
-        for (index, param) in template.template_params.iter().enumerate() {
-            if let Some(actual) = args.get(index) {
-                bindings.insert(param.name.clone(), actual.clone());
-                actuals.push(actual.clone());
-            } else if let Some(default) = &param.default {
-                // A default may reference earlier formals
-                // (`<value'type> = <key'type>`): substitute it through
-                // the bindings built so far.
-                let substituted = substitute_type(default, &bindings, &mut queue);
-                bindings.insert(param.name.clone(), substituted.clone());
-                actuals.push(substituted);
-            } else {
-                satisfied = false;
-                break;
+        // 8.3: a template interface's instance is an interface — the
+        // substituted bases' transitive signatures folded first (in
+        // base order), then its own substituted signatures; a repeated
+        // method name keeps its first entry.
+        if template.kind == DeclarationKind::Interface {
+            let mut methods: Vec<MethodDecl> = Vec::new();
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            let mut interface_bases: Vec<String> = Vec::new();
+            let mut stack: Vec<String> = Vec::new();
+            let mut ctx = Subst {
+                declarations,
+                types: binding.types.clone(),
+                values: binding.values.clone(),
+                defines: &defines,
+                queue: &mut queue,
+            };
+            for (base_type, _) in &template.bases {
+                let substituted = substitute_type(base_type, &mut ctx);
+                let base_name = match &substituted {
+                    TypeExpr::Named { name, .. } => Some(name.clone()),
+                    // A parameterised base instance carries its
+                    // canonical name (enqueued above, materialized by
+                    // the worklist).
+                    TypeExpr::TemplateRef { .. } => Some(substituted.render()),
+                    _ => None,
+                };
+                let Some(base_name) = base_name else {
+                    continue;
+                };
+                fold_interface_methods(
+                    &base_name,
+                    declarations,
+                    &mut stack,
+                    &mut seen,
+                    &mut methods,
+                    &mut elaborator.diagnostics,
+                );
+                if !interface_bases.contains(&base_name) {
+                    interface_bases.push(base_name);
+                }
             }
-        }
-        if !satisfied || bindings.is_empty() {
+            for member in &template.members {
+                let Member::Method(method) = member else {
+                    continue;
+                };
+                let owned = substitute_method(method.clone(), &mut ctx);
+                if seen.insert(owned.name.clone()) {
+                    methods.push(owned);
+                }
+            }
+            types.push(ElaboratedType {
+                kind: DeclarationKind::Interface,
+                name: canonical,
+                base: None,
+                fields: Vec::new(),
+                constraints: Vec::new(),
+                methods,
+                whens: Vec::new(),
+                ons: Vec::new(),
+                covers: Vec::new(),
+                expects: Vec::new(),
+                when_of: Vec::new(),
+                events: Vec::new(),
+                underlying: None,
+                enumerals: Vec::new(),
+                ports: Vec::new(),
+                unit_attributes: Vec::new(),
+                implements: Vec::new(),
+                interface_bases,
+                span: template.span,
+            });
             continue;
         }
+        // 8.4: a template numeric_type's instance records the
+        // substituted impl-struct reference; the operator machinery is
+        // the later numeric_type milestone.
+        if template.kind == DeclarationKind::NumericType {
+            let mut ctx = Subst {
+                declarations,
+                types: binding.types.clone(),
+                values: binding.values.clone(),
+                defines: &defines,
+                queue: &mut queue,
+            };
+            let underlying = template
+                .underlying
+                .as_ref()
+                .map(|underlying| substitute_type(underlying, &mut ctx));
+            types.push(ElaboratedType {
+                kind: DeclarationKind::NumericType,
+                name: canonical,
+                base: None,
+                fields: Vec::new(),
+                constraints: Vec::new(),
+                methods: Vec::new(),
+                whens: Vec::new(),
+                ons: Vec::new(),
+                covers: Vec::new(),
+                expects: Vec::new(),
+                when_of: Vec::new(),
+                events: Vec::new(),
+                underlying,
+                enumerals: Vec::new(),
+                ports: Vec::new(),
+                unit_attributes: Vec::new(),
+                implements: Vec::new(),
+                interface_bases: Vec::new(),
+                span: template.span,
+            });
+            continue;
+        }
+        let mut ctx = Subst {
+            declarations,
+            types: binding.types.clone(),
+            values: binding.values.clone(),
+            defines: &defines,
+            queue: &mut queue,
+        };
         let mut stack = Vec::new();
         let composed = elaborator.compose(template.name.as_str(), &mut stack);
         let mut fields = Vec::new();
         for (field, _) in composed.fields {
             let mut owned = field.clone();
-            owned.ty = substitute_type(&owned.ty, &bindings, &mut queue);
+            owned.ty = substitute_type(&owned.ty, &mut ctx);
             fields.push(owned);
         }
         let mut constraints: Vec<KeepConstraint> =
             composed.constraints.into_iter().cloned().collect();
         for constraint in &mut constraints {
-            substitute_expr(&mut constraint.expr, &bindings, &mut queue);
+            substitute_expr(&mut constraint.expr, &mut ctx);
         }
         let mut methods = Vec::new();
         for (method, _) in composed.methods {
-            methods.push(substitute_method(method.clone(), &bindings, &mut queue));
+            methods.push(substitute_method(method.clone(), &mut ctx));
         }
         let mut ons: Vec<crate::ast::OnDecl> =
             composed.ons.into_iter().map(|(on, _)| on.clone()).collect();
         for on in &mut ons {
-            substitute_statements(&mut on.body, &bindings, &mut queue);
+            substitute_statements(&mut on.body, &mut ctx);
         }
-        // 8.2 with 8.3's NOTE 3: each template extension applies to
-        // this instance only if all actual parameters comply with the
-        // types or type categories specified for the corresponding
-        // parameters in that extension. A complying extension's
-        // members substitute the extension's own formals (its tags may
-        // differ from the template's, 8.2) with the instance's actuals
-        // and append; a non-complying one does not apply at all.
+        // 8.7 with 8.2.3: the `implementing` entries substitute — a
+        // parameterised interface over the template's formals renders
+        // to the instance's canonical name (enqueued above,
+        // materialized by the worklist); concrete entries pass through.
+        let mut implements: Vec<String> = Vec::new();
+        for interface in &composed.implements {
+            let substituted = substitute_type(interface, &mut ctx);
+            let name = substituted.render();
+            if !implements.contains(&name) {
+                implements.push(name);
+            }
+        }
+        drop(ctx);
+        // 8.2 with 8.6: each template extension applies to this
+        // instance only if every actual matches the extension's
+        // entries — a parameter form binds the actual to the
+        // extension's own formal (a category constrains it), a
+        // concrete type-name or constant constrains the match — and
+        // the extension's `conditions` hold (8.5.3's bounding
+        // criteria). A complying extension's members substitute the
+        // extension's own formals (its tags may differ from the
+        // template's) and append; a non-matching one does not apply
+        // at all.
         let extension_indices = template_extends_by_target
             .get(template.name.as_str())
             .cloned()
             .unwrap_or_default();
         for extension_index in extension_indices {
             let extension = &declarations[extension_index];
-            if extension.template_params.len() != template.template_params.len() {
-                // 8.2: the extension's parameter count must equal the
+            let Some(spec) = &extension.template_extend else {
+                continue;
+            };
+            if spec.entries.len() != template.template_params.len() {
+                // 8.6: the extension's parameter count must equal the
                 // original template declaration's — reported once per
-                // extension, and the extension does not apply.
+                // extension, and the extension does not apply. The
+                // plan's E0127 (the pre-plan E0318 is retired by T4.4).
                 if reported_extension_arity.insert(extension_index) {
                     let (start, end) = extension.name_span;
                     elaborator.diagnostics.push(Diagnostic::new(
-                        // E0304 is allocated to the static-members stage
-                        // ("static member in when subtype"); this
-                        // template-arity mismatch predates that
-                        // allocation and takes the next free elaboration
-                        // code (the migration plan's collision rule).
-                        "E0318",
-                        format!(
-                            "template extension '{}' declares {} parameter(s) but template '{}' declares {}",
-                            extension.name,
-                            extension.template_params.len(),
-                            template.name,
-                            template.template_params.len()
-                        ),
+                        "E0127",
+                        "template extend: parameter count mismatch",
                         start,
                         end,
                     ));
                 }
                 continue;
             }
-            if !extension_applies(extension, &actuals, &types) {
+            let Some((extension_types, extension_values)) = match_template_extend_entries(
+                &spec.entries,
+                &binding.actuals,
+                declarations,
+                &defines,
+            ) else {
+                continue;
+            };
+            // 8.6 with 8.5.3: the extension's own conditions, over its
+            // own tags bound to the instance's actuals, must all hold.
+            // A condition that does not evaluate to a constant leaves
+            // the match undecided — the extension does not apply.
+            let conditions_hold = extension.template_conditions.iter().all(|condition| {
+                let mut substituted = condition.clone();
+                let mut queue = Vec::new();
+                let mut extension_ctx = Subst {
+                    declarations,
+                    types: extension_types.clone(),
+                    values: extension_values.clone(),
+                    defines: &defines,
+                    queue: &mut queue,
+                };
+                substitute_expr(&mut substituted, &mut extension_ctx);
+                matches!(
+                    eval_const_expr(&substituted, &extension_values, &defines, 0),
+                    Some(Const::Bool(true))
+                )
+            });
+            if !conditions_hold {
                 continue;
             }
-            let mut extension_bindings: BTreeMap<String, crate::ast::TypeExpr> = BTreeMap::new();
-            for (param, actual) in extension.template_params.iter().zip(actuals.iter()) {
-                extension_bindings.insert(param.name.clone(), actual.clone());
-            }
+            let mut extension_queue = Vec::new();
+            let mut extension_ctx = Subst {
+                declarations,
+                types: extension_types,
+                values: extension_values,
+                defines: &defines,
+                queue: &mut extension_queue,
+            };
             for member in &extension.members {
                 match member {
                     Member::Field(field) => {
                         let mut owned = field.clone();
-                        owned.ty = substitute_type(&owned.ty, &extension_bindings, &mut queue);
+                        owned.ty = substitute_type(&owned.ty, &mut extension_ctx);
                         fields.push(owned);
                     }
                     Member::Constraint(constraint) => {
                         let mut owned = constraint.clone();
-                        substitute_expr(&mut owned.expr, &extension_bindings, &mut queue);
+                        substitute_expr(&mut owned.expr, &mut extension_ctx);
                         constraints.push(owned);
                     }
                     Member::Method(method) => {
-                        methods.push(substitute_method(
-                            method.clone(),
-                            &extension_bindings,
-                            &mut queue,
-                        ));
+                        methods.push(substitute_method(method.clone(), &mut extension_ctx));
                     }
                     Member::On(on) => {
                         let mut owned = on.clone();
-                        substitute_statements(&mut owned.body, &extension_bindings, &mut queue);
+                        substitute_statements(&mut owned.body, &mut extension_ctx);
                         ons.push(owned);
                     }
+                    Member::Enumeral(_)
+                    | Member::Import { .. }
+                    | Member::Define { .. }
+                    | Member::Macro(_) => {}
                     // A `when` member of an extension is clause 8.6's
                     // template subtype instance; cover groups, expects,
-                    // ports, events, defines, imports and macros in an
-                    // extension body do not compose yet — documented gaps.
+                    // ports and events in an extension body do not
+                    // compose yet — documented gaps.
                     _ => {}
                 }
             }
+            // 8.6: the extension's `implementing` entries add to the
+            // instance's composed set (substituted, like the members).
+            for interface in &extension.implements {
+                let substituted = substitute_type(interface, &mut extension_ctx);
+                let name = substituted.render();
+                if !implements.contains(&name) {
+                    implements.push(name);
+                }
+            }
+            queue.append(&mut extension_queue);
         }
         // The parameterized base substitutes to this view's base name —
         // a plain type's name, or another instance's canonical name
         // (enqueued above, materialized by the worklist).
+        let mut base_ctx = Subst {
+            declarations,
+            types: binding.types.clone(),
+            values: binding.values.clone(),
+            defines: &defines,
+            queue: &mut queue,
+        };
         let base = template.like_type.as_ref().map(|like_type| {
-            match substitute_type(like_type, &bindings, &mut queue) {
+            match substitute_type(like_type, &mut base_ctx) {
                 crate::ast::TypeExpr::TemplateRef { name, args, .. } => {
                     crate::ast::template_instance_name(&name, &args)
                 }
@@ -690,6 +1358,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 other => other.render(),
             }
         });
+        drop(base_ctx);
         types.push(ElaboratedType {
             kind: template.kind,
             name: canonical,
@@ -707,10 +1376,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             enumerals: Vec::new(),
             ports: Vec::new(),
             unit_attributes: Vec::new(),
-            // The template's `implementing` clause carries over as
-            // written; parameterised interfaces over the template's
-            // formals substitute at instantiation in the T4.3 milestone.
-            implements: composed.implements.into_iter().map(str::to_owned).collect(),
+            implements,
             interface_bases: Vec::new(),
             span: template.span,
         });
@@ -724,16 +1390,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
     // (b) the `typeof()`/`typeof_item()` placeholders (5.9) resolve
     //     against the composed types and rewrite in place.
     finalize_type_positions(&mut types);
-    let mut defines = BTreeMap::new();
-    for declaration in declarations {
-        for member in &declaration.members {
-            if let Member::Define { name, value, .. } = member
-                && let Some(value) = value
-            {
-                defines.insert(name.clone(), value.clone());
-            }
-        }
-    }
+    let defines = collect_defines(declarations);
     // Recover sequence declarations from the parser's synthesized
     // `<name>.item` / `<name>.created_driver` / `<name>.created_kind`
     // string defines on the sequence struct.
@@ -796,7 +1453,7 @@ fn static_registry<K: RegistryKind>(declarations: &[Declaration]) -> BTreeMap<St
         if !matches!(
             declaration.kind,
             DeclarationKind::Struct | DeclarationKind::Unit | DeclarationKind::Extend
-        ) || declaration.template_extend
+        ) || declaration.template_extend.is_some()
         {
             continue;
         }
@@ -886,7 +1543,12 @@ fn fold_interface_methods(
     }
     stack.push(name.to_owned());
     for (base, _) in &declaration.bases {
-        fold_interface_methods(base, declarations, stack, seen, methods, diagnostics);
+        // The declaration view folds by the base's name; a
+        // parameterised base's instance composes in the instance view.
+        let Some(base_name) = base.declared_name() else {
+            continue;
+        };
+        fold_interface_methods(base_name, declarations, stack, seen, methods, diagnostics);
     }
     for member in &declaration.members {
         let Member::Method(method) = member else {
@@ -903,7 +1565,12 @@ impl<'a> Elaborator<'a> {
     /// A built-in unit (`sys`) is extended without being declared: fold its
     /// extend blocks into a synthesized type appended after the declared
     /// types.
-    fn compose_builtin_units(&mut self, types: &mut Vec<ElaboratedType>) {
+    fn compose_builtin_units(
+        &mut self,
+        types: &mut Vec<ElaboratedType>,
+        defines: &BTreeMap<String, Expr>,
+        queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
+    ) {
         for &builtin in crate::builtins::BUILTIN_UNITS {
             if self.base_by_name.contains_key(builtin) {
                 continue;
@@ -924,6 +1591,8 @@ impl<'a> Elaborator<'a> {
             composed.prepend(any_unit);
             self.check_duplicate_fields(builtin, &composed);
             self.check_method_redefinitions(builtin, &composed);
+            let implements =
+                render_implements(&composed.implements, self.declarations, defines, queue);
             types.push(ElaboratedType {
                 kind: DeclarationKind::Unit,
                 name: builtin.to_owned(),
@@ -967,7 +1636,7 @@ impl<'a> Elaborator<'a> {
                     .iter()
                     .flat_map(|index| self.extract_unit_attributes(&self.declarations[*index]))
                     .collect(),
-                implements: composed.implements.into_iter().map(str::to_owned).collect(),
+                implements,
                 interface_bases: Vec::new(),
                 span: self.declarations[extend_indices[0]].span,
             });
@@ -1163,10 +1832,15 @@ impl<'a> Elaborator<'a> {
     fn push_members(declaration: &'a Declaration, block: usize, composed: &mut Composed<'a>) {
         // The `implementing` clause rides with the contributing block
         // (clause 6.3): a like-chain base's interfaces, the declaration's
-        // own, and each extend block's compose in written order, deduped.
-        for interface_name in &declaration.implements {
-            if !composed.implements.contains(&interface_name.as_str()) {
-                composed.implements.push(interface_name.as_str());
+        // own, and each extend block's compose in written order, deduped
+        // by the entries' rendered spelling.
+        for interface in &declaration.implements {
+            if !composed
+                .implements
+                .iter()
+                .any(|recorded| recorded.render() == interface.render())
+            {
+                composed.implements.push(interface.clone());
             }
         }
         for member in &declaration.members {
@@ -1412,17 +2086,49 @@ fn resolve_bare_words(
     Some(pairs)
 }
 
+/// The substitution context of one template instantiation (8.3): the
+/// type formals' actuals, the value formals' constants, the file's
+/// `define` constants, the declarations (template lookups for 8.5.4's
+/// default filling) and the monomorphization worklist.
+struct Subst<'d> {
+    declarations: &'d [Declaration],
+    types: BTreeMap<String, crate::ast::TypeExpr>,
+    values: BTreeMap<String, Expr>,
+    defines: &'d BTreeMap<String, Expr>,
+    queue: &'d mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
+}
+
+impl<'d> Subst<'d> {
+    /// An empty binding: the formals stay unresolved, while template
+    /// references still fill their defaults and seed the queue — the
+    /// seed pass over the composed types and the expression walks that
+    /// carry no type bindings run through it.
+    fn new(
+        declarations: &'d [Declaration],
+        defines: &'d BTreeMap<String, Expr>,
+        queue: &'d mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
+    ) -> Self {
+        Subst {
+            declarations,
+            types: BTreeMap::new(),
+            values: BTreeMap::new(),
+            defines,
+            queue,
+        }
+    }
+}
+
 /// Substitute the bound actuals for the formals of a type position
 /// (8.3), enqueueing every template reference the substitution
-/// uncovers so the worklist materializes their instances.
-fn substitute_type(
-    ty: &crate::ast::TypeExpr,
-    bindings: &BTreeMap<String, crate::ast::TypeExpr>,
-    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
-) -> crate::ast::TypeExpr {
+/// uncovers so the worklist materializes their instances. The type
+/// formals (`<t'type>`) read the context's type bindings; the value
+/// formals (`<n'exp>`) — including inside scalar widths — read the
+/// value bindings; a template reference's trailing defaults fill from
+/// the referenced template's own (8.5.4).
+fn substitute_type(ty: &crate::ast::TypeExpr, ctx: &mut Subst) -> crate::ast::TypeExpr {
     match ty {
         crate::ast::TypeExpr::Formal { name, span } => {
-            bindings
+            ctx.types
                 .get(name)
                 .cloned()
                 .unwrap_or(crate::ast::TypeExpr::Formal {
@@ -1430,15 +2136,63 @@ fn substitute_type(
                     span: *span,
                 })
         }
+        // A scalar width is an expression position: a value parameter
+        // over it substitutes to the constant (8.5.2 — field widths).
+        crate::ast::TypeExpr::Scalar { base, width, span } => {
+            let substituted_width = width.as_ref().map(|width| {
+                let mut width = (**width).clone();
+                substitute_expr(&mut width, ctx);
+                Box::new(width)
+            });
+            crate::ast::TypeExpr::Scalar {
+                base: *base,
+                width: substituted_width,
+                span: *span,
+            }
+        }
+        crate::ast::TypeExpr::FormalWidth { name, width, span } => {
+            // The substituted actual takes the substituted width when it
+            // is a scalar; other actuals keep the qualified spelling
+            // over the actual's rendering.
+            let substituted_width = {
+                let mut expr = (**width).clone();
+                substitute_expr(&mut expr, ctx);
+                expr
+            };
+            let resolved =
+                ctx.types
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| crate::ast::TypeExpr::Formal {
+                        name: name.clone(),
+                        span: *span,
+                    });
+            match resolved {
+                crate::ast::TypeExpr::Scalar { base, span, .. } => crate::ast::TypeExpr::Scalar {
+                    base,
+                    width: Some(Box::new(substituted_width)),
+                    span,
+                },
+                resolved => crate::ast::TypeExpr::FormalWidth {
+                    name: resolved.render(),
+                    width: Box::new(substituted_width),
+                    span: *span,
+                },
+            }
+        }
         crate::ast::TypeExpr::List { element, key, span } => crate::ast::TypeExpr::List {
-            element: Box::new(substitute_type(element, bindings, queue)),
-            key: key.clone(),
+            element: Box::new(substitute_type(element, ctx)),
+            key: key.as_ref().map(|key| {
+                let mut key = (**key).clone();
+                substitute_expr(&mut key, ctx);
+                Box::new(key)
+            }),
             span: *span,
         },
         crate::ast::TypeExpr::WhenQualified { value, base, span } => {
             crate::ast::TypeExpr::WhenQualified {
                 value: value.clone(),
-                base: Box::new(substitute_type(base, bindings, queue)),
+                base: Box::new(substitute_type(base, ctx)),
                 span: *span,
             }
         }
@@ -1447,7 +2201,7 @@ fn substitute_type(
         // the placeholder itself resolves after instantiation.
         crate::ast::TypeExpr::TypeOf { expr, span } => {
             let mut expr = (**expr).clone();
-            substitute_expr(&mut expr, bindings, queue);
+            substitute_expr(&mut expr, ctx);
             crate::ast::TypeExpr::TypeOf {
                 expr: Box::new(expr),
                 span: *span,
@@ -1455,21 +2209,24 @@ fn substitute_type(
         }
         crate::ast::TypeExpr::TypeOfItem { expr, span } => {
             let mut expr = (**expr).clone();
-            substitute_expr(&mut expr, bindings, queue);
+            substitute_expr(&mut expr, ctx);
             crate::ast::TypeExpr::TypeOfItem {
                 expr: Box::new(expr),
                 span: *span,
             }
         }
         crate::ast::TypeExpr::TemplateRef { name, args, span } => {
-            let substituted: Vec<crate::ast::TypeExpr> = args
-                .iter()
-                .map(|arg| substitute_type(arg, bindings, queue))
-                .collect();
-            queue.push((name.clone(), substituted.clone()));
+            let substituted: Vec<crate::ast::TypeExpr> =
+                args.iter().map(|arg| substitute_type(arg, ctx)).collect();
+            // 8.5.4 with 8.3: the referenced template's trailing
+            // defaults fill the omitted arguments, so both the
+            // canonical name and the interpreter's instance lookup see
+            // the same full actual list.
+            let filled = fill_template_defaults(name, substituted, ctx);
+            ctx.queue.push((name.clone(), filled.clone()));
             crate::ast::TypeExpr::TemplateRef {
                 name: name.clone(),
-                args: substituted,
+                args: filled,
                 span: *span,
             }
         }
@@ -1477,127 +2234,136 @@ fn substitute_type(
     }
 }
 
+/// Fill a template reference's omitted trailing arguments from the
+/// template declaration's defaults (8.5.4), normalizing every value
+/// actual to its evaluated constant. An unknown template name or a
+/// parameter with neither actual nor default leaves the reference as
+/// written.
+fn fill_template_defaults(
+    template_name: &str,
+    args: Vec<crate::ast::TypeExpr>,
+    ctx: &mut Subst,
+) -> Vec<crate::ast::TypeExpr> {
+    let Some(template) = ctx.declarations.iter().find(|declaration| {
+        declaration.name == template_name
+            && !declaration.template_params.is_empty()
+            && declaration.template_extend.is_none()
+    }) else {
+        return args;
+    };
+    match bind_template_actuals(ctx.declarations, template, &args, ctx.defines, ctx.queue) {
+        Some(binding) => binding.actuals,
+        None => args,
+    }
+}
+
 /// Substitute one method's signatures and body (8.3: the substitution
 /// covers the whole template body, bodies included): parameter types,
 /// the return type, and every type position inside the actions. Each
 /// template reference the substitution uncovers joins the worklist.
-fn substitute_method(
-    mut method: MethodDecl,
-    bindings: &BTreeMap<String, crate::ast::TypeExpr>,
-    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
-) -> MethodDecl {
+fn substitute_method(mut method: MethodDecl, ctx: &mut Subst) -> MethodDecl {
     for param in &mut method.params {
         if let Some(ty) = &param.ty {
-            param.ty = Some(substitute_type(ty, bindings, queue));
+            param.ty = Some(substitute_type(ty, ctx));
         }
     }
     if let Some(return_type) = &method.return_type {
-        method.return_type = Some(substitute_type(return_type, bindings, queue));
+        method.return_type = Some(substitute_type(return_type, ctx));
     }
-    substitute_statements(&mut method.body, bindings, queue);
+    substitute_statements(&mut method.body, ctx);
     method
 }
 
 /// Substitute every type position inside a statement list, in place.
-fn substitute_statements(
-    statements: &mut [Stmt],
-    bindings: &BTreeMap<String, crate::ast::TypeExpr>,
-    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
-) {
+fn substitute_statements(statements: &mut [Stmt], ctx: &mut Subst) {
     for statement in statements {
-        substitute_stmt(statement, bindings, queue);
+        substitute_stmt(statement, ctx);
     }
 }
 
 /// The type positions of one statement (8.3): local-variable types,
 /// `new <type>` creations, casts, `is a` checks — recursively through
 /// the statement tree.
-fn substitute_stmt(
-    statement: &mut Stmt,
-    bindings: &BTreeMap<String, crate::ast::TypeExpr>,
-    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
-) {
+fn substitute_stmt(statement: &mut Stmt, ctx: &mut Subst) {
     match statement {
         Stmt::VarDecl { ty, init, .. } => {
             if let Some(ty) = ty {
-                *ty = substitute_type(ty, bindings, queue);
+                *ty = substitute_type(ty, ctx);
             }
             if let Some(init) = init {
-                substitute_expr(init, bindings, queue);
+                substitute_expr(init, ctx);
             }
         }
         Stmt::Assign { target, value, .. } => {
-            substitute_expr(target, bindings, queue);
-            substitute_expr(value, bindings, queue);
+            substitute_expr(target, ctx);
+            substitute_expr(value, ctx);
         }
-        Stmt::ExprStmt { expr, .. } => substitute_expr(expr, bindings, queue),
+        Stmt::ExprStmt { expr, .. } => substitute_expr(expr, ctx),
         Stmt::Return {
             value: Some(value), ..
-        } => substitute_expr(value, bindings, queue),
+        } => substitute_expr(value, ctx),
         Stmt::If {
             cond,
             then_body,
             else_body,
             ..
         } => {
-            substitute_expr(cond, bindings, queue);
-            substitute_statements(then_body, bindings, queue);
+            substitute_expr(cond, ctx);
+            substitute_statements(then_body, ctx);
             if let Some(else_body) = else_body {
-                substitute_statements(else_body, bindings, queue);
+                substitute_statements(else_body, ctx);
             }
         }
         Stmt::While { cond, body, .. } => {
-            substitute_expr(cond, bindings, queue);
-            substitute_statements(body, bindings, queue);
+            substitute_expr(cond, ctx);
+            substitute_statements(body, ctx);
         }
         Stmt::RepeatUntil { body, cond, .. } => {
-            substitute_statements(body, bindings, queue);
-            substitute_expr(cond, bindings, queue);
+            substitute_statements(body, ctx);
+            substitute_expr(cond, ctx);
         }
         Stmt::Print { exprs, .. } => {
             for expr in exprs {
-                substitute_expr(expr, bindings, queue);
+                substitute_expr(expr, ctx);
             }
         }
-        Stmt::Gen { expr, .. } => substitute_expr(expr, bindings, queue),
+        Stmt::Gen { expr, .. } => substitute_expr(expr, ctx),
         Stmt::Check {
             condition,
             else_body,
             ..
         } => {
-            substitute_expr(condition, bindings, queue);
-            substitute_statements(else_body, bindings, queue);
+            substitute_expr(condition, ctx);
+            substitute_statements(else_body, ctx);
         }
         Stmt::ForEach {
             using, list, body, ..
         } => {
             if let Some(using) = using {
-                substitute_expr(using, bindings, queue);
+                substitute_expr(using, ctx);
             }
-            substitute_expr(list, bindings, queue);
-            substitute_statements(body, bindings, queue);
+            substitute_expr(list, ctx);
+            substitute_statements(body, ctx);
         }
         Stmt::ForTo { from, to, body, .. } => {
-            substitute_expr(from, bindings, queue);
-            substitute_expr(to, bindings, queue);
-            substitute_statements(body, bindings, queue);
+            substitute_expr(from, ctx);
+            substitute_expr(to, ctx);
+            substitute_statements(body, ctx);
         }
-        Stmt::Wait { cycles, .. } => substitute_expr(cycles, bindings, queue),
-        Stmt::Start { call, .. } | Stmt::Compute { call, .. } => {
-            substitute_expr(call, bindings, queue)
-        }
+        Stmt::Wait { cycles, .. } => substitute_expr(cycles, ctx),
+        Stmt::Start { call, .. } | Stmt::Compute { call, .. } => substitute_expr(call, ctx),
         Stmt::Case {
             scrutinee, arms, ..
         } => {
-            substitute_expr(scrutinee, bindings, queue);
+            substitute_expr(scrutinee, ctx);
             for (alternatives, body) in arms {
                 for expr in alternatives {
-                    substitute_expr(expr, bindings, queue);
+                    substitute_expr(expr, ctx);
                 }
-                substitute_statements(body, bindings, queue);
+                substitute_statements(body, ctx);
             }
         }
-        Stmt::Emit { target, .. } => substitute_expr(target, bindings, queue),
+        Stmt::Emit { target, .. } => substitute_expr(target, ctx),
         // Statements without expression or type positions (`break`,
         // `continue`, `stop_run`, sequence `do`) and the temporal
         // forms (a `TemporalExpr` carries no type positions) need no
@@ -1606,20 +2372,25 @@ fn substitute_stmt(
     }
 }
 
-/// The type positions of one expression (8.3): `new <type>`,
+/// The type and value positions of one expression (8.3): `new <type>`,
 /// `expr.as_a(<type>)`, `expr is [not] a <type>`,
-/// `set_of_values(<type>)` — recursively through the expression tree.
-fn substitute_expr(
-    expr: &mut Expr,
-    bindings: &BTreeMap<String, crate::ast::TypeExpr>,
-    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
-) {
+/// `set_of_values(<type>)`, and — 8.5.2's value-parameter
+/// substitution — every `<n'exp>` formal, replaced with the bound
+/// constant. Recursively through the expression tree.
+fn substitute_expr(expr: &mut Expr, ctx: &mut Subst) {
     match expr {
+        Expr::Formal { name, .. } => {
+            if let Some(actual) = ctx.values.get(name) {
+                let mut substituted = actual.clone();
+                substitute_expr(&mut substituted, ctx);
+                *expr = substituted;
+            }
+        }
         Expr::New { ty, inits, .. } => {
             if let Some(ty) = ty {
-                *ty = substitute_type(ty, bindings, queue);
+                *ty = substitute_type(ty, ctx);
             }
-            substitute_statements(inits, bindings, queue);
+            substitute_statements(inits, ctx);
         }
         Expr::CastAs {
             expr: inner, ty, ..
@@ -1627,53 +2398,59 @@ fn substitute_expr(
         | Expr::IsA {
             expr: inner, ty, ..
         } => {
-            substitute_expr(inner, bindings, queue);
-            *ty = substitute_type(ty, bindings, queue);
+            substitute_expr(inner, ctx);
+            *ty = substitute_type(ty, ctx);
         }
         Expr::SetOfValues { ty, .. } => {
-            *ty = substitute_type(ty, bindings, queue);
+            *ty = substitute_type(ty, ctx);
         }
         // A subtype-qualified access's base carries the type positions.
-        Expr::QualifiedField { base, .. } => substitute_expr(base, bindings, queue),
-        Expr::MemberAccess { object, .. } => substitute_expr(object, bindings, queue),
+        Expr::QualifiedField { base, .. } => substitute_expr(base, ctx),
+        Expr::MemberAccess { object, .. } => substitute_expr(object, ctx),
         Expr::Call { callee, args, .. } => {
-            substitute_expr(callee, bindings, queue);
+            substitute_expr(callee, ctx);
             for arg in args {
-                substitute_expr(arg, bindings, queue);
+                substitute_expr(arg, ctx);
             }
         }
         Expr::Index { base, index, .. } => {
-            substitute_expr(base, bindings, queue);
-            substitute_expr(index, bindings, queue);
+            substitute_expr(base, ctx);
+            substitute_expr(index, ctx);
         }
         Expr::Binary { lhs, rhs, .. } => {
-            substitute_expr(lhs, bindings, queue);
-            substitute_expr(rhs, bindings, queue);
+            substitute_expr(lhs, ctx);
+            substitute_expr(rhs, ctx);
         }
-        Expr::Unary { expr: inner, .. } => substitute_expr(inner, bindings, queue),
-        Expr::Paren { expr: inner, .. } => substitute_expr(inner, bindings, queue),
+        Expr::Unary { expr: inner, .. } => substitute_expr(inner, ctx),
+        Expr::Paren { expr: inner, .. } => substitute_expr(inner, ctx),
         Expr::Ternary {
             cond,
             then_expr,
             else_expr,
             ..
         } => {
-            substitute_expr(cond, bindings, queue);
-            substitute_expr(then_expr, bindings, queue);
-            substitute_expr(else_expr, bindings, queue);
+            substitute_expr(cond, ctx);
+            substitute_expr(then_expr, ctx);
+            substitute_expr(else_expr, ctx);
         }
         Expr::BitSlice {
             base, high, low, ..
         } => {
-            substitute_expr(base, bindings, queue);
-            substitute_expr(high, bindings, queue);
-            substitute_expr(low, bindings, queue);
+            substitute_expr(base, ctx);
+            substitute_expr(high, ctx);
+            substitute_expr(low, ctx);
         }
         Expr::InSet { element, set, .. } => {
-            substitute_expr(element, bindings, queue);
-            substitute_in_set_expr(set, bindings, queue);
+            substitute_expr(element, ctx);
+            substitute_in_set_expr(set, ctx);
         }
-        Expr::SetLiteral { items, .. } => substitute_in_set_expr(items, bindings, queue),
+        Expr::SetLiteral { items, .. } => substitute_in_set_expr(items, ctx),
+        Expr::ListConcat { items, .. } => {
+            for item in items {
+                substitute_expr(item, ctx);
+            }
+        }
+        Expr::Evaluate { body, .. } => substitute_statements(body, ctx),
         // Literals, identifiers, HDL paths and select distributions
         // (choices are raw tokens) carry no type positions.
         _ => {}
@@ -1682,317 +2459,186 @@ fn substitute_expr(
 
 /// The type positions of one `[...]` set shape (the `in` right-hand
 /// side and the set literal), shared by [`substitute_expr`].
-fn substitute_in_set_expr(
-    set: &mut crate::ast::InSetExpr,
-    bindings: &BTreeMap<String, crate::ast::TypeExpr>,
-    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
-) {
+fn substitute_in_set_expr(set: &mut crate::ast::InSetExpr, ctx: &mut Subst) {
     match set {
         crate::ast::InSetExpr::Items(items) => {
             for item in items {
-                substitute_expr(item, bindings, queue);
+                substitute_expr(item, ctx);
             }
         }
         crate::ast::InSetExpr::Range(low, high) => {
-            substitute_expr(low, bindings, queue);
-            substitute_expr(high, bindings, queue);
+            substitute_expr(low, ctx);
+            substitute_expr(high, ctx);
         }
     }
 }
 
-/// 8.2's application rule with 8.3's NOTE 3: an extension applies to an
-/// instance only if every actual complies with the specification its
-/// position's parameter names — the `type` category (and a bare tag)
-/// imposes no constraint, the `scalar` and `enumerated` categories
-/// check the actual's shape, and any other spelling reads as 8.2's
-/// specific-type form: the actual must render to exactly that name.
-///
-/// The two categories implemented are the ones the extractable prose
-/// names (8.3's scalar example, 8.2.1's enumerated-type reading); the
-/// full category table of 8.1.2 is an image in the local redline copy,
-/// so any other category spelling cannot be honored — spelled as a
-/// specific type there, it can only ever mismatch (never a false
-/// application). The original template's own parameter categories stay
-/// unvalidated (8.3's NOTE 2), consistent with their treatment before
-/// extensions landed.
-fn extension_applies(
-    extension: &Declaration,
+/// 8.6's matching rule with 8.5.3's bounding criteria: a template
+/// extension applies to an instance only if every actual matches its
+/// positional entry. A parameter form binds the actual to the
+/// extension's own formal — a `<tag'type>` with no category imposes no
+/// constraint, a category checks the actual's shape ([`actual_in_category`]),
+/// a `<tag'exp>` binds the actual's constant; a concrete type-name or
+/// constant constrains the match to exactly that spelling / value.
+/// Returns the extension's own (type-formal, value-formal) binding
+/// maps for its body's substitution.
+fn match_template_extend_entries(
+    entries: &[crate::ast::TemplateExtendEntry],
     actuals: &[crate::ast::TypeExpr],
-    types: &[ElaboratedType],
+    declarations: &[Declaration],
+    defines: &BTreeMap<String, Expr>,
+) -> Option<(
+    BTreeMap<String, crate::ast::TypeExpr>,
+    BTreeMap<String, Expr>,
+)> {
+    let mut types: BTreeMap<String, crate::ast::TypeExpr> = BTreeMap::new();
+    let mut values: BTreeMap<String, Expr> = BTreeMap::new();
+    for (entry, actual) in entries.iter().zip(actuals) {
+        match entry {
+            crate::ast::TemplateExtendEntry::TypeParam { name, category } => {
+                if matches!(actual, crate::ast::TypeExpr::Value { .. }) {
+                    return None;
+                }
+                if let Some(category) = category
+                    && !actual_in_category(actual, category, declarations)
+                {
+                    return None;
+                }
+                types.insert(name.clone(), actual.clone());
+            }
+            crate::ast::TemplateExtendEntry::ValueParam { name, scalar } => {
+                let crate::ast::TypeExpr::Value { expr, .. } = actual else {
+                    return None;
+                };
+                let constant = eval_const_expr(expr, &values, defines, 0)?;
+                if !value_constant_matches_type(&constant, scalar, declarations) {
+                    return None;
+                }
+                values.insert(name.clone(), constant.as_expr());
+                types.insert(name.clone(), actual.clone());
+            }
+            crate::ast::TemplateExtendEntry::Concrete(concrete) => {
+                if matches!(actual, crate::ast::TypeExpr::Value { .. }) {
+                    return None;
+                }
+                if actual.render() != concrete.render() {
+                    return None;
+                }
+            }
+            crate::ast::TemplateExtendEntry::Constant(expected) => {
+                let crate::ast::TypeExpr::Value { expr, .. } = actual else {
+                    return None;
+                };
+                let constant = eval_const_expr(expr, &values, defines, 0)?;
+                let expected_constant = eval_const_expr(expected, &values, defines, 0)?;
+                if constant != expected_constant {
+                    return None;
+                }
+            }
+        }
+    }
+    Some((types, values))
+}
+
+/// Whether a value constant's kind matches the scalar type a value
+/// parameter (or extension entry) declares (8.5.2): an integer for the
+/// integral bases and named scalar types, a real for `real` (an
+/// integer actual promotes), a boolean for `bool`, a string for
+/// `string`. An enumerand constant is not modeled — the enumerated
+/// value-parameter actuals stay outside this milestone.
+pub(crate) fn value_constant_matches_type(
+    constant: &Const,
+    scalar: &crate::ast::TypeExpr,
+    declarations: &[Declaration],
 ) -> bool {
-    for (param, actual) in extension.template_params.iter().zip(actuals) {
-        let Some((_, category)) = param.name.split_once('\'') else {
-            continue;
-        };
-        let complies = match category {
-            "type" => true,
-            "scalar" => actual_is_scalar(actual, types),
-            "enumerated" => actual_is_enumerated(actual, types),
-            specific => actual.render() == specific,
-        };
-        if !complies {
-            return false;
+    match scalar {
+        crate::ast::TypeExpr::Scalar { base, .. } => match base {
+            crate::ast::ScalarBase::Bool => matches!(constant, Const::Bool(_)),
+            crate::ast::ScalarBase::String => matches!(constant, Const::Str(_)),
+            crate::ast::ScalarBase::Real => {
+                matches!(constant, Const::Real(_) | Const::Int(_))
+            }
+            _ => matches!(constant, Const::Int(_)),
+        },
+        // A named scalar type (an enumerated type or a scalar subtype):
+        // the constant model only carries integers here.
+        crate::ast::TypeExpr::Named { .. } => matches!(constant, Const::Int(_)),
+        _ => {
+            let _ = declarations;
+            false
         }
     }
-    true
 }
 
-/// Category compliance for `scalar`: a predefined scalar base, an
-/// inline enumeral list, or a declared scalar type — 5.1's prose reads
-/// scalar types as the numeric, Boolean and enumerated types (so an
-/// enumerated type complies; a struct does not, 8.3's map-of-structs
-/// example).
-fn actual_is_scalar(actual: &crate::ast::TypeExpr, types: &[ElaboratedType]) -> bool {
-    match actual {
-        crate::ast::TypeExpr::Scalar { .. } | crate::ast::TypeExpr::InlineEnum { .. } => true,
-        crate::ast::TypeExpr::Named { name, .. } => types.iter().any(|ty| {
-            &ty.name == name
-                && ty.kind == DeclarationKind::Type
-                && ty.underlying.as_ref().is_none_or(|underlying| {
-                    matches!(underlying, crate::ast::TypeExpr::Scalar { .. })
-                })
-        }),
-        _ => false,
+/// The `implementing` entries of a composed type, rendered to the
+/// canonical names the conformance checks and the interpreter read
+/// (clause 6.3): a concrete entry passes through; a parameterised one
+/// (`I of <t'type>`, clauses 8.2.3/8.7) renders to its instance's
+/// canonical name — enqueued so the interface instance materializes.
+fn render_implements(
+    implements: &[TypeExpr],
+    declarations: &[Declaration],
+    defines: &BTreeMap<String, Expr>,
+    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
+) -> Vec<String> {
+    let mut ctx = Subst::new(declarations, defines, queue);
+    let mut rendered: Vec<String> = Vec::new();
+    for interface in implements {
+        let substituted = substitute_type(interface, &mut ctx);
+        let name = substituted.render();
+        if !rendered.contains(&name) {
+            rendered.push(name);
+        }
     }
+    rendered
 }
 
-/// Category compliance for `enumerated`: an inline enumeral list or a
-/// declared `type` with enumerals — 8.2.1's reading that the extension
-/// applies only to the instances whose parameter is an enumerated type.
-fn actual_is_enumerated(actual: &crate::ast::TypeExpr, types: &[ElaboratedType]) -> bool {
-    match actual {
-        crate::ast::TypeExpr::InlineEnum { .. } => true,
-        crate::ast::TypeExpr::Named { name, .. } => types.iter().any(|ty| {
-            &ty.name == name && ty.kind == DeclarationKind::Type && !ty.enumerals.is_empty()
-        }),
-        _ => false,
-    }
+/// Substitute one condition (or other expression) through an
+/// instance's bindings (8.5.3): the well-formedness pass reads the
+/// substituted form's constant value; type positions inside it fill
+/// defaults without template lookups (conditions are value
+/// expressions).
+pub(crate) fn substitute_condition(
+    expr: &mut Expr,
+    type_bindings: &BTreeMap<String, TypeExpr>,
+    value_bindings: &BTreeMap<String, Expr>,
+    defines: &BTreeMap<String, Expr>,
+    queue: &mut Vec<(String, Vec<TypeExpr>)>,
+) {
+    let mut ctx = Subst {
+        declarations: &[],
+        types: type_bindings.clone(),
+        values: value_bindings.clone(),
+        defines,
+        queue,
+    };
+    substitute_expr(expr, &mut ctx);
 }
 
-/// Seed the monomorphization worklist from one type's member types and
-/// method bodies (8.3: a body's `new <template> of <actual>` is a
-/// reference to that instance).
-fn enqueue_member_refs(
-    entry: &ElaboratedType,
+/// Fill one composed type's template references' trailing defaults
+/// (8.5.4) and enqueue them for monomorphization (8.3): field types,
+/// method signatures and bodies, constraints, `on` bodies. Empty
+/// bindings — the formals of the raw template views stay unresolved;
+/// the instances the substitution uncovers materialize through the
+/// worklist.
+fn substitute_entry(
+    entry: &mut ElaboratedType,
+    declarations: &[Declaration],
+    defines: &BTreeMap<String, Expr>,
     queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
 ) {
-    for field in &entry.fields {
-        collect_template_refs(&field.ty, queue);
+    let mut ctx = Subst::new(declarations, defines, queue);
+    for field in &mut entry.fields {
+        field.ty = substitute_type(&field.ty, &mut ctx);
     }
-    for method in &entry.methods {
-        for param in &method.params {
-            if let Some(ty) = &param.ty {
-                collect_template_refs(ty, queue);
-            }
-        }
-        if let Some(return_type) = &method.return_type {
-            collect_template_refs(return_type, queue);
-        }
-        for statement in &method.body {
-            collect_statement_refs(statement, queue);
-        }
+    for constraint in &mut entry.constraints {
+        substitute_expr(&mut constraint.expr, &mut ctx);
     }
-}
-
-fn collect_template_refs(
-    ty: &crate::ast::TypeExpr,
-    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
-) {
-    match ty {
-        crate::ast::TypeExpr::TemplateRef { name, args, .. } => {
-            queue.push((name.clone(), args.clone()));
-            for arg in args {
-                collect_template_refs(arg, queue);
-            }
-        }
-        crate::ast::TypeExpr::List { element, .. } => collect_template_refs(element, queue),
-        crate::ast::TypeExpr::WhenQualified { base, .. } => collect_template_refs(base, queue),
-        // A `typeof()` placeholder's argument may reference a template
-        // instance in a type position inside an expression.
-        crate::ast::TypeExpr::TypeOf { expr, .. }
-        | crate::ast::TypeExpr::TypeOfItem { expr, .. } => collect_expression_refs(expr, queue),
-        _ => {}
+    for method in &mut entry.methods {
+        *method = substitute_method(method.clone(), &mut ctx);
     }
-}
-
-/// The worklist seeds of the template references in one statement —
-/// the read-only form of [`substitute_stmt`].
-fn collect_statement_refs(
-    statement: &crate::ast::Stmt,
-    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
-) {
-    match statement {
-        crate::ast::Stmt::VarDecl { ty, init, .. } => {
-            if let Some(ty) = ty {
-                collect_template_refs(ty, queue);
-            }
-            if let Some(init) = init {
-                collect_expression_refs(init, queue);
-            }
-        }
-        crate::ast::Stmt::Assign { target, value, .. } => {
-            collect_expression_refs(target, queue);
-            collect_expression_refs(value, queue);
-        }
-        crate::ast::Stmt::ExprStmt { expr, .. } => collect_expression_refs(expr, queue),
-        crate::ast::Stmt::Return {
-            value: Some(value), ..
-        } => collect_expression_refs(value, queue),
-        crate::ast::Stmt::If {
-            cond,
-            then_body,
-            else_body,
-            ..
-        } => {
-            collect_expression_refs(cond, queue);
-            for statement in then_body {
-                collect_statement_refs(statement, queue);
-            }
-            if let Some(else_body) = else_body {
-                for statement in else_body {
-                    collect_statement_refs(statement, queue);
-                }
-            }
-        }
-        crate::ast::Stmt::While { cond, body, .. } => {
-            collect_expression_refs(cond, queue);
-            for statement in body {
-                collect_statement_refs(statement, queue);
-            }
-        }
-        crate::ast::Stmt::RepeatUntil { body, cond, .. } => {
-            for statement in body {
-                collect_statement_refs(statement, queue);
-            }
-            collect_expression_refs(cond, queue);
-        }
-        crate::ast::Stmt::Print { exprs, .. } => {
-            for expr in exprs {
-                collect_expression_refs(expr, queue);
-            }
-        }
-        crate::ast::Stmt::Gen { expr, .. } => collect_expression_refs(expr, queue),
-        crate::ast::Stmt::Check {
-            condition,
-            else_body,
-            ..
-        } => {
-            collect_expression_refs(condition, queue);
-            for statement in else_body {
-                collect_statement_refs(statement, queue);
-            }
-        }
-        crate::ast::Stmt::ForEach {
-            using, list, body, ..
-        } => {
-            if let Some(using) = using {
-                collect_expression_refs(using, queue);
-            }
-            collect_expression_refs(list, queue);
-            for statement in body {
-                collect_statement_refs(statement, queue);
-            }
-        }
-        crate::ast::Stmt::ForTo { from, to, body, .. } => {
-            collect_expression_refs(from, queue);
-            collect_expression_refs(to, queue);
-            for statement in body {
-                collect_statement_refs(statement, queue);
-            }
-        }
-        crate::ast::Stmt::Wait { cycles, .. } => collect_expression_refs(cycles, queue),
-        crate::ast::Stmt::Start { call, .. } | crate::ast::Stmt::Compute { call, .. } => {
-            collect_expression_refs(call, queue)
-        }
-        crate::ast::Stmt::Case {
-            scrutinee, arms, ..
-        } => {
-            collect_expression_refs(scrutinee, queue);
-            for (alternatives, body) in arms {
-                for expr in alternatives {
-                    collect_expression_refs(expr, queue);
-                }
-                for statement in body {
-                    collect_statement_refs(statement, queue);
-                }
-            }
-        }
-        crate::ast::Stmt::Emit { target, .. } => collect_expression_refs(target, queue),
-        _ => {}
-    }
-}
-
-/// The worklist seeds of the template references in one expression —
-/// the read-only form of [`substitute_expr`].
-fn collect_expression_refs(
-    expr: &crate::ast::Expr,
-    queue: &mut Vec<(String, Vec<crate::ast::TypeExpr>)>,
-) {
-    match expr {
-        crate::ast::Expr::New { ty, inits, .. } => {
-            if let Some(ty) = ty {
-                collect_template_refs(ty, queue);
-            }
-            for statement in inits {
-                collect_statement_refs(statement, queue);
-            }
-        }
-        crate::ast::Expr::CastAs { expr, ty, .. } | crate::ast::Expr::IsA { expr, ty, .. } => {
-            collect_expression_refs(expr, queue);
-            collect_template_refs(ty, queue);
-        }
-        crate::ast::Expr::SetOfValues { ty, .. } => collect_template_refs(ty, queue),
-        crate::ast::Expr::MemberAccess { object, .. } => collect_expression_refs(object, queue),
-        crate::ast::Expr::Call { callee, args, .. } => {
-            collect_expression_refs(callee, queue);
-            for arg in args {
-                collect_expression_refs(arg, queue);
-            }
-        }
-        crate::ast::Expr::Index { base, index, .. } => {
-            collect_expression_refs(base, queue);
-            collect_expression_refs(index, queue);
-        }
-        crate::ast::Expr::Binary { lhs, rhs, .. } => {
-            collect_expression_refs(lhs, queue);
-            collect_expression_refs(rhs, queue);
-        }
-        crate::ast::Expr::Unary { expr, .. } => collect_expression_refs(expr, queue),
-        crate::ast::Expr::Paren { expr, .. } => collect_expression_refs(expr, queue),
-        crate::ast::Expr::Ternary {
-            cond,
-            then_expr,
-            else_expr,
-            ..
-        } => {
-            collect_expression_refs(cond, queue);
-            collect_expression_refs(then_expr, queue);
-            collect_expression_refs(else_expr, queue);
-        }
-        crate::ast::Expr::BitSlice {
-            base, high, low, ..
-        } => {
-            collect_expression_refs(base, queue);
-            collect_expression_refs(high, queue);
-            collect_expression_refs(low, queue);
-        }
-        crate::ast::Expr::InSet { element, set, .. } => {
-            collect_expression_refs(element, queue);
-            match set {
-                crate::ast::InSetExpr::Items(items) => {
-                    for item in items {
-                        collect_expression_refs(item, queue);
-                    }
-                }
-                crate::ast::InSetExpr::Range(low, high) => {
-                    collect_expression_refs(low, queue);
-                    collect_expression_refs(high, queue);
-                }
-            }
-        }
-        // A subtype-qualified access's type positions live in its base.
-        crate::ast::Expr::QualifiedField { base, .. } => collect_expression_refs(base, queue),
-        _ => {}
+    for on in &mut entry.ons {
+        substitute_statements(&mut on.body, &mut ctx);
     }
 }
 

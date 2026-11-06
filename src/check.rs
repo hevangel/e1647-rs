@@ -87,6 +87,13 @@
 //!   only`) outside the struct that declares it (clause 17.2.4)
 //! - `E0310` a static event declared inside a `when` subtype (clause
 //!   11.1.4.1; the dedicated code the plan reserves for it)
+//! - `E0313` a template value actual that is not a constant expression
+//!   of the value parameter's scalar type (clause 8.5.2) — raised here,
+//!   at the written instantiation site, like E0311/E0312 before it
+//! - `E0314` a template instance violating one of the template
+//!   declaration's `conditions` entries (clause 8.5.3)
+//! - `E0315` a template type actual not in the parameter's category
+//!   (clause 8.5.3)
 //!
 //! `E0308` ("static member cannot be added to 'global'") stays
 //! reserved and is unreachable in this implementation: `extend global`
@@ -138,6 +145,21 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
     let iface = IfaceCtx {
         interfaces: &interfaces,
         struct_impls: &struct_impls,
+    };
+    // The template declarations (clauses 8.2–8.6): the
+    // instantiation-site bounding checks (E0313–E0315) read them with
+    // the file's `define` constants. A `template extend` matches
+    // instances; it is not an instantiation target.
+    let templates = TemplateCtx {
+        declarations,
+        templates: declarations
+            .iter()
+            .filter(|declaration| {
+                !declaration.template_params.is_empty() && declaration.template_extend.is_none()
+            })
+            .map(|declaration| (declaration.name.as_str(), declaration))
+            .collect(),
+        defines: crate::elab::collect_defines(declarations),
     };
     let mut reported_implement_conflicts: BTreeSet<(String, String)> = BTreeSet::new();
     check_implement_targets(declarations, &interfaces, &mut diagnostics);
@@ -202,7 +224,7 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             check_interface_inherited_conflicts(declaration, &interfaces, &mut diagnostics);
         }
         if let Some(underlying) = &declaration.underlying {
-            check_named_type(underlying, &declared, &mut diagnostics);
+            check_named_type(underlying, &declared, &templates, &mut diagnostics);
             check_long_subtype(
                 underlying,
                 declaration.subtype_range.is_some(),
@@ -213,7 +235,10 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             declaration,
             &declared,
             &struct_fields,
-            declarations,
+            &DeclCtx {
+                declarations,
+                templates: &templates,
+            },
             &kinds,
             &static_members,
             &mut diagnostics,
@@ -225,6 +250,7 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             &struct_fields,
             &iface,
             &static_members,
+            &templates,
             &mut diagnostics,
         );
         check_static_members_in_whens(declaration, &mut diagnostics);
@@ -241,6 +267,7 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
                 struct_fields: &struct_fields,
                 own_fields: &own_fields,
                 iface: &iface,
+                templates: &templates,
             };
             check_statements(
                 &on.body,
@@ -403,10 +430,16 @@ fn check_interface_bases(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for (base, base_span) in &declaration.bases {
-        if !interfaces.contains_key(base.as_str()) {
+        // The base resolves by its name; a parameterised base of a
+        // template interface resolves like a plain one here (the
+        // instance view composes in elaboration).
+        let Some(base_name) = base.declared_name() else {
+            continue;
+        };
+        if !interfaces.contains_key(base_name) {
             diagnostics.push(Diagnostic::new(
                 "E0203",
-                format!("unknown interface '{base}' in like clause"),
+                format!("unknown interface '{base_name}' in like clause"),
                 base_span.0,
                 base_span.1,
             ));
@@ -457,7 +490,10 @@ fn interface_signature_sources<'d>(
     };
     stack.push(name);
     for (base, _) in &declaration.bases {
-        interface_signature_sources(base.as_str(), interfaces, stack, out);
+        let Some(base_name) = base.declared_name() else {
+            continue;
+        };
+        interface_signature_sources(base_name, interfaces, stack, out);
     }
     for member in &declaration.members {
         let Member::Method(method) = member else {
@@ -500,7 +536,10 @@ fn check_interface_inherited_conflicts(
     let mut sources: SignatureSources = BTreeMap::new();
     let mut stack = Vec::new();
     for (base, _) in &declaration.bases {
-        interface_signature_sources(base.as_str(), interfaces, &mut stack, &mut sources);
+        let Some(base_name) = base.declared_name() else {
+            continue;
+        };
+        interface_signature_sources(base_name, interfaces, &mut stack, &mut sources);
     }
     for (method_name, entries) in &sources {
         if conflicting_signature_sources(entries).is_some() {
@@ -531,8 +570,10 @@ fn struct_interface_sets(declarations: &[Declaration]) -> BTreeMap<&str, Vec<Str
         for declaration in declarations {
             let contributes = match declaration.kind {
                 DeclarationKind::Struct | DeclarationKind::Unit => true,
-                DeclarationKind::Extend => !declaration.template_extend,
-                DeclarationKind::Type | DeclarationKind::Interface => false,
+                DeclarationKind::Extend => declaration.template_extend.is_none(),
+                DeclarationKind::Type
+                | DeclarationKind::Interface
+                | DeclarationKind::NumericType => false,
             };
             if !contributes {
                 continue;
@@ -545,10 +586,12 @@ fn struct_interface_sets(declarations: &[Declaration]) -> BTreeMap<&str, Vec<Str
             };
             let target = sets.entry(declaration.name.as_str()).or_default();
             let before = target.len();
-            for name in like_set
-                .into_iter()
-                .chain(declaration.implements.iter().cloned())
-            {
+            for name in like_set.into_iter().chain(
+                declaration
+                    .implements
+                    .iter()
+                    .filter_map(|entry| entry.declared_name().map(str::to_owned)),
+            ) {
                 if !target.contains(&name) {
                     target.push(name);
                 }
@@ -571,8 +614,13 @@ fn check_implement_targets(
         if declaration.implements.is_empty() {
             continue;
         }
-        for interface_name in &declaration.implements {
-            if !interfaces.contains_key(interface_name.as_str()) {
+        for interface in &declaration.implements {
+            // The target resolves by its name — the template name of a
+            // parameterised entry (`I of <t'type>`, clause 8.2.3).
+            let Some(interface_name) = interface.declared_name() else {
+                continue;
+            };
+            if !interfaces.contains_key(interface_name) {
                 diagnostics.push(Diagnostic::new(
                     "E0203",
                     format!("unknown interface '{interface_name}' in implementing clause"),
@@ -605,7 +653,8 @@ fn check_implement_conflicts(
         if !matches!(
             declaration.kind,
             DeclarationKind::Struct | DeclarationKind::Unit | DeclarationKind::Extend
-        ) || (declaration.kind == DeclarationKind::Extend && declaration.template_extend)
+        ) || (declaration.kind == DeclarationKind::Extend
+            && declaration.template_extend.is_some())
         {
             continue;
         }
@@ -641,11 +690,19 @@ fn check_implement_conflicts(
     }
 }
 
+/// The shared single-file context of the member checks: the
+/// declarations and the template bounding context (clauses 8.5.2–8.5.4)
+/// the field checks read alongside the kind map.
+struct DeclCtx<'d> {
+    declarations: &'d [Declaration],
+    templates: &'d TemplateCtx<'d>,
+}
+
 fn check_fields(
     declaration: &Declaration,
     declared: &BTreeSet<&str>,
     struct_fields: &BTreeMap<&str, Vec<(&str, &TypeExpr)>>,
-    declarations: &[Declaration],
+    decl_ctx: &DeclCtx,
     kinds: &BTreeMap<&str, DeclarationKind>,
     static_members: &BTreeMap<&str, StaticNames>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -675,7 +732,7 @@ fn check_fields(
         own_fields.insert(field.name.as_str(), &field.ty);
     });
     for_each_field(&declaration.members, &mut |field| {
-        check_named_type(&field.ty, declared, diagnostics);
+        check_named_type(&field.ty, declared, decl_ctx.templates, diagnostics);
         check_long_subtype(&field.ty, false, diagnostics);
         let scope = TypeScope {
             locals: &own_fields,
@@ -693,7 +750,7 @@ fn check_fields(
         }
         check_field_prefixes(field, diagnostics);
         check_unit_instance_static_field(field, kinds, diagnostics);
-        check_keyed_list_key(&field.ty, declarations, diagnostics);
+        check_keyed_list_key(&field.ty, decl_ctx.declarations, diagnostics);
         if let Some(init) = &field.init {
             check_expr_static_accesses(init, static_members, diagnostics);
         }
@@ -856,6 +913,7 @@ fn check_methods(
     struct_fields: &BTreeMap<&str, Vec<(&str, &TypeExpr)>>,
     iface: &IfaceCtx,
     static_members: &BTreeMap<&str, StaticNames>,
+    templates: &TemplateCtx,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     // The declaration's own fields join every method's `typeof()` scope
@@ -882,13 +940,13 @@ fn check_methods(
                 ));
             }
             if let Some(ty) = &param.ty {
-                check_named_type(ty, declared, diagnostics);
+                check_named_type(ty, declared, templates, diagnostics);
                 check_long_subtype(ty, false, diagnostics);
                 locals.insert(param.name.as_str(), ty);
             }
         }
         if let Some(return_type) = &method.return_type {
-            check_named_type(return_type, declared, diagnostics);
+            check_named_type(return_type, declared, templates, diagnostics);
             check_long_subtype(return_type, false, diagnostics);
             let scope = TypeScope {
                 locals: &locals,
@@ -905,6 +963,7 @@ fn check_methods(
                 struct_fields,
                 own_fields: &own_fields,
                 iface,
+                templates,
             },
             &mut locals,
             &method.name,
@@ -1437,6 +1496,7 @@ struct StatementScope<'a> {
     struct_fields: &'a BTreeMap<&'a str, Vec<(&'a str, &'a TypeExpr)>>,
     own_fields: &'a BTreeMap<&'a str, &'a TypeExpr>,
     iface: &'a IfaceCtx<'a>,
+    templates: &'a TemplateCtx<'a>,
 }
 
 /// The interface tables the statement walk consults for the
@@ -1478,7 +1538,9 @@ impl<'a> IfaceCtx<'a> {
             }
             if let Some(declaration) = self.interfaces.get(current.as_str()) {
                 for (base, _) in &declaration.bases {
-                    stack.push(base.clone());
+                    if let Some(base_name) = base.declared_name() {
+                        stack.push(base_name.to_owned());
+                    }
                 }
             }
         }
@@ -1512,7 +1574,7 @@ fn check_statements<'a>(
                     ));
                 }
                 if let Some(ty) = ty {
-                    check_named_type(ty, scope.declared, diagnostics);
+                    check_named_type(ty, scope.declared, scope.templates, diagnostics);
                     check_long_subtype(ty, false, diagnostics);
                     let type_scope = TypeScope {
                         locals,
@@ -1727,7 +1789,12 @@ fn check_type_static_types(ty: &TypeExpr, scope: &TypeScope, diagnostics: &mut V
     }
 }
 
-fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut Vec<Diagnostic>) {
+fn check_named_type(
+    ty: &TypeExpr,
+    declared: &BTreeSet<&str>,
+    templates: &TemplateCtx,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     match ty {
         TypeExpr::Named { name, span } => {
             if !declared.contains(name.as_str()) && !crate::builtins::is_builtin_type(name) {
@@ -1739,14 +1806,20 @@ fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut 
                 ));
             }
         }
-        TypeExpr::List { element, .. } => check_named_type(element, declared, diagnostics),
+        TypeExpr::List { element, .. } => {
+            check_named_type(element, declared, templates, diagnostics)
+        }
         // A when-qualified type resolves if its base resolves (6.7 —
         // the subtype itself is checked at elaboration).
-        TypeExpr::WhenQualified { base, .. } => check_named_type(base, declared, diagnostics),
-        // A template instantiation checks its template name and each
-        // argument; a formal parameter is bound by the enclosing
-        // template declaration (checked at instantiation, a later
-        // milestone).
+        TypeExpr::WhenQualified { base, .. } => {
+            check_named_type(base, declared, templates, diagnostics)
+        }
+        // A template instantiation checks its template name, each
+        // argument, and — clause 8.5 — the actuals against the
+        // declaration's parameters: a value actual must be a constant
+        // of the parameter's scalar type (8.5.2), a type actual must
+        // comply with the parameter's category (8.5.3), and the whole
+        // instance must satisfy the declaration's `conditions`.
         TypeExpr::TemplateRef { name, args, span } => {
             if !declared.contains(name.as_str()) {
                 diagnostics.push(Diagnostic::new(
@@ -1756,17 +1829,171 @@ fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut 
                     span.1,
                 ));
             }
-            for arg in args {
-                check_named_type(arg, declared, diagnostics);
+            // 8.5.2: an argument at a value-parameter position names a
+            // constant, not a type — a `define` reference there is not
+            // an unknown-type error (the constant check is
+            // `check_template_instance`'s E0313).
+            let value_positions: Vec<bool> = match templates.templates.get(name.as_str()) {
+                Some(template) => template
+                    .template_params
+                    .iter()
+                    .map(|param| matches!(param.kind, crate::ast::TemplateParamKind::Value { .. }))
+                    .collect(),
+                None => Vec::new(),
+            };
+            for (index, arg) in args.iter().enumerate() {
+                let names_define = matches!(
+                    arg,
+                    TypeExpr::Named { name: arg_name, .. }
+                        if templates.defines.contains_key(arg_name)
+                );
+                if value_positions.get(index).copied().unwrap_or(false) && names_define {
+                    continue;
+                }
+                check_named_type(arg, declared, templates, diagnostics);
             }
+            check_template_instance(name, args, *span, templates, diagnostics);
         }
-        TypeExpr::Formal { .. } => {}
+        // A formal parameter is bound by the enclosing template
+        // declaration; a width-qualified formal is 8.5.4's derived-type
+        // default shape; a value actual is not a type position.
+        TypeExpr::Formal { .. } | TypeExpr::FormalWidth { .. } | TypeExpr::Value { .. } => {}
         // A `typeof()`/`typeof_item()` placeholder's argument is an
         // expression, not a type; its resolution is 5.9's
         // `check_type_static_types`, and the resolved type's own name is
         // validated after elaboration rewrites it.
         TypeExpr::TypeOf { .. } | TypeExpr::TypeOfItem { .. } => {}
         TypeExpr::Scalar { .. } | TypeExpr::InlineEnum { .. } => {}
+    }
+}
+
+/// The template declarations (by name), the file's declarations and
+/// `define` constants the instantiation-site checks read (clauses
+/// 8.5.2–8.5.4). A `template extend` is not an instantiation target —
+/// its entries match, they do not bind a new instance.
+struct TemplateCtx<'d> {
+    declarations: &'d [Declaration],
+    templates: BTreeMap<&'d str, &'d Declaration>,
+    defines: BTreeMap<String, Expr>,
+}
+
+/// Clause 8.5's bounding of one written instantiation site: the
+/// actuals against the parameters (E0313, E0315) and the instance
+/// against the declaration's `conditions` (E0314). The diagnostic
+/// points at the instantiation site — the type position the
+/// instantiation is written in. An unsatisfiable parameter (neither
+/// actual nor default) or an unevaluable condition is not a violation
+/// this pass can name; the elaborator skips such instances.
+fn check_template_instance(
+    name: &str,
+    args: &[TypeExpr],
+    span: crate::ast::Span,
+    templates: &TemplateCtx,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(template) = templates.templates.get(name) else {
+        return;
+    };
+    let mut queue = Vec::new();
+    let Some(binding) = crate::elab::bind_template_actuals(
+        templates.declarations,
+        template,
+        args,
+        &templates.defines,
+        &mut queue,
+    ) else {
+        return;
+    };
+    let instance = crate::ast::template_instance_name(name, &binding.actuals);
+    for (index, param) in template.template_params.iter().enumerate() {
+        let Some(actual) = binding.actuals.get(index) else {
+            continue;
+        };
+        match &param.kind {
+            crate::ast::TemplateParamKind::Value { scalar } => {
+                // 8.5.2: the actual must be a constant expression of
+                // the parameter's scalar type. The binding's value map
+                // holds the actual's evaluated constant when it is one.
+                let matches = binding.values.get(&param.name).is_some_and(|constant| {
+                    crate::elab::eval_const_expr(constant, &binding.values, &templates.defines, 0)
+                        .is_some_and(|value| {
+                            crate::elab::value_constant_matches_type(
+                                &value,
+                                scalar,
+                                templates.declarations,
+                            )
+                        })
+                });
+                if !matches {
+                    // The message cites the parameter's tag (the plan's
+                    // `<n'exp>` reads as 'n').
+                    let tag = param
+                        .name
+                        .split_once('\'')
+                        .map(|(tag, _)| tag)
+                        .unwrap_or(&param.name);
+                    diagnostics.push(Diagnostic::new(
+                        "E0313",
+                        format!(
+                            "actual for value parameter '{tag}' is not a constant expression of type '{scalar_name}'",
+                            scalar_name = scalar.render(),
+                        ),
+                        span.0,
+                        span.1,
+                    ));
+                }
+            }
+            crate::ast::TemplateParamKind::Type => {
+                // 8.5.3: the actual must comply with the parameter's
+                // category (a plain `<tag'type>` imposes none); a value
+                // where a type is expected is its own mismatch.
+                let category = param.category.as_deref().unwrap_or("type");
+                let is_value = matches!(actual, TypeExpr::Value { .. });
+                if is_value
+                    || !crate::elab::actual_in_category(actual, category, templates.declarations)
+                {
+                    let rendered = actual.render();
+                    diagnostics.push(Diagnostic::new(
+                        "E0315",
+                        format!(
+                            "actual type '{rendered}' for parameter <{param_name}> is not in category '{category}'",
+                            param_name = param.name,
+                        ),
+                        span.0,
+                        span.1,
+                    ));
+                }
+            }
+        }
+    }
+    // 8.5.3: the instance's actuals must satisfy every `conditions`
+    // entry — a constant expression over the value parameters. The
+    // first violated condition is reported; a condition that does not
+    // evaluate to a constant is not checkable here.
+    for condition in &template.template_conditions {
+        let mut substituted = condition.clone();
+        let mut condition_queue = Vec::new();
+        crate::elab::substitute_condition(
+            &mut substituted,
+            &binding.types,
+            &binding.values,
+            &templates.defines,
+            &mut condition_queue,
+        );
+        if matches!(
+            crate::elab::eval_const_expr(&substituted, &binding.values, &templates.defines, 0),
+            Some(crate::elab::Const::Bool(false))
+        ) {
+            diagnostics.push(Diagnostic::new(
+                "E0314",
+                format!(
+                    "template instance '{instance}' violates condition '{condition_text}'",
+                    condition_text = crate::ast::render_expr_compact(condition),
+                ),
+                span.0,
+                span.1,
+            ));
+        }
     }
 }
 
@@ -1969,6 +2196,9 @@ fn for_each_sub_expr<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
         | Expr::BoolLiteral { .. }
         | Expr::StringLiteral { .. }
         | Expr::Ident { .. }
+        // A template value formal is bound by the enclosing template
+        // declaration, not by the walk's scopes.
+        | Expr::Formal { .. }
         | Expr::HdlPath { .. }
         | Expr::SetOfValues { .. }
         // The `Type` of a static access is a name, not an expression.
@@ -2104,6 +2334,9 @@ fn check_constraint_fields(
 fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Span)>) {
     match expr {
         Expr::Ident { name, span } => roots.push((name.clone(), *span)),
+        // A template value formal is bound by the enclosing template
+        // declaration, not a constraint root.
+        Expr::Formal { .. } => {}
         Expr::MemberAccess { object, .. } => collect_root_identifiers(object, roots),
         // `Type::member` names a static member of a type — a legal
         // constraint reference, not an unknown root (clause 4.17.4).

@@ -22,6 +22,14 @@ pub enum DeclarationKind {
     Extend,
     /// `type name: [A, B, C];` — its members are [`Member::Enumeral`].
     Type,
+    /// `template numeric_type name of (params): impl-struct of (...);`
+    /// (clause 8.4) — the declaration form of the 2019 template numeric
+    /// types. Recorded with the impl-struct reference in
+    /// [`Declaration::underlying`]; instances materialize at
+    /// monomorphization with their parameters substituted. The
+    /// numeric_type operator machinery itself is a later milestone
+    /// (the migration plan's T7.1).
+    NumericType,
     /// `[package] interface name [like base, ...] { signature; ... }`
     /// (clause 6.13): a named collection of method signatures. No object
     /// is *of* an interface type; a value of interface type points at an
@@ -29,16 +37,78 @@ pub enum DeclarationKind {
     Interface,
 }
 
-/// One formal type parameter of a template declaration (clause 8.2):
-/// `<[tag']type-category>` with an optional default (`=<type>`), the
-/// default only for trailing parameters.
+/// One formal parameter of a template declaration (clauses 8.2, 8.5):
+/// a type parameter `<[tag']type[: category]>` or — 2019 clause 8.5.2 —
+/// a value parameter `<[tag']exp>: scalar-type`, each with an optional
+/// default (defaults only for trailing parameters, 8.5.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateParam {
     /// The raw parameter text between the angle brackets (`type`,
-    /// `key'type`).
+    /// `key'type`, `depth'exp`) — the spelling the body's
+    /// [`TypeExpr::Formal`] and [`Expr::Formal`] references use.
     pub name: String,
     pub name_span: Span,
-    pub default: Option<TypeExpr>,
+    /// The parameter's type category: the 2016 in-bracket word
+    /// (`<key'scalar>` → `scalar`) or the 2019 `: category` suffix
+    /// (8.5.3). `None` for a plain `<tag'type>` — no constraint.
+    pub category: Option<String>,
+    pub kind: TemplateParamKind,
+    pub default: Option<TemplateDefault>,
+}
+
+/// The kind of one [`TemplateParam`] (clauses 8.2, 8.5.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplateParamKind {
+    /// `<tag'type[: category]>` — the actual is a type.
+    Type,
+    /// `<tag'exp>: scalar-type` — the actual is a constant expression of
+    /// the scalar type, substituted as a constant where a constant
+    /// expression of that type is expected (8.5.2).
+    Value {
+        /// The parameter's scalar type (numeric, enum, bool; the parser
+        /// accepts scalar-shaped spellings and the well-formedness pass
+        /// rejects a custom numeric subtype with E0126).
+        scalar: TypeExpr,
+    },
+}
+
+/// The default of one [`TemplateParam`] (8.5.4): a type default on a
+/// type parameter, a constant-expression default on a value parameter.
+/// A default may reference earlier parameters of either kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplateDefault {
+    Type(TypeExpr),
+    Value(Expr),
+}
+
+/// `template extend name of (entries) [implementing I, ...]
+/// [conditions { ... }] { members }` (clause 8.6): the parameter-list
+/// entries of a template extension. Each entry either binds the
+/// instance's actual to a formal of the extension's own (a parameter
+/// form) or constrains the match to one concrete type / constant value.
+/// The tags of the parameter forms may differ from the declaration's;
+/// the extension body uses its own tags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateExtendSpec {
+    pub entries: Vec<TemplateExtendEntry>,
+}
+
+/// One entry of a [`TemplateExtendSpec`]'s parameter list (clause 8.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplateExtendEntry {
+    /// `<tag'type[: category]>` — binds the actual type; a category
+    /// constrains it (8.5.3's bounding criteria).
+    TypeParam {
+        name: String,
+        category: Option<String>,
+    },
+    /// `<tag'exp>: scalar-type` — binds the actual value, which must be
+    /// a constant of the scalar type.
+    ValueParam { name: String, scalar: TypeExpr },
+    /// A concrete `type-name` the actual must render to exactly.
+    Concrete(TypeExpr),
+    /// A `constant-value` the actual must equal.
+    Constant(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,15 +126,21 @@ pub struct Declaration {
     /// (E0207); the range does not narrow values yet.
     pub subtype_range: Option<(Expr, Expr)>,
     /// `template struct name of <params> { .. }` (clause 8): the formal
-    /// type parameters, recorded. Instantiation (monomorphization) is a
-    /// later milestone.
+    /// parameters — type and value parameters — recorded. Instantiation
+    /// (monomorphization) substitutes them into the instance's body.
     pub template_params: Vec<TemplateParam>,
-    /// `template extend name of <params> { .. };` (clause 8.6): a
-    /// template extension declaration. Its members apply to the
-    /// instances whose actuals comply with the parameters' types or
-    /// categories (8.3's NOTE 3), substituted with the instance's
-    /// actuals — elaboration applies them, not name composition.
-    pub template_extend: bool,
+    /// `conditions { bool-exp; ... }` (clause 8.5.3) of a template
+    /// declaration: constant expressions over the value parameters each
+    /// instance's actuals must satisfy. Violations are reported at the
+    /// instantiation site (E0314); a `template extend`'s failing
+    /// conditions mean the extension does not apply.
+    pub template_conditions: Vec<Expr>,
+    /// `template extend name of (entries) [implementing ...]
+    /// [conditions { ... }] { members };` (clause 8.6): a template
+    /// extension declaration. Its members apply to the instances whose
+    /// actuals match the entries, satisfy the categories and the
+    /// conditions — elaboration applies them, not name composition.
+    pub template_extend: Option<TemplateExtendSpec>,
     /// `package` visibility prefix recorded (clause 22); not enforced.
     pub packaged: bool,
     /// `struct derived like base { .. }` inheritance clause. For
@@ -78,13 +154,19 @@ pub struct Declaration {
     /// inherited interfaces, in written order. An interface includes all
     /// of their members. Only interfaces may appear here (checked in
     /// `check.rs`); the spans point at each base name for diagnostics.
-    pub bases: Vec<(String, Span)>,
+    /// A template interface's bases may be parameterised over its
+    /// parameters (`like I, J of <t'type>`, clause 8.3) — recorded as
+    /// written and substituted at instantiation (8.7).
+    pub bases: Vec<(TypeExpr, Span)>,
     /// `struct S [like B] implementing I1, I2, ... { .. }` and
     /// `extend S implementing I { .. }` (clause 6.3, 31.4): the
-    /// implemented interfaces, in written order. Elaboration composes
-    /// the per-type set (like-chain bases and extend blocks add to it);
-    /// subtypes implement their base's interfaces.
-    pub implements: Vec<String>,
+    /// implemented interfaces, in written order, as written — a
+    /// template's `implementing` clause may be parameterised over its
+    /// parameters (`implementing I of <t'type>`, clauses 8.2.3, 8.7),
+    /// substituted at instantiation. Elaboration composes the per-type
+    /// set (like-chain bases and extend blocks add to it); subtypes
+    /// implement their base's interfaces.
+    pub implements: Vec<TypeExpr>,
     /// `template struct t of <type> like container of <type> { .. }` —
     /// the parameterized base type, recorded (clause 8.5.2).
     pub like_type: Option<TypeExpr>,
@@ -716,6 +798,21 @@ pub enum TypeExpr {
     /// (`<type>`, `<key'type>`) — the raw text between the angle
     /// brackets. Bound during template instantiation, a later milestone.
     Formal { name: String, span: Span },
+    /// `<formal>(bits: exp)` — a width-qualified formal type, the shape
+    /// of a 8.5.4 derived-type default (`<second'type> =
+    /// <first'type>(bits: <first'exp>)`). Substitution resolves the
+    /// formal: a scalar actual takes the substituted width; other
+    /// actuals keep the qualified spelling over the actual's rendering.
+    FormalWidth {
+        name: String,
+        width: Box<Expr>,
+        span: Span,
+    },
+    /// A template's value actual in a template-argument list
+    /// (`fifo of (byte, 8)`, clause 8.5.2): a constant expression, not
+    /// a type. Canonical instance names render it through
+    /// [`render_expr_compact`].
+    Value { expr: Box<Expr>, span: Span },
     /// A template instantiation in a type position (`deque of int`,
     /// `map of (key_t, value_t)`).
     TemplateRef {
@@ -744,9 +841,22 @@ impl TypeExpr {
             | TypeExpr::WhenQualified { span, .. }
             | TypeExpr::InlineEnum { span, .. }
             | TypeExpr::Formal { span, .. }
+            | TypeExpr::FormalWidth { span, .. }
+            | TypeExpr::Value { span, .. }
             | TypeExpr::TemplateRef { span, .. }
             | TypeExpr::TypeOf { span, .. }
             | TypeExpr::TypeOfItem { span, .. } => *span,
+        }
+    }
+
+    /// The declared (or template) name a type position names: the
+    /// identifier of a named type or of a template instantiation — the
+    /// name the well-formedness pass resolves against declarations.
+    /// `None` for the shapes that are not plain names.
+    pub fn declared_name(&self) -> Option<&str> {
+        match self {
+            TypeExpr::Named { name, .. } | TypeExpr::TemplateRef { name, .. } => Some(name),
+            _ => None,
         }
     }
 
@@ -769,6 +879,10 @@ impl TypeExpr {
             }
             TypeExpr::InlineEnum { names, .. } => format!("[{}]", names.join(", ")),
             TypeExpr::Formal { name, .. } => format!("<{name}>"),
+            TypeExpr::FormalWidth { name, width, .. } => {
+                format!("{name}(bits: {})", render_expr_compact(width))
+            }
+            TypeExpr::Value { expr, .. } => render_expr_compact(expr),
             TypeExpr::TemplateRef { name, args, .. } => template_instance_name(name, args),
             TypeExpr::TypeOf { expr, .. } => format!("typeof({})", render_expr_compact(expr)),
             TypeExpr::TypeOfItem { expr, .. } => {
@@ -794,6 +908,7 @@ pub fn render_expr_compact(expr: &Expr) -> String {
         }
         Expr::StringLiteral { value, .. } => format!("\"{value}\""),
         Expr::Ident { name, .. } => name.clone(),
+        Expr::Formal { name, .. } => format!("<{name}>"),
         Expr::MemberAccess { object, name, .. } => {
             format!("{}.{}", render_expr_compact(object), name)
         }
@@ -801,7 +916,104 @@ pub fn render_expr_compact(expr: &Expr) -> String {
             type_name, member, ..
         } => format!("{type_name}::{member}"),
         Expr::Paren { expr, .. } => format!("({})", render_expr_compact(expr)),
+        Expr::Binary { op, lhs, rhs, .. } => format!(
+            "{} {} {}",
+            render_expr_compact(lhs),
+            binary_op_text(*op),
+            render_expr_compact(rhs)
+        ),
+        Expr::Unary {
+            op, expr: inner, ..
+        } => format!("{}{}", unary_op_text(*op), render_expr_compact(inner)),
+        Expr::Call { callee, args, .. } => format!(
+            "{}({})",
+            render_expr_compact(callee),
+            args.iter()
+                .map(render_expr_compact)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Index { base, index, .. } => {
+            format!(
+                "{}[{}]",
+                render_expr_compact(base),
+                render_expr_compact(index)
+            )
+        }
+        Expr::BitSlice {
+            base, high, low, ..
+        } => format!(
+            "{}[{}:{}]",
+            render_expr_compact(base),
+            render_expr_compact(high),
+            render_expr_compact(low)
+        ),
+        Expr::CastAs {
+            expr: inner, ty, ..
+        } => {
+            format!("{}.as_a({})", render_expr_compact(inner), ty.render())
+        }
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => format!(
+            "{} ? {} : {}",
+            render_expr_compact(cond),
+            render_expr_compact(then_expr),
+            render_expr_compact(else_expr)
+        ),
+        Expr::ListConcat { items, .. } => format!(
+            "{{{}}}",
+            items
+                .iter()
+                .map(render_expr_compact)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         _ => "...".to_owned(),
+    }
+}
+
+/// The source spelling of a binary operator, for the compact renderer.
+fn binary_op_text(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::LogicalOr => "||",
+        BinaryOp::LogicalAnd => "&&",
+        BinaryOp::BitOr => "|",
+        BinaryOp::BitXor => "^",
+        BinaryOp::BitAnd => "&",
+        BinaryOp::Eq => "==",
+        BinaryOp::NotEq => "!=",
+        BinaryOp::ListPtrEq => "list_ptr==",
+        BinaryOp::ListPtrNe => "!list_ptr=",
+        BinaryOp::IdentityEq => "==",
+        BinaryOp::IdentityNe => "!=",
+        BinaryOp::Lt => "<",
+        BinaryOp::Le => "<=",
+        BinaryOp::Gt => ">",
+        BinaryOp::Ge => ">=",
+        BinaryOp::Match => "~",
+        BinaryOp::NotMatch => "!~",
+        BinaryOp::ShiftLeft => "<<",
+        BinaryOp::ShiftRight => ">>",
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Mod => "%",
+        BinaryOp::Imply => "=>",
+    }
+}
+
+/// The source spelling of a unary operator, for the compact renderer.
+fn unary_op_text(op: UnaryOp) -> &'static str {
+    match op {
+        UnaryOp::Not => "!",
+        UnaryOp::Negate => "-",
+        UnaryOp::Plus => "+",
+        UnaryOp::BitNot => "~",
     }
 }
 
@@ -882,6 +1094,14 @@ pub enum Expr {
         span: Span,
     },
     Ident {
+        name: String,
+        span: Span,
+    },
+    /// A template's value parameter used in an expression position
+    /// (`<depth'exp>` inside the body, clause 8.5.2) — the raw
+    /// `tag'exp` text between the angle brackets. Substituted with the
+    /// instance's constant actual at instantiation.
+    Formal {
         name: String,
         span: Span,
     },
@@ -1174,6 +1394,7 @@ impl Expr {
             | Expr::BoolLiteral { span, .. }
             | Expr::StringLiteral { span, .. }
             | Expr::Ident { span, .. }
+            | Expr::Formal { span, .. }
             | Expr::MemberAccess { span, .. }
             | Expr::Call { span, .. }
             | Expr::Index { span, .. }

@@ -321,14 +321,17 @@ fn template_instances_monomorphize() {
 
 #[test]
 fn template_defaults_fill_trailing_parameters() {
-    // 8.3: trailing parameters may be omitted when defaults exist —
-    // `map of (int)` binds <value'type> to its default, <key'type>.
+    // 8.3 with 8.5.4: trailing parameters may be omitted when defaults
+    // exist — `map of (int)` binds <value'type> to its default,
+    // <key'type>, and the canonical name renders the filled actuals
+    // (`map of (int, int)`): the omitted and the explicit spellings are
+    // the same instance.
     let result = elaborated(
         "template struct map of (<key'type>, <value'type> = <key'type>) {\n    \
          put(k: <key'type>, v: <value'type>) is undefined;\n};\n\
          extend sys {\n    m: map of (int);\n    n: map of (int, string);\n};\n",
     );
-    let defaulted = find(&result, "map of (int)");
+    let defaulted = find(&result, "map of (int, int)");
     let put = defaulted
         .methods
         .iter()
@@ -337,7 +340,9 @@ fn template_defaults_fill_trailing_parameters() {
     let render_param = |param: &Option<e1647::ast::TypeExpr>| param.as_ref().map(|ty| ty.render());
     assert_eq!(render_param(&put.params[0].ty), Some("int".to_owned()));
     assert_eq!(render_param(&put.params[1].ty), Some("int".to_owned()));
-    // The explicit two-argument instance is a distinct view.
+    // The explicit two-argument instance is a distinct view, and the
+    // defaults-filled spelling is the only `map of (int, int)` — the
+    // omitted form did not materialize a second one.
     let explicit = find(&result, "map of (int, string)");
     let put_explicit = explicit
         .methods
@@ -348,6 +353,15 @@ fn template_defaults_fill_trailing_parameters() {
         render_param(&put_explicit.params[1].ty),
         Some("string".to_owned())
     );
+    assert_eq!(
+        result
+            .types
+            .iter()
+            .filter(|ty| ty.name == "map of (int, int)")
+            .count(),
+        1
+    );
+    assert!(!result.types.iter().any(|ty| ty.name == "map of (int)"));
 }
 
 #[test]
@@ -413,9 +427,10 @@ fn template_extension_specific_type_parameter_form() {
 
 #[test]
 fn template_extension_arity_mismatch_is_reported_once() {
-    // 8.2: the extension's parameter count must equal the original
-    // template declaration's — reported once, and the extension does
-    // not apply.
+    // 8.6: the extension's parameter count must equal the original
+    // template declaration's — reported once (the migration plan's
+    // E0127; the pre-plan E0318 allocation is retired by T4.4), and the
+    // extension does not apply.
     let parsed = parse(
         "template struct box of <type> {\n    v: <type>;\n};\n\
          template extend box of (<a'type>, <b'type>) {\n    w: <b'type>;\n};\n\
@@ -426,13 +441,7 @@ fn template_extension_arity_mismatch_is_reported_once() {
     let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
     assert_eq!(
         rendered,
-        vec![
-            // E0304 is the static-members stage's code ("static member in
-            // when subtype"); this template-arity diagnostic takes the
-            // next free elaboration code (E0318) per the migration plan's
-            // collision rule.
-            "4:17: error[E0318]: template extension 'box' declares 2 parameter(s) but template 'box' declares 1"
-        ]
+        vec!["4:17: error[E0127]: template extend: parameter count mismatch"]
     );
     // The instance still materializes without the extension's members.
     assert_eq!(field_names(find(&result, "box of (int)")), vec!["v"]);
@@ -711,4 +720,204 @@ fn implementing_composes_across_like_chains_and_extends() {
     // The synthesized when view carries the base's interfaces.
     let view = find(&result, "BUSY s");
     assert_eq!(view.implements, vec!["i1", "i2", "i3"]);
+}
+
+#[test]
+fn value_parameters_bind_and_substitute() {
+    // 8.5.2 with 8.2.1: a value parameter names a scalar type; its
+    // actual is a constant expression substituted where a constant of
+    // that type is expected — in field widths, in method bodies, in the
+    // instance's canonical name.
+    let result = elaborated(
+        "template struct fifo of (<t'type>, <depth'exp>: uint = 4) {\n    \
+         !items: list of <t'type>;\n\
+         capacity(): uint is { return <depth'exp>; };\n\
+         width_field: uint(bits: <depth'exp>);\n};\n\
+         extend sys {\n    f8: fifo of (byte, 8);\n    f4: fifo of (int);\n};\n",
+    );
+    // The instance canonical name renders the value actual; the
+    // defaults-omitted spelling is the same instance.
+    let f8 = find(&result, "fifo of (byte, 8)");
+    let capacity = f8
+        .methods
+        .iter()
+        .find(|method| method.name == "capacity")
+        .expect("the capacity method");
+    let e1647::ast::Stmt::Return {
+        value: Some(returned),
+        ..
+    } = &capacity.body[0]
+    else {
+        panic!("expected a returning capacity body");
+    };
+    let e1647::ast::Expr::IntLiteral { text, .. } = returned else {
+        panic!("expected the substituted constant, got {:?}", returned);
+    };
+    assert_eq!(text, "8");
+    // A scalar width over the value parameter substitutes to the
+    // constant (`uint(bits: 8)`).
+    let width_field = f8
+        .fields
+        .iter()
+        .find(|field| field.name == "width_field")
+        .expect("the width field");
+    assert_eq!(width_field.ty.render(), "uint(bits: 8)".to_owned());
+    // The omitted actual took the default: the same canonical name and
+    // body constant as an explicit `fifo of (int, 4)`.
+    find(&result, "fifo of (int, 4)");
+    assert!(
+        !result.types.iter().any(|ty| ty.name == "fifo of (int)"),
+        "the defaults-filled spelling is the instance's only name"
+    );
+}
+
+#[test]
+fn template_conditions_gate_the_instance_and_the_extension() {
+    // 8.5.3 with 8.6: a violating condition reports at the
+    // instantiation site (the fixture pass; the elaborator still
+    // composes), and a template extension whose conditions fail for an
+    // instance does not apply to it.
+    let parsed = parse(
+        "template struct map of (<key'type>, <max_size'exp>: uint = 1000)\n\
+         conditions { <max_size'exp> % 100 == 0 } {\n    !n: uint;\n};\n\
+         template extend map of (<k'type>, <m'exp>: uint) conditions { <m'exp> >= 300 } {\n    \
+         extra: uint;\n};\n\
+         extend sys {\n    small: map of (int, 100);\n    large: map of (int, 500);\n};\n",
+    );
+    assert!(parsed.diagnostics.is_empty());
+    let result = elaborate(&parsed.declarations);
+    assert!(result.diagnostics.is_empty());
+    // The 500 instance satisfies the declaration's condition and gets
+    // the extension; the 100 instance satisfies the condition but not
+    // the extension's.
+    let small = find(&result, "map of (int, 100)");
+    assert_eq!(field_names(small), vec!["n"]);
+    let large = find(&result, "map of (int, 500)");
+    assert_eq!(field_names(large), vec!["n", "extra"]);
+}
+
+#[test]
+fn template_extend_entries_match_concrete_and_constant() {
+    // 8.6: the extension applies to every instance whose actuals match
+    // the entries — a parameter form binds, a concrete type-name and a
+    // constant constrain — so `packet of (color_t, 4)` gets narrow(),
+    // `packet of (color_t, 8)` gets wide(), and neither gets the other.
+    let result = elaborated(
+        "type color_t: [red, green];\n\
+         template struct packet of (<k'type>, <w'exp>: uint) { !kind: <k'type>; };\n\
+         template extend packet of (<e'type>: enum, <n'exp>: uint) conditions { <n'exp> >= 8 } {\n    \
+         wide(): bool is { return TRUE; };\n};\n\
+         template extend packet of (color_t, 4) {\n    \
+         narrow(): bool is { return TRUE; };\n};\n\
+         extend sys {\n    a: packet of (color_t, 8);\n    b: packet of (color_t, 4);\n};\n",
+    );
+    let wide = find(&result, "packet of (color_t, 8)");
+    assert!(wide.methods.iter().any(|method| method.name == "wide"));
+    assert!(
+        wide.methods.iter().all(|method| method.name != "narrow"),
+        "the constant-4 extension does not apply to the 8 instance"
+    );
+    let narrow = find(&result, "packet of (color_t, 4)");
+    assert!(narrow.methods.iter().any(|method| method.name == "narrow"));
+    assert!(
+        narrow.methods.iter().all(|method| method.name != "wide"),
+        "the condition-gated extension does not apply to the 4 instance"
+    );
+}
+
+#[test]
+fn derived_defaults_render_in_the_canonical_name() {
+    // 8.5.4: defaults derived from earlier parameters — a value default
+    // over an earlier value parameter evaluates to its constant, a
+    // type default over a value parameter substitutes into the width
+    // — and the canonical name renders the filled actuals.
+    let result = elaborated(
+        "template struct t1 of (<first'type>, <first'exp>: int, \
+         <second'exp>: int = <first'exp> + 5, \
+         <second'type> = <first'type>(bits: <first'exp>), \
+         <third'type> = list of <first'type>) {\n    \
+         !data: <second'type>;\n};\n\
+         extend sys {\n    v: t1 of (uint, 4);\n};\n",
+    );
+    let instance = find(&result, "t1 of (uint, 4, 9, uint(bits: 4), list of uint)");
+    let data = instance
+        .fields
+        .iter()
+        .find(|field| field.name == "data")
+        .expect("the data field");
+    assert_eq!(data.ty.render(), "uint(bits: 4)".to_owned());
+}
+
+#[test]
+fn template_interface_instances_materialize() {
+    // 8.3: a template interface's instance is an interface — the
+    // substituted bases' signatures fold first, then its own, with the
+    // parameters substituted throughout.
+    let result = elaborated(
+        "interface countable { count(): uint; };\n\
+         template interface stack_i of (<t'type>) like countable {\n    \
+         push(x: <t'type>);\n};\n\
+         extend sys {\n    s: stack_i of (int);\n};\n",
+    );
+    let instance = find(&result, "stack_i of (int)");
+    assert_eq!(instance.kind, DeclarationKind::Interface);
+    assert_eq!(instance.interface_bases, vec!["countable"]);
+    let methods: Vec<&str> = instance.methods.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(methods, vec!["count", "push"]);
+    let push = instance
+        .methods
+        .iter()
+        .find(|method| method.name == "push")
+        .expect("the push signature");
+    assert_eq!(
+        push.params[0].ty.as_ref().map(|ty| ty.render()),
+        Some("int".to_owned())
+    );
+}
+
+#[test]
+fn template_numeric_type_instances_record_the_impl_struct() {
+    // 8.4: a template numeric_type's instance records the substituted
+    // impl-struct reference; the operator machinery is the later
+    // numeric_type milestone.
+    let result = elaborated(
+        "struct base_int { !bits: uint; };\n\
+         template numeric_type width_t of (<bits'exp>: uint): base_int of (<bits'exp>);\n\
+         extend sys {\n    w: width_t of (4);\n};\n",
+    );
+    let instance = find(&result, "width_t of (4)");
+    assert_eq!(instance.kind, DeclarationKind::NumericType);
+    assert_eq!(
+        instance
+            .underlying
+            .as_ref()
+            .map(|underlying| underlying.render()),
+        Some("base_int of (4)".to_owned())
+    );
+}
+
+#[test]
+fn parameterised_implementing_substitutes_on_instantiation() {
+    // 8.2.3 with 8.7: a template struct's `implementing` entry may be
+    // parameterised over the template parameters; the instance
+    // implements the substituted interface instance.
+    let result = elaborated(
+        "template interface wrapper of <t'type> { wrap(): <t'type>; };\n\
+         template struct box of <t'type> implementing wrapper of <t'type> {\n    \
+         !v: <t'type>;\n};\n\
+         extend sys {\n    b: box of (int);\n};\n",
+    );
+    let instance = find(&result, "box of (int)");
+    assert_eq!(instance.implements, vec!["wrapper of (int)"]);
+    // The interface instance materialized with its signature
+    // substituted.
+    let wrapper = find(&result, "wrapper of (int)");
+    assert_eq!(wrapper.kind, DeclarationKind::Interface);
+    assert_eq!(
+        wrapper.methods[0]
+            .return_type
+            .as_ref()
+            .map(|ty| ty.render()),
+        Some("int".to_owned())
+    );
 }
