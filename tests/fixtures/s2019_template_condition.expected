@@ -1,0 +1,1 @@
+8:11: error[E0314]: template instance 'map of (uint, string, 150)' violates condition '<max_size'exp> % 100 == 0'

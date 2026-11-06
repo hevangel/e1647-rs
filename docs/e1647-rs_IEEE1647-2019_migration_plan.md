@@ -1153,7 +1153,7 @@ Phase 12 — Docs/claims [Sonnet]
 | E0315 | elab | template type actual not in category |
 | E0316 | elab | range-generated field not scalar |
 | E0317 | elab/gen | unsupported constraint shape on rgf field |
-| E0318 | elab | template extension parameter-count mismatch (moved from a pre-plan E0304 use by T2.1) |
+| E0318 | elab | (retired by T4.4: the template-extension parameter-count mismatch reports as E0127; E0318 was the pre-plan allocation, moved from a pre-plan E0304 use by T2.1) |
 | E0320 | elab | annotation type extended/inherited |
 | E0321 | elab | annotation type used in its declaring module |
 | E0411 | runtime | `list_ptr==` operand types differ |
