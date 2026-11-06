@@ -378,10 +378,20 @@ fn print_elaborated_type(elaborated_type: &e1647::elab::ElaboratedType) {
         DeclarationKind::Unit => "unit",
         DeclarationKind::Type => "type",
         DeclarationKind::Extend => "extend",
+        DeclarationKind::Interface => "interface",
     };
     match &elaborated_type.base {
         Some(base) => println!("{kind} {} like {base}", elaborated_type.name),
         None => println!("{kind} {}", elaborated_type.name),
+    }
+    // Clause 6.13: an interface lists its inherited interfaces; a
+    // struct/unit lists the interfaces its `implementing` clauses
+    // composed (like-chain bases and extends included).
+    if !elaborated_type.interface_bases.is_empty() {
+        println!("  like {}", elaborated_type.interface_bases.join(", "));
+    }
+    if !elaborated_type.implements.is_empty() {
+        println!("  implementing {}", elaborated_type.implements.join(", "));
     }
     for enumeral in &elaborated_type.enumerals {
         match &enumeral.value {

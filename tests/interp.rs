@@ -1227,17 +1227,19 @@ fn const_field_keeps_its_init_value_through_gen() {
 }
 
 #[test]
-fn static_field_prefix_is_rejected_as_unsupported() {
-    // Clause 6.9.3: the contextual `static` prefix is not parsed yet;
-    // the static-members stage owns it. A member genuinely named
-    // `static` keeps parsing.
+fn static_prefix_is_a_contextual_word() {
+    // Clause 6.9.3: `static` prefixes a member only when a member
+    // declarator follows; a member genuinely named `static` keeps
+    // parsing as before.
     let result = parse("struct s {\n    static count: uint;\n};\n");
-    let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
-    assert_eq!(rendered.len(), 1);
     assert!(
-        rendered[0].contains("E0113") && rendered[0].contains("static"),
-        "expected the static not-supported diagnostic: {:?}",
-        rendered
+        result.diagnostics.is_empty(),
+        "a static-prefixed field parses (T2.1): {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
     );
     let named = parse("struct s {\n    static: uint;\n    m: uint;\n};\n");
     assert!(
@@ -1249,6 +1251,82 @@ fn static_field_prefix_is_rejected_as_unsupported() {
             .map(|d| d.render())
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn static_field_is_shared_per_type_and_created_at_declaration() {
+    // T2.1 (clause 6.9.3): one shared occurrence per type — zero
+    // instances still read the declaration-time value, every `init()`
+    // bumps the same counter, and the `!`-prefixed static string keeps
+    // its declaration value. Static fields are excluded from instance
+    // formatting (`print`/`to_string`).
+    let output = clean_output(
+        "<'\nstruct counter {\n    static count: uint;\n    static !label: string = \"ctr\";\n    id: uint;\n    init() is also { counter::count = counter::count + 1; };\n};\nextend sys {\n    run() is also {\n        out(counter::count, \"\\n\");\n        var a: counter = new; var b: counter = new; var c: counter = new;\n        out(counter::count, \"\\n\");\n        out(counter::label, \"\\n\");\n        out(a.id == b.id or TRUE, \"\\n\");\n        print a;\n    };\n};\n'>\n",
+        1,
+    );
+    assert_eq!(output, "0\n3\nctr\nTRUE\na = counter{id: 0}\n");
+}
+
+#[test]
+fn static_method_dispatches_without_an_instance() {
+    // T2.2 (clause 17.2.2): `Type::name(...)` calls without an
+    // instance; a static method may call a sibling static method
+    // through the type.
+    let output = clean_output(
+        "<'\nstruct math {\n    static sum(a: int, b: int): int is { return a + b; };\n    static twice(a: int): int is { return math::sum(a, a); };\n};\nextend sys {\n    run() is also { out(math::sum(2, 3), \"\\n\"); out(math::twice(21), \"\\n\"); };\n};\n'>\n",
+        1,
+    );
+    assert_eq!(output, "5\n42\n");
+}
+
+#[test]
+fn static_method_rejects_instance_dispatch() {
+    // T2.2 (clause 17.2.2): the instance call form has no static
+    // dispatch — a static method has no `me`, so the dot operator does
+    // not reach it.
+    let result = run_source(
+        "<'\nstruct sm {\n    static f(): uint is { return 3; };\n};\nextend sys {\n    run() is also {\n        var n: sm = new;\n        out(n.f());\n    };\n};\n'>\n",
+        1,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.render().contains("E0402") && d.render().contains("static method")),
+        "expected the static-dispatch diagnostic: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn static_event_fires_both_on_forms_with_no_instance() {
+    // T2.3 (clauses 11.1.4.1, 11.2): `emit Type::event` triggers the
+    // declaring type's `static on` blocks and every type-qualified
+    // `on Type::event` block, with no instance.
+    let output = clean_output(
+        "<'\nstruct bus {\n    static event reset;\n    static on reset { out(\"bus reset seen\\n\"); };\n};\nextend bus {\n    on bus::reset { out(\"qualified reset seen\\n\"); };\n};\nextend sys {\n    run() is also { emit bus::reset; emit bus::reset; };\n};\n'>\n",
+        1,
+    );
+    assert_eq!(
+        output,
+        "bus reset seen\nqualified reset seen\nbus reset seen\nqualified reset seen\n"
+    );
+}
+
+#[test]
+fn static_field_bare_name_resolves_inside_the_type() {
+    // T2.1 (clause 6.9.3): inside the type, the static field is
+    // reachable by its bare name — read and write — and a path may
+    // start at `Type::field` and continue through non-static fields.
+    let output = clean_output(
+        "<'\nstruct inner {\n    v: uint;\n};\nstruct holder {\n    static box: inner;\n    static tally: uint;\n    bump() is { tally = tally + 1; };\n    get_tally(): uint is { return tally; };\n};\nextend sys {\n    run() is also {\n        var n: holder = new;\n        n.bump();\n        out(n.get_tally(), \"\\n\");\n        out(holder::box.v == 0, \"\\n\");\n    };\n};\n'>\n",
+        1,
+    );
+    assert_eq!(output, "1\nTRUE\n");
 }
 
 #[test]
@@ -3009,6 +3087,81 @@ fn do_bind_outside_connect_ports_is_e0420() {
 }
 
 #[test]
+fn interface_dispatch_casts_and_is_a_compose() {
+    // 5.2.9/5.4.4.4/5.7.1/5.10.2.4 (the migration's T3.3): an
+    // interface-typed variable holds the implementing instance; a call
+    // through it dispatches on the object's actual type; `is a` holds
+    // for implementors; an `as_a` between an interface and an unrelated
+    // struct is legal and yields NULL on mismatch.
+    let output = clean_output(
+        "interface shape { area(): uint; };\n\
+         struct square implementing shape { side: uint; area(): uint is { return side * side; }; };\n\
+         struct rect implementing shape { w: uint; h: uint; area(): uint is { return w * h; }; };\n\
+         struct blob { };\n\
+         extend sys {\n    run() is also {\n        var sq: square = new; sq.side = 3;\n        \
+         var rc: rect = new; rc.w = 2; rc.h = 5;\n        \
+         var shapes: list of shape = {sq; rc};\n        \
+         var total: uint = 0;\n        \
+         for each (s) in shapes { total = total + s.area(); };\n        \
+         out(total, \"\n\");\n        \
+         var sh: shape = sq;\n        \
+         out(sh is a square, \"\n\");\n        \
+         out(sh.as_a(rect) == NULL, \"\n\");\n        \
+         var b: blob = new;\n        \
+         out(b is a shape, \"\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "19\nTRUE\nTRUE\nFALSE\n");
+}
+
+#[test]
+fn interface_base_assignment_and_casts_follow_inheritance() {
+    // 6.13 + 5.4.4.4: implementing an interface implies implementing its
+    // `like` bases — a struct→base-interface assignment is the automatic
+    // cast, an interface→base-interface cast keeps the pointer, and a
+    // base→unrelated-interface cast is legal but NULL.
+    let output = clean_output(
+        "interface base_i { m(): uint; };\n\
+         interface derived_i like base_i { n(): uint; };\n\
+         interface unrelated { m(): uint; };\n\
+         struct s implementing derived_i {\n    m(): uint is { return 7; };\n    n(): uint is { return 8; };\n};\n\
+         extend sys {\n    run() is also {\n        var d: derived_i = new s;\n        \
+         out(d.n(), \"\n\");\n        \
+         var b: base_i = d;\n        \
+         out(b.m(), \"\n\");\n        \
+         out(b.as_a(derived_i).n(), \"\n\");\n        \
+         var u: unrelated = b.as_a(unrelated);\n        \
+         out(u == NULL, \"\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "8\n7\n8\nTRUE\n");
+}
+
+#[test]
+fn interface_call_without_implementation_reports_e0414() {
+    // 6.13 (the migration's T3.4): the interface method resolves through
+    // the object's actual struct type; a type that implements the
+    // interface without providing the method is a run-time error at the
+    // call — E0414 names the struct and the method.
+    let result = run_source(
+        "interface shape { area(): uint; };\n\
+         struct lazy implementing shape { };\n\
+         extend sys {\n    run() is also {\n        var s: shape = new lazy;\n        \
+         s.area();\n    };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0414");
+    assert!(
+        diagnostic
+            .render()
+            .contains("struct 'lazy' does not implement interface method 'area'"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
 fn do_bind_inside_connect_ports_is_accepted() {
     // T8.2: inside the connect_ports() sub-phase the call is legal; the
     // keep-bind model has no procedural bindings pending, so it is a
@@ -3444,4 +3597,35 @@ fn swap_is_a_recognised_pack_tool_name() {
         "rendered: {}",
         diagnostic.render()
     );
+}
+
+#[test]
+fn interface_typed_values_print_the_underlying_struct_or_null() {
+    // T3.5: printing an interface-typed value renders the underlying
+    // instance exactly as a struct-typed one does; a NULL interface
+    // value (the default) prints NULL.
+    let output = clean_output(
+        "interface shape { area(): uint; };\n\
+         struct square implementing shape { side: uint; area(): uint is { return side * side; }; };\n\
+         extend sys {\n    run() is also {\n        var filled: shape = new square;\n        \
+         out(filled, \"\\n\");\n        \
+         var nothing: shape;\n        \
+         out(nothing, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "square{side: 0}\nNULL\n");
+}
+
+#[test]
+fn interface_default_and_generated_fields_are_null() {
+    // 5.2.9: an interface-typed field's default is NULL, and `gen` does
+    // not invent an instance for it — the field stays NULL.
+    let output = clean_output(
+        "interface shape { area(): uint; };\n\
+         struct holder {\n    sh: shape;\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         gen h;\n        out(h.sh == NULL, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUE\n");
 }

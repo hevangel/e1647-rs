@@ -1,0 +1,1 @@
+7:21: error[E0218]: keyed list key cannot be a static field: 'elem.k' (clause 5.2.11)

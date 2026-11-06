@@ -1,0 +1,2 @@
+6:12: error[E0306]: static field 'bad' of unit-instance type 'u' is not allowed (clause 6.9.3; 7.2.2, 7.2.4)
+7:12: error[E0306]: static field 'bad_list' of unit-instance type 'u' is not allowed (clause 6.9.3; 7.2.2, 7.2.4)

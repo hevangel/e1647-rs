@@ -1,0 +1,1 @@
+6:28: error[E0312]: cannot assign 'blob' to interface 'shape': 'blob' does not implement 'shape' (clause 5.4.4.4)

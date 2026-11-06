@@ -4,7 +4,11 @@
 //! fields (single names and name groups), `like` inheritance clauses, `keep`
 //! constraint expressions, enumeral type declarations, `when` subtype
 //! members, and methods with parameter lists and statement bodies (including
-//! `while`/`break`/`continue`). Temporal expressions, events and coverage
+//! `while`/`break`/`continue`). The 2019 `interface` declaration (clause
+//! 6.13) is represented with kind [`DeclarationKind::Interface`]: its
+//! members are method *signatures* (body-less [`MethodDecl`]s), and the
+//! `implementing` clause of structs, units and extends is recorded on
+//! [`Declaration::implements`]. Temporal expressions, events and coverage
 //! are later milestones and not representable here.
 
 use crate::lexer::Position;
@@ -18,6 +22,11 @@ pub enum DeclarationKind {
     Extend,
     /// `type name: [A, B, C];` — its members are [`Member::Enumeral`].
     Type,
+    /// `[package] interface name [like base, ...] { signature; ... }`
+    /// (clause 6.13): a named collection of method signatures. No object
+    /// is *of* an interface type; a value of interface type points at an
+    /// instance whose type implements the interface, or is NULL.
+    Interface,
 }
 
 /// One formal type parameter of a template declaration (clause 8.2):
@@ -60,9 +69,22 @@ pub struct Declaration {
     pub packaged: bool,
     /// `struct derived like base { .. }` inheritance clause. For
     /// template declarations the base name; the full parameterized base
-    /// type is in [`Declaration::like_type`].
+    /// type is in [`Declaration::like_type`]. Interfaces record their
+    /// (possibly several) bases in [`Declaration::bases`] and leave this
+    /// empty.
     pub like: Option<String>,
     pub like_span: Option<Span>,
+    /// `interface name like base1, base2, ... { .. }` (clause 6.13): the
+    /// inherited interfaces, in written order. An interface includes all
+    /// of their members. Only interfaces may appear here (checked in
+    /// `check.rs`); the spans point at each base name for diagnostics.
+    pub bases: Vec<(String, Span)>,
+    /// `struct S [like B] implementing I1, I2, ... { .. }` and
+    /// `extend S implementing I { .. }` (clause 6.3, 31.4): the
+    /// implemented interfaces, in written order. Elaboration composes
+    /// the per-type set (like-chain bases and extend blocks add to it);
+    /// subtypes implement their base's interfaces.
+    pub implements: Vec<String>,
     /// `template struct t of <type> like container of <type> { .. }` —
     /// the parameterized base type, recorded (clause 8.5.2).
     pub like_type: Option<TypeExpr>,
@@ -155,12 +177,17 @@ pub enum PortDirection {
 /// An `event` member: `event name;` (explicitly emitted) or
 /// `event name is <trigger>;` (e.g. `is fall(clk$) @sim`,
 /// `is cycle @p_smp.clock_f`, `is @sys.any`). The trigger is stored as
-/// written; edge scheduling is a later milestone.
+/// written; edge scheduling is a later milestone. The `static event`
+/// form (clause 11.1.4.1) belongs to the type itself — one occurrence,
+/// emitted as `Type::name` — and is not legal inside a `when` subtype.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventDecl {
     pub name: String,
     pub name_span: Span,
     pub trigger: Option<EventTrigger>,
+    /// `static event name;` — the event of the type itself (clause
+    /// 11.1.4.1), not of an instance.
+    pub is_static: bool,
     pub span: Span,
 }
 
@@ -222,11 +249,18 @@ pub struct Field {
     /// `const name` prefix (clause 6.9.4): the field is initialised once
     /// — by its init value, in `init()`, or by `do_unpack()`.
     pub is_const: bool,
+    /// `static name` prefix (clause 6.9.3): one shared occurrence per
+    /// declaring type, existing with zero instances, created at
+    /// declaration and initialised from the init value or the type
+    /// default. Storage and access rules are the static-members stage
+    /// (T2.1): the value lives in the interpreter's per-type static
+    /// store, never in an instance.
+    pub is_static: bool,
     /// `= init-value` suffix (clause 6.9.1/6.9.2), as written. Allowed
-    /// only where a value is not generated (a `!` or `const` field;
-    /// `static` is a later stage) and only for scalar/string/set fields
-    /// or lists thereof; `check.rs` enforces the generated-field rule
-    /// (E0211).
+    /// only where a value is not generated (a `!` or `const` field, or
+    /// a `static` field, whose value is created at declaration) and
+    /// only for scalar/string/set fields or lists thereof; `check.rs`
+    /// enforces the generated-field rule (E0211).
     pub init: Option<Expr>,
     /// `package name: ...;` / `protected name: ...;` / `private name:
     /// ...;` visibility prefix (clause 22), recorded only.
@@ -257,6 +291,12 @@ pub struct MethodDecl {
     pub tcm_event: Option<Expr>,
     /// `is also` / `is first` / `is only` extension modifier.
     pub modifier: Option<MethodModifier>,
+    /// `static name(params) ...` prefix (clause 17.2.2): the method is
+    /// called as `Type::name(...)` without an instance; `me` and the
+    /// generation/check/message actions are not usable in it (E0215,
+    /// E0216), and it can be extended only in the struct that declares
+    /// it (E0309). A static method is not a TCM.
+    pub is_static: bool,
     pub body: Vec<Stmt>,
     pub span: Span,
 }
@@ -302,10 +342,18 @@ pub struct MacroDecl {
 /// `on` member is a repeated declaration (the `is also` effect), so the
 /// composed list is ordered. The clause's restriction — no
 /// time-consuming actions or TCMs in the block — is not enforced here.
+/// The static forms (2019 clause 11.2): `static on <event>` runs on a
+/// static event of the context struct, and `on Type::event` names a
+/// static event of another struct explicitly; both run with no `me`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnDecl {
     /// The dotted event path (`reset_done`, `driver.clock`).
     pub path: Vec<String>,
+    /// `static on <event>` — the static form of the block.
+    pub is_static: bool,
+    /// `on Type::event` — the type-qualified form: the struct the named
+    /// static event belongs to.
+    pub type_qualified: Option<String>,
     pub body: Vec<Stmt>,
     pub span: Span,
 }
@@ -749,6 +797,9 @@ pub fn render_expr_compact(expr: &Expr) -> String {
         Expr::MemberAccess { object, name, .. } => {
             format!("{}.{}", render_expr_compact(object), name)
         }
+        Expr::StaticAccess {
+            type_name, member, ..
+        } => format!("{type_name}::{member}"),
         Expr::Paren { expr, .. } => format!("({})", render_expr_compact(expr)),
         _ => "...".to_owned(),
     }
@@ -1001,6 +1052,19 @@ pub enum Expr {
         items: InSetExpr,
         span: Span,
     },
+    /// `Type::member` — the static access (clause 4.17.4). One shared
+    /// occurrence per type: a static field's value, a static method
+    /// (when the access is a call's callee) or a static event (as an
+    /// `emit`/`on` target). The member must be declared `static` in
+    /// exactly `Type` — not a `like` parent — for the access to be
+    /// legal (E0307). A path may start here and continue through
+    /// non-static fields (`Type::field.sub`).
+    StaticAccess {
+        type_name: String,
+        member: String,
+        member_span: Span,
+        span: Span,
+    },
 }
 
 /// The right-hand side of an `in` membership expression.
@@ -1127,6 +1191,7 @@ impl Expr {
             | Expr::Evaluate { span, .. }
             | Expr::QualifiedField { span, .. }
             | Expr::SetLiteral { span, .. }
+            | Expr::StaticAccess { span, .. }
             | Expr::New { span, .. }
             | Expr::Select { span, .. }
             | Expr::HdlPath { span, .. } => *span,

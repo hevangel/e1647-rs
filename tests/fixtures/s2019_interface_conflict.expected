@@ -1,0 +1,1 @@
+4:11: error[E0219]: interface 'c' inherits conflicting signatures for 'f' (clause 6.13)

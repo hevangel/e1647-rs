@@ -1,0 +1,1 @@
+9:13: error[E0307]: 'b::s': 's' is not a static member declared in 'b' (clause 4.17.4)

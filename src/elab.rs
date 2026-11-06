@@ -19,10 +19,54 @@
 //!   the parser's `E0202`; reported once per name)
 //! - `E0303` a method is redefined without `is also` / `is first` /
 //!   `is only` (reported once per name)
+//!
+//! ## Interface attachment design (clause 6.13, 6.3 — the migration's
+//! T3.1–T3.4)
+//!
+//! Interfaces attach to composed types through the same member-composition
+//! model as everything else, without joining `like` chains:
+//!
+//! - An `interface` declaration composes to its own [`ElaboratedType`]
+//!   (kind `Interface`) whose `methods` are its transitive signatures —
+//!   the `like` bases' members folded first (in base order, recursively),
+//!   then its own; a repeated method name keeps its first entry. Interfaces
+//!   never enter the struct `like`-composition tables, so a struct cannot
+//!   inherit one as a base (the checker rejects that and `extend I`).
+//! - A struct/unit's `implementing` clause is collected by the same
+//!   `compose` walk that folds `like` chains and extends: the like-chain
+//!   bases' interface sets come first, then the declaration's own, then
+//!   each extend block's, deduped in written order. The composed set is
+//!   recorded on the elaborated type; synthesized `when`-subtype views
+//!   clone it (subtypes implement their base's interfaces). Assignment/
+//!   cast conformance checks read this set: a struct value cast to an
+//!   interface is kept when the set contains the interface (or an
+//!   interface that inherits it) and becomes NULL otherwise.
+//! - Dynamic dispatch needs no new machinery: an interface-typed value IS
+//!   the implementing instance (`Value::Object`), so a method call through
+//!   it resolves on the instance's actual type. The only addition is the
+//!   missing-method diagnosis: when the call's object expression is
+//!   interface-typed and the interface (transitively) declares the method
+//!   the instance's type does not provide, the interpreter reports `E0414`
+//!   instead of the plain not-found error.
+//!
+//! The interface-conflict diagnostics (E0219, E0311) and the assignment
+//! conformance check (E0312) run in `check.rs` — the well-formedness pass,
+//! which the fixture contract sees; this module records what the checks
+//! and the interpreter consume.
+//! - `E0318` a template extension's parameter count differs from the
+//!   template declaration's (8.2; reported once per extension)
+//!
+//! The elaboration-range static-member codes of the 2019 migration
+//! (`E0304`–`E0309`, `E0310`) are raised from the well-formedness pass
+//! ([`crate::check`]) in this stage: the fixture harness and the CLI's
+//! `parse` command stop at parse + check, so the diagnostics must be
+//! visible there; the codes keep their plan allocation. The static
+//! member registries this module produces ([`Elaborated::static_fields`]
+//! and siblings) are the interpreter's static-storage keyspace.
 
 use crate::ast::{
-    Declaration, DeclarationKind, Enumeral, Expr, Field, KeepConstraint, Member, MethodDecl, Stmt,
-    WhenDecl,
+    Declaration, DeclarationKind, Enumeral, EventDecl, Expr, Field, KeepConstraint, Member,
+    MethodDecl, Stmt, WhenDecl,
 };
 use crate::diagnostic::Diagnostic;
 use std::collections::{BTreeMap, BTreeSet};
@@ -75,6 +119,18 @@ pub struct ElaboratedType {
     /// milestones; the recording keeps the constraint out of gen and
     /// makes the setting visible.
     pub unit_attributes: Vec<(String, String, String)>,
+    /// `implementing I1, I2, ...` composed per type (clause 6.3): the
+    /// like-chain bases' interfaces first, then the declaration's own,
+    /// then each extend block's, deduped in written order. Synthesized
+    /// when-subtype views inherit the base's set — subtypes implement
+    /// their base's interfaces. The conformance checks (E0312 in
+    /// `check.rs`, the casts and `is a` in `interp.rs`) and the interface
+    /// conflict check (E0311) read this set.
+    pub implements: Vec<String>,
+    /// For an `interface` declaration (clause 6.13): the inherited
+    /// interfaces in written order. The composed `methods` list already
+    /// includes the transitive bases' signatures.
+    pub interface_bases: Vec<String>,
     pub span: crate::ast::Span,
 }
 
@@ -112,21 +168,47 @@ pub struct Elaborated {
     /// markers.
     pub sequences: Vec<SequenceInfo>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The static members (2019 static-members stage: clauses 6.9.3
+    /// fields, 17.2.2 methods, 11.1.4.1 events, 11.2 `on` blocks) by the
+    /// canonical name of the type that declares them — the base
+    /// declaration's name, or the extend target for an `extend T {
+    /// static ... }` member, so an extension adds to the same store the
+    /// declaration owns. Template-extension members are not folded in:
+    /// they apply per instance (8.2/8.3-NOTE-3), which a per-type
+    /// singleton contradicts (a documented gap). `when` blocks never
+    /// contribute — a static member there is rejected before elaboration
+    /// (E0304/E0310 at the well-formedness pass). The interpreter keys
+    /// its static store and its `Type::member` resolution by these names;
+    /// the well-formedness pass builds its own view of the same
+    /// namespace straight from the declarations.
+    pub static_fields: BTreeMap<String, Vec<Field>>,
+    pub static_methods: BTreeMap<String, Vec<MethodDecl>>,
+    pub static_events: BTreeMap<String, Vec<EventDecl>>,
+    /// Every static-context `on` block: `static on <event>` keyed by its
+    /// declaring type, and `on Type::event` keyed by the type that
+    /// declares the block (the interpreter matches the latter by the
+    /// block's `type_qualified` target instead).
+    pub static_ons: BTreeMap<String, Vec<crate::ast::OnDecl>>,
 }
 
 /// One type's members, tagged with the declaration or extend block that
-/// contributed them (its index in the declaration slice).
+/// contributed them (its index in the declaration slice). Events and
+/// `on` blocks carry the block index too — the static-member
+/// registries need the declaring type.
 #[derive(Debug, Default, Clone)]
 struct Composed<'a> {
     fields: Vec<(&'a Field, usize)>,
     constraints: Vec<&'a KeepConstraint>,
     methods: Vec<(&'a MethodDecl, usize)>,
     whens: Vec<&'a WhenDecl>,
-    ons: Vec<&'a crate::ast::OnDecl>,
+    ons: Vec<(&'a crate::ast::OnDecl, usize)>,
     covers: Vec<&'a crate::ast::CoverGroupDecl>,
     expects: Vec<&'a crate::ast::ExpectDecl>,
-    events: Vec<&'a crate::ast::EventDecl>,
+    events: Vec<(&'a crate::ast::EventDecl, usize)>,
     ports: Vec<(&'a crate::ast::PortDecl, usize)>,
+    /// The `implementing` clause composed across the like chain and the
+    /// extend blocks (clause 6.3), deduped in written order.
+    implements: Vec<&'a str>,
 }
 
 impl<'a> Composed<'a> {
@@ -196,6 +278,10 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             DeclarationKind::Struct | DeclarationKind::Unit | DeclarationKind::Type => {
                 base_by_name.insert(declaration.name.as_str(), index);
             }
+            // An interface is not a `like`-composable struct base (the
+            // checker rejects `struct S like I` and `extend I`); it
+            // composes through its own arm below.
+            DeclarationKind::Interface => {}
         }
     }
     let mut elaborator = Elaborator {
@@ -242,11 +328,15 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                         .map(|(method, _)| method.clone())
                         .collect(),
                     whens: composed.whens.into_iter().cloned().collect(),
-                    ons: composed.ons.into_iter().cloned().collect(),
+                    ons: composed.ons.into_iter().map(|(on, _)| on.clone()).collect(),
                     covers: composed.covers.into_iter().cloned().collect(),
                     expects: composed.expects.into_iter().cloned().collect(),
                     when_of: Vec::new(),
-                    events: composed.events.into_iter().cloned().collect(),
+                    events: composed
+                        .events
+                        .into_iter()
+                        .map(|(event, _)| event.clone())
+                        .collect(),
                     underlying: None,
                     enumerals: Vec::new(),
                     ports: composed
@@ -262,6 +352,8 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                         })
                         .collect(),
                     unit_attributes,
+                    implements: composed.implements.into_iter().map(str::to_owned).collect(),
+                    interface_bases: Vec::new(),
                     span: declaration.span,
                 });
             }
@@ -281,6 +373,8 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 underlying: declaration.underlying.clone(),
                 ports: Vec::new(),
                 unit_attributes: Vec::new(),
+                implements: Vec::new(),
+                interface_bases: Vec::new(),
                 enumerals: declaration
                     .members
                     .iter()
@@ -291,6 +385,49 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                     .collect(),
                 span: declaration.span,
             }),
+            // Clause 6.13: an interface composes to its transitive
+            // signatures — the `like` bases' members folded first (in
+            // base order, recursively), then its own; a repeated method
+            // name keeps its first entry (exact duplicates collapse;
+            // conflicting signatures are E0219 in `check.rs`). No
+            // `extend` folding — extending an interface is rejected.
+            DeclarationKind::Interface => {
+                let mut methods: Vec<MethodDecl> = Vec::new();
+                let mut seen: BTreeSet<String> = BTreeSet::new();
+                let mut stack: Vec<String> = Vec::new();
+                fold_interface_methods(
+                    &declaration.name,
+                    declarations,
+                    &mut stack,
+                    &mut seen,
+                    &mut methods,
+                    &mut elaborator.diagnostics,
+                );
+                types.push(ElaboratedType {
+                    kind: DeclarationKind::Interface,
+                    name: declaration.name.clone(),
+                    base: None,
+                    fields: Vec::new(),
+                    constraints: Vec::new(),
+                    methods,
+                    whens: Vec::new(),
+                    ons: Vec::new(),
+                    covers: Vec::new(),
+                    expects: Vec::new(),
+                    when_of: Vec::new(),
+                    events: Vec::new(),
+                    underlying: None,
+                    ports: Vec::new(),
+                    implements: Vec::new(),
+                    interface_bases: declaration
+                        .bases
+                        .iter()
+                        .map(|(base, _)| base.clone())
+                        .collect(),
+                    enumerals: Vec::new(),
+                    span: declaration.span,
+                });
+            }
             DeclarationKind::Extend => {}
         }
     }
@@ -455,7 +592,8 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         for (method, _) in composed.methods {
             methods.push(substitute_method(method.clone(), &bindings, &mut queue));
         }
-        let mut ons: Vec<crate::ast::OnDecl> = composed.ons.into_iter().cloned().collect();
+        let mut ons: Vec<crate::ast::OnDecl> =
+            composed.ons.into_iter().map(|(on, _)| on.clone()).collect();
         for on in &mut ons {
             substitute_statements(&mut on.body, &bindings, &mut queue);
         }
@@ -479,7 +617,12 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                 if reported_extension_arity.insert(extension_index) {
                     let (start, end) = extension.name_span;
                     elaborator.diagnostics.push(Diagnostic::new(
-                        "E0304",
+                        // E0304 is allocated to the static-members stage
+                        // ("static member in when subtype"); this
+                        // template-arity mismatch predates that
+                        // allocation and takes the next free elaboration
+                        // code (the migration plan's collision rule).
+                        "E0318",
                         format!(
                             "template extension '{}' declares {} parameter(s) but template '{}' declares {}",
                             extension.name,
@@ -561,6 +704,11 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             enumerals: Vec::new(),
             ports: Vec::new(),
             unit_attributes: Vec::new(),
+            // The template's `implementing` clause carries over as
+            // written; parameterised interfaces over the template's
+            // formals substitute at instantiation in the T4.3 milestone.
+            implements: composed.implements.into_iter().map(str::to_owned).collect(),
+            interface_bases: Vec::new(),
             span: template.span,
         });
     }
@@ -623,7 +771,129 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         defines,
         sequences,
         diagnostics: elaborator.diagnostics,
+        static_fields: static_registry(declarations),
+        static_methods: static_registry(declarations),
+        static_events: static_registry(declarations),
+        static_ons: static_registry(declarations),
     }
+}
+
+/// The static-member registries (see [`Elaborated`]'s fields): one
+/// shared collection walk keyed by the declaring type's canonical name.
+/// Members are collected in declaration order — base declaration first,
+/// then each extend block in source order — which is the order the
+/// interpreter composes static `on` blocks and static method bodies in.
+fn static_registry<K: RegistryKind>(declarations: &[Declaration]) -> BTreeMap<String, Vec<K>> {
+    let mut registry: BTreeMap<String, Vec<K>> = BTreeMap::new();
+    for declaration in declarations {
+        // Only struct/unit declarations and the extend blocks that
+        // target them contribute; a `type` declaration has no members of
+        // these kinds, and a template extension applies per instance
+        // (8.2/8.3-NOTE-3), never to the type's static store.
+        if !matches!(
+            declaration.kind,
+            DeclarationKind::Struct | DeclarationKind::Unit | DeclarationKind::Extend
+        ) || declaration.template_extend
+        {
+            continue;
+        }
+        for member in &declaration.members {
+            if let Some(entry) = K::from_member(member) {
+                registry
+                    .entry(declaration.name.clone())
+                    .or_default()
+                    .push(entry);
+            }
+        }
+    }
+    registry
+}
+
+/// One static-registry value kind extracted from a member.
+trait RegistryKind: Sized {
+    fn from_member(member: &Member) -> Option<Self>;
+}
+
+impl RegistryKind for Field {
+    fn from_member(member: &Member) -> Option<Self> {
+        match member {
+            Member::Field(field) if field.is_static => Some(field.clone()),
+            _ => None,
+        }
+    }
+}
+
+impl RegistryKind for MethodDecl {
+    fn from_member(member: &Member) -> Option<Self> {
+        match member {
+            Member::Method(method) if method.is_static => Some(method.clone()),
+            _ => None,
+        }
+    }
+}
+
+impl RegistryKind for crate::ast::EventDecl {
+    fn from_member(member: &Member) -> Option<Self> {
+        match member {
+            Member::Event(event) if event.is_static => Some(event.clone()),
+            _ => None,
+        }
+    }
+}
+
+impl RegistryKind for crate::ast::OnDecl {
+    fn from_member(member: &Member) -> Option<Self> {
+        match member {
+            // Both static forms of clause 11.2 are static-context blocks:
+            // `static on <event>` and the type-qualified `on Type::event`.
+            Member::On(on) if on.is_static || on.type_qualified.is_some() => Some(on.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Fold one interface's transitive method signatures (clause 6.13): the
+/// `like` bases' members first (recursively, in base order), then the
+/// interface's own; a repeated method name keeps its first entry. A
+/// `like` cycle is reported once per fold entry (E0301) and stops the
+/// walk.
+fn fold_interface_methods(
+    name: &str,
+    declarations: &[Declaration],
+    stack: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    methods: &mut Vec<MethodDecl>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(declaration) = declarations
+        .iter()
+        .find(|d| d.kind == DeclarationKind::Interface && d.name == name)
+    else {
+        return;
+    };
+    if stack.iter().any(|entry| entry == name) {
+        let (start, end) = declaration.name_span;
+        diagnostics.push(Diagnostic::new(
+            "E0301",
+            format!("inheritance cycle involving '{name}'"),
+            start,
+            end,
+        ));
+        return;
+    }
+    stack.push(name.to_owned());
+    for (base, _) in &declaration.bases {
+        fold_interface_methods(base, declarations, stack, seen, methods, diagnostics);
+    }
+    for member in &declaration.members {
+        let Member::Method(method) = member else {
+            continue;
+        };
+        if seen.insert(method.name.clone()) {
+            methods.push(method.clone());
+        }
+    }
+    stack.pop();
 }
 
 impl<'a> Elaborator<'a> {
@@ -667,11 +937,15 @@ impl<'a> Elaborator<'a> {
                     .map(|(method, _)| method.clone())
                     .collect(),
                 whens: composed.whens.into_iter().cloned().collect(),
-                ons: composed.ons.into_iter().cloned().collect(),
+                ons: composed.ons.into_iter().map(|(on, _)| on.clone()).collect(),
                 covers: composed.covers.into_iter().cloned().collect(),
                 expects: composed.expects.into_iter().cloned().collect(),
                 when_of: Vec::new(),
-                events: composed.events.into_iter().cloned().collect(),
+                events: composed
+                    .events
+                    .into_iter()
+                    .map(|(event, _)| event.clone())
+                    .collect(),
                 underlying: None,
                 enumerals: Vec::new(),
                 ports: composed
@@ -690,6 +964,8 @@ impl<'a> Elaborator<'a> {
                     .iter()
                     .flat_map(|index| self.extract_unit_attributes(&self.declarations[*index]))
                     .collect(),
+                implements: composed.implements.into_iter().map(str::to_owned).collect(),
+                interface_bases: Vec::new(),
                 span: self.declarations[extend_indices[0]].span,
             });
         }
@@ -882,17 +1158,25 @@ impl<'a> Elaborator<'a> {
     }
 
     fn push_members(declaration: &'a Declaration, block: usize, composed: &mut Composed<'a>) {
+        // The `implementing` clause rides with the contributing block
+        // (clause 6.3): a like-chain base's interfaces, the declaration's
+        // own, and each extend block's compose in written order, deduped.
+        for interface_name in &declaration.implements {
+            if !composed.implements.contains(&interface_name.as_str()) {
+                composed.implements.push(interface_name.as_str());
+            }
+        }
         for member in &declaration.members {
             match member {
                 Member::Field(field) => composed.fields.push((field, block)),
                 Member::Constraint(constraint) => composed.constraints.push(constraint),
                 Member::Method(method) => composed.methods.push((method, block)),
                 Member::When(when) => composed.whens.push(when),
-                Member::On(on) => composed.ons.push(on),
+                Member::On(on) => composed.ons.push((on, block)),
                 Member::Cover(cover) => composed.covers.push(cover),
                 Member::Expect(expect) => composed.expects.push(expect),
                 Member::Port(port) => composed.ports.push((port, block)),
-                Member::Event(event) => composed.events.push(event),
+                Member::Event(event) => composed.events.push((event, block)),
                 Member::Import { .. } | Member::Define { .. } | Member::Macro(_) => {}
                 Member::Enumeral(_) => {}
             }

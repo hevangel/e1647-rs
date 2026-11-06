@@ -1,0 +1,1 @@
+3:13: error[E0305]: static field 'x' cannot be physical or generated (clause 6.9.3)

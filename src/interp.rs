@@ -147,7 +147,8 @@
 //! the one-cycle implicit sync of the stand-alone model.
 
 use crate::ast::{
-    BinaryOp, DeclarationKind, Expr, MethodDecl, ScalarBase, Stmt, TypeExpr, UnaryOp, WhenQualifier,
+    BinaryOp, DeclarationKind, EventDecl, Expr, Field, MethodDecl, OnDecl, ScalarBase, Stmt,
+    TypeExpr, UnaryOp, WhenQualifier,
 };
 use crate::diagnostic::Diagnostic;
 use crate::elab::Elaborated;
@@ -504,6 +505,49 @@ struct Interp<'a> {
     dut_errors: usize,
     /// `define` constants resolved to values.
     defines: std::collections::BTreeMap<String, Value>,
+    /// The static field store (T2.1): one shared occurrence per
+    /// declaring type, keyed by the canonical type name the static
+    /// member is declared in, then by field name. Initialized at
+    /// program start — a static field exists with zero instances — and
+    /// read/written by `Type::field` accesses and by bare static names.
+    ///
+    /// ## Static-storage design note (T2.1–T2.3)
+    ///
+    /// Static storage lives HERE, in the interpreter: a per-type map
+    /// keyed by the canonical name of the type that declares the
+    /// member, created at program start (so a static field exists with
+    /// zero instances) and initialised once from the field's init value
+    /// or type default. The declaring name comes from the elaboration's
+    /// static registries ([`Elaborated::static_fields`] and siblings),
+    /// whose key is the type the member was declared in — the base
+    /// declaration's name, or the extend target for an `extend T {
+    /// static ... }` member, so extension adds to the same store. A
+    /// `when` subtype never contributes: static members are rejected
+    /// inside `when` blocks at the well-formedness pass (E0304/E0310),
+    /// and the synthesized views' field lists may carry the base's
+    /// static flags but the view's own name is never a store key — a
+    /// bare static reference from a view instance resolves through the
+    /// view's base chain to the owning store. `Type::field` resolves
+    /// through the same registries: the member must be declared in
+    /// exactly `Type` (validated by the well-formedness pass, E0307),
+    /// and the access reads/writes `statics[Type][field]`; a path may
+    /// start at a static field and continue through instance fields of
+    /// its value. Instances never carry static fields —
+    /// [`Interp::instantiate`] skips them, so `gen` skips them and
+    /// instance formatting (`print`, `to_string`) never includes them.
+    statics: BTreeMap<String, BTreeMap<String, Value>>,
+    /// The static members by declaring type name (from elaboration):
+    /// fields, methods, events, and the static `on` blocks. The
+    /// `Type::member` runtime resolution reads these; a static field's
+    /// store key is the same name.
+    static_fields: &'a BTreeMap<String, Vec<Field>>,
+    static_methods: &'a BTreeMap<String, Vec<MethodDecl>>,
+    static_events: &'a BTreeMap<String, Vec<EventDecl>>,
+    static_ons: &'a BTreeMap<String, Vec<OnDecl>>,
+    /// The type whose static method is currently executing (T2.2):
+    /// bare static-field and bare static-method references inside a
+    /// static method resolve against it (`me` does not exist there).
+    static_context: Option<String>,
     /// The declared type expected of the expression currently being
     /// evaluated, when the evaluation site knows one: the declared type
     /// of a `var`/assignment target or of the call argument's parameter.
@@ -696,6 +740,12 @@ fn run_inner(
         stop_requested: false,
         dut_errors: 0,
         defines,
+        statics: BTreeMap::new(),
+        static_fields: &elaborated.static_fields,
+        static_methods: &elaborated.static_methods,
+        static_events: &elaborated.static_events,
+        static_ons: &elaborated.static_ons,
+        static_context: None,
         expected_type: None,
         new_type_hint: None,
         pending_diagnostics: Vec::new(),
@@ -706,6 +756,41 @@ fn run_inner(
         in_connect_ports: false,
         overall_grade: None,
     };
+    // The static fields are created at declaration (clause 6.9.3):
+    // every store entry exists before any instance does, initialised
+    // from the init value or the type default. Init values are constant
+    // expressions, so the empty-frame / no-instance context suffices;
+    // an expression that cannot evaluate keeps the type default and the
+    // failure is reported through the run diagnostics.
+    let static_inits: Vec<(String, Field)> = elaborated
+        .static_fields
+        .iter()
+        .flat_map(|(type_name, fields)| {
+            fields
+                .iter()
+                .map(move |field| (type_name.clone(), field.clone()))
+        })
+        .collect();
+    for (type_name, field) in static_inits {
+        let value = match &field.init {
+            Some(init) => {
+                let mut frame = Frame::default();
+                match interp.eval(init, &mut frame, None) {
+                    Ok(value) => value,
+                    Err(diagnostic) => {
+                        interp.pending_diagnostics.push(diagnostic);
+                        interp.default_for(&field.ty)
+                    }
+                }
+            }
+            None => interp.default_for(&field.ty),
+        };
+        interp
+            .statics
+            .entry(type_name)
+            .or_default()
+            .insert(field.name, value);
+    }
     let types: &[crate::elab::ElaboratedType] = interp.types;
     let Some(sys) = types
         .iter()
@@ -1205,12 +1290,18 @@ impl<'a> Interp<'a> {
         let types: &[crate::elab::ElaboratedType] = self.types;
         if let Some(ty) = types.iter().find(|t| t.name == type_name) {
             for field in &ty.fields {
+                // A static field does not live in instances (clause
+                // 6.9.3): its one shared occurrence is in the per-type
+                // static store, so instance creation skips it — which
+                // also keeps it out of `gen` and out of instance
+                // formatting (`print`, `to_string`).
+                if field.is_static {
+                    continue;
+                }
                 let value = match &field.init {
                     // Clause 6.9.1/6.9.4: a field's init value is set at
-                    // instance creation, before `init()` runs (the
-                    // `init()` dispatch itself is a later milestone, so
-                    // instance creation is the only init point today).
-                    // Init values are constant expressions, so the empty
+                    // instance creation, before `init()` runs. Init
+                    // values are constant expressions, so the empty
                     // frame / no-instance context suffices; an expression
                     // that cannot evaluate keeps the type default and the
                     // failure is reported through the run diagnostics.
@@ -1261,6 +1352,41 @@ impl<'a> Interp<'a> {
             if let Some(v) = self.determinant_value(index, &id, &value) {
                 self.instances[index].set(&id, v);
             }
+        }
+        // The composed `init()` blocks run at instance creation (the
+        // clause 17.1 implicit call; the static-members runtime test
+        // relies on it). e calls `init()` after the instance's
+        // generation; this model runs it at creation — the only point
+        // shared by every creation site — so a later explicit `gen` of
+        // the instance can overwrite generated fields it set (a
+        // documented approximation). The blocks run inline (an atomic
+        // region: no suspension), with the fresh instance as `me`; a
+        // block's error is collected and instance creation still
+        // succeeds, like a field init failure.
+        if self.depth <= 100 {
+            let init_blocks: Vec<Vec<Stmt>> = types
+                .iter()
+                .find(|t| t.name == type_name)
+                .map(|ty| {
+                    ty.methods
+                        .iter()
+                        .filter(|method| method.name == "init")
+                        .map(|method| method.body.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.depth += 1;
+            self.atomic_depth += 1;
+            for body in &init_blocks {
+                let mut frame = Frame::default();
+                match self.exec_block(body, &mut frame, Some(index)) {
+                    Ok(Flow::Stop) => self.stop_requested = true,
+                    Ok(_) => {}
+                    Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
+                }
+            }
+            self.atomic_depth -= 1;
+            self.depth -= 1;
         }
         index
     }
@@ -1329,14 +1455,21 @@ impl<'a> Interp<'a> {
             }
             TypeExpr::Named { name, .. } => {
                 let types: &[crate::elab::ElaboratedType] = self.types;
-                if let Some(t) = types.iter().find(|t| t.name == name.as_str())
-                    && t.kind == DeclarationKind::Type
-                    && let Some(first) = t.enumerals.first()
-                {
-                    return Value::Enum {
-                        type_name: name.clone(),
-                        name: first.name.clone(),
-                    };
+                if let Some(t) = types.iter().find(|t| t.name == name.as_str()) {
+                    // Clause 5.2.9/5.4.4.4: an interface-typed value is a
+                    // pointer to an instance that implements the
+                    // interface, or NULL — the default.
+                    if t.kind == DeclarationKind::Interface {
+                        return Value::Void;
+                    }
+                    if t.kind == DeclarationKind::Type
+                        && let Some(first) = t.enumerals.first()
+                    {
+                        return Value::Enum {
+                            type_name: name.clone(),
+                            name: first.name.clone(),
+                        };
+                    }
                 }
                 if self.depth > 100 {
                     return Value::Void;
@@ -2196,9 +2329,19 @@ impl<'a> Interp<'a> {
             Stmt::Emit { target, span } => {
                 // 11.1.3.2: emit causes the event to occur; the action
                 // itself does not consume time.
-                let path = self.event_path(target)?;
-                let owner = self.resolve_event_owner(target, frame, me);
-                self.fire_event(&path, owner, *span, frame)?;
+                if let Expr::StaticAccess {
+                    type_name, member, ..
+                } = target
+                {
+                    // `emit Type::event` (clause 11.2): the static
+                    // event of the type itself — one occurrence, no
+                    // instance, the static `on` blocks run with no `me`.
+                    self.fire_static_event(type_name, member, *span, frame)?;
+                } else {
+                    let path = self.event_path(target)?;
+                    let owner = self.resolve_event_owner(target, frame, me);
+                    self.fire_event(&path, owner, *span, frame)?;
+                }
                 Ok(Flow::Normal)
             }
             Stmt::Start { call, span } => {
@@ -2229,6 +2372,19 @@ impl<'a> Interp<'a> {
                             return Err(self.error("E0402", "start requires an object", *span));
                         };
                         (index, name.clone())
+                    }
+                    // A static method is not a TCM (clause 17.2.2): it
+                    // has no instance to schedule and no sampling event.
+                    Expr::StaticAccess {
+                        type_name, member, ..
+                    } => {
+                        return Err(self.error(
+                            "E0402",
+                            format!(
+                                "'{type_name}::{member}' is a static method; static methods are not TCMs and cannot be started"
+                            ),
+                            *span,
+                        ));
                     }
                     _ => return Err(self.error("E0402", "start target not supported", *span)),
                 };
@@ -2323,6 +2479,18 @@ impl<'a> Interp<'a> {
                             return Err(self.error("E0402", "compute requires an object", *span));
                         };
                         self.call_method(index, name, values, *span)?;
+                    }
+                    // See `start`: a static method is not a TCM.
+                    Expr::StaticAccess {
+                        type_name, member, ..
+                    } => {
+                        return Err(self.error(
+                            "E0402",
+                            format!(
+                                "'{type_name}::{member}' is a static method; static methods are not TCMs and cannot be computed"
+                            ),
+                            *span,
+                        ));
                     }
                     _ => return Err(self.error("E0402", "compute target not supported", *span)),
                 }
@@ -2625,14 +2793,17 @@ impl<'a> Interp<'a> {
         // not generated — they are instantiated structurally. A `const`
         // field keeps its value too: it is initialised once (by its init
         // value, in `init()`, or by `do_unpack()` — clause 6.9.4), so
-        // generation must not overwrite it. A subtype view's determinant
-        // fields are fixed by the view (6.7) and are not sampled.
+        // generation must not overwrite it. A static field is not an
+        // instance member at all (clause 6.9.3) and is never generated.
+        // A subtype view's determinant fields are fixed by the view
+        // (6.7) and are not sampled.
         let field_types: Vec<(String, TypeExpr)> = ty
             .fields
             .iter()
             .filter(|field| {
                 !field.no_gen
                     && !field.is_const
+                    && !field.is_static
                     && !self.is_unit_typed(&field.ty)
                     && !ty.when_of.iter().any(|(id, _)| id == &field.name)
             })
@@ -3142,18 +3313,24 @@ impl<'a> Interp<'a> {
             }
             TypeExpr::Named { name, .. } => {
                 let types: &[crate::elab::ElaboratedType] = self.types;
-                if let Some(t) = types.iter().find(|t| t.name == name.as_str())
-                    && t.kind == DeclarationKind::Type
-                {
-                    let names: Vec<&str> = t.enumerals.iter().map(|e| e.name.as_str()).collect();
-                    if names.is_empty() {
+                if let Some(t) = types.iter().find(|t| t.name == name.as_str()) {
+                    // Clause 5.2.9: no object is of an interface type — a
+                    // generated interface-typed field stays NULL.
+                    if t.kind == DeclarationKind::Interface {
                         return Ok(Value::Void);
                     }
-                    let pick = names[self.rng.below(names.len() as u128) as usize];
-                    return Ok(Value::Enum {
-                        type_name: name.clone(),
-                        name: pick.to_owned(),
-                    });
+                    if t.kind == DeclarationKind::Type {
+                        let names: Vec<&str> =
+                            t.enumerals.iter().map(|e| e.name.as_str()).collect();
+                        if names.is_empty() {
+                            return Ok(Value::Void);
+                        }
+                        let pick = names[self.rng.below(names.len() as u128) as usize];
+                        return Ok(Value::Enum {
+                            type_name: name.clone(),
+                            name: pick.to_owned(),
+                        });
+                    }
                 }
                 if self.depth > 50 {
                     return Err(self.error("E0406", "recursion too deep", origin_span()));
@@ -3281,6 +3458,18 @@ impl<'a> Interp<'a> {
                 return Err(diagnostic);
             }
         };
+        // A static method is called as `Type::name(...)` (clause 17.2.2)
+        // — the instance form has no static dispatch: it would hand the
+        // method a `me` that a static method must not have.
+        if blocks.iter().all(|block| block.is_static) {
+            return Err(self.error(
+                "E0402",
+                format!(
+                    "'{name}' is a static method of '{type_name}'; call it as '{type_name}::{name}(...)' (clause 17.2.2)"
+                ),
+                span,
+            ));
+        }
         if self.depth > 200 {
             return Err(self.error("E0406", "recursion too deep", span));
         }
@@ -3326,6 +3515,141 @@ impl<'a> Interp<'a> {
         self.atomic_depth -= 1;
         self.depth -= 1;
         Ok(result)
+    }
+
+    /// `Type::method(args)` — the static method dispatch (clause
+    /// 17.2.2): the composed static blocks of the declaring type run
+    /// without a receiver. A static method is not a TCM: its body is an
+    /// atomic region like an inline call, and bare static-field /
+    /// static-method references inside it resolve against
+    /// `static_context` (this type).
+    fn call_static_method(
+        &mut self,
+        type_name: &str,
+        name: &str,
+        args: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let blocks: Vec<&MethodDecl> = self
+            .static_methods
+            .get(type_name)
+            .map(|methods| {
+                methods
+                    .iter()
+                    .filter(|method| method.name == name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if blocks.is_empty() {
+            return Err(self.error(
+                "E0401",
+                format!("static method '{type_name}::{name}' not found"),
+                span,
+            ));
+        }
+        if self.depth > 200 {
+            return Err(self.error("E0406", "recursion too deep", span));
+        }
+        self.depth += 1;
+        self.atomic_depth += 1;
+        let previous_context = self.static_context.take();
+        self.static_context = Some(type_name.to_owned());
+        let mut result = Value::Void;
+        for block in &blocks {
+            if args.len() != block.params.len() {
+                self.static_context = previous_context;
+                self.atomic_depth -= 1;
+                self.depth -= 1;
+                return Err(self.error(
+                    "E0402",
+                    format!(
+                        "static method '{name}' expects {} argument(s), got {}",
+                        block.params.len(),
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            let mut frame = Frame::default();
+            for (param, arg) in block.params.iter().zip(args.iter()) {
+                if let Some(ty) = &param.ty {
+                    frame.local_types.insert(param.name.clone(), ty.clone());
+                }
+                frame.locals.insert(param.name.clone(), arg.clone());
+            }
+            match self.exec_block(&block.body, &mut frame, None)? {
+                Flow::Return(value) => result = value,
+                Flow::Normal | Flow::Break | Flow::Continue => {}
+                Flow::Stop => {
+                    self.stop_requested = true;
+                }
+                // Suspension is disabled in atomic regions.
+                Flow::Suspend => {}
+            }
+        }
+        self.static_context = previous_context;
+        self.atomic_depth -= 1;
+        self.depth -= 1;
+        Ok(result)
+    }
+
+    /// The value of `Type::field` from the static store (clause
+    /// 6.9.3/4.17.4). The well-formedness pass validates the access
+    /// shape; a missing entry is a runtime gap (see the store's design
+    /// note on `Interp::statics`).
+    fn read_static_field(
+        &self,
+        type_name: &str,
+        member: &str,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        self.statics
+            .get(type_name)
+            .and_then(|fields| fields.get(member))
+            .cloned()
+            .ok_or_else(|| {
+                self.error(
+                    "E0401",
+                    format!("unknown static member '{type_name}::{member}'"),
+                    span,
+                )
+            })
+    }
+
+    /// The declaring type of a static field referenced by bare name, or
+    /// `None`. The starting point is the enclosing instance's type (an
+    /// instance method sees its type's and its ancestors' statics) or,
+    /// inside a static method, the static context's type. The walk
+    /// follows the composed `base` chain (like parents, when views to
+    /// their base) to the type whose registry declares the field — the
+    /// same name its store entry lives under.
+    fn bare_static_field_owner(&self, me: Option<usize>, name: &str) -> Option<String> {
+        let start = match (me, &self.static_context) {
+            (Some(index), _) => self.instances[index].type_name.clone(),
+            (None, Some(type_name)) => type_name.clone(),
+            (None, None) => return None,
+        };
+        self.static_field_owner_from(&start, name)
+    }
+
+    fn static_field_owner_from(&self, start: &str, name: &str) -> Option<String> {
+        let mut current = start.to_owned();
+        // The chain is bounded (elaboration rejects cycles); the cap
+        // keeps a pathological type list from looping here.
+        for _ in 0..64 {
+            if let Some(fields) = self.static_fields.get(&current)
+                && fields.iter().any(|field| field.name == name)
+            {
+                return Some(current);
+            }
+            let base = self
+                .types
+                .iter()
+                .find(|ty| ty.name == current)
+                .and_then(|ty| ty.base.clone())?;
+            current = base;
+        }
+        None
     }
 
     /// Dispatch a built-in routine call.
@@ -4440,6 +4764,12 @@ impl<'a> Interp<'a> {
                 prefix.push_str(name);
                 Ok(prefix)
             }
+            // `Type::event` — a static event's log path is its
+            // type-qualified spelling (`bus::reset`), the form TCM
+            // sampling events (`f() @bus::reset`) park on.
+            Expr::StaticAccess {
+                type_name, member, ..
+            } => Ok(format!("{type_name}::{member}")),
             _ => Err(self.error("E0402", "unsupported event target", target.span())),
         }
     }
@@ -5432,6 +5762,8 @@ impl<'a> Interp<'a> {
                     _ => None,
                 }
             }
+            // A static event has no instance owner.
+            Expr::StaticAccess { .. } => None,
             _ => None,
         }
     }
@@ -5487,6 +5819,92 @@ impl<'a> Interp<'a> {
         }
         self.atomic_depth -= 1;
         self.depth -= 1;
+        Ok(())
+    }
+
+    /// Fire the static event `Type::event` (clause 11.1.4.1/11.2): one
+    /// occurrence of the type itself, no instance. The occurrence is
+    /// recorded in the temporal log under the type-qualified path
+    /// (`bus::reset`) — the same log every event shares — TCMs parked
+    /// on the path (`f() @bus::reset`) wake, and the static `on` blocks
+    /// run: the declaring type's `static on <event>` blocks (composed
+    /// per type, base-most first, then extends) and every
+    /// type-qualified `on Type::event` block, all with no `me` (the
+    /// same restrictions the static methods have, E0215/E0216 at the
+    /// well-formedness pass). Coverage groups are sampled by path with
+    /// no owner — an instance-dependent item evaluation has no `me` and
+    /// keeps its previous behavior of not sampling.
+    fn fire_static_event(
+        &mut self,
+        type_name: &str,
+        event_name: &str,
+        span: crate::ast::Span,
+        frame: &mut Frame,
+    ) -> Result<(), Diagnostic> {
+        // The well-formedness pass validated the spelling; the runtime
+        // check is the backstop for the documented gaps (statics inside
+        // template bodies).
+        let declared = self
+            .static_events
+            .get(type_name)
+            .is_some_and(|events| events.iter().any(|event| event.name == event_name));
+        if !declared {
+            return Err(self.error(
+                "E0401",
+                format!("unknown static event '{type_name}::{event_name}'"),
+                span,
+            ));
+        }
+        let path = format!("{type_name}::{event_name}");
+        self.emitted.insert(path.clone());
+        self.pad_log();
+        self.temporal_log[self.cycle as usize].record(&path);
+        self.wake_tcm_listeners(&path);
+        // The static on blocks: `static on <event>` of the declaring
+        // type, plus every `on Type::event` block regardless of its
+        // declaring type — both are static context (clause 11.2's
+        // static forms), composed per type, not per instance.
+        let mut blocks: Vec<(String, OnDecl)> = Vec::new();
+        for (owner, ons) in self.static_ons {
+            for on in ons {
+                let matches_static = owner == type_name
+                    && on.type_qualified.is_none()
+                    && on.is_static
+                    && on.path.last().map(String::as_str) == Some(event_name);
+                let matches_qualified = on.type_qualified.as_deref() == Some(type_name)
+                    && on.path.last().map(String::as_str) == Some(event_name);
+                if matches_static || matches_qualified {
+                    blocks.push((owner.clone(), on.clone()));
+                }
+            }
+        }
+        if !blocks.is_empty() {
+            if self.depth > 200 {
+                return Err(self.error("E0406", "recursion too deep", span));
+            }
+            self.depth += 1;
+            // Static on blocks are atomic regions like instance ones.
+            self.atomic_depth += 1;
+            let previous_context = self.static_context.take();
+            for (owner, block) in &blocks {
+                // The block is static context of its declaring type: a
+                // bare static-field reference inside resolves against
+                // that type's store (no `me` exists here).
+                self.static_context = Some(owner.clone());
+                let mut on_frame = Frame::default();
+                match self.exec_block(&block.body, &mut on_frame, None)? {
+                    Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_) => {}
+                    Flow::Stop => {
+                        self.stop_requested = true;
+                    }
+                    Flow::Suspend => {}
+                }
+            }
+            self.static_context = previous_context;
+            self.atomic_depth -= 1;
+            self.depth -= 1;
+        }
+        self.sample_cover_groups(&path, None, frame);
         Ok(())
     }
 
@@ -5710,6 +6128,17 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(value.clone());
                 }
+                // A static field named bare (T2.1): inside the type (or
+                // its children — the shared occurrence), or inside a
+                // static method of the type. The resolution walks the
+                // instance's (or the static context's) base chain to the
+                // declaring type's store entry.
+                if let Some(owner) = self.bare_static_field_owner(me, name)
+                    && let Some(value) =
+                        self.statics.get(&owner).and_then(|fields| fields.get(name))
+                {
+                    return Ok(value.clone());
+                }
                 // A simple_port/event_port member read is the port
                 // handle (clause 9): the 9.13 binding methods dispatch on
                 // it; the port's *value* is the `name$` bridge access,
@@ -5916,7 +6345,55 @@ impl<'a> Interp<'a> {
                         // arguments to values first.
                         let object_value = self.eval(object, frame, me)?;
                         match object_value {
-                            Value::Object(index) => self.call_method(index, name, values, *span),
+                            Value::Object(index) => {
+                                // Clause 6.13 dynamic dispatch: a call
+                                // through an interface-typed expression
+                                // invokes the object's actual type's
+                                // method (call_method resolves on the
+                                // instance). When the interface declares
+                                // the method but the actual type does
+                                // not provide it, the missing
+                                // implementation is the error (E0414) —
+                                // not the plain not-found one.
+                                let interface_name = self
+                                    .static_type_of(object, frame, me)
+                                    .and_then(|declared| match declared {
+                                        TypeExpr::Named { name: ty_name, .. }
+                                            if self.is_interface(&ty_name) =>
+                                        {
+                                            Some(ty_name)
+                                        }
+                                        _ => None,
+                                    });
+                                if let Some(interface_name) = interface_name {
+                                    let declares = self
+                                        .types
+                                        .iter()
+                                        .find(|t| {
+                                            t.name == interface_name
+                                                && t.kind == DeclarationKind::Interface
+                                        })
+                                        .is_some_and(|t| t.methods.iter().any(|m| m.name == *name));
+                                    if declares {
+                                        let type_name = self.instances[index].type_name.clone();
+                                        let types: &[crate::elab::ElaboratedType] = self.types;
+                                        let provides =
+                                            types.iter().find(|t| t.name == type_name).is_some_and(
+                                                |t| t.methods.iter().any(|m| m.name == *name),
+                                            );
+                                        if !provides {
+                                            return Err(self.error(
+                                                "E0414",
+                                                format!(
+                                                    "struct '{type_name}' does not implement interface method '{name}'"
+                                                ),
+                                                *span,
+                                            ));
+                                        }
+                                    }
+                                }
+                                self.call_method(index, name, values, *span)
+                            }
                             Value::Port {
                                 owner,
                                 name: port_name,
@@ -5980,6 +6457,11 @@ impl<'a> Interp<'a> {
                         };
                         self.call_method(index, field, values, *span)
                     }
+                    // `Type::method(args)` — the static method call
+                    // (clause 17.2.2): dispatched without a receiver.
+                    Expr::StaticAccess {
+                        type_name, member, ..
+                    } => self.call_static_method(type_name, member, values, *span),
                     _ => Err(self.error("E0402", "call target not supported", *span)),
                 }
             }
@@ -6124,6 +6606,51 @@ impl<'a> Interp<'a> {
                         type_name: inline_enum_key(names),
                         name: names[*index as usize].clone(),
                     });
+                }
+                // Interface casts (5.10.2.4): no object is of an
+                // interface type, so an `as_a` to an interface is a
+                // checked reference cast — the same pointer when the
+                // object's type implements the interface, NULL
+                // otherwise. The same NULL-on-mismatch applies when an
+                // INTERFACE-typed expression casts to a struct or
+                // another interface: the pointer is kept when the object
+                // satisfies the target, and NULL when it does not (a
+                // subtype might implement the target later, so the cast
+                // itself is legal). Struct-to-struct casts keep their
+                // value-preserving behavior below.
+                if let TypeExpr::Named { name, .. } = ty {
+                    if self.is_interface(name) {
+                        return Ok(match value {
+                            Value::Object(index)
+                                if self.implements_interface(
+                                    &self.instances[index].type_name.clone(),
+                                    name,
+                                ) =>
+                            {
+                                Value::Object(index)
+                            }
+                            _ => Value::Void,
+                        });
+                    }
+                    if let Value::Object(index) = value {
+                        let operand_is_interface = self
+                            .static_type_of(expr, frame, me)
+                            .is_some_and(|operand| match &operand {
+                                TypeExpr::Named {
+                                    name: operand_name, ..
+                                } => self.is_interface(operand_name),
+                                _ => false,
+                            });
+                        if operand_is_interface {
+                            return Ok(
+                                if self.type_is_a(&self.instances[index].type_name.clone(), name) {
+                                    Value::Object(index)
+                                } else {
+                                    Value::Void
+                                },
+                            );
+                        }
+                    }
                 }
                 Ok(value)
             }
@@ -6358,6 +6885,17 @@ impl<'a> Interp<'a> {
                 if self.depth > 100 {
                     return Ok(Value::Void);
                 }
+                // Clause 5.2.9: no object is *of* an interface type — an
+                // interface-typed value points at an instance of a
+                // struct that implements it, so `new <interface>` has no
+                // instance to create.
+                if self.is_interface(&new_name) {
+                    return Err(self.error(
+                        "E0402",
+                        format!("cannot instantiate interface '{new_name}' (clause 5.2.9)"),
+                        *span,
+                    ));
+                }
                 self.depth += 1;
                 let index = self.instantiate(&new_name);
                 let mut frame = Frame::default();
@@ -6383,6 +6921,21 @@ impl<'a> Interp<'a> {
                     Ok(value) => Ok(Value::Int(value)),
                     Err(msg) => Err(self.error("E0408", msg, *span)),
                 }
+            }
+            Expr::StaticAccess {
+                type_name,
+                member,
+                span,
+                ..
+            } => {
+                // `Type::field` (clause 4.17.4): the shared per-type
+                // occurrence from the static store. The well-formedness
+                // pass has validated that the member is a static member
+                // declared in exactly `Type`; a missing store entry here
+                // means the store was never initialized for it (a static
+                // inside a template body — a documented gap) or the
+                // member is a static method used as a value.
+                self.read_static_field(type_name, member, *span)
             }
         }
     }
@@ -6417,7 +6970,17 @@ impl<'a> Interp<'a> {
             )),
             TypeExpr::List { .. } => Ok(matches!(value, Value::List(_))),
             TypeExpr::Named { name, .. } => Ok(match value {
-                Value::Object(index) => self.type_is_a(&self.instances[*index].type_name, name),
+                Value::Object(index) => {
+                    // Clause 5.7.1: `is a <interface>` holds for an
+                    // instance whose type implements the interface
+                    // (directly or through inheritance); for a struct
+                    // type name the `like` walk decides.
+                    if self.is_interface(name) {
+                        self.implements_interface(&self.instances[*index].type_name.clone(), name)
+                    } else {
+                        self.type_is_a(&self.instances[*index].type_name, name)
+                    }
+                }
                 Value::Enum { type_name, .. } => self.type_is_a(type_name, name),
                 _ => false,
             }),
@@ -6482,6 +7045,53 @@ impl<'a> Interp<'a> {
             }
         }
         false
+    }
+
+    /// Whether `name` declares an interface (clause 6.13).
+    fn is_interface(&self, name: &str) -> bool {
+        self.types
+            .iter()
+            .any(|t| t.name == name && t.kind == DeclarationKind::Interface)
+    }
+
+    /// Whether interface `name` is `target` or inherits from it (clause
+    /// 6.13: an interface includes all of its `like` bases' members).
+    fn interface_is_a(&self, name: &str, target: &str) -> bool {
+        let mut stack = vec![name.to_owned()];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if current == target {
+                return true;
+            }
+            if let Some(declared) = self
+                .types
+                .iter()
+                .find(|t| t.name == current && t.kind == DeclarationKind::Interface)
+            {
+                for base in &declared.interface_bases {
+                    stack.push(base.clone());
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the struct type `type_name` implements interface `iface`
+    /// (clause 6.3): its composed `implementing` set contains the
+    /// interface, or an interface that inherits it. The composed set
+    /// carries the like-chain bases' and the extend blocks' interfaces,
+    /// so subtypes implement their base's interfaces.
+    fn implements_interface(&self, type_name: &str, iface: &str) -> bool {
+        let Some(declared) = self.types.iter().find(|t| t.name == type_name) else {
+            return false;
+        };
+        declared
+            .implements
+            .iter()
+            .any(|implemented| *implemented == iface || self.interface_is_a(implemented, iface))
     }
 
     /// Evaluate `expr` with `hint` as the declared type expected of it —
@@ -6730,6 +7340,12 @@ impl<'a> Interp<'a> {
                         },
                     ) => ta == tb && na == nb,
                     (Value::Object(a), Value::Object(b)) => a == b,
+                    // NULL comparisons (5.4.4.4): two null references are
+                    // equal; an object never equals NULL. The regular
+                    // value-vs-NULL comparison stays the type error it
+                    // was.
+                    (Value::Void, Value::Void) => true,
+                    (Value::Object(_), Value::Void) | (Value::Void, Value::Object(_)) => false,
                     // The regular `==` on lists is item-by-item (4.11.4's
                     // contrast with `list_ptr==`).
                     (Value::List(a), Value::List(b)) => lists_equal(a, b, 0),
@@ -7109,6 +7725,15 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(value.clone());
                 }
+                // A static field named bare (T2.1) — the read side of
+                // the bare-name resolution (see [`Interp::eval`]'s
+                // `Expr::Ident` arm).
+                if let Some(owner) = self.bare_static_field_owner(me, name)
+                    && let Some(value) =
+                        self.statics.get(&owner).and_then(|fields| fields.get(name))
+                {
+                    return Ok(value.clone());
+                }
                 // The root unit instance is addressable by name from any
                 // method (`for each in sys.ops`).
                 if name == "sys"
@@ -7177,10 +7802,22 @@ impl<'a> Interp<'a> {
                     frame.locals.insert(name.clone(), value);
                     return Ok(());
                 }
-                if let Some(index) = me {
-                    if self.instances[index].set(name, value) {
-                        return Ok(());
-                    }
+                if let Some(index) = me
+                    && self.instances[index].set(name, value.clone())
+                {
+                    return Ok(());
+                }
+                // A static field named bare (T2.1): the write lands in
+                // the declaring type's store entry — the same
+                // resolution the read side uses.
+                if let Some(owner) = self.bare_static_field_owner(me, name) {
+                    self.statics
+                        .entry(owner)
+                        .or_default()
+                        .insert(name.clone(), value);
+                    return Ok(());
+                }
+                if me.is_some() {
                     return Err(self.error("E0401", format!("unknown field '{name}'"), span));
                 }
                 Err(self.error("E0401", format!("unknown identifier '{name}'"), span))
@@ -7252,6 +7889,23 @@ impl<'a> Interp<'a> {
                 }
                 self.instances[index].set(field, value);
                 Ok(())
+            }
+            Expr::StaticAccess {
+                type_name, member, ..
+            } => {
+                // `Type::field = value` (clause 4.17.4): the write lands
+                // in the declaring type's store entry — the one shared
+                // occurrence, visible to every instance.
+                if let Some(fields) = self.statics.get_mut(type_name) {
+                    fields.insert(member.clone(), value);
+                    Ok(())
+                } else {
+                    Err(self.error(
+                        "E0401",
+                        format!("unknown static member '{type_name}::{member}'"),
+                        span,
+                    ))
+                }
             }
             _ => Err(self.error("E0402", "unsupported assignment target", span)),
         }
@@ -7358,7 +8012,11 @@ impl<'a> Interp<'a> {
             // A port handle renders by its member name (clause 9); the
             // port's value is the `name$` bridge access, not this.
             Value::Port { name, .. } => format!("port {name}"),
-            Value::Void => "void".to_owned(),
+            // Clause 5.4.4.4: `Value::Void` doubles as the null
+            // reference — an interface-typed variable with no instance
+            // prints NULL (T3.5). A struct-typed interface value prints
+            // the underlying instance, as any object does above.
+            Value::Void => "NULL".to_owned(),
         }
     }
 
