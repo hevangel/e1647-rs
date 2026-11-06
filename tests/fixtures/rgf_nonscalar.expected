@@ -1,0 +1,2 @@
+4:6: error[E0316]: range-generated field 'data' must be scalar (numeric, enum or bool; clause 6.9.7)
+5:6: error[E0316]: range-generated field 'name' must be scalar (numeric, enum or bool; clause 6.9.7)

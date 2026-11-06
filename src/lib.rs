@@ -6,7 +6,8 @@
 //! ([`parser`], [`ast`], [`check`]), member composition that folds
 //! `like` chains and `extend` blocks into per-type member lists
 //! ([`elab`]), and an interpreter that executes the non-temporal statement
-//! subset, including `gen` as a seeded rejection sampler ([`interp`]).
+//! subset, including `gen` as a seeded rejection sampler with reduced-set
+//! generation for range-generated (`~`) fields ([`interp`]).
 //! The clause 12 temporal-engine core evaluates sampled normal forms
 //! over explicit finite paths ([`temporal`]), and the run loop drives
 //! it: an event log fed by `emit`, a clause 13.2.2 scheduler running
