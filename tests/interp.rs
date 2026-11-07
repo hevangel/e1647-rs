@@ -4830,3 +4830,237 @@ fn reflection_stub_yields_to_a_user_method_of_the_same_name() {
     );
     assert_eq!(output, "user\n");
 }
+// ---------------------------------------------------------------------------
+// Phase 7 (T7.1–T7.4): custom numeric types (5.2.15, 5.8.4, clause 31),
+// the operator dispatch, and the 5.6.3 precision rules.
+// ---------------------------------------------------------------------------
+
+/// The fixed-point struct the plan's T7.2 runtime test declares: `raw`
+/// stores the value scaled by 100.
+const FIXED_POINT_STRUCT: &str = "\
+struct fx_s implementing numeric_i of (fx_s, TRUE, 32) {\n\
+    !raw: int;\n\
+    set_initial_value() is { raw = 0; };\n\
+    numeric_assign(other: fx_s) is { raw = other.raw; };\n\
+    numeric_from_int(v: int) is { raw = v * 100; };\n\
+    numeric_to_int(): int is { return raw / 100; };\n\
+    numeric_add(other: fx_s, res: fx_s) is { res.raw = raw + other.raw; };\n\
+    numeric_compare(other: fx_s): int is {\n\
+        if raw < other.raw then { return -1 } else if raw > other.raw then { return 1 } else { return 0 };\n\
+    };\n\
+    numeric_to_string(radix: numeric_format_kind): string is { return append(raw / 100, \".\", raw % 100); };\n\
+};\n\
+numeric_type fx_t: fx_s;\n";
+
+#[test]
+fn custom_numeric_fixed_point_operators_and_missing_method() {
+    // The plan's T7.2 runtime test (5.8.4, clause 31): `a + b`
+    // dispatches to numeric_add with a fresh result instance, `out`
+    // renders through numeric_to_string(dec), `as_a(int)` through
+    // numeric_to_int, `<` through numeric_compare — and `a * b`
+    // without a numeric_multiply definition is the runtime E0418.
+    let result = run_source(
+        &format!(
+            "{FIXED_POINT_STRUCT}extend sys {{\n    \
+             run() is also {{\n        \
+             var a: fx_t = 3;\n        \
+             var b: fx_t = 4;\n        \
+             var c: fx_t = a + b;\n        \
+             out(c);\n        \
+             out(c.as_a(int));\n        \
+             out(a < b);\n        \
+             var d: fx_t = a * b;\n    \
+             }};\n}};\n"
+        ),
+        1,
+    );
+    assert_eq!(result.output, "7.07TRUE");
+    assert_eq!(result.diagnostics.len(), 1);
+    let rendered = result.diagnostics[0].render();
+    assert!(
+        rendered.contains("error[E0418]")
+            && rendered.contains("operation '*' is not implemented by numeric type 'fx_t'")
+            && rendered.contains("(numeric_multiply missing)"),
+        "unexpected diagnostic: {rendered}"
+    );
+}
+
+#[test]
+fn custom_numeric_value_semantics_and_conversions() {
+    // T7.1's value model: binding a custom numeric value into any slot
+    // copies it (`numeric_assign`), a plain scalar builds into the
+    // type through `numeric_from_int` (T7.3's implicit conversions),
+    // and comparisons dispatch through `numeric_compare`.
+    let output = clean_output(
+        &format!(
+            "{FIXED_POINT_STRUCT}extend sys {{\n    \
+             run() is also {{\n        \
+             var a: fx_t = 3;\n        \
+             var e: fx_t = a;\n        \
+             out(a == e);\n        \
+             var b: fx_t = 4;\n        \
+             out(b > a);\n        \
+             var c: fx_t = a + b;\n        \
+             out(c);\n        \
+             var f: fx_t = a + a;\n        \
+             out(f.as_a(int));\n        \
+             var n: int = 42;\n        \
+             var g: fx_t = n;\n        \
+             out(g);\n        \
+             var h := a;\n        \
+             out(h == a);\n    \
+             }};\n}};\n"
+        ),
+        1,
+    );
+    assert_eq!(output, "TRUETRUE7.0642.0TRUE");
+}
+
+#[test]
+fn custom_numeric_mixed_scalar_operand_converts() {
+    // T7.3: arithmetic on a custom numeric and a plain scalar converts
+    // the scalar via `numeric_from_int` first (`a + 2` is 5.0, and the
+    // scalar comparison converts the 10 the same way).
+    let output = clean_output(
+        &format!(
+            "{FIXED_POINT_STRUCT}extend sys {{\n    \
+             run() is also {{\n        \
+             var a: fx_t = 3;\n        \
+             var d: fx_t = a + 2;\n        \
+             out(d);\n        \
+             out(a < 10);\n    \
+             }};\n}};\n"
+        ),
+        1,
+    );
+    assert_eq!(output, "5.0TRUE");
+}
+
+#[test]
+fn custom_numeric_field_defaults_via_set_initial_value() {
+    // T7.1's defaulting rule: a field/variable of a custom numeric
+    // type defaults to a fresh value whose `set_initial_value()`
+    // defines the state.
+    let output = clean_output(
+        &format!(
+            "{FIXED_POINT_STRUCT}struct holder_s {{ !v: fx_t; }};\n\
+             extend sys {{\n    \
+             run() is also {{\n        \
+             var h: holder_s;\n        \
+             out(h.v);\n        \
+             out(h.v.as_a(int));\n    \
+             }};\n}};\n"
+        ),
+        1,
+    );
+    assert_eq!(output, "0.00");
+}
+
+#[test]
+fn custom_numeric_missing_conversions_report_e0418() {
+    // T7.3: a struct without the clause 31 conversion pair reports
+    // E0418 where the conversion is needed — a scalar into the type
+    // (`numeric_from_int`), a message render (`numeric_to_string`) and
+    // an `as_a(int)` (`numeric_to_int`). Each run reports the first
+    // missing method the statement sequence reaches.
+    let bare = "\
+struct bare_s implementing numeric_i of (bare_s, TRUE, 32) {\n\
+    !raw: int;\n\
+    set_initial_value() is { raw = 0; };\n\
+    numeric_assign(other: bare_s) is { raw = other.raw; };\n\
+};\n\
+numeric_type bare_t: bare_s;\n";
+    let from_int = run_source(
+        &format!(
+            "{bare}extend sys {{\n    \
+             run() is also {{ var a: bare_t = 3; }};\n}};\n"
+        ),
+        1,
+    );
+    assert_eq!(from_int.diagnostics.len(), 1);
+    assert!(
+        from_int.diagnostics[0]
+            .render()
+            .contains("error[E0418]: conversion is not implemented by numeric type 'bare_t' (numeric_from_int missing)"),
+        "unexpected diagnostic: {:?}",
+        from_int.diagnostics[0].render()
+    );
+    let to_string = run_source(
+        &format!(
+            "{bare}extend sys {{\n    \
+             run() is also {{ var a: bare_t; out(a); }};\n}};\n"
+        ),
+        1,
+    );
+    assert_eq!(to_string.diagnostics.len(), 1);
+    assert!(
+        to_string.diagnostics[0]
+            .render()
+            .contains("error[E0418]: output is not implemented by numeric type 'bare_t' (numeric_to_string missing)"),
+        "unexpected diagnostic: {:?}",
+        to_string.diagnostics[0].render()
+    );
+    let to_int = run_source(
+        &format!(
+            "{bare}extend sys {{\n    \
+             run() is also {{ var a: bare_t; out(a.as_a(int)); }};\n}};\n"
+        ),
+        1,
+    );
+    assert_eq!(to_int.diagnostics.len(), 1);
+    assert!(
+        to_int.diagnostics[0]
+            .render()
+            .contains("error[E0418]: conversion to 'int' is not implemented by numeric type 'bare_t' (numeric_to_int missing)"),
+        "unexpected diagnostic: {:?}",
+        to_int.diagnostics[0].render()
+    );
+}
+
+#[test]
+fn precision_rules_64_bit_unbounded_and_real_contexts() {
+    // 5.6.3 (the plan's T7.4 runtime test): rule (c) computes the
+    // int(bits:64) comparison unbounded (-1 < 1, TRUE); rule (b)
+    // computes the longint/longuint comparison at unsigned 64 bits
+    // (-1 casts to MAX_LONGUINT, so `<` is FALSE); rule (d) computes
+    // the real + unbounded-int sum in double precision; rule (a)
+    // wraps the uint subtraction at 32 unsigned bits.
+    let output = clean_output(
+        "extend sys {\n    \
+         run() is also {\n        \
+         var x1: int(bits: 64) = -1;  var x2: uint(bits: 64) = 1;\n        \
+         out(x1 < x2);\n        \
+         var y1: longint = -1;        var y2: longuint = 1;\n        \
+         out(y1 < y2);\n        \
+         var z1: real = 7.2;          var z2: int(bits: *) = 10;\n        \
+         out(z1 + z2);\n        \
+         var u: uint = 0;\n        \
+         out(u - 1 == MAX_UINT);\n    \
+         };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUEFALSE17.2TRUE");
+}
+
+#[test]
+fn precision_rules_wrap_signed_32_bit_results() {
+    // 5.6.3's rule (a): the 32-bit signed context truncates the result
+    // (an int overflow wraps), while the unbounded path an untyped
+    // literal expression runs at keeps the full value.
+    let output = clean_output(
+        "extend sys {\n    \
+         run() is also {\n        \
+         var big: int = 2147483647;\n        \
+         var wrapped: int = big + 1;\n        \
+         out(wrapped == -2147483648);\n        \
+         var literal_sum: int = 2147483647 + 1;\n        \
+         out(literal_sum);\n    \
+         };\n};\n",
+        1,
+    );
+    // `big + 1`: both operands are declared ints — a 32-bit signed
+    // context, so the sum wraps to INT_MIN. The literal-only sum is
+    // not a variable context (static_type_of does not resolve a
+    // literal), so it computes unbounded and prints the full value.
+    assert_eq!(output, "TRUE2147483648");
+}

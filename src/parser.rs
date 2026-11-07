@@ -721,6 +721,23 @@ impl Parser {
                     }
                     continue;
                 }
+                // `numeric_type T: S;` (clause 5.8.4) — the plain
+                // custom numeric type: values of `T` take their operator
+                // behavior from the `numeric_i` methods `S` implements
+                // (T7.1). The `template numeric_type` form parses in
+                // parse_template_declaration.
+                Some(TokenKind::Keyword(k)) if k.as_str() == "numeric_type" => {
+                    if let Some(mut declaration) = self.parse_numeric_type_declaration() {
+                        declaration.packaged = packaged;
+                        declaration.annotations = std::mem::take(&mut pending_annotations);
+                        packaged = false;
+                        declarations.push(declaration);
+                    } else {
+                        packaged = false;
+                        pending_annotations.clear();
+                    }
+                    continue;
+                }
                 // `template (struct|unit) ...` (clause 8).
                 Some(TokenKind::Keyword(k)) if k.as_str() == "template" => {
                     if let Some(mut declaration) = self.parse_template_declaration() {
@@ -745,6 +762,7 @@ impl Parser {
                                     k.as_str(),
                                     "template" | "struct" | "unit" | "extend" | "type"
                                         | "interface" | "annotation" | "repeatable"
+                                        | "numeric_type"
                                 )
                         ) =>
                 {
@@ -1544,6 +1562,51 @@ impl Parser {
     /// (`type small: uint [0..7];` — clause 5.2.3.1) — the underlying
     /// representation and the range are recorded; distinct-type
     /// semantics and range narrowing over them are a later milestone.
+    /// `numeric_type T: S;` (clause 5.8.4) — the plain custom numeric
+    /// type: values of `T` take their operator behavior from the
+    /// `numeric_i` methods `S` implements (T7.1; the base must be a
+    /// struct implementing `numeric_i` of `(S, is-signed, bit-size)` —
+    /// clause 31.4 — which `check.rs` reports as `E0132`). The
+    /// implementing-struct reference records in `underlying`, like the
+    /// `template numeric_type` form's.
+    fn parse_numeric_type_declaration(&mut self) -> Option<Declaration> {
+        let start = self.current_span().0;
+        self.bump(); // 'numeric_type'
+        let (name, name_span) = self.expect_type_name("expected the numeric_type name")?;
+        self.expect_punct(
+            ":",
+            "E0103",
+            "expected ':' before the implementing struct type",
+        )?;
+        let underlying = self.parse_type()?;
+        self.expect_punct(
+            ";",
+            "E0105",
+            "expected ';' after the numeric_type declaration",
+        )?;
+        let end = self.last_end();
+        Some(Declaration {
+            kind: DeclarationKind::NumericType,
+            name,
+            name_span,
+            underlying: Some(underlying),
+            subtype_range: None,
+            template_params: Vec::new(),
+            template_conditions: Vec::new(),
+            template_extend: None,
+            packaged: false,
+            like: None,
+            like_span: None,
+            like_type: None,
+            bases: Vec::new(),
+            implements: Vec::new(),
+            modifiers: Vec::new(),
+            annotations: Vec::new(),
+            members: Vec::new(),
+            span: (start, end),
+        })
+    }
+
     fn parse_type_declaration(&mut self) -> Option<Declaration> {
         let start = self.current_span().0;
         self.bump(); // 'type'
@@ -1552,9 +1615,16 @@ impl Parser {
         if !self.at_punct("[") {
             // Scalar/list type declaration: record the representation.
             let underlying = self.parse_type()?;
-            // The range qualification applies to a scalar base only; a
-            // `[` after any other underlying type stays a syntax error.
-            let subtype_range = if matches!(underlying, TypeExpr::Scalar { .. }) {
+            // The range qualification is legal on a scalar base; after
+            // a named base it parses too, so the well-formedness pass
+            // can name the rule it breaks — a custom numeric type
+            // cannot have subtypes (5.8.4's honest error, T7.1) and no
+            // other named type takes a range. Any other underlying
+            // shape stays a syntax error.
+            let subtype_range = if matches!(
+                underlying,
+                TypeExpr::Scalar { .. } | TypeExpr::Named { .. } | TypeExpr::TemplateRef { .. }
+            ) {
                 self.parse_subtype_range()?
             } else {
                 None
@@ -1743,7 +1813,22 @@ impl Parser {
             return None;
         }
         self.expect_punct(":", "E0103", "expected ':' after 'bits'")?;
-        let expr = self.parse_expr()?;
+        // `int(bits: *)` / `uint(bits: *)` — the unbounded-width
+        // spelling (clause 5.2.3.1's `bits` BNF alternative). The `*`
+        // is otherwise the multiplication operator, so it is matched
+        // here ahead of the expression parser and recorded as a marker
+        // identifier the width helpers read: `width_bits` and the 5.6.3
+        // operand classification treat the star width as unbounded.
+        let expr = if self.at_punct("*") {
+            let (star_start, star_end) = self.current_span();
+            self.bump();
+            Expr::Ident {
+                name: "*".to_owned(),
+                span: (star_start, star_end),
+            }
+        } else {
+            self.parse_expr()?
+        };
         self.expect_punct(")", "E0110", "expected ')' after width specification")?;
         Some(Box::new(expr))
     }

@@ -208,6 +208,9 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
         &mut reported_implement_conflicts,
         &mut diagnostics,
     );
+    // T7.1: a struct implementing numeric_i cannot have subtypes
+    // (`like` derivations and `when` blocks — clause 5.8.4).
+    check_numeric_i_subtypes(declarations, &struct_impls, &mut diagnostics);
     // Enumerals live in the file-global namespace once their `type` is
     // declared, so any `keep` constraint may reference them. Inline
     // enumerals (`kind : [imm, reg]`) contribute the same way.
@@ -290,6 +293,16 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
                 declaration.subtype_range.is_some(),
                 &mut diagnostics,
             );
+            // A named base with a subtype range (the custom-numeric
+            // shapes among them — T7.1).
+            check_named_subtype(
+                underlying,
+                declaration.subtype_range.is_some(),
+                &kinds,
+                &mut diagnostics,
+            );
+            // T7.1: the numeric_type's base must implement numeric_i.
+            check_numeric_type_base(declaration, &kinds, &struct_impls, &mut diagnostics);
         }
         check_fields(
             declaration,
@@ -1061,11 +1074,18 @@ fn check_implement_targets(
         }
         for interface in &declaration.implements {
             // The target resolves by its name — the template name of a
-            // parameterised entry (`I of <t'type>`, clause 8.2.3).
+            // parameterised entry (`I of <t'type>`, clause 8.2.3). The
+            // clause 31 numeric interfaces (`base_numeric_i`,
+            // `numeric_i of (...)`) are predefined: they resolve
+            // without a declaration (T7.2), and their parameterised
+            // instances are the legal `implementing` targets of a
+            // `numeric_type`'s implementing struct (31.4).
             let Some(interface_name) = interface.declared_name() else {
                 continue;
             };
-            if !interfaces.contains_key(interface_name) {
+            if !interfaces.contains_key(interface_name)
+                && !crate::builtins::is_builtin_interface(interface_name)
+            {
                 diagnostics.push(Diagnostic::new(
                     "E0203",
                     format!("unknown interface '{interface_name}' in implementing clause"),
@@ -2779,6 +2799,154 @@ fn check_long_subtype(ty: &TypeExpr, ranged: bool, diagnostics: &mut Vec<Diagnos
         span.0,
         span.1,
     ));
+}
+
+/// T7.1 (5.2.15, 5.8.4, 31.4): the base of a `numeric_type T: S;` must
+/// be a struct or unit whose composed `implementing` set realizes the
+/// clause 31 `numeric_i` interface (`numeric_i of (S, is-signed,
+/// bit-size)`); the operator dispatch (T7.3) reads the method table of
+/// that implementation, so a base without one has nothing to dispatch
+/// to. Reported as `E0132` at the numeric_type's name.
+fn check_numeric_type_base(
+    declaration: &Declaration,
+    kinds: &BTreeMap<&str, DeclarationKind>,
+    struct_impls: &BTreeMap<&str, Vec<String>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if declaration.kind != DeclarationKind::NumericType {
+        return;
+    }
+    let Some(base) = declaration
+        .underlying
+        .as_ref()
+        .and_then(|ty| ty.declared_name())
+    else {
+        return;
+    };
+    let is_struct = matches!(
+        kinds.get(base),
+        Some(DeclarationKind::Struct | DeclarationKind::Unit)
+    );
+    let implements_numeric_i = struct_impls
+        .get(base)
+        .is_some_and(|set| set.iter().any(|interface| interface == "numeric_i"));
+    if !is_struct {
+        diagnostics.push(Diagnostic::new(
+            "E0132",
+            format!(
+                "numeric_type '{}' base must be a struct implementing numeric_i ('{base}' is not a struct/unit)",
+                declaration.name
+            ),
+            declaration.name_span.0,
+            declaration.name_span.1,
+        ));
+    } else if !implements_numeric_i {
+        diagnostics.push(Diagnostic::new(
+            "E0132",
+            format!(
+                "numeric_type '{}' base must be a struct implementing numeric_i ('{base}' does not implement numeric_i)",
+                declaration.name
+            ),
+            declaration.name_span.0,
+            declaration.name_span.1,
+        ));
+    }
+}
+
+/// T7.1 (5.8.4): a named type takes no subtype range. The shapes that
+/// parse are a custom numeric type (`type t: fx_t [0..5]` — a numeric
+/// type cannot have subtypes) and any other named base (`type t: foo
+/// [0..5]` was the parser's stray-`[` error before; the checker now
+/// names the rule). Both report `E0207`, the same not-allowed rule the
+/// long types carry. The `(bits: n)` bit-width spelling after a named
+/// type does not parse at all — the parser's syntax error is the
+/// honest refusal there.
+fn check_named_subtype(
+    underlying: &TypeExpr,
+    ranged: bool,
+    kinds: &BTreeMap<&str, DeclarationKind>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let TypeExpr::Named { name, span } = underlying else {
+        return;
+    };
+    if !ranged {
+        return;
+    }
+    let what = if kinds.get(name.as_str()) == Some(&DeclarationKind::NumericType) {
+        format!("custom numeric type '{name}'")
+    } else {
+        format!("'{name}'")
+    };
+    diagnostics.push(Diagnostic::new(
+        "E0207",
+        format!("subtype of {what} is not allowed"),
+        span.0,
+        span.1,
+    ));
+}
+
+/// T7.1 (5.8.4): a struct implementing `numeric_i` cannot have
+/// subtypes — its values exist only through the numeric_type that
+/// names it, and a derivation (`like` base or `when` block) would
+/// promise operator behavior the derived type has no numeric_i
+/// instance for. Reported at the derivation site with `E0207`.
+fn check_numeric_i_subtypes(
+    declarations: &[Declaration],
+    struct_impls: &BTreeMap<&str, Vec<String>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    fn when_spans(members: &[Member], spans: &mut Vec<crate::ast::Span>) {
+        for member in members {
+            if let Member::When(when) = member {
+                spans.push(when.span);
+                when_spans(&when.members, spans);
+            }
+        }
+    }
+    let implements_numeric_i = |name: &str| {
+        struct_impls
+            .get(name)
+            .is_some_and(|set| set.iter().any(|interface| interface == "numeric_i"))
+    };
+    for declaration in declarations {
+        if !matches!(
+            declaration.kind,
+            DeclarationKind::Struct | DeclarationKind::Unit
+        ) {
+            continue;
+        }
+        // `struct S like N ...` where N implements numeric_i.
+        if let Some(like) = &declaration.like
+            && implements_numeric_i(like)
+        {
+            let span = declaration.like_span.unwrap_or(declaration.name_span);
+            diagnostics.push(Diagnostic::new(
+                "E0207",
+                format!(
+                    "struct '{like}' implements numeric_i and cannot have subtypes (clause 5.8.4)"
+                ),
+                span.0,
+                span.1,
+            ));
+        }
+        // A `when` block on the implementing struct itself.
+        if implements_numeric_i(&declaration.name) {
+            let mut spans = Vec::new();
+            when_spans(&declaration.members, &mut spans);
+            for span in spans {
+                diagnostics.push(Diagnostic::new(
+                    "E0207",
+                    format!(
+                        "struct '{}' implements numeric_i and cannot have subtypes (clause 5.8.4)",
+                        declaration.name
+                    ),
+                    span.0,
+                    span.1,
+                ));
+            }
+        }
+    }
 }
 
 /// Visit every expression reachable from the statement, nested bodies

@@ -128,6 +128,10 @@ pub const BUILTIN_TYPES: &[&str] = &[
     "table_row",
     "table_manager",
     "instance_iterator",
+    // The clause 31 `numeric_format_kind` enumerand type — the radix
+    // parameter of `numeric_to_string` (T7.2). The enumerands are
+    // [`NUMERIC_FORMAT_KIND`]; the elaborator synthesizes the type.
+    "numeric_format_kind",
 ];
 
 pub fn is_builtin_type(name: &str) -> bool {
@@ -215,6 +219,26 @@ pub fn reflection_type_clause(name: &str) -> Option<&'static str> {
         .find(|(entry, _)| *entry == name)
         .map(|(_, clause)| *clause)
 }
+
+/// Predeclared template interfaces of clause 31 (T7.2): `base_numeric_i`
+/// and its extending `numeric_i of (<me'type>, <signed'exp>: bool,
+/// <bits'exp>: int)`. The implementing struct of a `numeric_type`
+/// (5.2.15, 5.8.4, 31.4) realizes the second. The names resolve in
+/// `implementing` clauses and type positions without a declaration;
+/// elaboration synthesizes their composed signature sets (the clause 31
+/// tables), and the interpreter's custom-numeric operator dispatch
+/// (T7.3) calls the methods of that shape on the implementing struct.
+pub const BUILTIN_INTERFACES: &[&str] = &["base_numeric_i", "numeric_i"];
+
+pub fn is_builtin_interface(name: &str) -> bool {
+    BUILTIN_INTERFACES.contains(&name)
+}
+
+/// The clause 31 `numeric_format_kind` enumerands, in declared order —
+/// the radix spellings `numeric_to_string(radix)` accepts (`dec` is the
+/// plain print radix; the enum's default value is its first member,
+/// `none`).
+pub const NUMERIC_FORMAT_KIND: &[&str] = &["none", "dec", "hex", "bin", "oct", "udec", "float"];
 
 pub fn is_builtin_routine(name: &str) -> bool {
     BUILTIN_ROUTINES.contains(&name)
