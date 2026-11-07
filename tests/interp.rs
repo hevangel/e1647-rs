@@ -3630,6 +3630,101 @@ fn interface_default_and_generated_fields_are_null() {
     assert_eq!(output, "TRUE\n");
 }
 
+// ---------------------------------------------------------------------------
+// T9.1 (26.2): the `table … with { … }` preprocessor expansion.
+// ---------------------------------------------------------------------------
+
+/// The migration plan's T9.1 test: a struct member table declaring one
+/// field per row, a set-literal table over actions and a `count` table.
+fn table_regs_source() -> String {
+    "<'\n\
+     struct regs {\n    \
+     table { #name | #width ;\n            \
+     ctrl  | 8      ;\n            \
+     stat  | 4      ;\n            \
+     data  | 16     } with {\n        \
+     <#name>: uint(bits: <#width>);\n        \
+     keep <#name> < <#width>;\n    };\n};\n\
+     extend sys {\n    \
+     run() is also {\n        \
+     var r: regs; gen r;\n        \
+     table [1..3] with { out(\"row <#0> value <#1>\\n\"); };\n        \
+     table count { a | 1; b | 2 } with { out(\"rows: <#1>\\n\"); };\n    };\n};\n'>\n"
+        .to_owned()
+}
+
+#[test]
+fn table_expansion_declares_members_and_iterates_rows() {
+    // T9.1: the member table expands one field + constraint per row
+    // (elab lists ctrl/stat/data at widths 8/4/16), the set-literal
+    // table runs its body once per row with the row index and first
+    // column substituted, and `count` reduces the data to the row
+    // count.
+    let parsed = e1647::parser::parse(&table_regs_source());
+    assert!(
+        parsed.diagnostics.is_empty(),
+        "parse diagnostics: {:?}",
+        parsed
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    let elaborated = elaborate(&parsed.declarations);
+    assert!(
+        elaborated.diagnostics.is_empty(),
+        "elab diagnostics: {:?}",
+        elaborated
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    let regs = elaborated
+        .types
+        .iter()
+        .find(|t| t.name == "regs")
+        .expect("the regs type elaborated");
+    let widths: Vec<(String, u32)> = regs
+        .fields
+        .iter()
+        .filter_map(|field| match &field.ty {
+            e1647::ast::TypeExpr::Scalar {
+                width: Some(width), ..
+            } => match width.as_ref() {
+                e1647::ast::Expr::IntLiteral { text, .. } => text
+                    .parse::<u32>()
+                    .ok()
+                    .map(|width| (field.name.clone(), width)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        widths,
+        vec![
+            ("ctrl".to_owned(), 8),
+            ("stat".to_owned(), 4),
+            ("data".to_owned(), 16)
+        ]
+    );
+    let result = run(&elaborated, 1);
+    assert!(
+        result.diagnostics.is_empty(),
+        "run diagnostics: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        result.output,
+        "row 0 value 1\nrow 1 value 2\nrow 2 value 3\nrows: 2\n"
+    );
+}
+
 #[test]
 fn gen_chosen_from_picks_satisfying_elements_deterministically() {
     // T6.1 (10.5.8): `keep p chosen_from read_only(lps)` assigns p a
@@ -3760,6 +3855,145 @@ fn rgf_set_is_the_intersection_of_the_constraint_intervals() {
 }
 
 #[test]
+fn nested_table_refers_to_the_enclosing_row() {
+    // T9.1's nested test: the outer table iterates { A; B }, the inner
+    // table runs inside each outer row; `<##1>` reads the enclosing
+    // row's first cell, `<#1>` the inner row's.
+    let output = clean_output(
+        "extend sys {\n    \
+         run() is also {\n        \
+         table { A; B } with {\n            \
+         table [1..2] with { out(\"<##1>-<#1>\\n\"); };\n        \
+         };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "A-1\nA-2\nB-1\nB-2\n");
+}
+
+#[test]
+fn count_excludes_the_header_row() {
+    // With `count`, the header row is not a data row: the two data
+    // rows count as 2 (a headerless two-row table counts 2 as well —
+    // the plan's `table count { a | 1; b | 2 }` case covers that).
+    let output = clean_output(
+        "extend sys {\n    \
+         run() is also {\n        \
+         table count { #a | #b ; 1 | 2 ; 3 | 4 } with { out(\"count=<#1>\\n\"); };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "count=2\n");
+}
+
+// ---------------------------------------------------------------------------
+// T9.2 (26.3): `table from operator(...) using filter/unique`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn table_from_csv_to_table_with_filter() {
+    // T9.2's test: the rows come from tests/data/regs.csv's `regs`
+    // table; the filter drops the `dummy` row, so `ctrl:8` and
+    // `stat:4` print.
+    let path = format!("{}/tests/data/regs", env!("CARGO_MANIFEST_DIR"));
+    let source = format!(
+        "extend sys {{\n    \
+         run() is also {{\n        \
+         table from csv_to_table(\"{path}\", \"regs\")\n            \
+         using filter = table_column(\"name\") != \"dummy\"\n            \
+         with {{ out(\"<#name>:<#width>\\n\"); }};\n    }};\n}};\n"
+    );
+    let output = clean_output(&source, 1);
+    assert_eq!(output, "ctrl:8\nstat:4\n");
+}
+
+#[test]
+fn table_from_csv_to_table_with_unique() {
+    // The unique option keeps the first row per distinct value,
+    // applied after the filter — over the `dups` table whose widths
+    // repeat (8, 4, 8, 4, 8), only the first 8 and the first 4 stay.
+    let path = format!("{}/tests/data/regs", env!("CARGO_MANIFEST_DIR"));
+    let source = format!(
+        "extend sys {{\n    \
+         run() is also {{\n        \
+         table from csv_to_table(\"{path}\", \"dups\")\n            \
+         using unique = table_column(\"width\")\n            \
+         with {{ out(\"<#name>\\n\"); }};\n    }};\n}};\n"
+    );
+    let output = clean_output(&source, 1);
+    assert_eq!(output, "a\nb\n");
+}
+
+// ---------------------------------------------------------------------------
+// T9.3 (32.3): the procedural table API.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn table_procedural_api_basics() {
+    // T9.3's test: create_table + add_row + set_data/read round-trip;
+    // rows number from 0, columns from 1.
+    let output = clean_output(
+        "extend sys {\n    \
+         run() is also {\n        \
+         var t := table_manager.create_table({\"a\";\"b\"});\n        \
+         t.add_row();\n        \
+         t.get_row(0).set_data(1, \"x\");\n        \
+         out(t.get_rows_num(), \" \", t.get_columns_num(), \" \", \
+         t.get_row(0).get_data(1), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "1 2 x\n");
+}
+
+#[test]
+fn table_row_index_column_and_row_api() {
+    // Column 0 is the row index; the row/row_with_data creators and
+    // the source-info copies work on standalone rows.
+    let output = clean_output(
+        "extend sys {\n    \
+         run() is also {\n        \
+         var t := table_manager.create_table({\"a\";\"b\"});\n        \
+         t.add_row(); t.add_row();\n        \
+         out(t.get_row(1).get_data(0), \"\\n\");\n        \
+         var r := table_manager.create_row_with_data({\"p\";\"q\"});\n        \
+         out(r.get_size(), \" \", r.get_data(1), r.get_data(2), \"\\n\");\n        \
+         var s := table_manager.create_row(2);\n        \
+         s.copy_source_info_from(r);\n        \
+         s.set_data(2, \"z\");\n        \
+         out(s.get_data(2), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "1\n2 pq\nz\n");
+}
+
+#[test]
+fn table_read_from_csv_is_cached_and_read_only() {
+    // A table read from a file is read-only: set_data through a row is
+    // the copy-first runtime error; the copy is writable.
+    let parsed = e1647::parser::parse(&format!(
+        "extend sys {{\n    \
+         run() is also {{\n        \
+         var t := table_manager.read_table_from_csv(\"{}/tests/data/regs\", \"regs\");\n        \
+         t.get_row(0).set_data(1, \"9\");\n    }};\n}};\n",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    assert!(parsed.diagnostics.is_empty(), "parse failed");
+    let elaborated = elaborate(&parsed.declarations);
+    assert!(elaborated.diagnostics.is_empty(), "elab failed");
+    let result = run(&elaborated, 1);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.render().contains("read-only")),
+        "expected the copy-first read-only error, got {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn gen_chosen_from_target_is_an_alias_of_one_list_element() {
     // T6.1: pointer semantics — the target holds one of the list's
     // elements (object identity), not a copy. `has(it list_ptr== ...)`
@@ -3826,6 +4060,56 @@ fn gen_chosen_from_no_satisfying_element_reports_e0417() {
             .contains("chosen_from: no element of 'lps' satisfies the constraints on 'p'"),
         "rendered: {}",
         diagnostic.render()
+    );
+}
+
+#[test]
+fn table_copy_is_writable_and_read_helpers_work() {
+    // copy() lifts the read-only flag; the csv readers report their
+    // source, and the manager's line helpers answer per 32.3.3.
+    let path = format!("{}/tests/data/regs", env!("CARGO_MANIFEST_DIR"));
+    let output = clean_output(
+        &format!(
+            "extend sys {{\n    \
+             run() is also {{\n        \
+             var t := table_manager.read_table_from_csv(\"{path}\", \"regs\");\n        \
+             var c := t.copy();\n        \
+             c.get_row(0).set_data(1, \"9\");\n        \
+             out(c.get_row(0).get_data(1), \"\\n\");\n        \
+             out(t.get_row(0).get_csv_file_name() != \"\", \"\\n\");\n        \
+             out(t.get_row(0).get_csv_line_num(), \"\\n\");\n        \
+             out(table_manager.is_empty_line(\"  , \"), \"\\n\");\n        \
+             out(table_manager.get_table_tag_from_row(\"regs,x\"), \"\\n\");\n    }};\n}};\n"
+        ),
+        1,
+    );
+    assert_eq!(output, "9\nTRUE\n3\nTRUE\nregs\n");
+}
+
+#[test]
+fn excel_table_readers_report_the_stub() {
+    // The excel readers are the honest 32.3 stubs: recognised, E0419
+    // at run time.
+    let parsed = e1647::parser::parse(
+        "extend sys {\n    \
+         run() is also {\n        \
+         table_manager.read_table_from_excel(\"f\", \"s\", \"t\");\n    };\n};\n",
+    );
+    assert!(parsed.diagnostics.is_empty(), "parse failed");
+    let elaborated = elaborate(&parsed.declarations);
+    assert!(elaborated.diagnostics.is_empty(), "elab failed");
+    let result = run(&elaborated, 1);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.render().contains("E0419")),
+        "expected the E0419 stub, got {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
     );
 }
 

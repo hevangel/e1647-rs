@@ -89,8 +89,17 @@ pub fn is_builtin_base(name: &str) -> bool {
 
 /// Predeclared value types usable in type positions without a
 /// declaration in the source file (`var f: file`, `ev: event;`,
-/// `var s: set` — the set type of 5.2.12).
-pub const BUILTIN_TYPES: &[&str] = &["file", "event", "set"];
+/// `var s: set` — the set type of 5.2.12; `t: table` and
+/// `r: table_row` — the 32.3 table API; `table_manager` is the
+/// singleton receiver's type).
+pub const BUILTIN_TYPES: &[&str] = &[
+    "file",
+    "event",
+    "set",
+    "table",
+    "table_row",
+    "table_manager",
+];
 
 pub fn is_builtin_type(name: &str) -> bool {
     BUILTIN_TYPES.contains(&name)
