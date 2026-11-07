@@ -260,13 +260,6 @@ pub enum Value {
     /// handed out by the iterator — `new instance_path_item` is the
     /// construction stub (E0419, clause 32.2).
     InstancePathItem(Rc<InstancePathItem>),
-    /// see [`Interp::bind_slot_value`]. Operations on the value
-    /// dispatch to the struct's `numeric_*` methods (T7.3).
-    Custom {
-        type_name: String,
-        instance: usize,
-    },
->>>>>>> origin/main
     Void,
 }
 
