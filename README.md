@@ -10,84 +10,19 @@
   <em>Slopman (present) &#8594; Rustman (pending sufficient token expenditure).</em>
 </p>
 
-> **Status: pre-alpha.** The implementation target is **IEEE 1647-2019**
-> (clause citations in code comments, diagnostics and docs use the 2019
-> numbering; historical entries in the verification log predate the
-> migration and cite 2016 — see [docs/REFERENCES.md](docs/REFERENCES.md)).
-> Implements a source tokenizer and a parser for a
-> declared subset of the language: struct/unit/extend/type declarations,
-> fields, scalar/list/named and enumeral types, `keep`/`keep soft`
-> constraints, `when` subtype members, ports, events and sequences, and
-> methods with parameter lists and statement bodies (including `for`,
-> `case`, `check that`, `wait`, `emit` and `start`), with diagnostic
-> fixtures. `import` loads a sibling file. Member composition folds `like`
-> chains and `extend` blocks into per-type member lists. The interpreter
-> (`e1647 run`) executes that subset, including `print`/`out` and `gen` —
-> a seeded rejection sampler by default, or a seeded solve of conjunctive
-> linear constraints via the Pumpkin CP solver when the `solver-pumpkin`
-> cargo feature is enabled. A single xezim VPI bridge (`src/hdl.rs`,
-> `hdl_load` and quoted signal paths) drives one mixed SystemVerilog
-> example. The clause 12 temporal-engine core (`src/temporal.rs`)
-> propagates sampling events to sampled normal form and evaluates
-> temporal expressions over explicit finite paths; the run loop drives
-> it: `emit` feeds an event log, the clause 13.2.2 scheduler runs
-> `start`ed TCMs concurrently (round-robin turns suspending at
-> `wait`/`sync`), temporal waits re-evaluate against the log, and
-> `expect`/`assume` rules are checked at quit. Coverage groups
-> (clause 14) collect basic-item buckets and grades on their sampling
-> event (`run --coverage` reports them), and `select` distributions
-> (clause 10) bias the seeded rejection sampler
-> (weights/min/max/edges/others/normal). `when` subtypes (clause 6.7)
-> resolve: when-qualified field types instantiate synthesized subtype
-> views whose when members apply. Template instances (clause 8.7)
-> monomorphize: actuals substitute for formals (method bodies
-> included) and template-typed fields carry the instance; clause 8.6
-> template extensions apply to the instances whose actuals comply
-> with the extension's parameter categories. Simple macros (clause 15)
-> expand before
-> parsing, and the reflection set (`set_of_values` with the 28.5 set
-> pseudo-methods) evaluates. Clause 20's `repeat until` loops and the
-> `do` sugar run. The IEEE 1647-2019 lexical/syntactic foundation runs:
-> `/* */` comments are standard and may span code segments (4.2.4),
-> statements may span code segments (4.2.3), statements and members may
-> be brace-grouped (4.3.2/4.3.3), `longint`/`longuint` exist (5.2.3.1),
-> `list_ptr==`/`!list_ptr=` compare reference-identity lists (4.11.4),
-> `in_table` rows match tuples (4.11.8), `evaluate { … }` is an
-> expression (4.17.7), `typeof()`/`typeof_item()` resolve in type
-> positions (5.9), subtype qualifiers qualify dot access (4.17.3), and
-> field declarations take initial values (6.9). The simulator-side
-> temporal integration samples
-> `rise/fall/change(HDL expression) @sim` events and `hdl_path()`-bound
-> event ports each virtual cycle (a live session, or an injected signal
-> history where the simulator is unavailable), and TCMs declared
-> `@event` commence when that event occurs.
->
-> The 2019 migration's feature phases all run (PRs #40–#49; per-phase
-> limits in the PR bodies and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
-> static fields/methods/events with `Type::member` access (6.9.3,
-> 17.2, 11.1.4.1); `interface` declarations, `implementing`, casts and
-> dynamic dispatch (6.13); the template rework — value parameters,
-> `conditions`, `template extend`, derived defaults, template
-> interfaces/numeric types (8.2–8.7); range-generated `~` fields with
-> reduced-set generation, `rgf=` and the rgf routines (6.9.7, 10.3.13,
-> 18.6, 29.13); `keep target chosen_from read_only(list)` (10.5.8);
-> custom numeric types with the `numeric_i` operator dispatch and the
-> 5.6.3 precision rules (5.2.15, clause 31); the Table 1 execution
-> phases (`setup`/`extract`/`check`/`finalize`, generation sub-phases,
-> port-binding and unit queries — 9.13, 7.3–7.4); `table … with { … }`
-> expansion, `csv_to_table` and the `table_manager` API (26, 32.3);
-> `annotation @name` with attachments (35); the reflection catalogue
-> and `instance_iterator` (32.1–32.2, [docs/REFLECTION_2019.md](docs/REFLECTION_2019.md)).
-> Recognised-but-unimplemented library names report `E0419` with their
-> clause (see `UNIMPLEMENTED_2019` in `src/interp.rs`).
->
-> It does **not** yet do
-> full type
-> checking,
-> resolution, event-driven temporal evaluation, non-linear or
-> disjunctive constraint solving, or general testbench execution. No IEEE
-> conformance is claimed. See [docs/ROADMAP.md](docs/ROADMAP.md) for the
-> staged plan.
+> **Status: pre-alpha — full inventory in [docs/STATUS.md](docs/STATUS.md).**
+> The implementation target is **IEEE 1647-2019**. Today the tool
+> tokenizes, parses and elaborates a declared subset of the language and
+> executes it: `e1647 run` generates seeded-random data under `keep`
+> constraints, drives the Table 1 execution phases, runs TCMs on the
+> clause 13 scheduler, checks temporal `expect`/`assume` rules and
+> collects coverage. The IEEE 1647-2019 feature set runs: static
+> members, interfaces, the template rework, range-generated fields,
+> `chosen_from`, custom numeric types, tables, annotations, and the
+> reflection catalogue with `instance_iterator`. Full type checking,
+> event-driven temporal evaluation, non-linear constraint solving and
+> general testbench execution do **not** exist yet, and no IEEE
+> conformance is claimed.
 
 ## From Slopman to Rustman
 
@@ -153,7 +88,7 @@ limits).
 | `Dockerfile`, `compose.yml` | The toolchain container (see Quick start) |
 | `tests/` | Integration tests and `tests/fixtures/` diagnostic fixtures |
 | `examples/` | Small e-language sources used by tests and the CLI |
-| `docs/` | Architecture, roadmap, references and the verification log |
+| `docs/` | Architecture, roadmap, status inventory, references and the verification log |
 | `external/` | Pinned read-only reference repositories (see [external/README.md](external/README.md)) |
 | `slopman-logo.png`, `rustman-logo.png` | The project mascot, present and prospective (see [From Slopman to Rustman](#from-slopman-to-rustman)) |
 
