@@ -1,0 +1,3 @@
+4:5: error[E0207]: struct 'fx_s' implements numeric_i and cannot have subtypes (clause 5.8.4)
+8:17: error[E0207]: struct 'fx_s' implements numeric_i and cannot have subtypes (clause 5.8.4)
+7:14: error[E0207]: subtype of custom numeric type 'fx_t' is not allowed

@@ -152,12 +152,80 @@ fn method_redefinition_requires_modifier() {
 #[test]
 fn type_declarations_pass_through_enumerals() {
     let result = elaborated("type color_e: [RED, GREEN = 2];\n");
-    assert_eq!(result.types.len(), 1);
-    assert_eq!(result.types[0].kind, DeclarationKind::Type);
-    assert_eq!(result.types[0].enumerals.len(), 2);
-    assert_eq!(result.types[0].enumerals[1].name, "GREEN");
-    assert!(result.types[0].enumerals[1].value.is_some());
-    assert!(result.types[0].fields.is_empty());
+    // The clause 31 numeric builtins (T7.2) synthesize after the
+    // declared types; the declared `type` keeps its enumerals.
+    let color = result
+        .types
+        .iter()
+        .find(|declared| declared.name == "color_e" && declared.kind == DeclarationKind::Type)
+        .expect("the declared type is elaborated");
+    assert_eq!(color.enumerals.len(), 2);
+    assert_eq!(color.enumerals[1].name, "GREEN");
+    assert!(color.enumerals[1].value.is_some());
+    assert!(color.fields.is_empty());
+}
+
+#[test]
+fn builtin_numeric_interfaces_and_format_kind_are_synthesized() {
+    // T7.2 (clause 31): the predefined numeric interfaces and the
+    // `numeric_format_kind` enumerand type exist without a
+    // declaration; `numeric_i` composes like `base_numeric_i` and adds
+    // its operator signatures.
+    let result = elaborated("");
+    let base = find(&result, "base_numeric_i");
+    assert_eq!(base.kind, DeclarationKind::Interface);
+    assert!(base.methods.iter().any(|m| m.name == "set_initial_value"));
+    assert!(base.methods.iter().any(|m| m.name == "numeric_from_int"));
+    assert!(base.methods.iter().any(|m| m.name == "numeric_to_string"));
+    let numeric_i = find(&result, "numeric_i");
+    assert_eq!(numeric_i.kind, DeclarationKind::Interface);
+    assert_eq!(numeric_i.interface_bases, vec!["base_numeric_i".to_owned()]);
+    // The composed method set carries the base's signatures too.
+    assert!(
+        numeric_i
+            .methods
+            .iter()
+            .any(|m| m.name == "numeric_from_int")
+    );
+    assert!(numeric_i.methods.iter().any(|m| m.name == "numeric_add"));
+    assert!(
+        numeric_i
+            .methods
+            .iter()
+            .any(|m| m.name == "numeric_compare")
+    );
+    assert!(
+        numeric_i
+            .methods
+            .iter()
+            .any(|m| m.name == "numeric_unary_minus")
+    );
+    assert!(numeric_i.methods.iter().any(|m| m.name == "numeric_is_nan"));
+    let format_kind = result
+        .types
+        .iter()
+        .find(|t| t.name == "numeric_format_kind")
+        .expect("numeric_format_kind is synthesized");
+    assert_eq!(format_kind.kind, DeclarationKind::Type);
+    let names: Vec<&str> = format_kind
+        .enumerals
+        .iter()
+        .map(|enumeral| enumeral.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["none", "dec", "hex", "bin", "oct", "udec", "float"]
+    );
+}
+
+#[test]
+fn user_declaration_shadows_the_builtin_numeric_interfaces() {
+    // A file-declared interface of a predefined numeric name is the
+    // one the elaborated types carry — the builtin is skipped.
+    let result = elaborated("interface base_numeric_i { ping(): int; };\n");
+    let base = find(&result, "base_numeric_i");
+    assert_eq!(base.methods.len(), 1);
+    assert!(base.methods.iter().all(|m| m.name == "ping"));
 }
 
 #[test]
@@ -877,11 +945,13 @@ fn template_interface_instances_materialize() {
 
 #[test]
 fn template_numeric_type_instances_record_the_impl_struct() {
-    // 8.4: a template numeric_type's instance records the substituted
-    // impl-struct reference; the operator machinery is the later
-    // numeric_type milestone.
+    // 8.4 with T7.1: a template numeric_type's instance records the
+    // substituted impl-struct reference, and the impl-struct must
+    // implement `numeric_i` (clause 31.4) — a base without the
+    // implementation is the checker's E0132, like the plain
+    // `numeric_type T: S;` form.
     let result = elaborated(
-        "struct base_int { !bits: uint; };\n\
+        "struct base_int implementing numeric_i of (base_int, TRUE, 32) { !bits: uint; };\n\
          template numeric_type width_t of (<bits'exp>: uint): base_int of (<bits'exp>);\n\
          extend sys {\n    w: width_t of (4);\n};\n",
     );
