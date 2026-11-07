@@ -3747,3 +3747,815 @@ fn new_of_annotation_type_is_rejected() {
         ]
     );
 }
+// ---------------------------------------------------------------------------
+// T9.1 (26.2): the `table … with { … }` preprocessor expansion.
+// ---------------------------------------------------------------------------
+
+/// The migration plan's T9.1 test: a struct member table declaring one
+/// field per row, a set-literal table over actions and a `count` table.
+fn table_regs_source() -> String {
+    "<'\n\
+     struct regs {\n    \
+     table { #name | #width ;\n            \
+     ctrl  | 8      ;\n            \
+     stat  | 4      ;\n            \
+     data  | 16     } with {\n        \
+     <#name>: uint(bits: <#width>);\n        \
+     keep <#name> < <#width>;\n    };\n};\n\
+     extend sys {\n    \
+     run() is also {\n        \
+     var r: regs; gen r;\n        \
+     table [1..3] with { out(\"row <#0> value <#1>\\n\"); };\n        \
+     table count { a | 1; b | 2 } with { out(\"rows: <#1>\\n\"); };\n    };\n};\n'>\n"
+        .to_owned()
+}
+
+#[test]
+fn table_expansion_declares_members_and_iterates_rows() {
+    // T9.1: the member table expands one field + constraint per row
+    // (elab lists ctrl/stat/data at widths 8/4/16), the set-literal
+    // table runs its body once per row with the row index and first
+    // column substituted, and `count` reduces the data to the row
+    // count.
+    let parsed = e1647::parser::parse(&table_regs_source());
+    assert!(
+        parsed.diagnostics.is_empty(),
+        "parse diagnostics: {:?}",
+        parsed
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    let elaborated = elaborate(&parsed.declarations);
+    assert!(
+        elaborated.diagnostics.is_empty(),
+        "elab diagnostics: {:?}",
+        elaborated
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    let regs = elaborated
+        .types
+        .iter()
+        .find(|t| t.name == "regs")
+        .expect("the regs type elaborated");
+    let widths: Vec<(String, u32)> = regs
+        .fields
+        .iter()
+        .filter_map(|field| match &field.ty {
+            e1647::ast::TypeExpr::Scalar {
+                width: Some(width), ..
+            } => match width.as_ref() {
+                e1647::ast::Expr::IntLiteral { text, .. } => text
+                    .parse::<u32>()
+                    .ok()
+                    .map(|width| (field.name.clone(), width)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        widths,
+        vec![
+            ("ctrl".to_owned(), 8),
+            ("stat".to_owned(), 4),
+            ("data".to_owned(), 16)
+        ]
+    );
+    let result = run(&elaborated, 1);
+    assert!(
+        result.diagnostics.is_empty(),
+        "run diagnostics: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        result.output,
+        "row 0 value 1\nrow 1 value 2\nrow 2 value 3\nrows: 2\n"
+    );
+}
+
+#[test]
+fn gen_chosen_from_picks_satisfying_elements_deterministically() {
+    // T6.1 (10.5.8): `keep p chosen_from read_only(lps)` assigns p a
+    // pointer to one of the read-only list's elements, chosen so the
+    // other constraints on paths through the target hold (p.x > 5);
+    // 20 generations print 20 TRUE lines, and the choice is uniform over
+    // the satisfying elements under the seeded RNG (across fixed seeds
+    // every satisfying value is reached).
+    let source = "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    !lps: list of packet_s;\n    p: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n    keep p.x > 5;\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         for i from 0 to 9 { var q: packet_s = new; q.x = i; h.lps.add(q); };\n        \
+         for k from 1 to 20 { gen h.p; out(h.p.x > 5, \" \", h.p.x, \"\\n\"); };\n    };\n};\n";
+    let first = clean_output(source, 1);
+    let lines: Vec<&str> = first.lines().collect();
+    assert_eq!(lines.len(), 20);
+    assert!(
+        lines.iter().all(|line| line.starts_with("TRUE ")),
+        "every generation must satisfy p.x > 5: {first:?}"
+    );
+    let second = clean_output(source, 1);
+    assert_eq!(first, second, "the same seed must reproduce the run");
+    let mut seen = std::collections::BTreeSet::new();
+    for seed in 1..=5u64 {
+        let output = clean_output(source, seed);
+        for line in output.lines() {
+            let value: i128 = line["TRUE ".len()..]
+                .trim()
+                .parse()
+                .expect("integer output");
+            assert!((6..=9).contains(&value), "constraint violated: x = {value}");
+            seen.insert(value);
+        }
+    }
+    assert_eq!(
+        seen,
+        std::collections::BTreeSet::from([6, 7, 8, 9]),
+        "the uniform choice must reach every satisfying element across seeds"
+    );
+}
+
+// --- Range-generated fields (clause 6.9.7, 10.3.13, 18.6, 29.13) ---
+
+#[test]
+fn rgf_reduced_set_satisfies_the_constraints_per_branch() {
+    // The migration plan T5.2's worked example: `c => a < 10` and
+    // `!c => b < 10` produce complementary reduced sets, and each
+    // field's concrete value stays inside its set — 30 lines, all TRUE.
+    let output = clean_output(
+        "struct rg {\n\
+         \x20   c: bool;\n\
+         \x20   ~b: uint;\n\
+         \x20   ~a: uint;\n\
+         \x20   keep c => a < 10;\n\
+         \x20   keep !c => b < 10;\n\
+         };\n\
+         extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var r: rg;\n\
+         \x20       for i from 1 to 10 {\n\
+         \x20           gen r;\n\
+         \x20           if r.c then {\n\
+         \x20               out(rgf_get_range(r.a) == [0..9]);\n\
+         \x20               out(rgf_get_range(r.b) == [0..MAX_UINT]);\n\
+         \x20           } else {\n\
+         \x20               out(rgf_get_range(r.b) == [0..9]);\n\
+         \x20               out(rgf_get_range(r.a) == [0..MAX_UINT]);\n\
+         \x20           };\n\
+         \x20           out(r.a in rgf_get_range(r.a) and r.b in rgf_get_range(r.b));\n\
+         \x20       };\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "TRUE".repeat(30));
+}
+
+#[test]
+fn rgf_set_is_the_intersection_of_the_constraint_intervals() {
+    // Supported shapes: `in` with a range, `!=` (complement within the
+    // type range), a mirrored comparison, and a same-field `||` union.
+    // The concrete value is the set's minimum.
+    let output = clean_output(
+        "struct bounded_s {\n\
+         \x20   ~a: uint;\n\
+         \x20   keep a in [2..6];\n\
+         \x20   keep a != 5;\n\
+         };\n\
+         struct mirrored_s {\n\
+         \x20   ~a: uint;\n\
+         \x20   keep 10 > a;\n\
+         };\n\
+         struct union_s {\n\
+         \x20   ~a: uint;\n\
+         \x20   keep a == 3 || a == 7;\n\
+         };\n\
+         struct excluded_s {\n\
+         \x20   ~a: uint;\n\
+         \x20   keep a not in [0..4];\n\
+         };\n\
+         extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var bounded: bounded_s;\n\
+         \x20       gen bounded;\n\
+         \x20       out(bounded.a, \" \", rgf_get_range(bounded.a), \"\\n\");\n\
+         \x20       var mirrored: mirrored_s;\n\
+         \x20       gen mirrored;\n\
+         \x20       out(mirrored.a, \" \", rgf_get_range(mirrored.a), \"\\n\");\n\
+         \x20       var unioned: union_s;\n\
+         \x20       gen unioned;\n\
+         \x20       out(unioned.a, \" \", rgf_get_range(unioned.a), \"\\n\");\n\
+         \x20       var excluded: excluded_s;\n\
+         \x20       gen excluded;\n\
+         \x20       out(excluded.a, \" \", rgf_get_range(excluded.a), \"\\n\");\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(
+        output,
+        "2 [2..4,6]\n\
+         0 [0..9]\n\
+         3 [3,7]\n\
+         5 [5..4294967295]\n"
+    );
+}
+
+#[test]
+fn nested_table_refers_to_the_enclosing_row() {
+    // T9.1's nested test: the outer table iterates { A; B }, the inner
+    // table runs inside each outer row; `<##1>` reads the enclosing
+    // row's first cell, `<#1>` the inner row's.
+    let output = clean_output(
+        "extend sys {\n    \
+         run() is also {\n        \
+         table { A; B } with {\n            \
+         table [1..2] with { out(\"<##1>-<#1>\\n\"); };\n        \
+         };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "A-1\nA-2\nB-1\nB-2\n");
+}
+
+#[test]
+fn count_excludes_the_header_row() {
+    // With `count`, the header row is not a data row: the two data
+    // rows count as 2 (a headerless two-row table counts 2 as well —
+    // the plan's `table count { a | 1; b | 2 }` case covers that).
+    let output = clean_output(
+        "extend sys {\n    \
+         run() is also {\n        \
+         table count { #a | #b ; 1 | 2 ; 3 | 4 } with { out(\"count=<#1>\\n\"); };\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "count=2\n");
+}
+
+// ---------------------------------------------------------------------------
+// T9.2 (26.3): `table from operator(...) using filter/unique`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn table_from_csv_to_table_with_filter() {
+    // T9.2's test: the rows come from tests/data/regs.csv's `regs`
+    // table; the filter drops the `dummy` row, so `ctrl:8` and
+    // `stat:4` print.
+    let path = format!("{}/tests/data/regs", env!("CARGO_MANIFEST_DIR"));
+    let source = format!(
+        "extend sys {{\n    \
+         run() is also {{\n        \
+         table from csv_to_table(\"{path}\", \"regs\")\n            \
+         using filter = table_column(\"name\") != \"dummy\"\n            \
+         with {{ out(\"<#name>:<#width>\\n\"); }};\n    }};\n}};\n"
+    );
+    let output = clean_output(&source, 1);
+    assert_eq!(output, "ctrl:8\nstat:4\n");
+}
+
+#[test]
+fn table_from_csv_to_table_with_unique() {
+    // The unique option keeps the first row per distinct value,
+    // applied after the filter — over the `dups` table whose widths
+    // repeat (8, 4, 8, 4, 8), only the first 8 and the first 4 stay.
+    let path = format!("{}/tests/data/regs", env!("CARGO_MANIFEST_DIR"));
+    let source = format!(
+        "extend sys {{\n    \
+         run() is also {{\n        \
+         table from csv_to_table(\"{path}\", \"dups\")\n            \
+         using unique = table_column(\"width\")\n            \
+         with {{ out(\"<#name>\\n\"); }};\n    }};\n}};\n"
+    );
+    let output = clean_output(&source, 1);
+    assert_eq!(output, "a\nb\n");
+}
+
+// ---------------------------------------------------------------------------
+// T9.3 (32.3): the procedural table API.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn table_procedural_api_basics() {
+    // T9.3's test: create_table + add_row + set_data/read round-trip;
+    // rows number from 0, columns from 1.
+    let output = clean_output(
+        "extend sys {\n    \
+         run() is also {\n        \
+         var t := table_manager.create_table({\"a\";\"b\"});\n        \
+         t.add_row();\n        \
+         t.get_row(0).set_data(1, \"x\");\n        \
+         out(t.get_rows_num(), \" \", t.get_columns_num(), \" \", \
+         t.get_row(0).get_data(1), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "1 2 x\n");
+}
+
+#[test]
+fn table_row_index_column_and_row_api() {
+    // Column 0 is the row index; the row/row_with_data creators and
+    // the source-info copies work on standalone rows.
+    let output = clean_output(
+        "extend sys {\n    \
+         run() is also {\n        \
+         var t := table_manager.create_table({\"a\";\"b\"});\n        \
+         t.add_row(); t.add_row();\n        \
+         out(t.get_row(1).get_data(0), \"\\n\");\n        \
+         var r := table_manager.create_row_with_data({\"p\";\"q\"});\n        \
+         out(r.get_size(), \" \", r.get_data(1), r.get_data(2), \"\\n\");\n        \
+         var s := table_manager.create_row(2);\n        \
+         s.copy_source_info_from(r);\n        \
+         s.set_data(2, \"z\");\n        \
+         out(s.get_data(2), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "1\n2 pq\nz\n");
+}
+
+#[test]
+fn table_read_from_csv_is_cached_and_read_only() {
+    // A table read from a file is read-only: set_data through a row is
+    // the copy-first runtime error; the copy is writable.
+    let parsed = e1647::parser::parse(&format!(
+        "extend sys {{\n    \
+         run() is also {{\n        \
+         var t := table_manager.read_table_from_csv(\"{}/tests/data/regs\", \"regs\");\n        \
+         t.get_row(0).set_data(1, \"9\");\n    }};\n}};\n",
+        env!("CARGO_MANIFEST_DIR")
+    ));
+    assert!(parsed.diagnostics.is_empty(), "parse failed");
+    let elaborated = elaborate(&parsed.declarations);
+    assert!(elaborated.diagnostics.is_empty(), "elab failed");
+    let result = run(&elaborated, 1);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.render().contains("read-only")),
+        "expected the copy-first read-only error, got {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn gen_chosen_from_target_is_an_alias_of_one_list_element() {
+    // T6.1: pointer semantics — the target holds one of the list's
+    // elements (object identity), not a copy. `has(it list_ptr== ...)`
+    // is not in the runtime subset, so the alias is found by comparing
+    // object equality against each element.
+    let output = clean_output(
+        "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    !lps: list of packet_s;\n    p: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         for i from 0 to 9 { var q: packet_s = new; q.x = i + 3; h.lps.add(q); };\n        \
+         gen h.p;\n        var hit: int = -1;\n        \
+         for i from 0 to 9 { if h.p == h.lps[i] { hit = i; }; };\n        \
+         out(hit >= 0, \"\\n\");\n        \
+         out(h.p.x == h.lps[hit].x, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUE\nTRUE\n");
+}
+
+#[test]
+fn gen_whole_object_applies_chosen_from_to_the_target_field() {
+    // T6.1: `gen h` (the whole enclosing instance) also applies the
+    // chosen_from constraint to its target field instead of sampling a
+    // fresh packet, and the other constraints on paths through the
+    // target hold.
+    let output = clean_output(
+        "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    !lps: list of packet_s;\n    p: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n    keep p.x > 5;\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         for i from 0 to 9 { var q: packet_s = new; q.x = i; h.lps.add(q); };\n        \
+         gen h;\n        out(h.p.x > 5, \"\\n\");\n        \
+         var hit: int = -1;\n        \
+         for i from 0 to 9 { if h.p == h.lps[i] { hit = i; }; };\n        \
+         out(hit >= 0, \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUE\nTRUE\n");
+}
+
+#[test]
+fn gen_chosen_from_no_satisfying_element_reports_e0417() {
+    // T6.1: after every element's x drops to 1, no element satisfies
+    // p.x > 5 — the generation contradiction is E0417.
+    let result = run_source(
+        "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    !lps: list of packet_s;\n    p: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n    keep p.x > 5;\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         for i from 0 to 9 { var q: packet_s = new; q.x = i; h.lps.add(q); };\n        \
+         for each (e) in h.lps { e.x = 1; };\n        \
+         gen h.p;\n    };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0417");
+    assert!(
+        diagnostic
+            .render()
+            .contains("chosen_from: no element of 'lps' satisfies the constraints on 'p'"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn table_copy_is_writable_and_read_helpers_work() {
+    // copy() lifts the read-only flag; the csv readers report their
+    // source, and the manager's line helpers answer per 32.3.3.
+    let path = format!("{}/tests/data/regs", env!("CARGO_MANIFEST_DIR"));
+    let output = clean_output(
+        &format!(
+            "extend sys {{\n    \
+             run() is also {{\n        \
+             var t := table_manager.read_table_from_csv(\"{path}\", \"regs\");\n        \
+             var c := t.copy();\n        \
+             c.get_row(0).set_data(1, \"9\");\n        \
+             out(c.get_row(0).get_data(1), \"\\n\");\n        \
+             out(t.get_row(0).get_csv_file_name() != \"\", \"\\n\");\n        \
+             out(t.get_row(0).get_csv_line_num(), \"\\n\");\n        \
+             out(table_manager.is_empty_line(\"  , \"), \"\\n\");\n        \
+             out(table_manager.get_table_tag_from_row(\"regs,x\"), \"\\n\");\n    }};\n}};\n"
+        ),
+        1,
+    );
+    assert_eq!(output, "9\nTRUE\n3\nTRUE\nregs\n");
+}
+
+#[test]
+fn excel_table_readers_report_the_stub() {
+    // The excel readers are the honest 32.3 stubs: recognised, E0419
+    // at run time.
+    let parsed = e1647::parser::parse(
+        "extend sys {\n    \
+         run() is also {\n        \
+         table_manager.read_table_from_excel(\"f\", \"s\", \"t\");\n    };\n};\n",
+    );
+    assert!(parsed.diagnostics.is_empty(), "parse failed");
+    let elaborated = elaborate(&parsed.declarations);
+    assert!(elaborated.diagnostics.is_empty(), "elab failed");
+    let result = run(&elaborated, 1);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.render().contains("E0419")),
+        "expected the E0419 stub, got {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn gen_chosen_from_empty_list_reports_e0417() {
+    // T6.1: an empty read-only list is a generation contradiction too.
+    let result = run_source(
+        "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    !lps: list of packet_s;\n    p: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         gen h.p;\n    };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0417");
+    assert!(
+        diagnostic
+            .render()
+            .contains("chosen_from: no element of 'lps' satisfies the constraints on 'p'"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn gen_chosen_from_pointer_equality_constraint_is_e0402() {
+    // T6.1: a pointer-equality constraint on the chosen_from target is
+    // an unsupported shape, reported instead of silently ignored.
+    let result = run_source(
+        "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    lps: list of packet_s;\n    p: packet_s;\n    q: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n    keep p == q;\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         var q: packet_s = new; h.lps.add(q);\n        \
+         gen h.p;\n    };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0402");
+    assert!(
+        diagnostic
+            .render()
+            .contains("pointer-equality constraint on the target 'p' is not supported"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn gen_chosen_from_nongenerative_target_is_e0402() {
+    // T6.1: the target must be a generative struct field — a `!` field
+    // keeps its value and is never assigned by gen.
+    let result = run_source(
+        "\n\
+         struct packet_s { x: uint; };\n\
+         struct holder {\n    !lps: list of packet_s;\n    !p: packet_s;\n    \
+         keep p chosen_from read_only(lps);\n};\n\
+         extend sys {\n    run() is also {\n        var h: holder = new;\n        \
+         var q: packet_s = new; h.lps.add(q);\n        \
+         gen h.p;\n    };\n};\n",
+        1,
+    );
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0402");
+    assert!(
+        diagnostic
+            .render()
+            .contains("chosen_from target 'p' must be a generative struct field"),
+        "rendered: {}",
+        diagnostic.render()
+    );
+}
+
+#[test]
+fn rgf_was_reduced_flags_whether_constraints_narrowed_the_type_range() {
+    // T5.4: reduced TRUE where the constraints narrowed the set, FALSE
+    // for a field whose set is the type's full range.
+    let output = clean_output(
+        "struct pair_s {\n\
+         \x20   c: bool;\n\
+         \x20   ~a: uint;\n\
+         \x20   ~b: uint;\n\
+         \x20   keep c == TRUE;\n\
+         \x20   keep a < 10;\n\
+         };\n\
+         extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var r: pair_s;\n\
+         \x20       gen r;\n\
+         \x20       out(rgf_was_reduced(r.a), \" \", rgf_was_reduced(r.b), \"\\n\");\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "TRUE FALSE\n");
+}
+
+#[test]
+fn rgf_assign_within_and_outside_the_generated_set() {
+    // T5.3: `rgf=` assigns a value of the generated set; outside it the
+    // run reports E0415 with the set rendered as written. No automatic
+    // width cast — the membership test is the whole check.
+    let source = "struct sized_s {\n\
+                  \x20   c: bool;\n\
+                  \x20   ~a: uint;\n\
+                  \x20   keep c == TRUE;\n\
+                  \x20   keep a < 10;\n\
+                  };\n\
+                  extend sys {\n\
+                  \x20   run() is also {\n\
+                  \x20       var r: sized_s;\n\
+                  \x20       gen r;\n\
+                  \x20       r.a rgf= 7;\n\
+                  \x20       out(r.a);\n\
+                  \x20       r.a rgf= 12;\n\
+                  \x20       out(r.a);\n\
+                  \x20   };\n\
+                  };\n";
+    let result = run_source(source, 1);
+    assert_eq!(result.output, "7");
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0415");
+    assert!(
+        diagnostic
+            .message
+            .contains("value 12 is outside the generated range [0..9] of 'a'"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[test]
+fn rgf_queries_before_generation() {
+    // T5.4: `rgf_was_generated` is FALSE before any `gen`; the range
+    // queries report E0416 until the field was generated.
+    let source = "struct lone_s {\n\
+                  \x20   ~a: uint;\n\
+                  };\n\
+                  extend sys {\n\
+                  \x20   run() is also {\n\
+                  \x20       var r: lone_s;\n\
+                  \x20       out(rgf_was_generated(r.a));\n\
+                  \x20       out(rgf_get_range(r.a));\n\
+                  \x20   };\n\
+                  };\n";
+    let result = run_source(source, 1);
+    assert_eq!(result.output, "FALSE");
+    let codes: Vec<&str> = result
+        .diagnostics
+        .iter()
+        .map(|d| d.code)
+        .collect::<Vec<_>>();
+    assert_eq!(codes, vec!["E0416"]);
+    assert!(
+        result.diagnostics[0]
+            .message
+            .contains("rgf query/assign before generation"),
+        "{}",
+        result.diagnostics[0].message
+    );
+}
+
+#[test]
+fn rgf_unsupported_constraint_shapes_report_e0317() {
+    // T5.2: arithmetic over the rgf field, a comparison between two rgf
+    // fields, a negation over an rgf atom, and two atoms naming
+    // different fields are outside the supported shapes.
+    let shapes = [
+        ("arith_s", "keep a + 1 < 5;"),
+        ("coupled_s", "keep a < b;"),
+        ("negated_s", "keep !(a > 3);"),
+        ("two_field_s", "keep a > 3 && b < 10;"),
+    ];
+    for (name, constraint) in shapes {
+        let source = format!(
+            "struct {name} {{\n\
+             \x20   ~a: uint;\n\
+             \x20   ~b: uint;\n\
+             \x20   {constraint}\n\
+             }};\n\
+             extend sys {{\n\
+             \x20   run() is also {{\n\
+             \x20       var r: {name};\n\
+             \x20       gen r;\n\
+             \x20   }};\n\
+             }};\n"
+        );
+        let result = run_source(&source, 1);
+        let codes: Vec<&str> = result
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>();
+        assert_eq!(codes, vec!["E0317"], "{name}: {source}");
+        assert!(
+            result.diagnostics[0]
+                .message
+                .contains("unsupported constraint shape for range-generated field"),
+            "{name}: {}",
+            result.diagnostics[0].message
+        );
+    }
+}
+
+#[test]
+fn rgf_implication_with_false_antecedent_keeps_the_full_range() {
+    // The implication rule: a FALSE antecedent contributes the field
+    // type's full range, so the set is unreduced and the minimum is the
+    // type's bottom.
+    let output = clean_output(
+        "struct branch_s {\n\
+         \x20   c: bool;\n\
+         \x20   ~a: uint;\n\
+         \x20   ~b: uint;\n\
+         \x20   keep c == FALSE;\n\
+         \x20   keep c => a < 3;\n\
+         \x20   keep !c => b < 4;\n\
+         };\n\
+         extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var r: branch_s;\n\
+         \x20       gen r;\n\
+         \x20       out(r.a, \" \", rgf_get_range(r.a) == [0..MAX_UINT], \" \");\n\
+         \x20       out(r.b, \" \", rgf_get_range(r.b) == [0..3], \"\\n\");\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "0 TRUE 0 TRUE\n");
+}
+
+#[test]
+fn rgf_enum_and_bool_fields_carry_index_sets() {
+    // The value model keeps integer intervals, so an enumeral field's
+    // generated set is its enumerand indices (the set model's numbering)
+    // and a bool field's is {0, 1}; the concrete value maps back to the
+    // enumerand or the boolean.
+    let output = clean_output(
+        "type color_e: [RED, GREEN, BLUE];\n\
+         struct colored_s {\n\
+         \x20   ~c: color_e;\n\
+         \x20   keep c != GREEN;\n\
+         };\n\
+         struct flagged_s {\n\
+         \x20   ~f: bool;\n\
+         \x20   keep f == TRUE;\n\
+         };\n\
+         extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var colored: colored_s;\n\
+         \x20       gen colored;\n\
+         \x20       out(colored.c, \" \", rgf_get_range(colored.c), \"\\n\");\n\
+         \x20       var flagged: flagged_s;\n\
+         \x20       gen flagged;\n\
+         \x20       out(flagged.f, \" \", rgf_get_range(flagged.f), \"\\n\");\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "RED [0,2]\nTRUE [1]\n");
+}
+
+#[test]
+fn in_accepts_a_general_set_or_list_expression() {
+    // The `in` right operand is a set expression (4.11.6's set-exp):
+    // a set value is tested by interval membership, a list by item
+    // equality.
+    let output = clean_output(
+        "extend sys {\n\
+         \x20   run() is also {\n\
+         \x20       var l: list of uint = {1; 2; 3};\n\
+         \x20       out(2 in l, \" \", 9 in l, \" \");\n\
+         \x20       var s: set = [1..5];\n\
+         \x20       out(4 in s, \" \", 9 in s, \"\\n\");\n\
+         \x20   };\n\
+         };\n",
+        1,
+    );
+    assert_eq!(output, "TRUE FALSE TRUE FALSE\n");
+}
+
+#[test]
+fn template_value_parameter_substitutes_in_method_bodies() {
+    // 8.5.2 (the migration's T4.1): a value parameter's constant
+    // substitutes where a constant expression of that type is expected
+    // — a method body's return, a condition, a call argument — and the
+    // defaults-omitted spelling instantiates the same instance as the
+    // explicit one.
+    let output = clean_output(
+        "template struct fifo of (<t'type>, <depth'exp>: uint = 4) {\n    \
+         !items: list of <t'type>;\n    \
+         capacity(): uint is { return <depth'exp>; };\n    \
+         push(x: <t'type>): bool is {\n        \
+         if items.size() >= <depth'exp> then { return FALSE };\n        \
+         items.add(x); return TRUE;\n    };\n};\n\
+         extend sys {\n    run() is also {\n        \
+         var f8: fifo of (byte, 8) = new;\n        \
+         var f4: fifo of (int) = new;\n        \
+         out(f8.capacity()); out(f4.capacity());\n        \
+         for i from 1 to 5 { compute f4.push(i) };\n        \
+         out(f4.items.size());\n    };\n};\n",
+        1,
+    );
+    // capacity 8 and 4; the fifth push of 5 against capacity 4 is
+    // rejected, so the list holds 4.
+    assert_eq!(output, "844");
+}
+
+#[test]
+fn template_extend_members_apply_by_bounding_criteria() {
+    // 8.6 (the migration's T4.4): an extension's members apply to the
+    // instances whose actuals match the entries and satisfy the
+    // conditions — `wide()` exists only on the 8 instance, `narrow()`
+    // only on the 4 one.
+    let output = clean_output(
+        "type color_t: [red, green];\n\
+         template struct packet of (<k'type>, <w'exp>: uint) { !kind: <k'type>; };\n\
+         template extend packet of (<e'type>: enum, <n'exp>: uint) conditions { <n'exp> >= 8 } {\n    \
+         wide(): bool is { return TRUE; };\n};\n\
+         template extend packet of (color_t, 4) {\n    \
+         narrow(): bool is { return TRUE; };\n};\n\
+         extend sys {\n    run() is also {\n        \
+         var a: packet of (color_t, 8) = new;\n        \
+         var b: packet of (color_t, 4) = new;\n        \
+         out(a.wide()); out(b.narrow());\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "TRUETRUE");
+}

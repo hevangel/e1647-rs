@@ -60,6 +60,12 @@ pub const BUILTIN_ROUTINES: &[&str] = &[
     // deep-copied items, a struct copy is a fresh instance with deep
     // copied fields (its `copy()` blocks run).
     "deep_copy",
+    // The clause 29.13 range-generation routines over a `~` field
+    // (clause 6.9.7): `rgf_was_generated(f)`, `rgf_get_range(f)` (the
+    // generated reduced set of 10.3.13) and `rgf_was_reduced(f)`.
+    "rgf_was_generated",
+    "rgf_get_range",
+    "rgf_was_reduced",
     // The clause 35.4 annotation API's element-taking calls and the
     // definition-element surface (T10.3): recognised, arity-checked,
     // E0419 at run time — only `@T.get_all_annotations()` is
@@ -92,8 +98,17 @@ pub fn is_builtin_base(name: &str) -> bool {
 
 /// Predeclared value types usable in type positions without a
 /// declaration in the source file (`var f: file`, `ev: event;`,
-/// `var s: set` — the set type of 5.2.12).
-pub const BUILTIN_TYPES: &[&str] = &["file", "event", "set"];
+/// `var s: set` — the set type of 5.2.12; `t: table` and
+/// `r: table_row` — the 32.3 table API; `table_manager` is the
+/// singleton receiver's type).
+pub const BUILTIN_TYPES: &[&str] = &[
+    "file",
+    "event",
+    "set",
+    "table",
+    "table_row",
+    "table_manager",
+];
 
 pub fn is_builtin_type(name: &str) -> bool {
     BUILTIN_TYPES.contains(&name)

@@ -8,7 +8,10 @@
 //! blocks), scalar (`uint(bits: 8)`-style widths included), `list of`, and
 //! named types, field init values (`= init-value`, clause 6.9.1/6.9.2),
 //! enumeral type declarations, `keep` and `keep soft` constraint
-//! expressions, `when` subtype members (`value'id` modifiers per the
+//! expressions — including the clause 10.5.8 `target chosen_from
+//! read_only(list)` form, whose right side must be exactly a
+//! `read_only(exp)` call (`E0131` otherwise) — `when` subtype members
+//! (`value'id` modifiers per the
 //! reference grammar's `struct_type_modifier`), and method members with
 //! parameter lists and statement bodies (local `var` declarations,
 //! assignments, expression statements including calls and indexing,
@@ -77,6 +80,12 @@
 //!   interpreter, where the inference contexts (the declared type of the
 //!   assignment/`var` target or of the call's parameter) actually resolve
 //! - `E0123` `return`/`wait`/`sync` inside an `evaluate` block (clause 4.17.7)
+//! - `E0126` a template value parameter without a scalar type (clause 8.5.2)
+//! - `E0128` a `template extend` whose parameter list has no entries
+//!   (clause 8.6)
+//! - `E0129` a defaulted template parameter followed by a non-defaulted
+//!   one (clause 8.5.4)
+//! - `E0131` `chosen_from` right side is not `read_only(exp)` (clause 10.5.8)
 //! - `E0201` duplicate declaration name
 //! - `E0202` duplicate field name
 //! - `E0203` unknown type name
@@ -87,13 +96,14 @@
 
 use crate::ast::{
     BinaryOp, Declaration, DeclarationKind, Enumeral, Expr, Field, InSetExpr, KeepConstraint,
-    Member, MethodDecl, MethodModifier, OnDecl, Param, ScalarBase, Stmt, SubtypeModifier,
+    Member, MethodDecl, MethodModifier, OnDecl, Param, ScalarBase, Span, Stmt, SubtypeModifier,
     TableElem, TypeExpr, UnaryOp, WhenDecl, WhenQualifier,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Position, Token, TokenKind};
 use crate::macros;
 use crate::preproc;
+use crate::tables;
 use std::collections::BTreeSet;
 
 /// Predefined e names that lex as keywords but appear as bare values or
@@ -246,7 +256,14 @@ pub fn parse(source: &str) -> ParseResult {
 pub fn parse_unchecked(source: &str) -> ParseResult {
     let mut diagnostics = Vec::new();
     let tokens = match lexer::tokenize(source) {
-        Ok(tokens) => macros::expand_macros(preproc::substitute_defines(tokens)),
+        // The pre-passes run in phase order (see `parse`).
+        Ok(tokens) => {
+            let mut table_diagnostics = Vec::new();
+            let tokens =
+                tables::expand_tables(preproc::substitute_defines(tokens), &mut table_diagnostics);
+            diagnostics.extend(table_diagnostics);
+            macros::expand_macros(tokens)
+        }
         Err(err) => {
             let end = Position {
                 byte: err.position.byte + 1,
@@ -591,7 +608,8 @@ impl Parser {
                             underlying: None,
                             subtype_range: None,
                             template_params: Vec::new(),
-                            template_extend: false,
+                            template_conditions: Vec::new(),
+                            template_extend: None,
                             packaged: false,
                             like: None,
                             like_span: None,
@@ -641,7 +659,8 @@ impl Parser {
                             underlying: None,
                             subtype_range: None,
                             template_params: Vec::new(),
-                            template_extend: false,
+                            template_conditions: Vec::new(),
+                            template_extend: None,
                             packaged: false,
                             like: None,
                             like_span: None,
@@ -887,7 +906,8 @@ impl Parser {
                 underlying: None,
                 subtype_range: None,
                 template_params: Vec::new(),
-                template_extend: false,
+                template_conditions: Vec::new(),
+                template_extend: None,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -906,7 +926,8 @@ impl Parser {
                 underlying: None,
                 subtype_range: None,
                 template_params: Vec::new(),
-                template_extend: false,
+                template_conditions: Vec::new(),
+                template_extend: None,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -949,7 +970,8 @@ impl Parser {
                 underlying: None,
                 subtype_range: None,
                 template_params: Vec::new(),
-                template_extend: false,
+                template_conditions: Vec::new(),
+                template_extend: None,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -1098,57 +1120,124 @@ impl Parser {
         })
     }
 
-    /// `template (struct|unit|extend) name of <params> [like base] {
-    /// members };` (clause 8.2/8.6). The parameters are recorded; a
-    /// template extension (8.2) records its own formal parameters and is
-    /// flagged `template_extend` — the elaborator applies it to the
-    /// instances whose actuals comply (8.3's NOTE 3), not by name
-    /// composition. A parameterized base type (`like container of
-    /// <type>`) lands in `like` (the base name) and `like_type` (the
-    /// full expression); the `like` clause is a template-definition
-    /// form and is not parsed on extensions (the 8.2 syntax example is
-    /// an image in the local redline copy, so only the prose is
-    /// implemented).
+    /// `template (struct|unit|interface|numeric_type|extend) name of
+    /// (params) [like base] [implementing I, ...] [conditions { ... }]
+    /// { members };` (clauses 8.2, 8.5, 8.6) — and the clause 8.4
+    /// `template numeric_type name of (params): impl-struct of (...);`
+    /// form, whose head closes with the impl-struct type and a
+    /// semicolon instead of a body. The parameters are recorded (type
+    /// and value parameters, 8.5.2); a template extension (8.6) records
+    /// its entry list in `template_extend` — the elaborator applies it
+    /// to the instances whose actuals match the entries, the categories
+    /// and the conditions, not by name composition. A parameterized
+    /// base type (`like container of <type>`) lands in `like` (the base
+    /// name) and `like_type` (the full expression); a template
+    /// interface's bases are the comma list recorded in `bases`, each
+    /// possibly parameterised over the formals (`like I, J of <t'type>`,
+    /// clause 8.3) and substituted at instantiation (8.7).
     fn parse_template_declaration(&mut self) -> Option<Declaration> {
         let start = self.current_span().0;
         self.bump(); // 'template'
-        let (kind, template_extend) = match self.peek_kind() {
-            Some(TokenKind::Keyword(k)) if k == "struct" => (DeclarationKind::Struct, false),
-            Some(TokenKind::Keyword(k)) if k == "unit" => (DeclarationKind::Unit, false),
-            // `template extend name of <params> { .. };` (clause 8.6).
-            Some(TokenKind::Keyword(k)) if k == "extend" => (DeclarationKind::Extend, true),
+        let kind = match self.peek_kind() {
+            Some(TokenKind::Keyword(k)) if k == "struct" => DeclarationKind::Struct,
+            Some(TokenKind::Keyword(k)) if k == "unit" => DeclarationKind::Unit,
+            // `template interface name of (params) like I, J of <t'type>`
+            // (clause 8.3): a template interface's instances are
+            // interfaces.
+            Some(TokenKind::Keyword(k)) if k == "interface" => DeclarationKind::Interface,
+            // `template numeric_type name of (params): impl of (...)`
+            // (clause 8.4): recorded; the operator machinery is a later
+            // milestone.
+            Some(TokenKind::Keyword(k)) if k == "numeric_type" => DeclarationKind::NumericType,
+            // `template extend name of (entries) { .. };` (clause 8.6).
+            Some(TokenKind::Keyword(k)) if k == "extend" => DeclarationKind::Extend,
             _ => {
                 self.error_here(
                     "E0101",
-                    "expected 'struct', 'unit' or 'extend' after 'template'",
+                    "expected 'struct', 'unit', 'interface', 'numeric_type' or 'extend' after 'template'",
                 );
                 self.recover_to_declaration_boundary();
                 return None;
             }
         };
-        self.bump(); // 'struct' | 'unit' | 'extend'
+        let template_extend = kind == DeclarationKind::Extend;
+        self.bump(); // 'struct' | 'unit' | 'interface' | 'numeric_type' | 'extend'
         let (name, name_span) = self.expect_identifier("E0102", "expected the template name")?;
         self.expect_keyword_word("of")?;
-        let mut template_params = Vec::new();
+        let mut template_params: Vec<crate::ast::TemplateParam> = Vec::new();
+        let mut extend_entries: Vec<crate::ast::TemplateExtendEntry> = Vec::new();
         if self.eat_punct("(") {
-            loop {
-                template_params.push(self.parse_template_param()?);
-                if !self.eat_punct(",") {
-                    break;
+            if self.eat_punct(")") {
+                if template_extend {
+                    // Clause 8.6: an extension's parameter list must
+                    // name at least one entry — an all-empty list has
+                    // nothing to match against (the plan's E0128).
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0128",
+                        "template extend: at least one parameter must be a <tag'type>/<tag'exp> parameter",
+                        name_span.0,
+                        name_span.1,
+                    ));
+                } else {
+                    self.error_here("E0102", "expected a template parameter");
                 }
+            } else {
+                loop {
+                    if template_extend {
+                        extend_entries.push(self.parse_template_extend_entry()?);
+                    } else {
+                        template_params.push(self.parse_template_param()?);
+                    }
+                    if !self.eat_punct(",") {
+                        break;
+                    }
+                }
+                self.expect_punct(
+                    ")",
+                    "E0110",
+                    "expected ')' to close the template parameters",
+                )?;
             }
-            self.expect_punct(
-                ")",
-                "E0110",
-                "expected ')' to close the template parameters",
-            )?;
+        } else if template_extend {
+            extend_entries.push(self.parse_template_extend_entry()?);
         } else {
             template_params.push(self.parse_template_param()?);
+        }
+        // 8.5.4: defaults must be trailing — a defaulted parameter
+        // cannot be followed by one without.
+        let mut defaulted_seen = false;
+        for param in &template_params {
+            if param.default.is_some() {
+                defaulted_seen = true;
+            } else if defaulted_seen {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0129",
+                    "a parameter with a default cannot be followed by one without",
+                    param.name_span.0,
+                    param.name_span.1,
+                ));
+            }
         }
         let mut like = None;
         let mut like_span = None;
         let mut like_type = None;
-        if !template_extend && self.eat_keyword("like") {
+        let mut bases: Vec<(TypeExpr, Span)> = Vec::new();
+        if kind == DeclarationKind::Interface {
+            // Clause 8.3: `template interface name of (params) like I,
+            // J of <t'type>` — a comma list of bases, each possibly
+            // parameterised over the formals; substituted at
+            // instantiation (8.7).
+            if self.eat_keyword("like") {
+                loop {
+                    let base = self.parse_type()?;
+                    let base_span = base.span();
+                    bases.push((base, base_span));
+                    if !self.eat_punct(",") {
+                        break;
+                    }
+                }
+            }
+        } else if !template_extend && self.eat_keyword("like") {
             let base = self.parse_type()?;
             like_span = Some(base.span());
             like = match &base {
@@ -1158,6 +1247,75 @@ impl Parser {
                 _ => None,
             };
             like_type = Some(base);
+        }
+        // `implementing I1, I2 of <t'type>, ...` (clauses 6.3, 8.2.3):
+        // the implemented interfaces as written — concrete or
+        // parameterised over the template's parameters; substitution
+        // happens on instantiation (8.7).
+        let mut implements: Vec<TypeExpr> = Vec::new();
+        if self.eat_keyword("implementing") {
+            loop {
+                implements.push(self.parse_type()?);
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+        }
+        // `conditions { bool-exp; ... }` (clause 8.5.3): constant
+        // expressions over the value parameters, after the
+        // base/implementing clauses and before the body. On an
+        // extension the conditions bound which instances it applies to.
+        let mut conditions: Vec<Expr> = Vec::new();
+        if self.eat_keyword("conditions") {
+            self.expect_punct("{", "E0106", "expected '{' to open the conditions")?;
+            loop {
+                if self.at_punct("}") || self.peek().is_none() {
+                    break;
+                }
+                conditions.push(self.parse_expr()?);
+                if !self.eat_punct(";") {
+                    break;
+                }
+            }
+            self.expect_punct("}", "E0107", "expected '}' to close the conditions")?;
+        }
+        let template_extend_spec = if template_extend {
+            Some(crate::ast::TemplateExtendSpec {
+                entries: extend_entries,
+            })
+        } else {
+            None
+        };
+        // Clause 8.4: a template numeric_type's head closes with the
+        // impl-struct reference and a semicolon — no body.
+        if kind == DeclarationKind::NumericType {
+            self.expect_punct(":", "E0103", "expected ':' before the impl-struct type")?;
+            let underlying = self.parse_type()?;
+            self.expect_punct(
+                ";",
+                "E0105",
+                "expected ';' after the numeric_type declaration",
+            )?;
+            let end = self.last_end();
+            return Some(Declaration {
+                kind,
+                name,
+                name_span,
+                underlying: Some(underlying),
+                subtype_range: None,
+                template_params,
+                template_conditions: conditions,
+                template_extend: None,
+                packaged: false,
+                like: None,
+                like_span: None,
+                like_type: None,
+                bases,
+                implements,
+                modifiers: Vec::new(),
+                members: Vec::new(),
+                span: (start, end),
+            });
         }
         if self
             .expect_punct("{", "E0106", "expected '{' to open the declaration body")
@@ -1171,20 +1329,31 @@ impl Parser {
                 underlying: None,
                 subtype_range: None,
                 template_params,
-                template_extend,
+                template_conditions: conditions,
+                template_extend: template_extend_spec,
                 packaged: false,
                 like,
                 like_span,
                 like_type,
-                bases: Vec::new(),
-                implements: Vec::new(),
+                bases,
+                implements,
                 modifiers: Vec::new(),
                 annotations: Vec::new(),
                 members: Vec::new(),
                 span: (start, self.eof),
             });
         }
-        let members = self.parse_member_list();
+        let members = if kind == DeclarationKind::Interface {
+            // Clause 6.13 body mode: a template interface's members are
+            // signatures, like a plain interface's.
+            let saved_interface_body = self.interface_body;
+            self.interface_body = true;
+            let members = self.parse_member_list();
+            self.interface_body = saved_interface_body;
+            members
+        } else {
+            self.parse_member_list()
+        };
         self.eat_punct(";");
         let end = self.last_end();
         Some(Declaration {
@@ -1194,13 +1363,14 @@ impl Parser {
             underlying: None,
             subtype_range: None,
             template_params,
-            template_extend,
+            template_conditions: conditions,
+            template_extend: template_extend_spec,
             packaged: false,
             like,
             like_span,
             like_type,
-            bases: Vec::new(),
-            implements: Vec::new(),
+            bases,
+            implements,
             modifiers: Vec::new(),
             annotations: Vec::new(),
             members,
@@ -1208,27 +1378,161 @@ impl Parser {
         })
     }
 
-    /// One `<[tag']category [= default]>` template parameter.
+    /// One template parameter (clauses 8.2, 8.5.2, 8.5.3): a type
+    /// parameter `<[tag']type[: category]> [= default-type]` or a value
+    /// parameter `<[tag']exp>: scalar-type [= default-value]`. The
+    /// in-bracket word after `'` selects the kind — `exp` is the value
+    /// form, `type` the plain type form, any other word the 2016
+    /// category form (`<key'scalar>`); the 2019 `: category` suffix on
+    /// a type parameter records the same constraint. A value parameter
+    /// requires the `: scalar-type` suffix (E0126) and takes a
+    /// constant-expression default. The full bracket text (`key'type`,
+    /// `depth'exp`) is the parameter's name — the spelling the body's
+    /// formals use.
     fn parse_template_param(&mut self) -> Option<crate::ast::TemplateParam> {
         self.expect_punct("<", "E0106", "expected '<' to open the template parameter")?;
-        let (name, name_span) = self.expect_word("E0102", "expected the parameter name")?;
-        let mut name = name;
+        let (tag, name_span) = self.expect_word("E0102", "expected the parameter name")?;
+        let mut name = tag;
+        let mut bracket_category: Option<String> = None;
         if self.eat_punct("'") {
-            let (category, _) = self.expect_word("E0102", "expected the parameter category")?;
+            let (word, _) = self.expect_word("E0102", "expected the parameter category")?;
             name.push('\'');
-            name.push_str(&category);
+            name.push_str(&word);
+            if word != "type" {
+                bracket_category = Some(word);
+            }
         }
         self.expect_punct(">", "E0107", "expected '>' to close the template parameter")?;
+        let is_value = name.ends_with("'exp") || name == "exp";
+        if is_value {
+            // Clause 8.5.2: a value parameter names its scalar type —
+            // `<tag'exp>: scalar-type`. Missing or non-scalar → E0126.
+            let scalar = if self.eat_punct(":") {
+                let scalar = self.parse_type()?;
+                let scalar_shaped =
+                    matches!(scalar, TypeExpr::Scalar { .. } | TypeExpr::Named { .. });
+                if !scalar_shaped {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0126",
+                        "template value parameter requires a scalar type",
+                        scalar.span().0,
+                        scalar.span().1,
+                    ));
+                }
+                scalar
+            } else {
+                let (start, end) = self.current_span();
+                self.diagnostics.push(Diagnostic::new(
+                    "E0126",
+                    "template value parameter requires a scalar type",
+                    start,
+                    end,
+                ));
+                // A placeholder keeps the parameter a value parameter;
+                // the actual's constant type is checked at
+                // instantiation.
+                TypeExpr::Named {
+                    name: "int".to_owned(),
+                    span: (start, end),
+                }
+            };
+            let default = if self.eat_punct("=") {
+                Some(crate::ast::TemplateDefault::Value(self.parse_expr()?))
+            } else {
+                None
+            };
+            return Some(crate::ast::TemplateParam {
+                name,
+                name_span,
+                category: None,
+                kind: crate::ast::TemplateParamKind::Value { scalar },
+                default,
+            });
+        }
+        // The 2019 `: category` suffix (8.5.3) on a type parameter.
+        let category = if self.eat_punct(":") {
+            let (word, _) = self.expect_word("E0102", "expected the parameter category")?;
+            Some(word)
+        } else {
+            bracket_category
+        };
         let default = if self.eat_punct("=") {
-            Some(self.parse_type()?)
+            Some(crate::ast::TemplateDefault::Type(self.parse_type()?))
         } else {
             None
         };
         Some(crate::ast::TemplateParam {
             name,
             name_span,
+            category,
+            kind: crate::ast::TemplateParamKind::Type,
             default,
         })
+    }
+
+    /// One entry of a `template extend` parameter list (clause 8.6): a
+    /// parameter form (`<tag'type[: category]>` or
+    /// `<tag'exp>: scalar-type`) that binds the instance's actual, or a
+    /// concrete `type-name` / `constant-value` that constrains the
+    /// match.
+    fn parse_template_extend_entry(&mut self) -> Option<crate::ast::TemplateExtendEntry> {
+        if self.at_punct("<") {
+            let param = self.parse_template_param()?;
+            return Some(match param.kind {
+                crate::ast::TemplateParamKind::Type => crate::ast::TemplateExtendEntry::TypeParam {
+                    name: param.name,
+                    category: param.category,
+                },
+                crate::ast::TemplateParamKind::Value { scalar } => {
+                    crate::ast::TemplateExtendEntry::ValueParam {
+                        name: param.name,
+                        scalar,
+                    }
+                }
+            });
+        }
+        if matches!(self.peek_kind(), Some(TokenKind::Number(_)))
+            || matches!(self.peek_kind(), Some(TokenKind::StringLiteral(_)))
+            || self.at_keyword("TRUE")
+            || self.at_keyword("FALSE")
+            || self.at_punct("-")
+            || self.at_punct("(")
+        {
+            return Some(crate::ast::TemplateExtendEntry::Constant(
+                self.parse_expr()?,
+            ));
+        }
+        Some(crate::ast::TemplateExtendEntry::Concrete(
+            self.parse_type()?,
+        ))
+    }
+
+    /// One argument of a template instantiation (`fifo of (byte, 8)`,
+    /// clause 8.5.2): a type (the `of` form's original reading) or —
+    /// for a value parameter — a constant expression. Literals and
+    /// leading sign/parenthesis tokens open a constant expression; a
+    /// leading `<` is a formal; everything else parses as a type.
+    fn parse_template_argument(&mut self) -> Option<TypeExpr> {
+        if self.at_punct("<") {
+            return self.parse_type();
+        }
+        let value_shaped = matches!(
+            self.peek_kind(),
+            Some(TokenKind::Number(_)) | Some(TokenKind::StringLiteral(_))
+        ) || self.at_keyword("TRUE")
+            || self.at_keyword("FALSE")
+            || self.at_punct("-")
+            || self.at_punct("(");
+        if value_shaped {
+            let span = self.current_span();
+            let expr = self.parse_expr()?;
+            let end = self.last_end();
+            return Some(TypeExpr::Value {
+                expr: Box::new(expr),
+                span: (span.0, end),
+            });
+        }
+        self.parse_type()
     }
 
     /// `type name: [ENUMERAL [= expr] , ..];` or the clause 5 scalar
@@ -1261,7 +1565,8 @@ impl Parser {
                 underlying: Some(underlying),
                 subtype_range,
                 template_params: Vec::new(),
-                template_extend: false,
+                template_conditions: Vec::new(),
+                template_extend: None,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -1286,7 +1591,8 @@ impl Parser {
                 underlying: None,
                 subtype_range: None,
                 template_params: Vec::new(),
-                template_extend: false,
+                template_conditions: Vec::new(),
+                template_extend: None,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -1335,7 +1641,8 @@ impl Parser {
                 underlying: None,
                 subtype_range: None,
                 template_params: Vec::new(),
-                template_extend: false,
+                template_conditions: Vec::new(),
+                template_extend: None,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -1369,7 +1676,8 @@ impl Parser {
                 underlying: None,
                 subtype_range: None,
                 template_params: Vec::new(),
-                template_extend: false,
+                template_conditions: Vec::new(),
+                template_extend: None,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -1390,7 +1698,8 @@ impl Parser {
             underlying: None,
             subtype_range: None,
             template_params: Vec::new(),
-            template_extend: false,
+            template_conditions: Vec::new(),
+            template_extend: None,
             packaged: false,
             like: None,
             like_span: None,
@@ -1448,11 +1757,14 @@ impl Parser {
         let start = self.current_span().0;
         self.bump(); // 'interface'
         let (name, name_span) = self.expect_type_name("expected the interface name")?;
-        let mut bases = Vec::new();
+        let mut bases: Vec<(TypeExpr, Span)> = Vec::new();
         if self.eat_keyword("like") {
             loop {
-                let (base, base_span) =
-                    self.expect_type_name("expected an interface name after 'like'")?;
+                // Each base is a type name; the full spelling is kept so
+                // a parameterised base of a template interface can be
+                // recorded (clause 8.3) — a plain base is a `Named`.
+                let base = self.parse_type()?;
+                let base_span = base.span();
                 bases.push((base, base_span));
                 if !self.eat_punct(",") {
                     break;
@@ -1471,7 +1783,8 @@ impl Parser {
                 underlying: None,
                 subtype_range: None,
                 template_params: Vec::new(),
-                template_extend: false,
+                template_conditions: Vec::new(),
+                template_extend: None,
                 packaged: false,
                 like: None,
                 like_span: None,
@@ -1501,7 +1814,8 @@ impl Parser {
             underlying: None,
             subtype_range: None,
             template_params: Vec::new(),
-            template_extend: false,
+            template_conditions: Vec::new(),
+            template_extend: None,
             packaged: false,
             like: None,
             like_span: None,
@@ -1603,14 +1917,14 @@ impl Parser {
         }
         // `implementing I1, I2, ...` (clause 6.3, 31.4): the interfaces
         // this struct/unit (or extend target) implements, in written
-        // order. Elaboration composes them per type; the conformance and
-        // conflict checks live in `check.rs`.
+        // order, as written — a template interface instance
+        // (`I of int`) is a legal target (clause 8.7). Elaboration
+        // composes them per type; the conformance and conflict checks
+        // live in `check.rs`.
         let mut implements = Vec::new();
         if self.eat_keyword("implementing") {
             loop {
-                let (interface_name, _) =
-                    self.expect_type_name("expected an interface name after 'implementing'")?;
-                implements.push(interface_name);
+                implements.push(self.parse_type()?);
                 if !self.eat_punct(",") {
                     break;
                 }
@@ -1628,7 +1942,8 @@ impl Parser {
                 underlying: None,
                 subtype_range: None,
                 template_params: Vec::new(),
-                template_extend: false,
+                template_conditions: Vec::new(),
+                template_extend: None,
                 packaged: false,
                 like_type,
                 like,
@@ -1653,7 +1968,8 @@ impl Parser {
             underlying: None,
             subtype_range: None,
             template_params: Vec::new(),
-            template_extend: false,
+            template_conditions: Vec::new(),
+            template_extend: None,
             packaged: false,
             like_type,
             like,
@@ -1967,6 +2283,11 @@ impl Parser {
     /// Whether the token after the current one is the given punctuation.
     fn peek_second_is_punct(&self, symbol: &str) -> bool {
         matches!(self.peek_second_kind(), Some(TokenKind::Punctuation(p)) if p == symbol)
+    }
+
+    /// Whether the token after the current one is the given keyword.
+    fn peek_second_is_keyword(&self, word: &str) -> bool {
+        matches!(self.peek_second_kind(), Some(TokenKind::Keyword(w)) if w == word)
     }
 
     /// Whether the token after the current one is the given word, as a
@@ -3571,7 +3892,9 @@ impl Parser {
         if self.at_punct("<") {
             // A template's formal parameter in a type position
             // (`<type>`, `<key'type>` — clause 8.2): recorded as the raw
-            // text between the brackets.
+            // text between the brackets. The 8.5.4 derived-type default
+            // shape `<formal>(bits: exp)` records the width; the
+            // substituted scalar actual takes it (8.7).
             self.bump();
             let (name, _) = self.expect_word("E0102", "expected the formal parameter name")?;
             let mut name = name;
@@ -3581,11 +3904,23 @@ impl Parser {
                 name.push_str(&category);
             }
             self.expect_punct(">", "E0107", "expected '>' to close the formal parameter")?;
+            let width = if self.at_punct("(") {
+                Some(self.parse_scalar_width()?)
+            } else {
+                None
+            };
             let end = self.last_end();
-            return Some(TypeExpr::Formal {
-                name,
-                span: (start, end),
-            });
+            return match width {
+                Some(width) => Some(TypeExpr::FormalWidth {
+                    name,
+                    width,
+                    span: (start, end),
+                }),
+                None => Some(TypeExpr::Formal {
+                    name,
+                    span: (start, end),
+                }),
+            };
         }
         if self.at_identifier() {
             let (name, span) = self.take_identifier();
@@ -3655,13 +3990,15 @@ impl Parser {
             }
             // `deque of int` — a template instantiation in a type
             // position (clause 8.7). `list of` never reaches here: the
-            // keyword branch handles it first.
+            // keyword branch handles it first. Each argument is a type
+            // or — for a value parameter — a constant expression
+            // (clause 8.5.2).
             if self.at_keyword("of") {
                 self.bump();
                 let args = if self.eat_punct("(") {
-                    let mut args = vec![self.parse_type()?];
+                    let mut args = vec![self.parse_template_argument()?];
                     while self.eat_punct(",") {
-                        args.push(self.parse_type()?);
+                        args.push(self.parse_template_argument()?);
                     }
                     self.expect_punct(
                         ")",
@@ -3670,7 +4007,7 @@ impl Parser {
                     )?;
                     args
                 } else {
-                    vec![self.parse_type()?]
+                    vec![self.parse_template_argument()?]
                 };
                 let end = self.last_end();
                 return Some(TypeExpr::TemplateRef {
@@ -3755,6 +4092,22 @@ impl Parser {
                 if let Some(hash_statements) = self.parse_hash_statements() {
                     statements.extend(hash_statements);
                 }
+                continue;
+            }
+            // Clause 4.3.2's pure-syntax brace group in an action
+            // position: the group's statements splice into the enclosing
+            // list, the same rule the member list applies at 4.3.3 and
+            // the module level at 4.3.2. The table expansion (26.2)
+            // emits exactly this shape.
+            if self.at_punct("{") {
+                self.bump();
+                statements.extend(self.parse_statements());
+                if self.at_punct("}") {
+                    self.bump();
+                } else {
+                    self.error_here("E0107", "expected '}' to close the brace group");
+                }
+                self.eat_punct(";");
                 continue;
             }
             if let Some(statement) = self.parse_statement() {
@@ -3976,6 +4329,24 @@ impl Parser {
             }
             _ => {
                 let expr = self.parse_expr()?;
+                // `field rgf= exp;` (clause 18.6): the `rgf=` operator
+                // assigns a concrete value to an already-generated
+                // range-generated field. The target's field-ness is the
+                // well-formedness pass's business (E0130 there).
+                if self.at_punct("rgf=") {
+                    self.bump();
+                    let value = self.parse_expr()?;
+                    // The last statement of a block may omit the `;`.
+                    if !self.eat_punct(";") && !self.at_punct("}") {
+                        self.expect_punct(";", "E0105", "expected ';' after assignment")?;
+                    }
+                    let end = self.last_end();
+                    return Some(Stmt::RgfAssign {
+                        target: expr,
+                        value,
+                        span: (start, end),
+                    });
+                }
                 if self.eat_punct("=") {
                     let value = self.parse_expr()?;
                     // The last statement of a block may omit the `;`.
@@ -4533,34 +4904,115 @@ impl Parser {
     }
 
     /// `expr in [a, b]` / `expr in [low .. high]`, left-associative, at
-    /// [`IN_LEVEL`].
+    /// [`IN_LEVEL`]. The row's other members: the `not in` negation
+    /// (Table 12's row) wraps the membership in a unary `not`; a
+    /// non-bracket right operand is a general set expression
+    /// ([`crate::ast::InSetExpr::Expr`], clause 4.11.6); and the second
+    /// binary keyword is `chosen_from` (clause 10.5.8): `target
+    /// chosen_from read_only(list)` — the right side must be exactly a
+    /// `read_only(exp)` call, whose argument is recorded unwrapped on
+    /// [`Expr::ChosenFrom`]; any other right side reports `E0131`.
     fn parse_in_level(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_binary_level(IN_LEVEL + 1)?;
-        while self.at_keyword("in") {
-            self.bump();
-            self.expect_punct("[", "E0106", "expected '[' after 'in'")?;
-            let first_item = self.parse_expr()?;
-            let set = if self.eat_punct("..") {
-                let high = self.parse_expr()?;
-                self.expect_punct("]", "E0107", "expected ']' to close the range")?;
-                crate::ast::InSetExpr::Range(Box::new(first_item), Box::new(high))
-            } else {
-                let mut items = vec![first_item];
-                while self.eat_punct(",") {
-                    items.push(self.parse_expr()?);
+        loop {
+            // `not in` — the negated membership, one operator per Table 12.
+            let negated = self.at_keyword("not") && self.peek_second_is_keyword("in");
+            if !negated && !self.at_keyword("in") && !self.at_keyword("chosen_from") {
+                break;
+            }
+            if self.at_keyword("chosen_from") {
+                let start = lhs.span().0;
+                self.bump();
+                // 10.5.8: the list is read-only — the wrapper is part of
+                // the syntax, so a bare list expression (or anything else)
+                // on the right side is E0131. `read_only` is a predefined
+                // name, not a keyword: the exact identifier followed by
+                // the opening parenthesis is the accepted spelling.
+                let list = if self.at_identifier_named("read_only") && self.peek_punct_at(1, "(") {
+                    self.bump();
+                    self.bump();
+                    let inner = self.parse_expr()?;
+                    self.expect_punct(")", "E0110", "expected ')' to close the read_only list")?;
+                    inner
+                } else {
+                    self.error_here(
+                        "E0131",
+                        "expected 'read_only(exp)' as the right side of 'chosen_from' (10.5.8)",
+                    );
+                    // Best-effort recovery: parse the right side as a
+                    // plain expression so the constraint (and its `;`)
+                    // still parse and only E0131 is reported. The
+                    // diagnostics are authoritative.
+                    self.parse_expr()?
+                };
+                let end = self.last_end();
+                lhs = Expr::ChosenFrom {
+                    target: Box::new(lhs),
+                    list: Box::new(list),
+                    span: (start, end),
+                };
+                continue;
+            }
+            self.bump(); // 'in', or 'not' before it
+            if negated {
+                self.bump(); // 'in'
+            }
+            let set = if self.at_punct("[") {
+                self.bump();
+                let first_item = self.parse_expr()?;
+                if self.eat_punct("..") {
+                    let high = self.parse_expr()?;
+                    self.expect_punct("]", "E0107", "expected ']' to close the range")?;
+                    crate::ast::InSetExpr::Range(Box::new(first_item), Box::new(high))
+                } else {
+                    let mut items = vec![first_item];
+                    while self.eat_punct(",") {
+                        items.push(self.parse_expr()?);
+                    }
+                    self.expect_punct("]", "E0107", "expected ']' to close the set")?;
+                    crate::ast::InSetExpr::Items(items)
                 }
-                self.expect_punct("]", "E0107", "expected ']' to close the set")?;
-                crate::ast::InSetExpr::Items(items)
+            } else {
+                // A general set expression (`x in rgf_get_range(f.a)`,
+                // 4.11.6's set-exp) — evaluated to a set value. It parses
+                // at the `in` row's operand level, so a looser operator
+                // (`a in s && b in t`) splits at the row, not inside the
+                // set expression.
+                crate::ast::InSetExpr::Expr(Box::new(self.parse_binary_level(IN_LEVEL + 1)?))
             };
             let start = lhs.span().0;
             let end = self.last_end();
-            lhs = Expr::InSet {
+            let membership = Expr::InSet {
                 element: Box::new(lhs),
                 set,
                 span: (start, end),
             };
+            lhs = if negated {
+                Expr::Unary {
+                    op: crate::ast::UnaryOp::Not,
+                    expr: Box::new(membership),
+                    span: (start, end),
+                }
+            } else {
+                membership
+            };
         }
         Some(lhs)
+    }
+
+    /// Whether the current token is the identifier `name` (keywords and
+    /// punctuation do not match).
+    fn at_identifier_named(&self, name: &str) -> bool {
+        matches!(self.peek_kind(), Some(TokenKind::Identifier(id)) if id == name)
+    }
+
+    /// Whether the token `offset` positions past the current one is the
+    /// punctuation `symbol` (0 is the current token).
+    fn peek_punct_at(&self, offset: usize, symbol: &str) -> bool {
+        matches!(
+            self.tokens.get(self.pos + offset).map(|t| &t.kind),
+            Some(TokenKind::Punctuation(p)) if p == symbol
+        )
     }
 
     /// `lhs ~ pattern` / `lhs !~ pattern` string match (clause 4.12),
@@ -4721,6 +5173,28 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Option<Expr> {
         let (start, end) = self.current_span();
+        // A template's value parameter in an expression position
+        // (`return <depth'exp>;`, clause 8.5.2) — the raw `tag'exp`
+        // text between the angle brackets, substituted with the
+        // instance's constant actual at instantiation. A binary `<`
+        // comparison never reaches primary position.
+        if self.at_punct("<") {
+            self.bump();
+            let (name, _) = self.expect_word("E0102", "expected the formal parameter name")?;
+            let mut name = name;
+            if self.eat_punct("'") {
+                let (word, _) = self.expect_word("E0102", "expected the parameter category")?;
+                name.push('\'');
+                name.push_str(&word);
+            }
+            self.expect_punct(">", "E0107", "expected '>' to close the formal parameter")?;
+            let formal_end = self.last_end();
+            let formal = Expr::Formal {
+                name,
+                span: (start, formal_end),
+            };
+            return self.parse_postfix_chain(formal, start);
+        }
         // `new [<type>] [with { assignments }]` — instance creation
         // (clause 6.3). The type is optional (`var p: packet = new;`).
         // Evaluation is staged: instances come from declared fields and

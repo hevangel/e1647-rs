@@ -6,14 +6,17 @@
 //! ([`parser`], [`ast`], [`check`]), member composition that folds
 //! `like` chains and `extend` blocks into per-type member lists
 //! ([`elab`]), and an interpreter that executes the non-temporal statement
-//! subset, including `gen` as a seeded rejection sampler ([`interp`]).
+//! subset, including `gen` as a seeded rejection sampler with reduced-set
+//! generation for range-generated (`~`) fields ([`interp`]).
 //! The clause 12 temporal-engine core evaluates sampled normal forms
 //! over explicit finite paths ([`temporal`]), and the run loop drives
 //! it: an event log fed by `emit`, a clause 13.2.2 scheduler running
 //! started TCMs concurrently (round-robin turns suspending at
 //! `wait`/`sync`), and quit-time `expect`/`assume` monitoring. The
 //! clause 21 preprocessor applies `#define` replacement rules as a
-//! token pre-pass ([`preproc`]). See docs/ROADMAP.md for what is
+//! token pre-pass ([`preproc`]), and the clause 26 `table … with { … }`
+//! construct expands as the pre-pass between it and the macro engine
+//! ([`tables`]). See docs/ROADMAP.md for what is
 //! deliberately not implemented yet.
 
 pub mod ast;
@@ -29,4 +32,5 @@ pub mod macros;
 pub mod parser;
 pub mod preproc;
 pub mod solve;
+pub mod tables;
 pub mod temporal;

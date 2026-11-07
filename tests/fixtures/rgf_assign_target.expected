@@ -1,0 +1,4 @@
+8:9: error[E0130]: rgf= target is not a range-generated field
+10:9: error[E0130]: rgf= target is not a range-generated field
+11:31: error[E0130]: 'rgf_was_generated' target is not a range-generated field
+12:27: error[E0130]: 'rgf_get_range' target is not a range-generated field

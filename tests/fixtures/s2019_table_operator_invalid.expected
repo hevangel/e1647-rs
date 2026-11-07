@@ -1,0 +1,1 @@
+4:15: error[E0136]: table operator 'my_op' must be a final method of table_manager returning a table type (26.3); only the predefined csv_to_table/excel_to_table are expandable in this stage

@@ -61,6 +61,11 @@
 //! - `E0218` a keyed-list key that is a static field or of list/set
 //!   type (clause 5.2.11; a struct-typed key may contain static
 //!   fields)
+//! - `E0130` an `rgf=` target, or a clause 29.13 rgf routine's field
+//!   argument, that is not a range-generated field (clause 18.6); an
+//!   unresolvable target path is left to the run time
+//! - `E0316` a range-generated (`~`) field of non-scalar type — the
+//!   type must be numeric, `bool`, or an enumeral (clause 6.9.7)
 //!
 //! The annotation checks of the 2019 annotations stage (IEEE 1647-2019
 //! clause 35) run here and, for the module-scope rule, from the parser:
@@ -107,6 +112,13 @@
 //!   only`) outside the struct that declares it (clause 17.2.4)
 //! - `E0310` a static event declared inside a `when` subtype (clause
 //!   11.1.4.1; the dedicated code the plan reserves for it)
+//! - `E0313` a template value actual that is not a constant expression
+//!   of the value parameter's scalar type (clause 8.5.2) — raised here,
+//!   at the written instantiation site, like E0311/E0312 before it
+//! - `E0314` a template instance violating one of the template
+//!   declaration's `conditions` entries (clause 8.5.3)
+//! - `E0315` a template type actual not in the parameter's category
+//!   (clause 8.5.3)
 //!
 //! `E0308` ("static member cannot be added to 'global'") stays
 //! reserved and is unreachable in this implementation: `extend global`
@@ -172,6 +184,21 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
         interfaces: &interfaces,
         struct_impls: &struct_impls,
     };
+    // The template declarations (clauses 8.2–8.6): the
+    // instantiation-site bounding checks (E0313–E0315) read them with
+    // the file's `define` constants. A `template extend` matches
+    // instances; it is not an instantiation target.
+    let templates = TemplateCtx {
+        declarations,
+        templates: declarations
+            .iter()
+            .filter(|declaration| {
+                !declaration.template_params.is_empty() && declaration.template_extend.is_none()
+            })
+            .map(|declaration| (declaration.name.as_str(), declaration))
+            .collect(),
+        defines: crate::elab::collect_defines(declarations),
+    };
     let mut reported_implement_conflicts: BTreeSet<(String, String)> = BTreeSet::new();
     check_implement_targets(declarations, &interfaces, &mut diagnostics);
     check_implement_conflicts(
@@ -226,6 +253,14 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             (declaration.name.as_str(), fields)
         })
         .collect();
+    // The range-generated-field tables (18.6, 29.13): per declaration
+    // name, the set of its `~` fields — the `rgf=` target rule (E0130)
+    // and the rgf routines' field argument resolve member paths against
+    // these.
+    let rgf_fields: BTreeMap<&str, BTreeSet<&str>> = declarations
+        .iter()
+        .map(|declaration| (declaration.name.as_str(), own_rgf_names(declaration)))
+        .collect();
     for declaration in declarations {
         check_extend_target(
             declaration,
@@ -249,7 +284,7 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             check_interface_inherited_conflicts(declaration, &interfaces, &mut diagnostics);
         }
         if let Some(underlying) = &declaration.underlying {
-            check_named_type(underlying, &declared, &mut diagnostics);
+            check_named_type(underlying, &declared, &templates, &mut diagnostics);
             check_long_subtype(
                 underlying,
                 declaration.subtype_range.is_some(),
@@ -260,7 +295,10 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             declaration,
             &declared,
             &struct_fields,
-            declarations,
+            &DeclCtx {
+                declarations,
+                templates: &templates,
+            },
             &kinds,
             &static_members,
             &mut diagnostics,
@@ -270,8 +308,10 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             declaration,
             &declared,
             &struct_fields,
+            &rgf_fields,
             &iface,
             &static_members,
+            &templates,
             &mut diagnostics,
         );
         check_static_members_in_whens(declaration, &mut diagnostics);
@@ -282,12 +322,16 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             for_each_field(&declaration.members, &mut |field| {
                 own_fields.insert(field.name.as_str(), &field.ty);
             });
+            let own_rgf = own_rgf_names(declaration);
             let mut locals: BTreeMap<&str, &TypeExpr> = own_fields.clone();
             let scope = StatementScope {
                 declared: &declared,
                 struct_fields: &struct_fields,
                 own_fields: &own_fields,
                 iface: &iface,
+                rgf_fields: &rgf_fields,
+                own_rgf: &own_rgf,
+                templates: &templates,
             };
             check_statements(
                 &on.body,
@@ -297,6 +341,7 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
                 &on.path.join("."),
                 &mut diagnostics,
             );
+            check_rgf_routine_args(&on.body, &locals, &scope, &mut diagnostics);
             // 11.3: "The on action block shall not contain any
             // time-consuming actions or TCMs" — wait/sync/start/compute
             // at any depth of the block are rejected.
@@ -325,6 +370,11 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
                 check_expr_static_accesses(&constraint.expr, &static_members, &mut diagnostics);
             });
         }
+        // 10.5.8: a `chosen_from` constraint is not allowed under a
+        // `when` subtype — reported here, where the when nesting is
+        // still visible (elaboration folds the block into a synthesized
+        // subtype view).
+        check_chosen_from_placement(&declaration.members, false, &mut diagnostics);
     }
     diagnostics
 }
@@ -821,10 +871,16 @@ fn check_interface_bases(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for (base, base_span) in &declaration.bases {
-        if !interfaces.contains_key(base.as_str()) {
+        // The base resolves by its name; a parameterised base of a
+        // template interface resolves like a plain one here (the
+        // instance view composes in elaboration).
+        let Some(base_name) = base.declared_name() else {
+            continue;
+        };
+        if !interfaces.contains_key(base_name) {
             diagnostics.push(Diagnostic::new(
                 "E0203",
-                format!("unknown interface '{base}' in like clause"),
+                format!("unknown interface '{base_name}' in like clause"),
                 base_span.0,
                 base_span.1,
             ));
@@ -875,7 +931,10 @@ fn interface_signature_sources<'d>(
     };
     stack.push(name);
     for (base, _) in &declaration.bases {
-        interface_signature_sources(base.as_str(), interfaces, stack, out);
+        let Some(base_name) = base.declared_name() else {
+            continue;
+        };
+        interface_signature_sources(base_name, interfaces, stack, out);
     }
     for member in &declaration.members {
         let Member::Method(method) = member else {
@@ -918,7 +977,10 @@ fn check_interface_inherited_conflicts(
     let mut sources: SignatureSources = BTreeMap::new();
     let mut stack = Vec::new();
     for (base, _) in &declaration.bases {
-        interface_signature_sources(base.as_str(), interfaces, &mut stack, &mut sources);
+        let Some(base_name) = base.declared_name() else {
+            continue;
+        };
+        interface_signature_sources(base_name, interfaces, &mut stack, &mut sources);
     }
     for (method_name, entries) in &sources {
         if conflicting_signature_sources(entries).is_some() {
@@ -949,8 +1011,10 @@ fn struct_interface_sets(declarations: &[Declaration]) -> BTreeMap<&str, Vec<Str
         for declaration in declarations {
             let contributes = match declaration.kind {
                 DeclarationKind::Struct | DeclarationKind::Unit => true,
-                DeclarationKind::Extend => !declaration.template_extend,
-                DeclarationKind::Type | DeclarationKind::Interface => false,
+                DeclarationKind::Extend => declaration.template_extend.is_none(),
+                DeclarationKind::Type
+                | DeclarationKind::Interface
+                | DeclarationKind::NumericType => false,
                 // An annotation type composes through neither `like`
                 // nor `implementing` (clause 35.2: it cannot be
                 // inherited from — E0320).
@@ -967,10 +1031,12 @@ fn struct_interface_sets(declarations: &[Declaration]) -> BTreeMap<&str, Vec<Str
             };
             let target = sets.entry(declaration.name.as_str()).or_default();
             let before = target.len();
-            for name in like_set
-                .into_iter()
-                .chain(declaration.implements.iter().cloned())
-            {
+            for name in like_set.into_iter().chain(
+                declaration
+                    .implements
+                    .iter()
+                    .filter_map(|entry| entry.declared_name().map(str::to_owned)),
+            ) {
                 if !target.contains(&name) {
                     target.push(name);
                 }
@@ -993,8 +1059,13 @@ fn check_implement_targets(
         if declaration.implements.is_empty() {
             continue;
         }
-        for interface_name in &declaration.implements {
-            if !interfaces.contains_key(interface_name.as_str()) {
+        for interface in &declaration.implements {
+            // The target resolves by its name — the template name of a
+            // parameterised entry (`I of <t'type>`, clause 8.2.3).
+            let Some(interface_name) = interface.declared_name() else {
+                continue;
+            };
+            if !interfaces.contains_key(interface_name) {
                 diagnostics.push(Diagnostic::new(
                     "E0203",
                     format!("unknown interface '{interface_name}' in implementing clause"),
@@ -1027,7 +1098,8 @@ fn check_implement_conflicts(
         if !matches!(
             declaration.kind,
             DeclarationKind::Struct | DeclarationKind::Unit | DeclarationKind::Extend
-        ) || (declaration.kind == DeclarationKind::Extend && declaration.template_extend)
+        ) || (declaration.kind == DeclarationKind::Extend
+            && declaration.template_extend.is_some())
         {
             continue;
         }
@@ -1063,11 +1135,19 @@ fn check_implement_conflicts(
     }
 }
 
+/// The shared single-file context of the member checks: the
+/// declarations and the template bounding context (clauses 8.5.2–8.5.4)
+/// the field checks read alongside the kind map.
+struct DeclCtx<'d> {
+    declarations: &'d [Declaration],
+    templates: &'d TemplateCtx<'d>,
+}
+
 fn check_fields(
     declaration: &Declaration,
     declared: &BTreeSet<&str>,
     struct_fields: &BTreeMap<&str, Vec<(&str, &TypeExpr)>>,
-    declarations: &[Declaration],
+    decl_ctx: &DeclCtx,
     kinds: &BTreeMap<&str, DeclarationKind>,
     static_members: &BTreeMap<&str, StaticNames>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -1102,7 +1182,7 @@ fn check_fields(
     // module's `check_annotation_body`.
     let annotation_body = matches!(declaration.kind, DeclarationKind::Annotation { .. });
     for_each_field(&declaration.members, &mut |field| {
-        check_named_type(&field.ty, declared, diagnostics);
+        check_named_type(&field.ty, declared, decl_ctx.templates, diagnostics);
         check_long_subtype(&field.ty, false, diagnostics);
         let scope = TypeScope {
             locals: &own_fields,
@@ -1119,9 +1199,10 @@ fn check_fields(
             check_width(width, diagnostics);
         }
         check_field_prefixes(field, annotation_body, diagnostics);
+        check_range_gen_field(field, kinds, diagnostics);
         if !annotation_body {
             check_unit_instance_static_field(field, kinds, diagnostics);
-            check_keyed_list_key(&field.ty, declarations, diagnostics);
+            check_keyed_list_key(&field.ty, decl_ctx.declarations, diagnostics);
         }
         if let Some(init) = &field.init {
             check_expr_static_accesses(init, static_members, diagnostics);
@@ -1231,6 +1312,57 @@ fn check_field_prefixes(field: &Field, annotation_body: bool, diagnostics: &mut 
     }
 }
 
+/// A range-generated (`~`) field is scalar (clause 6.9.7): its reduced
+/// set (10.3.13) is a set of scalar values, so the field's type must be
+/// numeric (the integer bases of Table 17), `bool`, or an enumeral type
+/// (a clause-5 `type` declaration). A `list`, struct, unit, interface,
+/// or a `real`/`string`/`time` field cannot carry a reduced set here —
+/// `E0316`. (`real`/`string`/`time` are rejected with the non-scalars:
+/// the v1 reduced-set model is integer-interval based, and none of the
+/// three has a representable full value set in it.)
+fn check_range_gen_field(
+    field: &Field,
+    kinds: &BTreeMap<&str, DeclarationKind>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !field.range_gen || rgf_scalar_type(&field.ty, kinds) {
+        return;
+    }
+    diagnostics.push(Diagnostic::new(
+        "E0316",
+        format!(
+            "range-generated field '{}' must be scalar (numeric, enum or bool; clause 6.9.7)",
+            field.name
+        ),
+        field.name_span.0,
+        field.name_span.1,
+    ));
+}
+
+/// Whether the type expression denotes a scalar type a reduced set can
+/// range over: an integer base, `bool`, an inline enumeral list, a
+/// when-qualified spelling of one of those, or a named clause-5 `type`
+/// declaration (enumeral or numeric-subtype).
+fn rgf_scalar_type(ty: &TypeExpr, kinds: &BTreeMap<&str, DeclarationKind>) -> bool {
+    match ty {
+        TypeExpr::Scalar { base, .. } => matches!(
+            base,
+            ScalarBase::Uint
+                | ScalarBase::Int
+                | ScalarBase::Longint
+                | ScalarBase::Longuint
+                | ScalarBase::Bit
+                | ScalarBase::Byte
+                | ScalarBase::Nibble
+                | ScalarBase::Bool
+        ),
+        TypeExpr::InlineEnum { .. } => true,
+        TypeExpr::Named { name, .. } => kinds.get(name.as_str()) == Some(&DeclarationKind::Type),
+        TypeExpr::WhenQualified { base, .. } => rgf_scalar_type(base, kinds),
+        _ => false,
+    }
+}
+
 /// A static field is not a unit instance and not a list of unit
 /// instances (clauses 6.9.3, 7.2.2, 7.2.4): a unit instance belongs to
 /// its parent instance, while a static field's one occurrence belongs
@@ -1297,12 +1429,15 @@ fn check_enumerals(declaration: &Declaration, diagnostics: &mut Vec<Diagnostic>)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_methods(
     declaration: &Declaration,
     declared: &BTreeSet<&str>,
     struct_fields: &BTreeMap<&str, Vec<(&str, &TypeExpr)>>,
+    rgf_fields: &BTreeMap<&str, BTreeSet<&str>>,
     iface: &IfaceCtx,
     static_members: &BTreeMap<&str, StaticNames>,
+    templates: &TemplateCtx,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     // The declaration's own fields join every method's `typeof()` scope
@@ -1311,6 +1446,10 @@ fn check_methods(
     for_each_field(&declaration.members, &mut |field| {
         own_fields.insert(field.name.as_str(), &field.ty);
     });
+    // The declaration's own range-generated fields: the `rgf=` target
+    // rule (E0130) and the clause 29.13 rgf routines' field argument
+    // resolve bare names against this set.
+    let own_rgf: BTreeSet<&str> = own_rgf_names(declaration);
     for_each_method(&declaration.members, &mut |method| {
         // Parameters and local variables share one namespace in this subset;
         // block scoping is a later milestone.
@@ -1329,13 +1468,13 @@ fn check_methods(
                 ));
             }
             if let Some(ty) = &param.ty {
-                check_named_type(ty, declared, diagnostics);
+                check_named_type(ty, declared, templates, diagnostics);
                 check_long_subtype(ty, false, diagnostics);
                 locals.insert(param.name.as_str(), ty);
             }
         }
         if let Some(return_type) = &method.return_type {
-            check_named_type(return_type, declared, diagnostics);
+            check_named_type(return_type, declared, templates, diagnostics);
             check_long_subtype(return_type, false, diagnostics);
             let scope = TypeScope {
                 locals: &locals,
@@ -1352,9 +1491,28 @@ fn check_methods(
                 struct_fields,
                 own_fields: &own_fields,
                 iface,
+                rgf_fields,
+                own_rgf: &own_rgf,
+                templates,
             },
             &mut locals,
             &method.name,
+            diagnostics,
+        );
+        // The clause 29.13 rgf routines' field argument names a
+        // range-generated field (E0130 otherwise).
+        check_rgf_routine_args(
+            &method.body,
+            &locals,
+            &StatementScope {
+                declared,
+                struct_fields,
+                own_fields: &own_fields,
+                iface,
+                rgf_fields,
+                own_rgf: &own_rgf,
+                templates,
+            },
             diagnostics,
         );
         // T2.2: a static method has no instance — `me`/`self` and the
@@ -1877,13 +2035,18 @@ fn check_on_body_time_consumption(
 /// The scope tables a statement walk checks against: the file's declared
 /// type names, the per-declaration field tables (`typeof()` member-path
 /// resolution, 5.9), the enclosing declaration's own fields
-/// (`me.field`), and the interface tables of the interface-assignment
-/// rule (5.4.4.4).
+/// (`me.field`), the interface tables of the interface-assignment
+/// rule (5.4.4.4), and the range-generated-field tables of the `rgf=`
+/// target rule (18.6, E0130): per declaration name, the set of its
+/// range-generated field names, plus the enclosing declaration's own.
 struct StatementScope<'a> {
     declared: &'a BTreeSet<&'a str>,
     struct_fields: &'a BTreeMap<&'a str, Vec<(&'a str, &'a TypeExpr)>>,
     own_fields: &'a BTreeMap<&'a str, &'a TypeExpr>,
     iface: &'a IfaceCtx<'a>,
+    rgf_fields: &'a BTreeMap<&'a str, BTreeSet<&'a str>>,
+    own_rgf: &'a BTreeSet<&'a str>,
+    templates: &'a TemplateCtx<'a>,
 }
 
 /// The interface tables the statement walk consults for the
@@ -1925,7 +2088,9 @@ impl<'a> IfaceCtx<'a> {
             }
             if let Some(declaration) = self.interfaces.get(current.as_str()) {
                 for (base, _) in &declaration.bases {
-                    stack.push(base.clone());
+                    if let Some(base_name) = base.declared_name() {
+                        stack.push(base_name.to_owned());
+                    }
                 }
             }
         }
@@ -1959,7 +2124,7 @@ fn check_statements<'a>(
                     ));
                 }
                 if let Some(ty) = ty {
-                    check_named_type(ty, scope.declared, diagnostics);
+                    check_named_type(ty, scope.declared, scope.templates, diagnostics);
                     check_long_subtype(ty, false, diagnostics);
                     let type_scope = TypeScope {
                         locals,
@@ -2028,6 +2193,20 @@ fn check_statements<'a>(
                         ),
                         new_span.0,
                         new_span.1,
+                    ));
+                }
+            }
+            Stmt::RgfAssign { target, span, .. } => {
+                // Clause 18.6: the `rgf=` target must be a range-generated
+                // field (E0130). The target is resolved against the same
+                // static tables as the clause 29.13 rgf routines' field
+                // argument; an unresolvable target is left to the run time.
+                if rgf_target_is_rgf(target, locals, scope) == Some(false) {
+                    diagnostics.push(Diagnostic::new(
+                        "E0130",
+                        "rgf= target is not a range-generated field",
+                        span.0,
+                        span.1,
                     ));
                 }
             }
@@ -2131,6 +2310,140 @@ fn scalar_type(base: ScalarBase) -> TypeExpr {
     }
 }
 
+/// The range-generated field names of one declaration, in no particular
+/// order (set semantics): the `~`-prefixed fields, `when` members
+/// included.
+fn own_rgf_names(declaration: &Declaration) -> BTreeSet<&str> {
+    let mut names = BTreeSet::new();
+    for_each_field(&declaration.members, &mut |field| {
+        if field.range_gen {
+            names.insert(field.name.as_str());
+        }
+    });
+    names
+}
+
+/// Whether the rgf-target expression (`rgf=` target, clause 18.6; the
+/// clause 29.13 rgf routines' field argument) statically names a
+/// range-generated field. `Some(false)` — the target resolves and is
+/// not range-generated (the E0130 trigger); `Some(true)` — it resolves
+/// to a `~` field; `None` — the path's types are not statically known
+/// here (a call result, an unresolvable root), left to the run time.
+fn rgf_target_is_rgf(
+    expr: &Expr,
+    locals: &BTreeMap<&str, &TypeExpr>,
+    scope: &StatementScope,
+) -> Option<bool> {
+    // The path's segments, root first.
+    let mut segments: Vec<&str> = Vec::new();
+    let mut cursor = expr;
+    loop {
+        match cursor {
+            Expr::Ident { name, .. } => {
+                segments.push(name.as_str());
+                break;
+            }
+            Expr::MemberAccess { object, name, .. } => {
+                segments.push(name.as_str());
+                cursor = object;
+            }
+            _ => return None,
+        }
+    }
+    segments.reverse();
+    // A `me`/`self` root is transparent: the walk then starts at the
+    // enclosing declaration's own fields.
+    let mut position = 0usize;
+    if segments[0] == "me" || segments[0] == "self" {
+        position = 1;
+        if position == segments.len() {
+            return None;
+        }
+        let ty = scope.own_fields.get(segments[position])?;
+        return rgf_target_through_type(ty, &segments[position + 1..], scope);
+    }
+    let first = segments[position];
+    // A field of the enclosing declaration: the last segment decides
+    // against the declaration's own `~` set; deeper segments resolve
+    // through the field's type.
+    if let Some(ty) = scope.own_fields.get(first) {
+        if position + 1 == segments.len() {
+            return Some(scope.own_rgf.contains(first));
+        }
+        return rgf_target_through_type(ty, &segments[position + 1..], scope);
+    }
+    // A local variable or parameter: a bare local is never a
+    // range-generated field; a deeper path resolves through its type.
+    if let Some(ty) = locals.get(first) {
+        if position + 1 == segments.len() {
+            return Some(false);
+        }
+        return rgf_target_through_type(ty, &segments[position + 1..], scope);
+    }
+    None
+}
+
+/// Continue the rgf-target resolution through a struct-like type's
+/// field table: `rest`'s last segment must be a range-generated field
+/// of the type it is reached through.
+fn rgf_target_through_type(ty: &TypeExpr, rest: &[&str], scope: &StatementScope) -> Option<bool> {
+    if rest.is_empty() {
+        // The path ended one segment short of a field: the target is the
+        // object itself, which is not a range-generated field.
+        return Some(false);
+    }
+    let type_name = struct_like_name(ty)?;
+    let fields = scope.struct_fields.get(type_name.as_str())?;
+    let (_, field_ty) = fields.iter().find(|(field, _)| *field == rest[0])?;
+    if rest.len() == 1 {
+        return Some(
+            scope
+                .rgf_fields
+                .get(type_name.as_str())
+                .is_some_and(|set| set.contains(rest[0])),
+        );
+    }
+    rgf_target_through_type(field_ty, &rest[1..], scope)
+}
+
+/// The clause 29.13 rgf routines: the field argument of
+/// `rgf_was_generated`/`rgf_get_range`/`rgf_was_reduced` must name a
+/// range-generated field (E0130, clause 18.6's target rule applied to
+/// the routines). Wrong arity is the run-time call check's business.
+fn check_rgf_routine_args<'a>(
+    statements: &'a [Stmt],
+    locals: &BTreeMap<&'a str, &'a TypeExpr>,
+    scope: &StatementScope<'a>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for_each_stmt_exprs(statements, &mut |expr| {
+        let Expr::Call { callee, args, .. } = expr else {
+            return;
+        };
+        let Expr::Ident { name, .. } = callee.as_ref() else {
+            return;
+        };
+        if !matches!(
+            name.as_str(),
+            "rgf_was_generated" | "rgf_get_range" | "rgf_was_reduced"
+        ) {
+            return;
+        }
+        let Some(arg) = args.first() else {
+            return;
+        };
+        if rgf_target_is_rgf(arg, locals, scope) == Some(false) {
+            let span = arg.span();
+            diagnostics.push(Diagnostic::new(
+                "E0130",
+                format!("'{name}' target is not a range-generated field"),
+                span.0,
+                span.1,
+            ));
+        }
+    });
+}
+
 /// Check the `typeof()`/`typeof_item()` leaves of a type position (5.9):
 /// the argument's static type must be determinable (`E0208`), and
 /// `typeof_item()`'s argument must be a list (`E0209`).
@@ -2174,7 +2487,12 @@ fn check_type_static_types(ty: &TypeExpr, scope: &TypeScope, diagnostics: &mut V
     }
 }
 
-fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut Vec<Diagnostic>) {
+fn check_named_type(
+    ty: &TypeExpr,
+    declared: &BTreeSet<&str>,
+    templates: &TemplateCtx,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     match ty {
         TypeExpr::Named { name, span } => {
             if !declared.contains(name.as_str()) && !crate::builtins::is_builtin_type(name) {
@@ -2186,14 +2504,20 @@ fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut 
                 ));
             }
         }
-        TypeExpr::List { element, .. } => check_named_type(element, declared, diagnostics),
+        TypeExpr::List { element, .. } => {
+            check_named_type(element, declared, templates, diagnostics)
+        }
         // A when-qualified type resolves if its base resolves (6.7 —
         // the subtype itself is checked at elaboration).
-        TypeExpr::WhenQualified { base, .. } => check_named_type(base, declared, diagnostics),
-        // A template instantiation checks its template name and each
-        // argument; a formal parameter is bound by the enclosing
-        // template declaration (checked at instantiation, a later
-        // milestone).
+        TypeExpr::WhenQualified { base, .. } => {
+            check_named_type(base, declared, templates, diagnostics)
+        }
+        // A template instantiation checks its template name, each
+        // argument, and — clause 8.5 — the actuals against the
+        // declaration's parameters: a value actual must be a constant
+        // of the parameter's scalar type (8.5.2), a type actual must
+        // comply with the parameter's category (8.5.3), and the whole
+        // instance must satisfy the declaration's `conditions`.
         TypeExpr::TemplateRef { name, args, span } => {
             if !declared.contains(name.as_str()) {
                 diagnostics.push(Diagnostic::new(
@@ -2203,17 +2527,171 @@ fn check_named_type(ty: &TypeExpr, declared: &BTreeSet<&str>, diagnostics: &mut 
                     span.1,
                 ));
             }
-            for arg in args {
-                check_named_type(arg, declared, diagnostics);
+            // 8.5.2: an argument at a value-parameter position names a
+            // constant, not a type — a `define` reference there is not
+            // an unknown-type error (the constant check is
+            // `check_template_instance`'s E0313).
+            let value_positions: Vec<bool> = match templates.templates.get(name.as_str()) {
+                Some(template) => template
+                    .template_params
+                    .iter()
+                    .map(|param| matches!(param.kind, crate::ast::TemplateParamKind::Value { .. }))
+                    .collect(),
+                None => Vec::new(),
+            };
+            for (index, arg) in args.iter().enumerate() {
+                let names_define = matches!(
+                    arg,
+                    TypeExpr::Named { name: arg_name, .. }
+                        if templates.defines.contains_key(arg_name)
+                );
+                if value_positions.get(index).copied().unwrap_or(false) && names_define {
+                    continue;
+                }
+                check_named_type(arg, declared, templates, diagnostics);
             }
+            check_template_instance(name, args, *span, templates, diagnostics);
         }
-        TypeExpr::Formal { .. } => {}
+        // A formal parameter is bound by the enclosing template
+        // declaration; a width-qualified formal is 8.5.4's derived-type
+        // default shape; a value actual is not a type position.
+        TypeExpr::Formal { .. } | TypeExpr::FormalWidth { .. } | TypeExpr::Value { .. } => {}
         // A `typeof()`/`typeof_item()` placeholder's argument is an
         // expression, not a type; its resolution is 5.9's
         // `check_type_static_types`, and the resolved type's own name is
         // validated after elaboration rewrites it.
         TypeExpr::TypeOf { .. } | TypeExpr::TypeOfItem { .. } => {}
         TypeExpr::Scalar { .. } | TypeExpr::InlineEnum { .. } => {}
+    }
+}
+
+/// The template declarations (by name), the file's declarations and
+/// `define` constants the instantiation-site checks read (clauses
+/// 8.5.2–8.5.4). A `template extend` is not an instantiation target —
+/// its entries match, they do not bind a new instance.
+struct TemplateCtx<'d> {
+    declarations: &'d [Declaration],
+    templates: BTreeMap<&'d str, &'d Declaration>,
+    defines: BTreeMap<String, Expr>,
+}
+
+/// Clause 8.5's bounding of one written instantiation site: the
+/// actuals against the parameters (E0313, E0315) and the instance
+/// against the declaration's `conditions` (E0314). The diagnostic
+/// points at the instantiation site — the type position the
+/// instantiation is written in. An unsatisfiable parameter (neither
+/// actual nor default) or an unevaluable condition is not a violation
+/// this pass can name; the elaborator skips such instances.
+fn check_template_instance(
+    name: &str,
+    args: &[TypeExpr],
+    span: crate::ast::Span,
+    templates: &TemplateCtx,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(template) = templates.templates.get(name) else {
+        return;
+    };
+    let mut queue = Vec::new();
+    let Some(binding) = crate::elab::bind_template_actuals(
+        templates.declarations,
+        template,
+        args,
+        &templates.defines,
+        &mut queue,
+    ) else {
+        return;
+    };
+    let instance = crate::ast::template_instance_name(name, &binding.actuals);
+    for (index, param) in template.template_params.iter().enumerate() {
+        let Some(actual) = binding.actuals.get(index) else {
+            continue;
+        };
+        match &param.kind {
+            crate::ast::TemplateParamKind::Value { scalar } => {
+                // 8.5.2: the actual must be a constant expression of
+                // the parameter's scalar type. The binding's value map
+                // holds the actual's evaluated constant when it is one.
+                let matches = binding.values.get(&param.name).is_some_and(|constant| {
+                    crate::elab::eval_const_expr(constant, &binding.values, &templates.defines, 0)
+                        .is_some_and(|value| {
+                            crate::elab::value_constant_matches_type(
+                                &value,
+                                scalar,
+                                templates.declarations,
+                            )
+                        })
+                });
+                if !matches {
+                    // The message cites the parameter's tag (the plan's
+                    // `<n'exp>` reads as 'n').
+                    let tag = param
+                        .name
+                        .split_once('\'')
+                        .map(|(tag, _)| tag)
+                        .unwrap_or(&param.name);
+                    diagnostics.push(Diagnostic::new(
+                        "E0313",
+                        format!(
+                            "actual for value parameter '{tag}' is not a constant expression of type '{scalar_name}'",
+                            scalar_name = scalar.render(),
+                        ),
+                        span.0,
+                        span.1,
+                    ));
+                }
+            }
+            crate::ast::TemplateParamKind::Type => {
+                // 8.5.3: the actual must comply with the parameter's
+                // category (a plain `<tag'type>` imposes none); a value
+                // where a type is expected is its own mismatch.
+                let category = param.category.as_deref().unwrap_or("type");
+                let is_value = matches!(actual, TypeExpr::Value { .. });
+                if is_value
+                    || !crate::elab::actual_in_category(actual, category, templates.declarations)
+                {
+                    let rendered = actual.render();
+                    diagnostics.push(Diagnostic::new(
+                        "E0315",
+                        format!(
+                            "actual type '{rendered}' for parameter <{param_name}> is not in category '{category}'",
+                            param_name = param.name,
+                        ),
+                        span.0,
+                        span.1,
+                    ));
+                }
+            }
+        }
+    }
+    // 8.5.3: the instance's actuals must satisfy every `conditions`
+    // entry — a constant expression over the value parameters. The
+    // first violated condition is reported; a condition that does not
+    // evaluate to a constant is not checkable here.
+    for condition in &template.template_conditions {
+        let mut substituted = condition.clone();
+        let mut condition_queue = Vec::new();
+        crate::elab::substitute_condition(
+            &mut substituted,
+            &binding.types,
+            &binding.values,
+            &templates.defines,
+            &mut condition_queue,
+        );
+        if matches!(
+            crate::elab::eval_const_expr(&substituted, &binding.values, &templates.defines, 0),
+            Some(crate::elab::Const::Bool(false))
+        ) {
+            diagnostics.push(Diagnostic::new(
+                "E0314",
+                format!(
+                    "template instance '{instance}' violates condition '{condition_text}'",
+                    condition_text = crate::ast::render_expr_compact(condition),
+                ),
+                span.0,
+                span.1,
+            ));
+        }
     }
 }
 
@@ -2323,6 +2801,10 @@ fn for_each_stmt_expr<'a>(statement: &'a Stmt, f: &mut impl FnMut(&'a Expr)) {
             for_each_sub_expr(target, f);
             for_each_sub_expr(value, f);
         }
+        Stmt::RgfAssign { target, value, .. } => {
+            for_each_sub_expr(target, f);
+            for_each_sub_expr(value, f);
+        }
         Stmt::ExprStmt { expr, .. } => for_each_sub_expr(expr, f),
         Stmt::Return {
             value: Some(value), ..
@@ -2416,6 +2898,9 @@ fn for_each_sub_expr<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
         | Expr::BoolLiteral { .. }
         | Expr::StringLiteral { .. }
         | Expr::Ident { .. }
+        // A template value formal is bound by the enclosing template
+        // declaration, not by the walk's scopes.
+        | Expr::Formal { .. }
         | Expr::HdlPath { .. }
         | Expr::SetOfValues { .. }
         // The `Type` of a static access is a name, not an expression.
@@ -2475,6 +2960,7 @@ fn for_each_sub_expr<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
                     for_each_sub_expr(low, f);
                     for_each_sub_expr(high, f);
                 }
+                crate::ast::InSetExpr::Expr(expr) => for_each_sub_expr(expr, f),
             }
         }
         Expr::IsA { expr, .. } => for_each_sub_expr(expr, f),
@@ -2495,6 +2981,9 @@ fn for_each_sub_expr<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
                             for_each_sub_expr(low, f);
                             for_each_sub_expr(high, f);
                         }
+                        crate::ast::TableElem::Set(crate::ast::InSetExpr::Expr(expr)) => {
+                            for_each_sub_expr(expr, f)
+                        }
                         crate::ast::TableElem::TypeSet { .. } => {}
                     }
                 }
@@ -2506,6 +2995,13 @@ fn for_each_sub_expr<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
             for item in items {
                 for_each_sub_expr(item, f);
             }
+        }
+        // The 10.5.8 chosen_from form: both the target path and the
+        // read-only list expression name fields of the enclosing
+        // declaration.
+        Expr::ChosenFrom { target, list, .. } => {
+            for_each_sub_expr(target, f);
+            for_each_sub_expr(list, f);
         }
     }
 }
@@ -2554,6 +3050,9 @@ fn check_constraint_fields(
 fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Span)>) {
     match expr {
         Expr::Ident { name, span } => roots.push((name.clone(), *span)),
+        // A template value formal is bound by the enclosing template
+        // declaration, not a constraint root.
+        Expr::Formal { .. } => {}
         Expr::MemberAccess { object, .. } => collect_root_identifiers(object, roots),
         // `Type::member` names a static member of a type — a legal
         // constraint reference, not an unknown root (clause 4.17.4).
@@ -2615,7 +3114,21 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
             collect_root_identifiers(low, roots);
             collect_root_identifiers(high, roots);
         }
+        Expr::InSet {
+            element,
+            set: crate::ast::InSetExpr::Expr(expr),
+            ..
+        } => {
+            collect_root_identifiers(element, roots);
+            collect_root_identifiers(expr, roots);
+        }
         Expr::IsA { expr, .. } => collect_root_identifiers(expr, roots),
+        // A 10.5.8 chosen_from constraint names its target path and the
+        // read-only list expression — both e fields.
+        Expr::ChosenFrom { target, list, .. } => {
+            collect_root_identifiers(target, roots);
+            collect_root_identifiers(list, roots);
+        }
         // An `in_table` test's tuple elements and row elements all name
         // values (a type-set element names a type, not a variable).
         Expr::InTable { tuple, rows, .. } => {
@@ -2636,6 +3149,9 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
                         crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
                             collect_root_identifiers(low, roots);
                             collect_root_identifiers(high, roots);
+                        }
+                        crate::ast::TableElem::Set(crate::ast::InSetExpr::Expr(expr)) => {
+                            collect_root_identifiers(expr, roots)
                         }
                         crate::ast::TableElem::TypeSet { .. } => {}
                     }
@@ -2688,6 +3204,12 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
             collect_root_identifiers(low, roots);
             collect_root_identifiers(high, roots);
         }
+        // A general set expression inside a set literal (recorded by the
+        // parser only for bracket literals; walked for completeness).
+        Expr::SetLiteral {
+            items: crate::ast::InSetExpr::Expr(expr),
+            ..
+        } => collect_root_identifiers(expr, roots),
         // A list concat's elements are ordinary sub-expressions.
         Expr::ListConcat { items, .. } => {
             for item in items {
@@ -2825,6 +3347,36 @@ fn for_each_constraint<'a>(members: &'a [Member], f: &mut impl FnMut(&'a KeepCon
         match member {
             Member::Constraint(constraint) => f(constraint),
             Member::When(when) => for_each_constraint(&when.members, f),
+            _ => {}
+        }
+    }
+}
+
+/// 10.5.8: a `chosen_from` constraint is not allowed under a `when`
+/// subtype. The when nesting is still visible at well-formedness time
+/// (elaboration folds each when block into a synthesized subtype view),
+/// so the misplaced constraint is reported here — E0402 keeps its
+/// plan allocation for the unsupported chosen_from shapes.
+fn check_chosen_from_placement(
+    members: &[Member],
+    in_when: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for member in members {
+        match member {
+            Member::Constraint(constraint) => {
+                if in_when && matches!(constraint.expr, Expr::ChosenFrom { .. }) {
+                    diagnostics.push(Diagnostic::new(
+                        "E0402",
+                        "chosen_from is not allowed under a when subtype (10.5.8)",
+                        constraint.span.0,
+                        constraint.span.1,
+                    ));
+                }
+            }
+            Member::When(when) => {
+                check_chosen_from_placement(&when.members, true, diagnostics);
+            }
             _ => {}
         }
     }
