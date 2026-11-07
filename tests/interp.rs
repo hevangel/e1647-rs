@@ -4559,3 +4559,274 @@ fn template_extend_members_apply_by_bounding_criteria() {
     );
     assert_eq!(output, "TRUETRUE");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 11 — the reflection catalogue (T11.1) and the clause 32.2
+// instance iterator (T11.2). Catalogue: docs/REFLECTION_2019.md.
+// ---------------------------------------------------------------------------
+
+/// The plan's T11.2 test tree: `sys.a`, `sys.a.b`, `sys.lst[2]`.
+const INSTANCE_TREE: &str = "unit leaf_u {\n    \
+     x: uint;\n};\n\
+     unit mid_u {\n    \
+     b: leaf_u;\n};\n\
+     extend sys {\n    \
+     a: mid_u;\n    \
+     lst: list of leaf_u;\n    \
+     keep lst.size() == 2;\n};\n";
+
+#[test]
+fn instance_iterator_walks_the_field_tree_in_field_order() {
+    // 32.2 (T11.2): the depth-first walk visits the root first (its
+    // path string is `sys`), then each instance field's own subtree in
+    // declaration order, list items flattened in index order — the
+    // plan's expected `get_current_path_string()` sequence.
+    let output = clean_output(
+        &format!(
+            "{}extend sys {{\n    run() is also {{\n        \
+             var it: instance_iterator = new instance_iterator;\n        \
+             it.start(sys);\n        \
+             out(it.get_current_path_string(), \"\\n\");\n        \
+             while it.next() {{\n            \
+             out(it.get_current_path_string(), \"\\n\");\n        \
+             }};\n    }};\n}};\n",
+            INSTANCE_TREE
+        ),
+        1,
+    );
+    assert_eq!(output, "sys\nsys.a\nsys.a.b\nsys.lst[0]\nsys.lst[1]\n");
+}
+
+#[test]
+fn instance_iterator_start_all_reports_depth_and_path_items() {
+    // 32.2: `start_all()` roots at sys without an explicit root; the
+    // depth is the field-step count from the iteration root (the root
+    // itself is 0, a list item shares its field's depth); a path item
+    // reports its field, its index chain and its instance, and the
+    // root item has none of them (NULL).
+    let output = clean_output(
+        &format!(
+            "{}extend sys {{\n    run() is also {{\n        \
+             var it: instance_iterator = new instance_iterator;\n        \
+             it.start_all();\n        \
+             var root_item: instance_path_item = it.get_path_item_by_index(0);\n        \
+             out(root_item.get_list_indices().size(), \"\\n\");\n        \
+             out(it.get_current_depth(), \" \", it.get_current_path_item().get_field(), \"\\n\");\n        \
+             while it.next() {{\n            \
+             var item: instance_path_item = it.get_current_path_item();\n            \
+             out(it.get_current_depth(), \" \", item.get_field(), \" \", \
+             item.get_list_index(), \" \", item.get_list_indices().size(), \"\\n\");\n        \
+             }};\n    }};\n}};\n",
+            INSTANCE_TREE
+        ),
+        1,
+    );
+    assert_eq!(
+        output,
+        "0\n0 NULL\n1 a NULL 0\n2 b NULL 0\n1 lst 0 1\n1 lst 1 1\n"
+    );
+}
+
+#[test]
+fn instance_iterator_get_current_instance_reads_the_visited_object() {
+    // 32.2: `get_current_instance()` is the visited object itself — a
+    // leaf's field reads through it.
+    let output = clean_output(
+        &format!(
+            "{}extend sys {{\n    run() is also {{\n        \
+             var it: instance_iterator = new instance_iterator;\n        \
+             it.start(sys.a);\n        \
+             it.next();\n        \
+             out(it.get_current_instance().x == sys.a.b.x, \"\\n\");\n    }};\n}};\n",
+            INSTANCE_TREE
+        ),
+        1,
+    );
+    assert_eq!(output, "TRUE\n");
+}
+
+#[test]
+fn instance_iterator_does_not_revisit_a_shared_object() {
+    // 32.2: an object already visited is not revisited — the leaf
+    // reached as `sys.a.b` and appended to `sys.lst` afterwards is
+    // walked once: `sys.lst[2]` never appears, the list slots the
+    // `gen` produced are distinct objects and are visited.
+    let output = clean_output(
+        &format!(
+            "{}extend sys {{\n    run() is also {{\n        \
+             sys.lst.add(sys.a.b);\n        \
+             var it: instance_iterator = new instance_iterator;\n        \
+             it.start(sys);\n        \
+             while it.next() {{\n            \
+             out(it.get_current_path_string(), \"\\n\");\n        \
+             }};\n    }};\n}};\n",
+            INSTANCE_TREE
+        ),
+        1,
+    );
+    assert_eq!(output, "sys.a\nsys.a.b\nsys.lst[0]\nsys.lst[1]\n");
+}
+
+#[test]
+fn instance_iterator_next_finish_and_stopped_states() {
+    // 32.2: `next()` runs FALSE past the end; the current-instance
+    // queries then report honestly, as they do before a start and for
+    // an out-of-range path index; `finish()` ends the iteration.
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        \
+         var it: instance_iterator = new instance_iterator;\n        \
+         out(it.get_current_path_string(), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(result.diagnostics[0].code, "E0402");
+    assert!(
+        result.diagnostics[0]
+            .message
+            .contains("has not been started"),
+        "not-started diagnostic: {:?}",
+        result.diagnostics[0].message
+    );
+
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        \
+         var it: instance_iterator = new instance_iterator;\n        \
+         it.start_all();\n        \
+         while it.next() {};\n        \
+         out(it.get_current_instance(), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(result.diagnostics[0].code, "E0402");
+    assert!(
+        result.diagnostics[0].message.contains("walk is over"),
+        "finished diagnostic: {:?}",
+        result.diagnostics[0].message
+    );
+
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        \
+         var it: instance_iterator = new instance_iterator;\n        \
+         it.start_all();\n        \
+         out(it.get_path_item_by_index(9), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(result.diagnostics[0].code, "E0404");
+    assert!(
+        result.diagnostics[0].message.contains("path item index 9"),
+        "range diagnostic: {:?}",
+        result.diagnostics[0].message
+    );
+
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        \
+         var it: instance_iterator = new instance_iterator;\n        \
+         it.start_all();\n        \
+         it.finish();\n        \
+         out(it.get_current_path_string(), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(result.diagnostics[0].code, "E0402");
+    assert!(
+        result.diagnostics[0]
+            .message
+            .contains("has not been started"),
+        "after-finish diagnostic: {:?}",
+        result.diagnostics[0].message
+    );
+}
+
+#[test]
+fn instance_iterator_deep_copy_is_independent() {
+    // 29.2.2 over the 32.2 iterator: a copy records the same walk but
+    // moves its own cursor.
+    let output = clean_output(
+        &format!(
+            "{}extend sys {{\n    run() is also {{\n        \
+             var it: instance_iterator = new instance_iterator;\n        \
+             it.start(sys);\n        \
+             var twin: instance_iterator = deep_copy(it);\n        \
+             out(it.next(), \" \", twin.get_current_path_string(), \"\\n\");\n        \
+             out(twin.next(), \" \", it.get_current_path_string(), \"\\n\");\n    }};\n}};\n",
+            INSTANCE_TREE
+        ),
+        1,
+    );
+    assert_eq!(output, "TRUE sys\nTRUE sys.a\n");
+}
+
+#[test]
+fn reflection_stub_calls_report_e0419_with_their_clause() {
+    // T11.1: a recognised catalogue name resolves to the honest E0419
+    // — the clause in the message, never "unknown name" — in the
+    // member form, the bare rf_manager-query form and the construction
+    // forms; the clause 32.2 hooks are stubs too.
+    let cases: &[(&str, &str)] = &[
+        (
+            "sys.get_check_actions();",
+            "'get_check_actions()' is recognised (clause 32.1.2.5.13) but not implemented in this stage",
+        ),
+        (
+            "get_user_template_types();",
+            "'get_user_template_types()' is recognised (clause 32.1.2.17) but not implemented in this stage",
+        ),
+        (
+            "eval_exp_string(\"1\");",
+            "'eval_exp_string()' is recognised (clause 32.1.4) but not implemented in this stage",
+        ),
+        (
+            "delete_list_element(NULL, 0);",
+            "'delete_list_element()' is recognised (clause 32.1.4) but not implemented in this stage",
+        ),
+    ];
+    for (call, message) in cases {
+        let result = run_source(
+            &format!("extend sys {{\n    run() is also {{\n        {call}\n    }};\n}};\n"),
+            1,
+        );
+        assert_eq!(result.diagnostics.len(), 1, "call: {call}");
+        assert_eq!(result.diagnostics[0].code, "E0419", "call: {call}");
+        assert_eq!(result.diagnostics[0].message, *message, "call: {call}");
+    }
+    for construction in ["new unit_instance_iterator", "new instance_path_item"] {
+        let result = run_source(
+            &format!(
+                "extend sys {{\n    run() is also {{\n        \
+                 var v: unit_instance_iterator = {construction};\n    }};\n}};\n"
+            ),
+            1,
+        );
+        assert_eq!(result.diagnostics.len(), 1, "construction: {construction}");
+        assert_eq!(result.diagnostics[0].code, "E0419");
+        assert!(
+            result.diagnostics[0].message.starts_with(&format!(
+                "'{}' is recognised (clause 32.2)",
+                construction.trim_start_matches("new ")
+            )),
+            "construction diagnostic: {:?}",
+            result.diagnostics[0].message
+        );
+    }
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        \
+         var it: instance_iterator = new instance_iterator;\n        \
+         it.start(sys);\n        \
+         out(it.skip_instance(), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        result.diagnostics[0].render(),
+        "5:13: error[E0419]: 'skip_instance()' is recognised (clause 32.2) but not implemented in this stage"
+    );
+}
+
+#[test]
+fn reflection_stub_yields_to_a_user_method_of_the_same_name() {
+    // The stub table is consulted only when nothing else resolves: a
+    // user-defined `get_range()` wins over the 32.1.2.5.4 stub.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        \
+         out(get_range(), \"\\n\");\n    };\n};\n\
+     extend sys {\n    get_range(): string is { return \"user\"; };\n};\n",
+        1,
+    );
+    assert_eq!(output, "user\n");
+}
