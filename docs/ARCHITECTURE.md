@@ -404,3 +404,72 @@ VHPI among the bindings that are not written), a backend selection knob
 (`hdl_load` resolves through the default backend), and a browser
 sandbox API (the wasm32 compilation check passes; there is no sandbox
 API and no wasm runtime test).
+
+## The 2019 migration stages (PRs #40–#49)
+
+Design notes for the IEEE 1647-2019 feature phases; per-phase honest
+limits live in the PR bodies and the module headers.
+
+- **Static storage (6.9.3, 17.2)** — `Interp::statics` is a per-type
+  `BTreeMap<TypeName, BTreeMap<FieldName, Value>>` created at program
+  start; keys come from elaboration's static-member registries (the
+  declaring base or `extend` target). `Type::member` validates the
+  declared-in-exactly-T rule (E0307); `when` subtypes never own store
+  keys; static `on` blocks compose per type and run with no `me`.
+- **Interface attachment (6.13)** — an `interface` composes to its own
+  ElaboratedType whose methods are the transitive signatures; a
+  struct's `implementing` set composes through the same walk as like
+  chains and extends (when-views clone it). An interface-typed value
+  IS the implementing instance — dispatch resolves on the actual type,
+  with E0414 when the method is missing. The conformance checks
+  (E0311/E0312) run in the well-formedness pass the fixture contract
+  observes.
+- **Template parameters (8.2–8.7)** — `TemplateParam` unifies type and
+  value parameters (kind/category/default); one binder
+  (`bind_template_actuals` + `eval_const_expr`) serves the
+  monomorphizer and the well-formedness pass; canonical instance names
+  are computed after binding (defaults filled, value actuals
+  normalized); `template extend` matches per entry (parameter forms
+  bind tags, concrete entries match by name/value) gated by
+  `conditions`.
+- **Range-generated fields (6.9.7, 10.3.13)** — `gen` excludes `~`
+  fields like `!` fields; after the other fields are concrete, each
+  rgf field's reduced set is the intersection over its supported
+  constraint shapes of the implied intervals (shape tree: `&&`
+  intersects, `||` unions, implications contribute per guard); the
+  concrete value is the set's minimum; per-instance `RgfState`
+  metadata backs `rgf=` and the 29.13 routines.
+- **chosen_from (10.5.8)** — `Expr::ChosenFrom` (the `read_only`
+  wrapper unwrapped at parse); gen substitutes each list element into
+  the target slot, evaluates the other constraints per candidate, and
+  picks uniformly with the seeded RNG; contradictions report E0417.
+- **Custom numerics (5.2.15, clause 31)** — `Value::Custom { type_name,
+  instance }` with value semantics (`bind_slot_value` mints a fresh
+  instance and runs `numeric_assign`); operator/conversion/output
+  dispatch routes to the implementing struct's `numeric_*` methods
+  (E0418 when missing); the 5.6.3 precision context classifies operand
+  static types (Real/Long/>32-bit/≤32-bit) and truncates in the 32/64
+  modes.
+- **Execution phases (Table 1, 9.13)** — setup → generate (pre/
+  post_generate) → connect_pointers → connect_ports (E0420-gated
+  `do_bind`) → check_generation → the 13.2.2 scheduler → run DFS →
+  extract → check → expect/assume → quit/finalize; the recognized
+  2019 library surface that has no model yet reports E0419 from the
+  `UNIMPLEMENTED_2019` table.
+- **Tables (26, 32.3)** — `src/tables.rs` is a token pre-pass between
+  `#define` replacement and macro expansion; expansions emit one brace
+  group per data row with `<#…>` substitution (stack depth = number of
+  `#`s, string literals included); `TableValue`/`TableRowValue` shared
+  handles back the procedural API; file-read tables are cached and
+  read-only until copied.
+- **Annotations (35)** — `Annotation { name, attrs, span }` records on
+  the node it precedes (declarations and the nine attachable member
+  structs); attachments have no semantic effect; elab collects the
+  registry `@T.get_all_annotations()` reads; the same-module rule is
+  enforced per file (every file is one module here).
+- **Reflection (32.1–32.2)** — the catalogue (`docs/REFLECTION_2019.md`)
+  registers 50 method names + 43 type names under E0419; a user method
+  of the same name always wins; `instance_iterator` is a
+  `Value::InstanceIterator` shared handle whose `start` computes the
+  full walk once (pre-order DFS, lists flattened, visited-set, depth
+  cap 64).

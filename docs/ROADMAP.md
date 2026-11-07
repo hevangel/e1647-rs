@@ -297,7 +297,10 @@
       the built-in `sys` unit's `run()` methods, and implicit
       generation plus
       a MAIN sequence start also run when no explicit `run()` exists.
-      Integers are unbounded `i128` (widths are not truncated). No
+      Integers are stored unbounded `i128`; the 5.6.3 precision rules
+      (the 2019 migration's Phase 7) truncate binary results to the
+      32/64-bit modes where the operand static types pin them (untyped
+      operand pairs stay unbounded). No
       event-driven scheduling
 - [~] Events, temporal expressions and time-consuming methods — started:
       event triggers are stored, `emit` records a firing and executes the
@@ -432,31 +435,35 @@ the work.
       for Phase 2 with the contextual `static` prefix), the 4.4.2.2
       `extend global` rewording, and the 4.4.5.3 literal-`global`
       ordering recorded (the global struct itself is not modelled yet)
-- [ ] Phase 2 — Static members (T2.1–T2.4): static fields and `::` access,
+- [x] Phase 2 — Static members (T2.1–T2.4): static fields and `::` access,
       static methods and their restrictions, static events and `on
       Type::event`, keyed-list key restrictions
-- [ ] Phase 3 — Interfaces (T3.1–T3.5): `interface` declarations,
+- [x] Phase 3 — Interfaces (T3.1–T3.5): `interface` declarations,
       `implementing`, interface types and casts, dynamic dispatch
-- [ ] Phase 4 — Templates rework (T4.1–T4.7): value parameters,
+- [x] Phase 4 — Templates rework (T4.1–T4.7): value parameters,
       `conditions` bounding, `implementing` in templates, `template
       extend`, derived defaults, template interfaces/numeric types
-- [ ] Phase 5 — Range-generated fields (T5.1–T5.4): the `~` modifier,
+- [x] Phase 5 — Range-generated fields (T5.1–T5.4): the `~` modifier,
       reduced-set generation, `rgf=`, the rgf routines
-- [ ] Phase 6 — `chosen_from` (T6.1)
-- [ ] Phase 7 — Custom numeric types and precision (T7.1–T7.4):
+- [x] Phase 6 — `chosen_from` (T6.1)
+- [x] Phase 7 — Custom numeric types and precision (T7.1–T7.4):
       `numeric_type` + `numeric_i`, operator dispatch, six-way precision
       rules
-- [ ] Phase 8 — Execution phases and library surface (T8.1–T8.12):
-      `extract`/`check`/`finalize`/`rerun`, generation sub-phases, port
+- [x] Phase 8 — Execution phases and library surface (T8.1–T8.12):
+      `extract`/`check`/`finalize`, generation sub-phases, port
       binding methods, unit queries, coverage API additions, message
       hooks, numeric list pseudo-methods, `deep_copy`, honest `E0419`
-      stubs
-- [ ] Phase 9 — Tables (T9.1–T9.3): the `table … with { … }` preprocessor,
+      stubs (`rerun()` included)
+- [x] Phase 9 — Tables (T9.1–T9.3): the `table … with { … }` preprocessor,
       `table from` operators + `csv_to_table`, the `table_manager` API
-- [ ] Phase 10 — Annotations (T10.1–T10.3): `annotation @name`, attaching
+- [x] Phase 10 — Annotations (T10.1–T10.3): `annotation @name`, attaching
       annotations, the annotation API
-- [ ] Phase 11 — Reflection catalogue (T11.1–T11.2): `E0419` stubs for the
+- [x] Phase 11 — Reflection catalogue (T11.1–T11.2): `E0419` stubs for the
       32.1 names, `docs/REFLECTION_2019.md`, `instance_iterator`
-- [ ] Phase 12 — Final docs/claims pass (T12.1)
+- [x] Phase 12 — Final docs/claims pass (T12.1)
+
+Per-phase limits and approximations live in the PRs (#40–#49) and the
+verification-log entries; the honest-gap summary lives in
+[ARCHITECTURE.md](ARCHITECTURE.md) and the README status line.
 
 All stages require standards-aware conformance testing; compatibility with commercial products is not assumed.

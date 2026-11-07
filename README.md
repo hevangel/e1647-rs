@@ -60,10 +60,31 @@
 > `rise/fall/change(HDL expression) @sim` events and `hdl_path()`-bound
 > event ports each virtual cycle (a live session, or an injected signal
 > history where the simulator is unavailable), and TCMs declared
-> `@event` commence when that event occurs. It does **not** yet do
+> `@event` commence when that event occurs.
+>
+> The 2019 migration's feature phases all run (PRs #40–#49; per-phase
+> limits in the PR bodies and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
+> static fields/methods/events with `Type::member` access (6.9.3,
+> 17.2, 11.1.4.1); `interface` declarations, `implementing`, casts and
+> dynamic dispatch (6.13); the template rework — value parameters,
+> `conditions`, `template extend`, derived defaults, template
+> interfaces/numeric types (8.2–8.7); range-generated `~` fields with
+> reduced-set generation, `rgf=` and the rgf routines (6.9.7, 10.3.13,
+> 18.6, 29.13); `keep target chosen_from read_only(list)` (10.5.8);
+> custom numeric types with the `numeric_i` operator dispatch and the
+> 5.6.3 precision rules (5.2.15, clause 31); the Table 1 execution
+> phases (`setup`/`extract`/`check`/`finalize`, generation sub-phases,
+> port-binding and unit queries — 9.13, 7.3–7.4); `table … with { … }`
+> expansion, `csv_to_table` and the `table_manager` API (26, 32.3);
+> `annotation @name` with attachments (35); the reflection catalogue
+> and `instance_iterator` (32.1–32.2, [docs/REFLECTION_2019.md](docs/REFLECTION_2019.md)).
+> Recognised-but-unimplemented library names report `E0419` with their
+> clause (see `UNIMPLEMENTED_2019` in `src/interp.rs`).
+>
+> It does **not** yet do
 > full type
 > checking,
-> resolution, event-driven temporal evaluation, coverage, non-linear or
+> resolution, event-driven temporal evaluation, non-linear or
 > disjunctive constraint solving, or general testbench execution. No IEEE
 > conformance is claimed. See [docs/ROADMAP.md](docs/ROADMAP.md) for the
 > staged plan.

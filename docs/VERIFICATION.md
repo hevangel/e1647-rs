@@ -3523,4 +3523,72 @@ Verification:
   dynamic v1 under the view's hard keeps; static field members are
   Phase 2.
 
+## 2026-11-07 (50) — Phases 2–11 of the IEEE 1647-2019 migration (branches merged through PRs #40–#49)
+
+Scope claimed: the remaining implementation phases of the migration
+plan, each landed through its own reviewed PR with the full trio and
+corpus check on the merged branch (per-phase design notes, honest
+limits and exact counts live in the PR bodies; this entry records the
+combined state):
+
+- **Phase 2 (#40)** — static fields/methods/events, `Type::member`
+  access, keyed-list key restrictions (E0212, E0215–E0218,
+  E0304–E0310; the pre-plan E0304 template code moved to E0318).
+  310 tests on the branch.
+- **Phase 3 (#41)** — `interface` declarations, `implementing`,
+  interface types/casts, dynamic dispatch (E0124, E0125, E0219,
+  E0311, E0312, E0414). 317 tests.
+- **Phase 8 (#42)** — the Table 1 execution phases (setup/extract/
+  check/finalize), generation sub-phases with E0420, the port-binding
+  and unit-query methods, numeric list aggregates, `deep_copy`,
+  `covers.sample_cg`/`compute_overall_grade`, message hooks, the
+  `UNIMPLEMENTED_2019` E0419 stub table. 343 tests.
+- **Phase 4 (#43)** — the 2019 template parameter model: value
+  parameters, `conditions` bounding, `implementing`, `template
+  extend` matching, derived defaults, template interfaces/numeric
+  types (E0126–E0129, E0313–E0315; E0127 retired the pre-plan E0318).
+  352 tests.
+- **Phase 5 (#44)** — range-generated fields: reduced-set generation,
+  `rgf=`, the 29.13 rgf routines, general set expressions in `in`
+  (E0316, E0317, E0130, E0415, E0416). 361 tests.
+- **Phase 6 (#45)** — `keep target chosen_from read_only(list)` with
+  seeded uniform candidate selection (E0131, E0417). 368 tests.
+- **Phase 9 (#46)** — the `table … with { … }` preprocessor expansion
+  (token pre-pass between `#define` and macro expansion),
+  `csv_to_table` + filter/unique, the `table_manager`/`table`/
+  `table_row` API (E0133–E0136). 378 tests.
+- **Phase 10 (#47)** — `annotation @name`, attachments on
+  declarations/members/macros, the same-module rule, `get_all_
+  annotations()` (E0137–E0140, E0320, E0321). 387 tests.
+- **Phase 7 (#48)** — custom numeric types: `Value::Custom` with
+  value semantics, the `numeric_*` operator/conversion/output
+  dispatch, the clause 31 builtin interfaces and `numeric_format_
+  kind`, the 5.6.3 precision rules (E0132, E0418). 396 tests.
+- **Phase 11 (#49)** — the 32.1 reflection catalogue
+  (`docs/REFLECTION_2019.md`, 50 method stubs + 43 type names under
+  E0419) and the 32.2 `instance_iterator` implemented (pre-order DFS,
+  lists flattened, visited-set, path rendering). 404 tests.
+
+Verification (each PR individually; final state on `main` at the
+merge of #49):
+
+- `cargo fmt --all -- --check` — pass
+- `cargo clippy --all-targets -- -D warnings` — pass, no warnings
+- `cargo test --all-targets` — **404 passed, 0 failed** (264 before
+  the migration; +140 net-new tests and 40+ new fixture pairs)
+- Corpus (absolute paths): etl 4, cover-edges **1** (intended: the
+  three `E0203 unknown type 'rf_struct'/'rf_type'` errors became
+  recognised catalogue names under Phase 11; `rf_field`, not in the
+  catalogue, stays honestly unknown), golden-imports 3,
+  golden-combined 0, igen-dist 0, type-min-max 0, save-restart 0,
+  d6w 0 — otherwise unchanged across all ten merges; run output on
+  igen-dist/my_traffic byte-identical.
+- No Specman reference runs were performed in this stage (none of the
+  landed constructs was qualified against EDA Playground here); the
+  behaviour notes cite the migration plan's paraphrased specs and the
+  clause numbers.
+- Honest limits per phase are recorded in the PR bodies (#40–#49),
+  the module headers, and now the ROADMAP/README/ARCHITECTURE claims
+  pass of the same change.
+
 
