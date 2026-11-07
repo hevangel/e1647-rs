@@ -25,8 +25,20 @@
 //! grouping is pure syntax (clause 4.3.2 module level, 4.3.3 member
 //! lists): a bare `{ ... }` splices its contents into the enclosing
 //! list, and groups nest. A statement (or member) may also span code
-//! segments (clause 4.2.3): the lexer skips prose between `'>` and `<'`,
+//! segments (clause 4.2.3): the lexer skips prose between `'> and `<'`,
 //! so the parser sees one continuous token stream.
+//!
+//! The 2019 annotations (clause 35) parse here: the `[package]
+//! [repeatable] annotation @name { member; ... }` declaration (35.2)
+//! and the `@name` / `@name(attr = const-exp, ...)` attachments
+//! immediately before a type declaration/extension, a template
+//! declaration/extension, a struct/interface member or a macro
+//! definition (35.3) — recorded on the AST nodes, no effect on
+//! semantics. An attachment before a `when` block is `E0140`; the
+//! body/member restrictions are the well-formedness pass's (E0137,
+//! E0138, E0139) and the same-module rule (E0321) runs per file from
+//! [`parse_unchecked`]. In expression position `@name` is the
+//! annotation type (35.4's API receiver).
 //!
 //! Everything else (events, temporal expressions, coverage, the
 //! single-statement `if ... do` form, `for`/`repeat` loops) is a later
@@ -227,49 +239,20 @@ pub struct ParseResult {
 /// Parse e source text. Never panics on bad input; problems are reported as
 /// diagnostics.
 pub fn parse(source: &str) -> ParseResult {
-    let mut diagnostics = Vec::new();
-    let tokens = match lexer::tokenize(source) {
-        // The pre-passes run in phase order: the clause 21 preprocessor
-        // (replacement rules) first, then the clause 26 table expansion
-        // (its row data may use defined names), then the clause 15
-        // macro expansion (a table body may invoke macros).
-        Ok(tokens) => {
-            let mut table_diagnostics = Vec::new();
-            let tokens =
-                tables::expand_tables(preproc::substitute_defines(tokens), &mut table_diagnostics);
-            diagnostics.extend(table_diagnostics);
-            macros::expand_macros(tokens)
-        }
-        Err(err) => {
-            let end = Position {
-                byte: err.position.byte + 1,
-                line: err.position.line,
-                column: err.position.column + 1,
-            };
-            diagnostics.push(Diagnostic::new("E0001", err.message, err.position, end));
-            return ParseResult {
-                declarations: Vec::new(),
-                diagnostics,
-            };
-        }
-    };
-    let eof = tokens.last().map(|t| t.end).unwrap_or(Position {
-        byte: source.len(),
-        line: 1,
-        column: 1,
-    });
-    let mut parser = Parser::new(tokens, eof);
-    let declarations = parser.parse_program();
-    diagnostics.extend(parser.diagnostics);
-    diagnostics.extend(crate::check::check_declarations(&declarations));
-    ParseResult {
-        declarations,
-        diagnostics,
-    }
+    let mut result = parse_unchecked(source);
+    result
+        .diagnostics
+        .extend(crate::check::check_declarations(&result.declarations));
+    result
 }
 
-/// Parse without the well-formedness pass — for multi-file drivers that
-/// merge declarations first and check the merged set once.
+/// Parse without the cross-declaration well-formedness pass — for
+/// multi-file drivers that merge declarations first and check the merged
+/// set once. The per-file annotation-module-scope check (E0321, clause
+/// 35.2) still runs here: it is defined per module, and in this
+/// implementation every file is one module (an imported file is spliced
+/// as whole declarations before the importing file's own), so the check
+/// must see each file alone.
 pub fn parse_unchecked(source: &str) -> ParseResult {
     let mut diagnostics = Vec::new();
     let tokens = match lexer::tokenize(source) {
@@ -302,6 +285,7 @@ pub fn parse_unchecked(source: &str) -> ParseResult {
     let mut parser = Parser::new(tokens, eof);
     let declarations = parser.parse_program();
     diagnostics.extend(parser.diagnostics);
+    diagnostics.extend(crate::check::check_annotation_module_scope(&declarations));
     ParseResult {
         declarations,
         diagnostics,
@@ -568,7 +552,30 @@ impl Parser {
         // `package` prefix of the next declaration (clause 22 visibility,
         // recorded not enforced).
         let mut packaged = false;
+        // `@name(...)` attachments collected for the declaration that
+        // follows (clause 35.3). Cleared when the attachable entity
+        // consumes them, when the entity is rejected, or at recovery.
+        let mut pending_annotations: Vec<crate::ast::Annotation> = Vec::new();
         while self.peek().is_some() {
+            // Clause 35.3: `@name` attachments accumulate until the
+            // entity they annotate; several may precede one entity.
+            if pending_annotations.is_empty() && self.at_punct("@") {
+                match self.parse_attached_annotations() {
+                    Some(annotations) => {
+                        if self.peek_attachable_module_entity() {
+                            pending_annotations = annotations;
+                        } else {
+                            self.error_here(
+                                "E0101",
+                                "an annotation attachment must precede a struct, unit, extend, type, interface, template or macro-definition declaration (clause 35.3)",
+                            );
+                            self.recover_to_declaration_boundary();
+                        }
+                    }
+                    None => self.recover_to_declaration_boundary(),
+                }
+                continue;
+            }
             let keyword = match self.peek_kind() {
                 Some(TokenKind::Keyword(k))
                     if matches!(
@@ -610,6 +617,7 @@ impl Parser {
                             bases: Vec::new(),
                             implements: Vec::new(),
                             modifiers: Vec::new(),
+                            annotations: Vec::new(),
                             members,
                             span: (gstart, gend),
                         }),
@@ -623,9 +631,20 @@ impl Parser {
                     } else {
                         self.parse_define().map(|m| vec![m])
                     };
-                    let Some(members) = members else {
+                    let Some(mut members) = members else {
+                        pending_annotations.clear();
                         continue;
                     };
+                    // A macro definition can carry annotations (clause
+                    // 35.3); a constant `define` cannot — an attachment
+                    // before a constant `define` was already rejected
+                    // at collection, so pending annotations here always
+                    // belong to the macro.
+                    if !pending_annotations.is_empty()
+                        && let Some(Member::Macro(macro_decl)) = members.last_mut()
+                    {
+                        macro_decl.annotations = std::mem::take(&mut pending_annotations);
+                    }
                     let gend = self.last_end();
                     match declarations.last_mut() {
                         Some(last)
@@ -649,6 +668,7 @@ impl Parser {
                             bases: Vec::new(),
                             implements: Vec::new(),
                             modifiers: Vec::new(),
+                            annotations: Vec::new(),
                             members,
                             span: (gstart, gend),
                         }),
@@ -666,14 +686,51 @@ impl Parser {
                     }
                     continue;
                 }
-                // `template (struct|unit) ...` (clause 8).
-                Some(TokenKind::Keyword(k)) if k.as_str() == "template" => {
-                    if let Some(mut declaration) = self.parse_template_declaration() {
+                // `[package] annotation @name { .. };` (clause 35.2) —
+                // a struct-like type in the type namespace. The
+                // annotation-body restrictions (only fields and
+                // methods, scalar/string/set field types) are checked
+                // in `check.rs` (E0137, E0138).
+                Some(TokenKind::Keyword(k)) if k.as_str() == "annotation" => {
+                    if let Some(mut declaration) = self.parse_annotation_declaration(false) {
                         declaration.packaged = packaged;
+                        declaration.annotations = std::mem::take(&mut pending_annotations);
                         packaged = false;
                         declarations.push(declaration);
                     } else {
                         packaged = false;
+                        pending_annotations.clear();
+                    }
+                    continue;
+                }
+                // `repeatable` is only a prefix of the annotation
+                // declaration (clause 35.2); elsewhere it stays the
+                // stray keyword it always was.
+                Some(TokenKind::Keyword(k))
+                    if k.as_str() == "repeatable" && self.peek_second_is_word("annotation") =>
+                {
+                    self.bump(); // 'repeatable'
+                    if let Some(mut declaration) = self.parse_annotation_declaration(true) {
+                        declaration.packaged = packaged;
+                        declaration.annotations = std::mem::take(&mut pending_annotations);
+                        packaged = false;
+                        declarations.push(declaration);
+                    } else {
+                        packaged = false;
+                        pending_annotations.clear();
+                    }
+                    continue;
+                }
+                // `template (struct|unit) ...` (clause 8).
+                Some(TokenKind::Keyword(k)) if k.as_str() == "template" => {
+                    if let Some(mut declaration) = self.parse_template_declaration() {
+                        declaration.packaged = packaged;
+                        declaration.annotations = std::mem::take(&mut pending_annotations);
+                        packaged = false;
+                        declarations.push(declaration);
+                    } else {
+                        packaged = false;
+                        pending_annotations.clear();
                     }
                     continue;
                 }
@@ -687,7 +744,7 @@ impl Parser {
                                 if matches!(
                                     k.as_str(),
                                     "template" | "struct" | "unit" | "extend" | "type"
-                                        | "interface"
+                                        | "interface" | "annotation" | "repeatable"
                                 )
                         ) =>
                 {
@@ -745,22 +802,31 @@ impl Parser {
             };
             let declaration = if keyword == "type" {
                 let mut declaration = self.parse_type_declaration();
+                // The annotations are consumed whether or not the
+                // declaration parsed — a failed parse must not leave
+                // them to attach to the next one.
+                let annotations = std::mem::take(&mut pending_annotations);
                 if let Some(d) = declaration.as_mut() {
                     d.packaged = packaged;
+                    d.annotations = annotations;
                 }
                 packaged = false;
                 declaration
             } else if keyword == "interface" {
                 let mut declaration = self.parse_interface_declaration();
+                let annotations = std::mem::take(&mut pending_annotations);
                 if let Some(d) = declaration.as_mut() {
                     d.packaged = packaged;
+                    d.annotations = annotations;
                 }
                 packaged = false;
                 declaration
             } else {
                 let mut declaration = self.parse_declaration(&keyword);
+                let annotations = std::mem::take(&mut pending_annotations);
                 if let Some(d) = declaration.as_mut() {
                     d.packaged = packaged;
+                    d.annotations = annotations;
                 }
                 packaged = false;
                 declaration
@@ -849,6 +915,7 @@ impl Parser {
                 bases: Vec::new(),
                 implements: Vec::new(),
                 modifiers: Vec::new(),
+                annotations: Vec::new(),
                 members: vec![members.pop().expect("MAIN enumeral")],
                 span: (start, end),
             },
@@ -868,12 +935,14 @@ impl Parser {
                 bases: Vec::new(),
                 implements: Vec::new(),
                 modifiers: Vec::new(),
+                annotations: Vec::new(),
                 members: vec![
                     Member::Event(crate::ast::EventDecl {
                         name: "item_done".to_owned(),
                         name_span: (start, start),
                         trigger: None,
                         is_static: false,
+                        annotations: Vec::new(),
                         span: (start, end),
                     }),
                     Member::Method(crate::ast::MethodDecl {
@@ -887,6 +956,7 @@ impl Parser {
                         tcm_event: None,
                         modifier: None,
                         is_static: false,
+                        annotations: Vec::new(),
                         body: Vec::new(),
                         span: (start, end),
                     }),
@@ -909,10 +979,147 @@ impl Parser {
                 bases: Vec::new(),
                 implements: Vec::new(),
                 modifiers: Vec::new(),
+                annotations: Vec::new(),
                 members,
                 span: (start, end),
             },
         ])
+    }
+
+    /// Whether the token at the cursor can open a module-level entity
+    /// an annotation may attach to (clause 35.3): a type
+    /// declaration/extension (`struct`, `unit`, `extend`, `type`,
+    /// `interface`), a template declaration/extension, a macro
+    /// definition, or a `package` prefix of one of those. The
+    /// `numeric_type`/`method_type` declaration forms and C routine
+    /// declarations of the clause's list do not parse in this
+    /// implementation yet, so no attachment can precede them.
+    fn peek_attachable_module_entity(&self) -> bool {
+        match self.peek_kind() {
+            Some(TokenKind::Keyword(k)) if k.as_str() == "package" => {
+                matches!(
+                    self.peek_second_kind(),
+                    Some(TokenKind::Keyword(k)) if matches!(
+                        k.as_str(),
+                        "struct" | "unit" | "extend" | "type" | "interface" | "template"
+                    )
+                )
+            }
+            Some(TokenKind::Keyword(k)) => {
+                matches!(
+                    k.as_str(),
+                    "struct" | "unit" | "extend" | "type" | "interface" | "template"
+                ) || (k.as_str() == "define" && self.peek_second_is_punct("<"))
+            }
+            _ => false,
+        }
+    }
+
+    /// `@name` / `@name(attr = const-exp, ...)` attachments (clause
+    /// 35.3): one or more, each from its `@` to the attribute list's
+    /// closing `)` (or the name's end without one). The attribute
+    /// values are constant expressions, recorded as written.
+    fn parse_attached_annotations(&mut self) -> Option<Vec<crate::ast::Annotation>> {
+        let mut annotations = Vec::new();
+        while self.at_punct("@") {
+            let start = self.current_span().0;
+            self.bump(); // '@'
+            let (name, _) = self.expect_word("E0102", "expected the annotation name after '@'")?;
+            let mut attrs = Vec::new();
+            if self.eat_punct("(") {
+                loop {
+                    let (attr, _) =
+                        self.expect_word("E0102", "expected an attribute name in the annotation")?;
+                    self.expect_punct(
+                        "=",
+                        "E0108",
+                        "expected '=' after the annotation attribute name",
+                    )?;
+                    let value = self.parse_expr()?;
+                    attrs.push((attr, value));
+                    if !self.eat_punct(",") {
+                        break;
+                    }
+                }
+                self.expect_punct(
+                    ")",
+                    "E0110",
+                    "expected ')' to close the annotation attributes",
+                )?;
+            }
+            let end = self.last_end();
+            annotations.push(crate::ast::Annotation {
+                name,
+                attrs,
+                span: (start, end),
+            });
+        }
+        Some(annotations)
+    }
+
+    /// `[package] [repeatable] annotation @name { member; ... };`
+    /// (clause 35.2): a struct-like type in the type namespace. The
+    /// members are recorded as written; the annotation-body
+    /// restrictions (only fields and methods, scalar/string/set field
+    /// types, no static fields, no access modifiers, `init()` not
+    /// extended, no `new`) are checked in `check.rs` (E0137, E0138 and
+    /// the E0113-coded shapes).
+    fn parse_annotation_declaration(&mut self, repeatable: bool) -> Option<Declaration> {
+        let start = self.current_span().0;
+        self.bump(); // 'annotation'
+        self.expect_punct("@", "E0106", "expected '@' before the annotation name")?;
+        let (name, name_span) = self.expect_word("E0102", "expected the annotation name")?;
+        if self
+            .expect_punct("{", "E0106", "expected '{' to open the annotation body")
+            .is_none()
+        {
+            self.recover_to_declaration_boundary();
+            return Some(Declaration {
+                kind: DeclarationKind::Annotation { repeatable },
+                name,
+                name_span,
+                underlying: None,
+                subtype_range: None,
+                template_params: Vec::new(),
+                template_conditions: Vec::new(),
+                template_extend: None,
+                packaged: false,
+                like: None,
+                like_span: None,
+                like_type: None,
+                bases: Vec::new(),
+                implements: Vec::new(),
+                modifiers: Vec::new(),
+                annotations: Vec::new(),
+                members: Vec::new(),
+                span: (start, self.eof),
+            });
+        }
+        let members = self.parse_member_list();
+        // e convention writes the closing brace as `};`; the semicolon is
+        // accepted but not required.
+        self.eat_punct(";");
+        let end = self.last_end();
+        Some(Declaration {
+            kind: DeclarationKind::Annotation { repeatable },
+            name,
+            name_span,
+            underlying: None,
+            subtype_range: None,
+            template_params: Vec::new(),
+            template_conditions: Vec::new(),
+            template_extend: None,
+            packaged: false,
+            like: None,
+            like_span: None,
+            like_type: None,
+            bases: Vec::new(),
+            implements: Vec::new(),
+            modifiers: Vec::new(),
+            annotations: Vec::new(),
+            members,
+            span: (start, end),
+        })
     }
 
     /// `template (struct|unit|interface|numeric_type|extend) name of
@@ -1108,6 +1315,7 @@ impl Parser {
                 bases,
                 implements,
                 modifiers: Vec::new(),
+                annotations: Vec::new(),
                 members: Vec::new(),
                 span: (start, end),
             });
@@ -1133,6 +1341,7 @@ impl Parser {
                 bases,
                 implements,
                 modifiers: Vec::new(),
+                annotations: Vec::new(),
                 members: Vec::new(),
                 span: (start, self.eof),
             });
@@ -1166,6 +1375,7 @@ impl Parser {
             bases,
             implements,
             modifiers: Vec::new(),
+            annotations: Vec::new(),
             members,
             span: (start, end),
         })
@@ -1367,6 +1577,7 @@ impl Parser {
                 bases: Vec::new(),
                 implements: Vec::new(),
                 modifiers: Vec::new(),
+                annotations: Vec::new(),
                 members: Vec::new(),
                 span: (start, end),
             });
@@ -1392,6 +1603,7 @@ impl Parser {
                 bases: Vec::new(),
                 implements: Vec::new(),
                 modifiers: Vec::new(),
+                annotations: Vec::new(),
                 members: Vec::new(),
                 span: (start, self.eof),
             });
@@ -1441,6 +1653,7 @@ impl Parser {
                 bases: Vec::new(),
                 implements: Vec::new(),
                 modifiers: Vec::new(),
+                annotations: Vec::new(),
                 members,
                 span: (start, self.last_end()),
             });
@@ -1475,6 +1688,7 @@ impl Parser {
                 bases: Vec::new(),
                 implements: Vec::new(),
                 modifiers: Vec::new(),
+                annotations: Vec::new(),
                 members,
                 span: (start, self.last_end()),
             });
@@ -1496,6 +1710,7 @@ impl Parser {
             bases: Vec::new(),
             implements: Vec::new(),
             modifiers: Vec::new(),
+            annotations: Vec::new(),
             members,
             span: (start, end),
         })
@@ -1580,6 +1795,7 @@ impl Parser {
                 bases,
                 implements: Vec::new(),
                 modifiers: Vec::new(),
+                annotations: Vec::new(),
                 members: Vec::new(),
                 span: (start, self.eof),
             });
@@ -1610,6 +1826,7 @@ impl Parser {
             bases,
             implements: Vec::new(),
             modifiers: Vec::new(),
+            annotations: Vec::new(),
             members,
             span: (start, end),
         })
@@ -1737,6 +1954,7 @@ impl Parser {
                 bases: Vec::new(),
                 implements,
                 modifiers,
+                annotations: Vec::new(),
                 members: Vec::new(),
                 span: (start, self.eof),
             });
@@ -1762,6 +1980,7 @@ impl Parser {
             bases: Vec::new(),
             implements,
             modifiers,
+            annotations: Vec::new(),
             members,
             span: (start, end),
         })
@@ -1798,6 +2017,75 @@ impl Parser {
     /// One member often produces several AST members (`a, b: uint;` is two
     /// fields), hence the vector.
     fn parse_member(&mut self) -> Option<Vec<Member>> {
+        // `@name` attachments before a struct/interface member (clause
+        // 35.3): the attachments precede the member declaration, and a
+        // name group's every field carries them. A `when` block cannot
+        // carry an annotation (E0140); members the clause's list does
+        // not name (`import`, a constant `define`, a preprocessor
+        // directive) are rejected rather than silently dropping the
+        // attachment.
+        if self.at_punct("@") {
+            let Some(annotations) = self.parse_attached_annotations() else {
+                self.recover_to_member_boundary();
+                return None;
+            };
+            if self.at_keyword("when") {
+                let span = annotations[0].span;
+                self.diagnostics.push(Diagnostic::new(
+                    "E0140",
+                    "an annotation cannot be attached to a when block (clause 35.3)",
+                    span.0,
+                    span.1,
+                ));
+                // Recovery skips the whole when block — its modifiers
+                // and brace-balanced body — so the member loop resumes
+                // at the enclosing body's boundary, not at the when
+                // body's `}`.
+                self.bump(); // 'when'
+                while self.peek().is_some() && !self.at_punct("{") && !self.at_punct(";") {
+                    self.bump();
+                }
+                if self.at_punct("{") {
+                    let mut depth = 0usize;
+                    while let Some(token) = self.peek() {
+                        match &token.kind {
+                            TokenKind::Punctuation(p) if p == "{" => {
+                                depth += 1;
+                                self.bump();
+                            }
+                            TokenKind::Punctuation(p) if p == "}" => {
+                                depth -= 1;
+                                self.bump();
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {
+                                self.bump();
+                            }
+                        }
+                    }
+                }
+                self.eat_punct(";");
+                return None;
+            }
+            if self.at_keyword("import")
+                || (self.peek_word_is("define") && !self.peek_second_is_punct("<"))
+                || self.at_punct("#")
+            {
+                self.error_here(
+                    "E0113",
+                    "an annotation cannot be attached to this member kind (clause 35.3)",
+                );
+                self.recover_to_member_boundary();
+                return None;
+            }
+            let mut members = self.parse_member()?;
+            for member in &mut members {
+                member.attach_annotations(&annotations);
+            }
+            return Some(members);
+        }
         // `package` / `protected` / `private` visibility prefix of a
         // member (`package items: …`, `private mset: …`, clause 22) —
         // recorded on the field, not enforced. The prefix is consumed by
@@ -1989,6 +2277,7 @@ impl Parser {
             category,
             pattern,
             computed,
+            annotations: Vec::new(),
             body,
             span: (start, end),
         }))
@@ -2124,6 +2413,7 @@ impl Parser {
                 empty: true,
                 is_also,
                 items: Vec::new(),
+                annotations: Vec::new(),
                 options: Vec::new(),
                 span: (start, end),
             });
@@ -2232,6 +2522,7 @@ impl Parser {
             empty: false,
             is_also,
             items,
+            annotations: Vec::new(),
             options,
             span: (start, end),
         })
@@ -2272,6 +2563,7 @@ impl Parser {
             kind,
             te,
             else_body,
+            annotations: Vec::new(),
             span: (start, end),
         })
     }
@@ -2522,6 +2814,7 @@ impl Parser {
             path,
             is_static: self.member_static,
             type_qualified,
+            annotations: Vec::new(),
             body,
             span: (start, end),
         })
@@ -2865,6 +3158,7 @@ impl Parser {
                             is_static: self.member_static,
                             init: None,
                             visibility: self.member_visibility.clone(),
+                            annotations: Vec::new(),
                         })
                     })
                     .collect(),
@@ -2908,6 +3202,7 @@ impl Parser {
                         is_static: self.member_static,
                         init: init.clone(),
                         visibility: self.member_visibility.clone(),
+                        annotations: Vec::new(),
                     })
                 })
                 .collect(),
@@ -2988,6 +3283,7 @@ impl Parser {
                 tcm_event,
                 modifier: None,
                 is_static: false,
+                annotations: Vec::new(),
                 body: Vec::new(),
                 span: (start, end),
             }));
@@ -3020,6 +3316,7 @@ impl Parser {
                 tcm_event,
                 modifier,
                 is_static: self.member_static,
+                annotations: Vec::new(),
                 body: Vec::new(),
                 span: (start, end),
             }));
@@ -3041,6 +3338,7 @@ impl Parser {
             tcm_event,
             modifier,
             is_static: self.member_static,
+            annotations: Vec::new(),
             body,
             span: (start, end),
         }))
@@ -3131,6 +3429,7 @@ impl Parser {
                     name_span,
                     direction,
                     element,
+                    annotations: Vec::new(),
                     span: (start, end),
                 }));
             }
@@ -3156,6 +3455,7 @@ impl Parser {
             name_span,
             direction,
             element,
+            annotations: Vec::new(),
             span: (start, end),
         }))
     }
@@ -3182,6 +3482,7 @@ impl Parser {
             // `static event name;` (clause 11.1.4.1): the event of the
             // type itself, emitted as `Type::name`.
             is_static: self.member_static,
+            annotations: Vec::new(),
             span: (start, end),
         }))
     }
@@ -3566,6 +3867,7 @@ impl Parser {
             expr,
             is_soft,
             is_bind,
+            annotations: Vec::new(),
             span: (start, end),
         })
     }
@@ -4993,6 +5295,22 @@ impl Parser {
             return self.parse_postfix_chain(ident, start);
         }
         match self.peek_kind() {
+            // `@name` — the annotation type in expression position
+            // (clause 35.4): the receiver of the annotation API's
+            // static methods (`@development.get_all_annotations()`).
+            // The postfix chain reads the member access; a bare
+            // `@name` has no value (a run-time error).
+            Some(TokenKind::Punctuation(p)) if p == "@" => {
+                self.bump(); // '@'
+                let (name, _) =
+                    self.expect_word("E0102", "expected the annotation type name after '@'")?;
+                let end = self.last_end();
+                let expr = Expr::AnnotationTypeRef {
+                    name,
+                    span: (start, end),
+                };
+                self.parse_postfix_chain(expr, start)
+            }
             // `[a, b, c]` / `[lo..hi]` / `[]` — a set literal (5.2.12) in
             // expression position (the same shape `in` and `in_table`
             // take). Index and bit-slice brackets are postfix: they only

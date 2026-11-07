@@ -67,6 +67,26 @@
 //! - `E0316` a range-generated (`~`) field of non-scalar type — the
 //!   type must be numeric, `bool`, or an enumeral (clause 6.9.7)
 //!
+//! The annotation checks of the 2019 annotations stage (IEEE 1647-2019
+//! clause 35) run here and, for the module-scope rule, from the parser:
+//!
+//! - `E0137` a member of an `annotation @name { .. }` body that is
+//!   neither a field nor a method (clause 35.2)
+//! - `E0138` an annotation field whose type is not scalar/string/set
+//!   (clause 35.2; see [`check_annotation_body`] for the reading)
+//! - `E0139` a second attachment of a non-`repeatable` annotation type
+//!   on one entity (clause 35.3)
+//! - `E0320` an annotation type extended (`extend @name`/`extend
+//!   name`) or inherited from (`like`) (clause 35.2)
+//! - `E0321` an annotation type used in the module that declares it —
+//!   raised by [`check_annotation_module_scope`], which the parser
+//!   calls once per file: every file is one module in this
+//!   implementation (an imported file is spliced as whole
+//!   declarations), so the same-file restriction must be evaluated
+//!   before the multi-file merge (clause 35.2)
+//! - `E0140` an annotation attached to a `when` block (clause 35.3) —
+//!   raised by the parser, which sees the attachment directly
+//!
 //! Further static-member restrictions of the 2019 static-members stage
 //! (IEEE 1647-2019 clauses 4.17.4, 6.9.3, 7.2.2, 7.2.4, 17.2.4) are
 //! raised from this pass under their elaboration-range codes — the
@@ -135,6 +155,19 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
                 declaration.name_span.1,
             ));
         }
+    }
+    // The annotation types (clause 35.2): a struct-like kind in the type
+    // namespace. Their names resolve in every type position (the
+    // same-module restriction is E0321, a per-file pass — see
+    // [`check_annotation_module_scope`]); their extend/like targets are
+    // rejected (E0320).
+    let annotation_decls: BTreeMap<&str, &Declaration> = declarations
+        .iter()
+        .filter(|declaration| matches!(declaration.kind, DeclarationKind::Annotation { .. }))
+        .map(|declaration| (declaration.name.as_str(), declaration))
+        .collect();
+    for name in annotation_decls.keys() {
+        declared.insert(name);
     }
     // The interface tables (clause 6.13, 6.3): which names are
     // interfaces, and the effective implemented-interface set per
@@ -229,8 +262,22 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
         .map(|declaration| (declaration.name.as_str(), own_rgf_names(declaration)))
         .collect();
     for declaration in declarations {
-        check_extend_target(declaration, &declared, &interfaces, &mut diagnostics);
-        check_like_target(declaration, &declared, &interfaces, &mut diagnostics);
+        check_extend_target(
+            declaration,
+            &declared,
+            &interfaces,
+            &annotation_decls,
+            &mut diagnostics,
+        );
+        check_like_target(
+            declaration,
+            &declared,
+            &interfaces,
+            &annotation_decls,
+            &mut diagnostics,
+        );
+        check_annotation_body(declaration, &kinds, &mut diagnostics);
+        check_annotation_repeats(declaration, &annotation_decls, &mut diagnostics);
         if declaration.kind == DeclarationKind::Interface {
             check_interface_members(declaration, &mut diagnostics);
             check_interface_bases(declaration, &interfaces, &mut diagnostics);
@@ -308,7 +355,12 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
             }
             check_body_static_accesses(&on.body, &static_members, &mut diagnostics);
         });
-        if declaration.kind != DeclarationKind::Extend {
+        // A `keep` member inside an annotation body is already E0137
+        // (not a field or method); walking its expression for the
+        // enclosing type's fields would only add noise.
+        if declaration.kind != DeclarationKind::Extend
+            && !matches!(declaration.kind, DeclarationKind::Annotation { .. })
+        {
             let mut field_names: BTreeSet<&str> = BTreeSet::new();
             for_each_field(&declaration.members, &mut |field| {
                 field_names.insert(field.name.as_str());
@@ -331,6 +383,7 @@ fn check_extend_target(
     declaration: &Declaration,
     declared: &BTreeSet<&str>,
     interfaces: &BTreeMap<&str, &Declaration>,
+    annotation_decls: &BTreeMap<&str, &Declaration>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     if declaration.kind != DeclarationKind::Extend {
@@ -339,6 +392,20 @@ fn check_extend_target(
     // The parser's pseudo-declaration holding file-level `define`/`import`
     // members is scope, not an extend of a real type.
     if declaration.name == "global" && declaration.like.is_none() {
+        return;
+    }
+    // Clause 35.2: an annotation type cannot be extended — its members
+    // are fixed at declaration.
+    if annotation_decls.contains_key(declaration.name.as_str()) {
+        diagnostics.push(Diagnostic::new(
+            "E0320",
+            format!(
+                "annotation type '{}' cannot be extended (clause 35.2)",
+                declaration.name
+            ),
+            declaration.name_span.0,
+            declaration.name_span.1,
+        ));
         return;
     }
     // Clause 6.13: only the interface declaration form exists here — an
@@ -377,12 +444,24 @@ fn check_like_target(
     declaration: &Declaration,
     declared: &BTreeSet<&str>,
     interfaces: &BTreeMap<&str, &Declaration>,
+    annotation_decls: &BTreeMap<&str, &Declaration>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(like) = &declaration.like else {
         return;
     };
     let like_span = declaration.like_span.unwrap_or(declaration.name_span);
+    // Clause 35.2: an annotation type cannot be inherited from — the
+    // annotation's members are fixed at declaration.
+    if annotation_decls.contains_key(like.as_str()) {
+        diagnostics.push(Diagnostic::new(
+            "E0320",
+            format!("annotation type '{like}' cannot be inherited from (clause 35.2)"),
+            like_span.0,
+            like_span.1,
+        ));
+        return;
+    }
     if interfaces.contains_key(like.as_str()) {
         // A struct/unit cannot `like` an interface (clause 6.3: `like`
         // bases are structs and units; interfaces attach through
@@ -404,6 +483,345 @@ fn check_like_target(
             like_span.0,
             like_span.1,
         ));
+    }
+}
+
+/// Clause 35.2 annotation-body restrictions. The members of an
+/// `annotation @name { .. }` body are fields and methods only
+/// (`E0137`); a field's type is a scalar or string base, an inline
+/// enumerand set, or a named `type` declaration — the clause's
+/// "scalar, string or set" reading, where a named scalar subtype
+/// (`type addr_t: int(bits: 8)`) counts as scalar and a named
+/// enumerand type as set (`E0138`). The restrictions the migration
+/// plan allocates no code for are reported under the parser's
+/// unsupported-member code `E0113` with their own messages: a `static`
+/// field, an access-modifier prefix, an extended `init()` and a `new`
+/// method. All annotation fields are implicitly `const` — recorded by
+/// the checker's leniency toward init values, not rewritten on the AST.
+fn check_annotation_body(
+    declaration: &Declaration,
+    kinds: &BTreeMap<&str, DeclarationKind>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !matches!(declaration.kind, DeclarationKind::Annotation { .. }) {
+        return;
+    }
+    for member in &declaration.members {
+        match member {
+            Member::Field(field) => {
+                if !annotation_field_type_allowed(&field.ty, kinds) {
+                    diagnostics.push(Diagnostic::new(
+                        "E0138",
+                        format!(
+                            "annotation field '{}' must be scalar, string or set (clause 35.2)",
+                            field.name
+                        ),
+                        field.name_span.0,
+                        field.name_span.1,
+                    ));
+                }
+                if field.is_static {
+                    diagnostics.push(Diagnostic::new(
+                        "E0113",
+                        format!(
+                            "a static field is not allowed in an annotation body: '{}' (clause 35.2)",
+                            field.name
+                        ),
+                        field.name_span.0,
+                        field.name_span.1,
+                    ));
+                }
+                if field.visibility.is_some() {
+                    diagnostics.push(Diagnostic::new(
+                        "E0113",
+                        format!(
+                            "an access modifier is not allowed on annotation member '{}' (clause 35.2)",
+                            field.name
+                        ),
+                        field.name_span.0,
+                        field.name_span.1,
+                    ));
+                }
+            }
+            Member::Method(method) => {
+                if method.name == "new" {
+                    diagnostics.push(Diagnostic::new(
+                        "E0113",
+                        "the 'new' method is not allowed in an annotation body (clause 35.2)",
+                        method.name_span.0,
+                        method.name_span.1,
+                    ));
+                }
+                if method.name == "init" && method.modifier.is_some() {
+                    diagnostics.push(Diagnostic::new(
+                        "E0113",
+                        "init() of an annotation cannot be extended (clause 35.2)",
+                        method.name_span.0,
+                        method.name_span.1,
+                    ));
+                }
+            }
+            other => {
+                let span = annotation_member_span(other);
+                diagnostics.push(Diagnostic::new(
+                    "E0137",
+                    "an annotation member must be a field or method (clause 35.2)",
+                    span.0,
+                    span.1,
+                ));
+            }
+        }
+    }
+}
+
+/// Whether an annotation field's type is one of clause 35.2's scalar,
+/// string or set shapes.
+fn annotation_field_type_allowed(ty: &TypeExpr, kinds: &BTreeMap<&str, DeclarationKind>) -> bool {
+    match ty {
+        // Any scalar base, `string` included (Table 17).
+        TypeExpr::Scalar { .. } => true,
+        // `[a, b]` — an inline enumerand set.
+        TypeExpr::InlineEnum { .. } => true,
+        // A named type is legal when it names a `type` declaration: an
+        // enumerand set or a scalar subtype. Structs, units, interfaces
+        // and other annotation types are not.
+        TypeExpr::Named { name, .. } => kinds.get(name.as_str()) == Some(&DeclarationKind::Type),
+        _ => false,
+    }
+}
+
+/// The span an annotation-body diagnostic points at.
+fn annotation_member_span(member: &Member) -> crate::ast::Span {
+    match member {
+        Member::Field(field) => field.name_span,
+        Member::Constraint(constraint) => constraint.span,
+        Member::When(when) => when.span,
+        Member::Event(event) => event.span,
+        Member::On(on) => on.span,
+        Member::Cover(cover) => cover.span,
+        Member::Expect(expect) => expect.span,
+        Member::Port(port) => port.span,
+        Member::Import { span, .. } | Member::Define { span, .. } => *span,
+        Member::Macro(macro_decl) => macro_decl.span,
+        Member::Enumeral(enumeral) => enumeral.name_span,
+        Member::Method(method) => method.name_span,
+    }
+}
+
+/// Clause 35.3: several annotations may precede one entity, and more
+/// than one of the same type only if that type is `repeatable`
+/// (`E0139`). An attachment of an annotation type this declaration set
+/// does not declare carries no repeatability information; no code is
+/// allocated for an unknown annotation type, so it is not reported.
+fn check_annotation_repeats(
+    declaration: &Declaration,
+    annotation_decls: &BTreeMap<&str, &Declaration>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    check_annotation_entity_repeats(&declaration.annotations, annotation_decls, diagnostics);
+    check_member_annotation_repeats(&declaration.members, annotation_decls, diagnostics);
+}
+
+fn check_member_annotation_repeats(
+    members: &[Member],
+    annotation_decls: &BTreeMap<&str, &Declaration>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for member in members {
+        if let Member::When(when) = member {
+            check_member_annotation_repeats(&when.members, annotation_decls, diagnostics);
+            continue;
+        }
+        check_annotation_entity_repeats(member_annotations(member), annotation_decls, diagnostics);
+    }
+}
+
+fn check_annotation_entity_repeats(
+    annotations: &[crate::ast::Annotation],
+    annotation_decls: &BTreeMap<&str, &Declaration>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut seen_non_repeatable: BTreeSet<&str> = BTreeSet::new();
+    for annotation in annotations {
+        let Some(decl) = annotation_decls.get(annotation.name.as_str()) else {
+            continue;
+        };
+        let DeclarationKind::Annotation { repeatable } = decl.kind else {
+            continue;
+        };
+        if !repeatable && !seen_non_repeatable.insert(annotation.name.as_str()) {
+            diagnostics.push(Diagnostic::new(
+                "E0139",
+                format!(
+                    "annotation '@{}' is not repeatable (clause 35.3)",
+                    annotation.name
+                ),
+                annotation.span.0,
+                annotation.span.1,
+            ));
+        }
+    }
+}
+
+/// The annotations attached to one member, for the repeat check.
+fn member_annotations(member: &Member) -> &[crate::ast::Annotation] {
+    match member {
+        Member::Field(field) => &field.annotations,
+        Member::Constraint(constraint) => &constraint.annotations,
+        Member::Method(method) => &method.annotations,
+        Member::Event(event) => &event.annotations,
+        Member::On(on) => &on.annotations,
+        Member::Cover(cover) => &cover.annotations,
+        Member::Expect(expect) => &expect.annotations,
+        Member::Port(port) => &port.annotations,
+        Member::Macro(macro_decl) => &macro_decl.annotations,
+        Member::Enumeral(_) | Member::When(_) | Member::Import { .. } | Member::Define { .. } => {
+            &[]
+        }
+    }
+}
+
+/// Clause 35.2: a newly declared annotation type cannot be used in the
+/// module that declares it — only from the next module. In this
+/// implementation every file is one module (the CLI splices an imported
+/// file's whole declarations before the importing file's own, so a
+/// merged-set check could not tell the files apart), and the parser
+/// calls this pass once per file, where the file boundary is known: any
+/// use of an annotation type declared in the same file — as a type
+/// (field, method parameter/return, local `var`) or as an attachment —
+/// is reported once per type at its first use (`E0321`). Extend/like
+/// targets of an annotation type are the E0320 domain, not uses here;
+/// `new` of one is a run-time error (E0402).
+pub fn check_annotation_module_scope(declarations: &[Declaration]) -> Vec<Diagnostic> {
+    let own_annotations: BTreeSet<&str> = declarations
+        .iter()
+        .filter(|declaration| matches!(declaration.kind, DeclarationKind::Annotation { .. }))
+        .map(|declaration| declaration.name.as_str())
+        .collect();
+    if own_annotations.is_empty() {
+        return Vec::new();
+    }
+    let mut state = ModuleScopeState {
+        own_annotations,
+        reported: BTreeSet::new(),
+        diagnostics: Vec::new(),
+    };
+    for declaration in declarations {
+        state.annotation_uses(&declaration.annotations);
+        for member in &declaration.members {
+            state.member_uses(member);
+        }
+        for_each_field(&declaration.members, &mut |field| {
+            state.type_uses(&field.ty);
+        });
+        for_each_method(&declaration.members, &mut |method| {
+            for param in &method.params {
+                if let Some(ty) = &param.ty {
+                    state.type_uses(ty);
+                }
+            }
+            if let Some(ty) = &method.return_type {
+                state.type_uses(ty);
+            }
+            state.statement_uses(&method.body);
+        });
+        for_each_on(&declaration.members, &mut |on| {
+            state.statement_uses(&on.body);
+        });
+        for member in &declaration.members {
+            if let Member::Expect(expect) = member {
+                state.statement_uses(&expect.else_body);
+            }
+        }
+    }
+    state.diagnostics
+}
+
+struct ModuleScopeState<'a> {
+    own_annotations: BTreeSet<&'a str>,
+    reported: BTreeSet<&'a str>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl<'a> ModuleScopeState<'a> {
+    fn report(&mut self, name: &'a str, span: crate::ast::Span) {
+        if self.own_annotations.contains(name) && self.reported.insert(name) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0321",
+                format!(
+                    "annotation type '{name}' is used in the module that declares it (clause 35.2)"
+                ),
+                span.0,
+                span.1,
+            ));
+        }
+    }
+
+    fn annotation_uses(&mut self, annotations: &'a [crate::ast::Annotation]) {
+        for annotation in annotations {
+            if self.own_annotations.contains(annotation.name.as_str()) {
+                let name = annotation.name.as_str();
+                let span = annotation.span;
+                self.report(name, span);
+            }
+        }
+    }
+
+    fn member_uses(&mut self, member: &'a Member) {
+        if let Member::When(when) = member {
+            for inner in &when.members {
+                self.member_uses(inner);
+            }
+        }
+        self.annotation_uses(member_annotations(member));
+    }
+
+    fn type_uses(&mut self, ty: &'a TypeExpr) {
+        match ty {
+            TypeExpr::Named { name, span } => {
+                let name = name.as_str();
+                let span = *span;
+                self.report(name, span);
+            }
+            TypeExpr::List { element, .. } => self.type_uses(element),
+            TypeExpr::WhenQualified { base, .. } => self.type_uses(base),
+            TypeExpr::TemplateRef { args, .. } => {
+                for arg in args {
+                    self.type_uses(arg);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn statement_uses(&mut self, statements: &'a [Stmt]) {
+        for statement in statements {
+            match statement {
+                Stmt::VarDecl { ty: Some(ty), .. } => self.type_uses(ty),
+                Stmt::If {
+                    then_body,
+                    else_body: Some(else_body),
+                    ..
+                } => {
+                    self.statement_uses(then_body);
+                    self.statement_uses(else_body);
+                }
+                Stmt::Check { else_body, .. } => self.statement_uses(else_body),
+                Stmt::While { body, .. }
+                | Stmt::RepeatUntil { body, .. }
+                | Stmt::ForEach { body, .. }
+                | Stmt::ForTo { body, .. } => self.statement_uses(body),
+                Stmt::Case { arms, default, .. } => {
+                    for (_, body) in arms {
+                        self.statement_uses(body);
+                    }
+                    if let Some(default) = default {
+                        self.statement_uses(default);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -597,6 +1015,10 @@ fn struct_interface_sets(declarations: &[Declaration]) -> BTreeMap<&str, Vec<Str
                 DeclarationKind::Type
                 | DeclarationKind::Interface
                 | DeclarationKind::NumericType => false,
+                // An annotation type composes through neither `like`
+                // nor `implementing` (clause 35.2: it cannot be
+                // inherited from — E0320).
+                DeclarationKind::Annotation { .. } => false,
             };
             if !contributes {
                 continue;
@@ -754,6 +1176,11 @@ fn check_fields(
     for_each_field(&declaration.members, &mut |field| {
         own_fields.insert(field.name.as_str(), &field.ty);
     });
+    // An annotation body's fields are implicitly `const` (clause 35.2):
+    // the generated-field prefix rules that assume instance generation
+    // do not apply; the annotation-specific restrictions are this
+    // module's `check_annotation_body`.
+    let annotation_body = matches!(declaration.kind, DeclarationKind::Annotation { .. });
     for_each_field(&declaration.members, &mut |field| {
         check_named_type(&field.ty, declared, decl_ctx.templates, diagnostics);
         check_long_subtype(&field.ty, false, diagnostics);
@@ -771,10 +1198,12 @@ fn check_fields(
         {
             check_width(width, diagnostics);
         }
-        check_field_prefixes(field, diagnostics);
+        check_field_prefixes(field, annotation_body, diagnostics);
         check_range_gen_field(field, kinds, diagnostics);
-        check_unit_instance_static_field(field, kinds, diagnostics);
-        check_keyed_list_key(&field.ty, decl_ctx.declarations, diagnostics);
+        if !annotation_body {
+            check_unit_instance_static_field(field, kinds, diagnostics);
+            check_keyed_list_key(&field.ty, decl_ctx.declarations, diagnostics);
+        }
         if let Some(init) = &field.init {
             check_expr_static_accesses(init, static_members, diagnostics);
         }
@@ -802,7 +1231,25 @@ fn check_fields(
 /// - A static field is neither physical nor range-generated (`E0305`,
 ///   clause 6.9.3): there is one shared value, not one per instance to
 ///   pack or generate.
-fn check_field_prefixes(field: &Field, diagnostics: &mut Vec<Diagnostic>) {
+fn check_field_prefixes(field: &Field, annotation_body: bool, diagnostics: &mut Vec<Diagnostic>) {
+    // In an annotation body the field is implicitly const (clause
+    // 35.2): an init value is legal, and the static-field rules fire
+    // from `check_annotation_body` instead — only the `!`/`~` syntax
+    // conflict stays here.
+    if annotation_body {
+        if field.no_gen && field.range_gen {
+            diagnostics.push(Diagnostic::new(
+                "E0213",
+                format!(
+                    "'!' and '~' cannot be combined on field '{}' (clause 6.9.1)",
+                    field.name
+                ),
+                field.name_span.0,
+                field.name_span.1,
+            ));
+        }
+        return;
+    }
     if field.no_gen && field.range_gen {
         diagnostics.push(Diagnostic::new(
             "E0213",
@@ -2458,6 +2905,9 @@ fn for_each_sub_expr<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
         | Expr::SetOfValues { .. }
         // The `Type` of a static access is a name, not an expression.
         | Expr::StaticAccess { .. }
+        // An annotation type reference is a name (clause 35.4); its
+        // member accesses walk through the MemberAccess arm.
+        | Expr::AnnotationTypeRef { .. }
         // A set literal's bounds enumerate, they are not walked here.
         | Expr::SetLiteral { .. } => {}
         Expr::MemberAccess { object, .. } => for_each_sub_expr(object, f),
@@ -2607,6 +3057,9 @@ fn collect_root_identifiers(expr: &Expr, roots: &mut Vec<(String, crate::ast::Sp
         // `Type::member` names a static member of a type — a legal
         // constraint reference, not an unknown root (clause 4.17.4).
         Expr::StaticAccess { .. } => {}
+        // `@name.member` names an annotation type's API method (clause
+        // 35.4) — likewise a legal reference, not an unknown root.
+        Expr::AnnotationTypeRef { .. } => {}
         Expr::Call { args, .. } => {
             for arg in args {
                 collect_root_identifiers(arg, roots);

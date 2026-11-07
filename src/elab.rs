@@ -643,6 +643,77 @@ pub struct Elaborated {
     /// declares the block (the interpreter matches the latter by the
     /// block's `type_qualified` target instead).
     pub static_ons: BTreeMap<String, Vec<crate::ast::OnDecl>>,
+    /// The annotation types (clause 35.2) by name, with their
+    /// `repeatable` flag — the interpreter's `new` rejection (E0402)
+    /// and the clause 35.4 API dispatch read this.
+    pub annotation_types: BTreeMap<String, bool>,
+    /// The attached annotations (clause 35.3) by annotation type name,
+    /// in attachment order — the clause 35.4 `get_all_annotations()`
+    /// returns these. Extend blocks fold into their target types, but
+    /// their members' attachments record here all the same.
+    pub attached_annotations: BTreeMap<String, Vec<AttachedAnnotation>>,
+}
+
+/// One attached annotation (clause 35.3) recorded for the clause 35.4
+/// API: the annotation type's name, the attachment's `(attribute,
+/// value-as-written)` pairs and the attachment's span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedAnnotation {
+    pub type_name: String,
+    pub attrs: Vec<(String, crate::ast::Expr)>,
+    pub span: crate::ast::Span,
+}
+
+/// Collect one declaration's attachments — the declaration's own and
+/// every member's, `when` bodies included — into the registry.
+fn collect_declaration_annotations(
+    declaration: &Declaration,
+    registry: &mut BTreeMap<String, Vec<AttachedAnnotation>>,
+) {
+    for annotation in &declaration.annotations {
+        registry
+            .entry(annotation.name.clone())
+            .or_default()
+            .push(AttachedAnnotation {
+                type_name: annotation.name.clone(),
+                attrs: annotation.attrs.clone(),
+                span: annotation.span,
+            });
+    }
+    collect_member_annotations(&declaration.members, registry);
+}
+
+fn collect_member_annotations(
+    members: &[Member],
+    registry: &mut BTreeMap<String, Vec<AttachedAnnotation>>,
+) {
+    for member in members {
+        if let Member::When(when) = member {
+            collect_member_annotations(&when.members, registry);
+        }
+        let annotations: &[crate::ast::Annotation] = match member {
+            Member::Field(field) => &field.annotations,
+            Member::Constraint(constraint) => &constraint.annotations,
+            Member::Method(method) => &method.annotations,
+            Member::Event(event) => &event.annotations,
+            Member::On(on) => &on.annotations,
+            Member::Cover(cover) => &cover.annotations,
+            Member::Expect(expect) => &expect.annotations,
+            Member::Port(port) => &port.annotations,
+            Member::Macro(macro_decl) => &macro_decl.annotations,
+            _ => continue,
+        };
+        for annotation in annotations {
+            registry
+                .entry(annotation.name.clone())
+                .or_default()
+                .push(AttachedAnnotation {
+                    type_name: annotation.name.clone(),
+                    attrs: annotation.attrs.clone(),
+                    span: annotation.span,
+                });
+        }
+    }
 }
 
 /// One type's members, tagged with the declaration or extend block that
@@ -714,6 +785,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
     let mut base_by_name: BTreeMap<&str, usize> = BTreeMap::new();
     let mut extends_by_target: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     let mut template_extends_by_target: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut annotation_types: BTreeMap<String, bool> = BTreeMap::new();
     for (index, declaration) in declarations.iter().enumerate() {
         match declaration.kind {
             DeclarationKind::Extend => {
@@ -743,6 +815,12 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             // checker rejects `struct S like I` and `extend I`); it
             // composes through its own arm below.
             DeclarationKind::Interface => {}
+            // An annotation type (clause 35.2) joins no composition: it
+            // cannot be extended or inherited from (E0320). Its name and
+            // `repeatable` flag are recorded for the clause 35.4 API.
+            DeclarationKind::Annotation { repeatable } => {
+                annotation_types.insert(declaration.name.clone(), repeatable);
+            }
         }
     }
     let mut elaborator = Elaborator {
@@ -934,10 +1012,23 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                     span: declaration.span,
                 });
             }
+            // An annotation type produces no composed type view (its
+            // members are recorded on the declaration; the clause 35.4
+            // API reads the attachment registry). Extends of it are
+            // rejected (E0320).
+            DeclarationKind::Annotation { .. } => {}
             DeclarationKind::Extend => {}
         }
     }
     elaborator.compose_builtin_units(&mut types, &defines, &mut queue);
+    // The attached annotations (clause 35.3), by annotation type name in
+    // attachment order — the clause 35.4 `get_all_annotations()` reads
+    // this registry. Extend blocks fold into their target types, but
+    // their attachments record here all the same.
+    let mut attached_annotations: BTreeMap<String, Vec<AttachedAnnotation>> = BTreeMap::new();
+    for declaration in declarations {
+        collect_declaration_annotations(declaration, &mut attached_annotations);
+    }
     // 6.7: synthesize one subtype view per `when` block (`when
     // BUSY'kind { .. }` on type `kind`'s owner): the base's composed
     // members with the when block's members appended, under the
@@ -1431,6 +1522,8 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         defines,
         sequences,
         diagnostics: elaborator.diagnostics,
+        annotation_types,
+        attached_annotations,
         static_fields: static_registry(declarations),
         static_methods: static_registry(declarations),
         static_events: static_registry(declarations),

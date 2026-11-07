@@ -1,0 +1,2 @@
+9:19: error[E0321]: annotation type 'reviewed' is used in the module that declares it (clause 35.2)
+9:39: error[E0139]: annotation '@reviewed' is not repeatable (clause 35.3)

@@ -598,6 +598,13 @@ struct Interp<'a> {
     static_methods: &'a BTreeMap<String, Vec<MethodDecl>>,
     static_events: &'a BTreeMap<String, Vec<EventDecl>>,
     static_ons: &'a BTreeMap<String, Vec<OnDecl>>,
+    /// The annotation types (clause 35.2) by name with their
+    /// `repeatable` flag: `new` of one is rejected (E0402) and the
+    /// clause 35.4 API dispatch resolves against it.
+    annotation_types: &'a BTreeMap<String, bool>,
+    /// The attached annotations (clause 35.3) by annotation type name —
+    /// the clause 35.4 `get_all_annotations()` reads this registry.
+    attached_annotations: &'a BTreeMap<String, Vec<crate::elab::AttachedAnnotation>>,
     /// The type whose static method is currently executing (T2.2):
     /// bare static-field and bare static-method references inside a
     /// static method resolve against it (`me` does not exist there).
@@ -691,6 +698,13 @@ const UNIMPLEMENTED_2019: &[(&str, &str, (usize, usize))] = &[
     // 19.1: `swap` is a predefined pack tool name; the byte-order swap
     // itself is not implemented.
     ("swap", "19.1", (1, 1)),
+    // 35.4: the element-taking annotation API and the
+    // definition-element surface need an rf_definition_element model;
+    // only get_all_annotations() is implemented (T10.3).
+    ("get_attached_annotation", "35.4", (1, 1)),
+    ("get_attached_annotations_list", "35.4", (1, 1)),
+    ("get_definition_element", "35.4", (0, 0)),
+    ("is_applicable", "35.4", (1, 1)),
 ];
 
 /// Instantiate the built-in `sys` unit and execute its `run()` methods.
@@ -804,6 +818,8 @@ fn run_inner(
         static_methods: &elaborated.static_methods,
         static_events: &elaborated.static_events,
         static_ons: &elaborated.static_ons,
+        annotation_types: &elaborated.annotation_types,
+        attached_annotations: &elaborated.attached_annotations,
         static_context: None,
         expected_type: None,
         new_type_hint: None,
@@ -4982,6 +4998,121 @@ impl<'a> Interp<'a> {
         Err(self.error("E0405", format!("routine '{name}' is not supported"), span))
     }
 
+    /// The clause 35.4 annotation API on `@T` (T10.3). `@T.
+    /// get_all_annotations()` is implemented for real: the list of the
+    /// type's recorded attachments (clause 35.3), each rendered
+    /// source-like with its attribute values as written — a
+    /// `list of string`. The element-taking calls
+    /// (`get_attached_annotation`, `get_attached_annotations_list`) and
+    /// the definition-element surface (`get_definition_element`,
+    /// `is_applicable`) are recognised, arity-checked stubs reporting
+    /// `E0419` at run time: there is no `rf_definition_element` model
+    /// in this stage (the reflection catalogue is a later phase).
+    fn call_annotation_type_method(
+        &self,
+        type_name: &str,
+        name: &str,
+        values: &[Value],
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let Some(_repeatable) = self.annotation_types.get(type_name) else {
+            return Err(self.error(
+                "E0401",
+                format!("unknown annotation type '@{type_name}'"),
+                span,
+            ));
+        };
+        match name {
+            "get_all_annotations" => {
+                if !values.is_empty() {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "'get_all_annotations()' expects no arguments, got {}",
+                            values.len()
+                        ),
+                        span,
+                    ));
+                }
+                let items = self
+                    .attached_annotations
+                    .get(type_name)
+                    .map(|annotations| {
+                        annotations
+                            .iter()
+                            .map(|annotation| Value::Str(render_attached_annotation(annotation)))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Ok(Value::List(ListValue {
+                    items: Rc::new(RefCell::new(items)),
+                    element: Some("string".to_owned()),
+                }))
+            }
+            // The recognised-but-unimplemented clause 35.4 surface: the
+            // same E0419 shape the UNIMPLEMENTED_2019 table produces
+            // (the table itself answers the call form first — these
+            // arms serve the bare member-access spellings).
+            "get_attached_annotation" | "get_attached_annotations_list" => {
+                if values.len() != 1 {
+                    return Err(self.error(
+                        "E0402",
+                        format!("'{name}()' expects one argument, got {}", values.len()),
+                        span,
+                    ));
+                }
+                Err(self.error(
+                    "E0419",
+                    format!(
+                        "'{name}()' is recognised (clause 35.4) but not implemented in this stage"
+                    ),
+                    span,
+                ))
+            }
+            "get_definition_element" => {
+                if !values.is_empty() {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "'get_definition_element()' expects no arguments, got {}",
+                            values.len()
+                        ),
+                        span,
+                    ));
+                }
+                Err(self.error(
+                    "E0419",
+                    "'get_definition_element()' is recognised (clause 35.4) but not implemented in this stage"
+                        .to_owned(),
+                    span,
+                ))
+            }
+            "is_applicable" => {
+                if values.len() != 1 {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "'is_applicable()' expects one argument, got {}",
+                            values.len()
+                        ),
+                        span,
+                    ));
+                }
+                Err(self.error(
+                    "E0419",
+                    "'is_applicable()' is recognised (clause 35.4) but not implemented in this stage"
+                        .to_owned(),
+                    span,
+                ))
+            }
+            _ => Err(self.error(
+                "E0405",
+                format!("annotation type '@{type_name}' has no method '{name}'"),
+                span,
+            )),
+        }
+    }
+
     /// The E0419 stub dispatch ([`UNIMPLEMENTED_2019`]): a recognised
     /// name with a compatible arity reports "'name()' is recognised
     /// (clause X) but not implemented in this stage"; a recognised name
@@ -8020,6 +8151,18 @@ impl<'a> Interp<'a> {
             Expr::MemberAccess {
                 object, name, span, ..
             } => {
+                // `@T.member` — the annotation API's static methods on
+                // the annotation type (clause 35.4): dispatched on the
+                // name, with no receiver value behind `@T`. A call
+                // through this shape dispatches in the `Expr::Call` arm
+                // with its arguments; this path is the argument-less
+                // member read.
+                if let Expr::AnnotationTypeRef {
+                    name: type_name, ..
+                } = object.as_ref()
+                {
+                    return self.call_annotation_type_method(type_name, name, &[], *span);
+                }
                 let object_value = self.eval(object, frame, me)?;
                 match object_value {
                     Value::Object(index) => {
@@ -8132,6 +8275,16 @@ impl<'a> Interp<'a> {
                         // to the builtin table first.
                         if crate::builtins::is_builtin_routine(name) {
                             return self.call_builtin(name, values, *span, me);
+                        }
+                        // `@T.method(args)` — the clause 35.4
+                        // annotation API on the annotation type:
+                        // dispatched on the name, no receiver value.
+                        if let Expr::AnnotationTypeRef {
+                            name: type_name, ..
+                        } = object.as_ref()
+                        {
+                            return self
+                                .call_annotation_type_method(type_name, name, &values, *span);
                         }
                         // The predefined `covers` (14.9), `files` (30.5)
                         // and `table_manager` (32.3) singletons are
@@ -8726,6 +8879,17 @@ impl<'a> Interp<'a> {
                 "select distribution expressions are not evaluated yet",
                 *span,
             )),
+            Expr::AnnotationTypeRef { name, span } => {
+                // A bare `@name` has no value (clause 35.4): the
+                // annotation type exists as the receiver of its API
+                // methods, which the member-access arm dispatches
+                // before evaluating its object.
+                Err(self.error(
+                    "E0402",
+                    format!("annotation type '@{name}' has no value — call one of its methods (@{name}.get_all_annotations(), clause 35.4)"),
+                    *span,
+                ))
+            }
             Expr::New { ty, inits, span } => {
                 // `new [<type>] [with { .. }]` (clause 6.3): a typed
                 // creation instantiates the named type — the
@@ -8771,6 +8935,18 @@ impl<'a> Interp<'a> {
                     return Err(self.error(
                         "E0402",
                         format!("cannot instantiate interface '{new_name}' (clause 5.2.9)"),
+                        *span,
+                    ));
+                }
+                // Clause 35.2: `new` is not allowed for an annotation
+                // type — the annotation exists as metadata recorded on
+                // declarations and members, not as an instance.
+                if self.annotation_types.contains_key(&new_name) {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "cannot instantiate annotation type '{new_name}' — 'new' is not allowed for annotations (clause 35.2)"
+                        ),
                         *span,
                     ));
                 }
@@ -10041,6 +10217,25 @@ fn intersect_domain(
 /// Stable type key for an inline enumeral list.
 fn inline_enum_key(names: &[String]) -> String {
     format!("[{}]", names.join(","))
+}
+
+/// The source-like rendering of one recorded attachment, as the clause
+/// 35.4 `get_all_annotations()` list element: `@name` or
+/// `@name(attr = value, ...)` with each attribute value compactly
+/// rendered as written (a string literal keeps its quotes). This is
+/// the annotation's documented value representation — a string, not a
+/// reflective object.
+fn render_attached_annotation(annotation: &crate::elab::AttachedAnnotation) -> String {
+    if annotation.attrs.is_empty() {
+        return format!("@{}", annotation.type_name);
+    }
+    let attrs = annotation
+        .attrs
+        .iter()
+        .map(|(attr, value)| format!("{attr} = {}", crate::ast::render_expr_compact(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("@{}({})", annotation.type_name, attrs)
 }
 
 fn as_i64(value: &Value) -> Option<i64> {
