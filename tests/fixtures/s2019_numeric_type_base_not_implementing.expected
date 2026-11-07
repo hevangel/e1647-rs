@@ -1,0 +1,4 @@
+3:14: error[E0132]: numeric_type 'nt1' base must be a struct implementing numeric_i ('not_a_struct' does not implement numeric_i)
+5:14: error[E0132]: numeric_type 'nt2' base must be a struct implementing numeric_i ('plain' does not implement numeric_i)
+6:19: error[E0203]: unknown type 'undefined_base'
+6:14: error[E0132]: numeric_type 'nt3' base must be a struct implementing numeric_i ('undefined_base' is not a struct/unit)

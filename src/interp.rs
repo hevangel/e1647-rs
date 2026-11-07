@@ -236,6 +236,19 @@ pub enum Value {
         table: Option<Rc<RefCell<crate::tables::TableValue>>>,
         row: Rc<RefCell<crate::tables::TableRowValue>>,
     },
+    /// A custom numeric type value (5.2.15, 5.8.4): the declaring
+    /// `numeric_type`'s name and the implementing-struct instance whose
+    /// `numeric_i` methods give the value its behavior (clause 31; the
+    /// T7.1 value model). By value, not by reference: binding a custom
+    /// value into a slot, passing it as an argument or copying a field
+    /// mints a fresh instance and runs the struct's `numeric_assign`
+    /// (a per-field deep copy when the struct does not define one) —
+    /// see [`Interp::bind_slot_value`]. Operations on the value
+    /// dispatch to the struct's `numeric_*` methods (T7.3).
+    Custom {
+        type_name: String,
+        instance: usize,
+    },
     Void,
 }
 
@@ -1381,10 +1394,22 @@ impl<'a> Interp<'a> {
                     // frame / no-instance context suffices; an expression
                     // that cannot evaluate keeps the type default and the
                     // failure is reported through the run diagnostics.
+                    // The value binds through the field's declared type
+                    // (T7.1: a custom-numeric field converts a scalar
+                    // init via `numeric_from_int`/`numeric_from_real`,
+                    // and a custom value copies).
                     Some(init) => {
                         let mut frame = Frame::default();
                         match self.eval(init, &mut frame, None) {
-                            Ok(value) => value,
+                            Ok(value) => {
+                                match self.bind_slot_value(value, Some(&field.ty), origin_span()) {
+                                    Ok(value) => value,
+                                    Err(diagnostic) => {
+                                        self.pending_diagnostics.push(diagnostic);
+                                        self.default_for(&field.ty)
+                                    }
+                                }
+                            }
                             Err(diagnostic) => {
                                 self.pending_diagnostics.push(diagnostic);
                                 self.default_for(&field.ty)
@@ -1544,6 +1569,13 @@ impl<'a> Interp<'a> {
                     if t.kind == DeclarationKind::Interface {
                         return Value::Void;
                     }
+                    // A custom numeric type defaults to a fresh value
+                    // of its implementing struct, initialized by
+                    // `set_initial_value()` when the struct defines it
+                    // (T7.1's defaulting rule).
+                    if t.kind == DeclarationKind::NumericType {
+                        return self.new_custom_numeric(name, origin_span());
+                    }
                     if t.kind == DeclarationKind::Type
                         && let Some(first) = t.enumerals.first()
                     {
@@ -1592,9 +1624,18 @@ impl<'a> Interp<'a> {
             // A template reference instantiates its monomorphized view
             // (8.3), which elaboration materialized under the canonical
             // name; a formal is bound only inside a template's own
-            // declaration and stays void here.
+            // declaration and stays void here. A monomorphized
+            // `template numeric_type` instance (8.4) defaults as the
+            // custom numeric value it is (T7.1), not as its struct.
             TypeExpr::TemplateRef { name, args, .. } => {
                 let instance = crate::ast::template_instance_name(name, args);
+                let types: &[crate::elab::ElaboratedType] = self.types;
+                if types
+                    .iter()
+                    .any(|t| t.name == instance && t.kind == DeclarationKind::NumericType)
+                {
+                    return self.new_custom_numeric(&instance, origin_span());
+                }
                 if self.depth > 100 {
                     return Value::Void;
                 }
@@ -2099,6 +2140,11 @@ impl<'a> Interp<'a> {
                 {
                     list.element = Some(element.render());
                 }
+                // The declared type binds the value (T7.1: a
+                // custom-numeric slot converts a scalar initializer
+                // through `numeric_from_int`/`numeric_from_real`, and a
+                // custom value copies — value semantics).
+                value = self.bind_slot_value(value, ty.as_ref(), statement.span())?;
                 if let Some(ty) = ty {
                     frame.local_types.insert(name.clone(), ty.clone());
                 }
@@ -2225,15 +2271,18 @@ impl<'a> Interp<'a> {
             }
             Stmt::Break { .. } => Ok(Flow::Break),
             Stmt::Continue { .. } => Ok(Flow::Continue),
-            Stmt::Print { exprs, .. } => {
+            Stmt::Print { exprs, span, .. } => {
                 let mut parts = Vec::new();
                 for expr in exprs {
                     let value = self.eval(expr, frame, me)?;
+                    // A custom numeric value renders through
+                    // numeric_to_string(dec) (T7.3); the absence of the
+                    // method is the checked E0418.
                     let text = match expr {
                         Expr::Ident { name, .. } => {
-                            format!("{name} = {}", self.format_value(&value))
+                            format!("{name} = {}", self.format_value_checked(&value, *span)?)
                         }
-                        _ => self.format_value(&value),
+                        _ => self.format_value_checked(&value, *span)?,
                     };
                     parts.push(text);
                 }
@@ -2602,7 +2651,13 @@ impl<'a> Interp<'a> {
                     for alternative in alternatives {
                         let alt_value = self.eval(alternative, frame, me)?;
                         if matches!(
-                            self.apply_binary(BinaryOp::Eq, value.clone(), alt_value, *span)?,
+                            self.apply_binary(
+                                BinaryOp::Eq,
+                                value.clone(),
+                                alt_value,
+                                *span,
+                                &Precision::unbounded(),
+                            )?,
                             Value::Bool(true)
                         ) {
                             matched = Some((Some(arm_index), body));
@@ -3210,6 +3265,12 @@ impl<'a> Interp<'a> {
         me: usize,
         span: crate::ast::Span,
     ) -> Result<(), Diagnostic> {
+        // The slot's declared type binds the value (T7.1's value
+        // semantics: a custom numeric copies; a scalar into a
+        // custom-numeric slot converts). The gen paths store sampled
+        // scalars, so the conversion arm never fires from there.
+        let declared = self.declared_type_of(name, slot_is_local, frame, me);
+        let value = self.bind_slot_value(value, declared.as_ref(), span)?;
         if slot_is_local {
             frame.locals.insert(name.to_owned(), value);
             return Ok(());
@@ -4706,7 +4767,13 @@ impl<'a> Interp<'a> {
                 if let Some(ty) = &param.ty {
                     frame.local_types.insert(param.name.clone(), ty.clone());
                 }
-                frame.locals.insert(param.name.clone(), arg.clone());
+                // A parameter binds by value (T7.1): a custom numeric
+                // argument copies, and a scalar argument converts when
+                // the parameter's declared type is a custom numeric
+                // type. The clause 31 dispatch passes struct objects,
+                // which bind unchanged.
+                let bound = self.bind_slot_value(arg.clone(), param.ty.as_ref(), span)?;
+                frame.locals.insert(param.name.clone(), bound);
             }
             match self.exec_block(&block.body, &mut frame, Some(object_index))? {
                 Flow::Return(value) => result = value,
@@ -4869,7 +4936,7 @@ impl<'a> Interp<'a> {
         me: Option<usize>,
     ) -> Result<Value, Diagnostic> {
         if name == "out" {
-            let text: String = values.iter().map(|v| self.format_value(v)).collect();
+            let text = self.format_values_checked(&values, span)?;
             self.output.push_str(&text);
             return Ok(Value::Void);
         }
@@ -4878,7 +4945,7 @@ impl<'a> Interp<'a> {
         }
         if name == "dut_error" || name == "error" {
             self.dut_errors += 1;
-            let text: String = values.iter().map(|v| self.format_value(v)).collect();
+            let text = self.format_values_checked(&values, span)?;
             self.output.push_str(&format!("{name}: {text}\n"));
             return Ok(Value::Void);
         }
@@ -4897,18 +4964,14 @@ impl<'a> Interp<'a> {
                     self.call_method(index, "user_message_handler", Vec::new(), span)?;
                 }
             }
-            let text: String = values
-                .iter()
-                .skip(1)
-                .map(|v| self.format_value(v))
-                .collect();
+            let text = self.format_values_checked(&values[1..], span)?;
             self.output.push_str(&text);
             self.output.push('\n');
             return Ok(Value::Void);
         }
         if name == "append" {
             // String concatenation form; list append is a later milestone.
-            let text: String = values.iter().map(|v| self.format_value(v)).collect();
+            let text = self.format_values_checked(&values, span)?;
             return Ok(Value::Str(text));
         }
         if name == "stop_run" {
@@ -6216,6 +6279,11 @@ impl<'a> Interp<'a> {
             | Value::Set(_)
             | Value::Void
             | Value::Port { .. } => Ok(value.clone()),
+            // A custom numeric value deep copies by value (T7.1): a
+            // fresh implementing-struct instance through the same
+            // copy rule a slot binding uses (`numeric_assign` when the
+            // struct defines it, a per-field deep copy otherwise).
+            Value::Custom { .. } => self.copy_custom_numeric(value, span),
             // A table deep copy (32.3's `copy`): a fresh writable table
             // with fresh row handles (see `TableValue::copied`).
             Value::Table(table) => Ok(Value::Table(Rc::new(RefCell::new(table.borrow().copied())))),
@@ -6253,6 +6321,664 @@ impl<'a> Interp<'a> {
                 Ok(Value::Object(new_index))
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Custom numeric types (5.2.15, 5.8.4, clause 31 — T7.1/T7.3): the
+    // by-value value model over the implementing struct's instances and
+    // the operator dispatch onto its `numeric_i` methods.
+    // ------------------------------------------------------------------
+
+    /// Whether `name` declares a `numeric_type` (5.8.4): values of the
+    /// name take their behavior from the implementing struct's
+    /// `numeric_i` methods, not from a plain struct's.
+    fn is_custom_numeric_type(&self, name: &str) -> bool {
+        self.types
+            .iter()
+            .any(|t| t.name == name && t.kind == DeclarationKind::NumericType)
+    }
+
+    /// The implementing struct of custom numeric type `name` — the
+    /// `numeric_type` declaration's underlying reference (5.8.4).
+    fn numeric_impl_struct(&self, name: &str) -> Option<String> {
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let declared = types
+            .iter()
+            .find(|t| t.name == name && t.kind == DeclarationKind::NumericType)?;
+        declared
+            .underlying
+            .as_ref()
+            .and_then(|ty| ty.declared_name())
+            .map(str::to_owned)
+    }
+
+    /// The `numeric_format_kind` enumerand for the default print radix:
+    /// `dec` (T7.3 — `out`/`print`/`append` render a custom numeric
+    /// value with `numeric_to_string(dec)`).
+    fn numeric_radix_dec() -> Value {
+        Value::Enum {
+            type_name: "numeric_format_kind".to_owned(),
+            name: "dec".to_owned(),
+        }
+    }
+
+    /// Call one `numeric_i`-shaped method on the implementing-struct
+    /// instance behind a custom numeric value (T7.3's dispatch). The
+    /// instance is the `me` receiver; `other`/`res` arguments arrive as
+    /// struct objects, so the method's writes (`res.raw = ...`) land in
+    /// the shared instance. `Ok(None)` when the struct does not define
+    /// the method — the operator sites turn that into `E0418`; the
+    /// lifecycle sites accept the absence.
+    fn call_numeric_method(
+        &mut self,
+        instance: usize,
+        method: &str,
+        args: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Option<Value>, Diagnostic> {
+        let type_name = self.instances[instance].type_name.clone();
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        if resolve_method_blocks(types, &type_name, method, span).is_err() {
+            return Ok(None);
+        }
+        let value = self.call_method(instance, method, args, span)?;
+        Ok(Some(value))
+    }
+
+    /// A fresh custom-numeric value of `type_name` (T7.1's defaulting
+    /// rule): a new instance of the implementing struct whose
+    /// `set_initial_value()` defines the initial state — the method
+    /// runs when the struct defines it; its absence leaves the fields
+    /// at their own defaults.
+    fn new_custom_numeric(&mut self, type_name: &str, span: crate::ast::Span) -> Value {
+        let Some(impl_name) = self.numeric_impl_struct(type_name) else {
+            return Value::Void;
+        };
+        let index = self.instantiate(&impl_name);
+        let _ = self.call_numeric_method(index, "set_initial_value", Vec::new(), span);
+        Value::Custom {
+            type_name: type_name.to_owned(),
+            instance: index,
+        }
+    }
+
+    /// The fresh result instance of a custom-numeric operation (the
+    /// `res` of the clause 31 `(other, res)` method shapes), or the
+    /// honest error when the type's declaration is broken.
+    fn custom_result_instance(
+        &mut self,
+        type_name: &str,
+        span: crate::ast::Span,
+    ) -> Result<usize, Diagnostic> {
+        match self.new_custom_numeric(type_name, span) {
+            Value::Custom { instance, .. } => Ok(instance),
+            _ => Err(self.error(
+                "E0402",
+                format!("numeric_type '{type_name}' has no implementing struct"),
+                span,
+            )),
+        }
+    }
+
+    /// The by-value copy of one custom numeric value (T7.1): a fresh
+    /// implementing-struct instance, default-initialized
+    /// (`set_initial_value()` when defined), then the struct's
+    /// `numeric_assign(other)` — the clause 31 copy the struct authors
+    /// when plain field-by-field copying is wrong. Without
+    /// `numeric_assign` the fields deep copy one by one.
+    fn copy_custom_numeric(
+        &mut self,
+        value: &Value,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let Value::Custom {
+            type_name,
+            instance,
+        } = value
+        else {
+            return Ok(value.clone());
+        };
+        let (type_name, instance) = (type_name.clone(), *instance);
+        let Some(impl_name) = self.numeric_impl_struct(&type_name) else {
+            return Ok(Value::Custom {
+                type_name,
+                instance,
+            });
+        };
+        let fresh = self.instantiate(&impl_name);
+        let _ = self.call_numeric_method(fresh, "set_initial_value", Vec::new(), span);
+        let assigned =
+            self.call_numeric_method(fresh, "numeric_assign", vec![Value::Object(instance)], span)?;
+        if assigned.is_none() {
+            // No numeric_assign: the fields deep copy — the honest
+            // by-value fallback, because a custom numeric's storage is
+            // its struct instance's storage.
+            let fields: Vec<(String, Value)> = self.instances[instance]
+                .fields
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            for (name, field_value) in fields {
+                let copied = self.deep_copy_value(&field_value, 0, span)?;
+                self.instances[fresh].set(&name, copied);
+            }
+        }
+        Ok(Value::Custom {
+            type_name,
+            instance: fresh,
+        })
+    }
+
+    /// Build a plain scalar into a custom-numeric value of `type_name`
+    /// (T7.3's implicit conversions): a fresh instance initialized by
+    /// `set_initial_value()`, then `numeric_from_int(v)` or
+    /// `numeric_from_real(v)` writes the scalar in. A struct without
+    /// the conversion pair reports `E0418`.
+    fn convert_scalar_to_custom(
+        &mut self,
+        value: &Value,
+        type_name: &str,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let (method, arg) = match value {
+            Value::Int(v) => ("numeric_from_int", Value::Int(*v)),
+            Value::Real(v) => ("numeric_from_real", Value::Real(*v)),
+            other => {
+                return Err(self.error(
+                    "E0402",
+                    format!(
+                        "cannot build a '{}' value from {} (a custom numeric value takes an int or real)",
+                        type_name,
+                        self.value_kind(other)
+                    ),
+                    span,
+                ));
+            }
+        };
+        let fresh = self.custom_result_instance(type_name, span)?;
+        if self
+            .call_numeric_method(fresh, method, vec![arg], span)?
+            .is_none()
+        {
+            return Err(self.numeric_method_missing(type_name, "conversion", method, span));
+        }
+        Ok(Value::Custom {
+            type_name: type_name.to_owned(),
+            instance: fresh,
+        })
+    }
+
+    /// The `E0418` diagnostic (T7.1): an operation or conversion the
+    /// clause 31 dispatch needs has no definition in the numeric type's
+    /// implementing struct.
+    fn numeric_method_missing(
+        &self,
+        type_name: &str,
+        what: &str,
+        method: &str,
+        span: crate::ast::Span,
+    ) -> Diagnostic {
+        self.error(
+            "E0418",
+            format!("{what} is not implemented by numeric type '{type_name}' ({method} missing)"),
+            span,
+        )
+    }
+
+    /// Bind `value` into a slot of declared type `ty` (T7.1's value
+    /// semantics and implicit conversions):
+    ///
+    /// - a custom-numeric value copies wherever it is bound — a typed
+    ///   or type-inferring slot, a field, a method parameter — so the
+    ///   source and the bound value never share storage
+    ///   (`numeric_assign` when the struct defines it, a deep field
+    ///   copy otherwise);
+    /// - a plain int/real builds into a custom-numeric slot through
+    ///   the `numeric_from_int`/`numeric_from_real` pair
+    ///   (`var a: fx_t = 3`);
+    /// - a custom value of a *different* numeric type is the honest
+    ///   `E0402` (an `as_a` conversion is the spelled route);
+    /// - everything else passes through unchanged.
+    fn bind_slot_value(
+        &mut self,
+        value: Value,
+        ty: Option<&TypeExpr>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        if let Some(TypeExpr::Named { name, .. }) = ty
+            && self.is_custom_numeric_type(name)
+        {
+            match &value {
+                Value::Custom { type_name, .. } if type_name != name => {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "cannot assign a '{type_name}' value to a '{name}' slot (use as_a('{name}'))"
+                        ),
+                        span,
+                    ));
+                }
+                Value::Custom { .. } => return self.copy_custom_numeric(&value, span),
+                Value::Int(_) | Value::Real(_) => {
+                    return self.convert_scalar_to_custom(&value, name, span);
+                }
+                _ => {}
+            }
+        }
+        if matches!(value, Value::Custom { .. }) {
+            return self.copy_custom_numeric(&value, span);
+        }
+        Ok(value)
+    }
+
+    /// The source symbol of a binary operator, for the `E0418` message.
+    fn operator_symbol(op: BinaryOp) -> &'static str {
+        match op {
+            BinaryOp::Add => "+",
+            BinaryOp::Sub => "-",
+            BinaryOp::Mul => "*",
+            BinaryOp::Div => "/",
+            BinaryOp::Mod => "%",
+            BinaryOp::Lt => "<",
+            BinaryOp::Le => "<=",
+            BinaryOp::Gt => ">",
+            BinaryOp::Ge => ">=",
+            BinaryOp::Eq | BinaryOp::IdentityEq => "==",
+            BinaryOp::NotEq | BinaryOp::IdentityNe => "!=",
+            BinaryOp::BitAnd => "&",
+            BinaryOp::BitOr => "|",
+            BinaryOp::BitXor => "^",
+            BinaryOp::ShiftLeft => "<<",
+            BinaryOp::ShiftRight => ">>",
+            _ => "operator",
+        }
+    }
+
+    /// The `other` operand of a custom-numeric binary operation: a
+    /// second custom value of the same type shares its instance; a
+    /// plain scalar converts into the custom type first (T7.3 —
+    /// `numeric_from_int`/`numeric_from_real`).
+    fn custom_operand_instance(
+        &mut self,
+        other: Value,
+        type_name: &str,
+        op: BinaryOp,
+        span: crate::ast::Span,
+    ) -> Result<usize, Diagnostic> {
+        match other {
+            Value::Custom {
+                type_name: other_type,
+                instance,
+            } if other_type == type_name => Ok(instance),
+            Value::Custom {
+                type_name: other_type,
+                ..
+            } => Err(self.error(
+                "E0402",
+                format!(
+                    "operator '{}' between numeric types '{type_name}' and '{other_type}' is not supported (use as_a)",
+                    Self::operator_symbol(op)
+                ),
+                span,
+            )),
+            scalar @ (Value::Int(_) | Value::Real(_)) => {
+                match self.convert_scalar_to_custom(&scalar, type_name, span)? {
+                    Value::Custom { instance, .. } => Ok(instance),
+                    _ => unreachable!("convert_scalar_to_custom returns a custom value"),
+                }
+            }
+            other => Err(self.error(
+                "E0402",
+                format!(
+                    "invalid operand ({}) for '{}' on a custom numeric value",
+                    self.value_kind(&other),
+                    Self::operator_symbol(op)
+                ),
+                span,
+            )),
+        }
+    }
+
+    /// Operators and comparisons on custom numeric values (5.2.15, 5.7,
+    /// clause 31 — T7.3): the arithmetic shapes call the struct's
+    /// `numeric_add/subtract/multiply/divide/modulo(other, res)` with a
+    /// fresh result instance; comparisons call `numeric_compare(other)`
+    /// (the -1/0/1 result reads against 0); the bitwise shapes call
+    /// `numeric_bit_and/or/xor(other, res)` and
+    /// `numeric_shift_left/right(n, res)`. A plain scalar operand
+    /// converts into the custom type first. A method the struct does
+    /// not define is the runtime `E0418`.
+    fn apply_custom_binary(
+        &mut self,
+        op: BinaryOp,
+        lhs: Value,
+        rhs: Value,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        use BinaryOp::*;
+        let lhs_is_custom = matches!(lhs, Value::Custom { .. });
+        let (type_name, instance, other_value) = if lhs_is_custom {
+            let Value::Custom {
+                type_name,
+                instance,
+            } = lhs
+            else {
+                unreachable!("lhs_is_custom checked above")
+            };
+            (type_name, instance, rhs)
+        } else {
+            let Value::Custom {
+                type_name,
+                instance,
+            } = rhs
+            else {
+                unreachable!("apply_custom_binary dispatched on a custom operand")
+            };
+            (type_name, instance, lhs)
+        };
+        // Comparisons dispatch through numeric_compare(other): int.
+        if let Lt | Le | Gt | Ge | Eq | NotEq = op {
+            let other_instance = self.custom_operand_instance(other_value, &type_name, op, span)?;
+            let ordering = self
+                .call_numeric_method(
+                    instance,
+                    "numeric_compare",
+                    vec![Value::Object(other_instance)],
+                    span,
+                )?
+                .ok_or_else(|| {
+                    self.numeric_method_missing(
+                        &type_name,
+                        &format!("operation '{}'", Self::operator_symbol(op)),
+                        "numeric_compare",
+                        span,
+                    )
+                })?;
+            let Value::Int(ordering) = ordering else {
+                return Err(self.error("E0402", "numeric_compare must return an int", span));
+            };
+            let result = match op {
+                Lt => ordering < 0,
+                Le => ordering <= 0,
+                Gt => ordering > 0,
+                Ge => ordering >= 0,
+                Eq => ordering == 0,
+                _ => ordering != 0,
+            };
+            return Ok(Value::Bool(result));
+        }
+        // The (other, res) shapes: a fresh instance carries the result.
+        let method = match op {
+            Add => "numeric_add",
+            Sub => "numeric_subtract",
+            Mul => "numeric_multiply",
+            Div => "numeric_divide",
+            Mod => "numeric_modulo",
+            BitAnd => "numeric_bit_and",
+            BitOr => "numeric_bit_or",
+            BitXor => "numeric_bit_xor",
+            ShiftLeft | ShiftRight => {
+                return self.apply_custom_shift(op, instance, other_value, &type_name, span);
+            }
+            // Native string matching and the list-pointer identity
+            // operators have no numeric_i method.
+            _ => {
+                return Err(self.error(
+                    "E0402",
+                    format!(
+                        "operator '{}' is not supported on a custom numeric value",
+                        Self::operator_symbol(op)
+                    ),
+                    span,
+                ));
+            }
+        };
+        let other_instance = self.custom_operand_instance(other_value, &type_name, op, span)?;
+        let res = self.custom_result_instance(&type_name, span)?;
+        if self
+            .call_numeric_method(
+                instance,
+                method,
+                vec![Value::Object(other_instance), Value::Object(res)],
+                span,
+            )?
+            .is_none()
+        {
+            return Err(self.numeric_method_missing(
+                &type_name,
+                &format!("operation '{}'", Self::operator_symbol(op)),
+                method,
+                span,
+            ));
+        }
+        Ok(Value::Custom {
+            type_name,
+            instance: res,
+        })
+    }
+
+    /// The shift shapes: the right operand is the integer shift amount
+    /// (`numeric_shift_left/right(n: int, res)` — clause 31.4), never
+    /// converted to the custom type.
+    fn apply_custom_shift(
+        &mut self,
+        op: BinaryOp,
+        instance: usize,
+        other_value: Value,
+        type_name: &str,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let Value::Int(n) = other_value else {
+            return Err(self.error("E0402", "shift amount must be an integer", span));
+        };
+        let method = if op == BinaryOp::ShiftLeft {
+            "numeric_shift_left"
+        } else {
+            "numeric_shift_right"
+        };
+        let res = self.custom_result_instance(type_name, span)?;
+        if self
+            .call_numeric_method(
+                instance,
+                method,
+                vec![Value::Int(n), Value::Object(res)],
+                span,
+            )?
+            .is_none()
+        {
+            return Err(self.numeric_method_missing(
+                type_name,
+                &format!("operation '{}'", Self::operator_symbol(op)),
+                method,
+                span,
+            ));
+        }
+        Ok(Value::Custom {
+            type_name: type_name.to_owned(),
+            instance: res,
+        })
+    }
+
+    /// Unary `numeric_unary_minus/plus/bit_not(res)` on a custom
+    /// numeric value (clause 31.4, T7.3): the method writes into a
+    /// fresh result instance.
+    fn custom_unary(
+        &mut self,
+        op: UnaryOp,
+        type_name: &str,
+        instance: usize,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let (method, symbol) = match op {
+            UnaryOp::Negate => ("numeric_unary_minus", "-"),
+            UnaryOp::Plus => ("numeric_unary_plus", "+"),
+            _ => ("numeric_bit_not", "~"),
+        };
+        let res = self.custom_result_instance(type_name, span)?;
+        if self
+            .call_numeric_method(instance, method, vec![Value::Object(res)], span)?
+            .is_none()
+        {
+            return Err(self.numeric_method_missing(
+                type_name,
+                &format!("operation unary '{symbol}'"),
+                method,
+                span,
+            ));
+        }
+        Ok(Value::Custom {
+            type_name: type_name.to_owned(),
+            instance: res,
+        })
+    }
+
+    /// `custom_value.as_a(target)` (5.10.2, T7.3): a scalar target
+    /// calls the matching `numeric_to_*` conversion of the clause 31
+    /// pair (`as_a(int)` is `numeric_to_int()`); another numeric type
+    /// writes this value into a fresh instance of the target's struct
+    /// via `numeric_to_numeric(other)`; the same type is a by-value
+    /// copy. A struct without the conversion reports `E0418`.
+    fn custom_numeric_as_a(
+        &mut self,
+        value: Value,
+        ty: &TypeExpr,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let Value::Custom {
+            type_name,
+            instance,
+        } = value
+        else {
+            unreachable!("custom_numeric_as_a dispatched on a custom value")
+        };
+        match ty {
+            TypeExpr::Named { name, .. } if *name == type_name => self.copy_custom_numeric(
+                &Value::Custom {
+                    type_name,
+                    instance,
+                },
+                span,
+            ),
+            TypeExpr::Named { name, .. } if self.is_custom_numeric_type(name) => {
+                let target = self.custom_result_instance(name, span)?;
+                if self
+                    .call_numeric_method(
+                        instance,
+                        "numeric_to_numeric",
+                        vec![Value::Object(target)],
+                        span,
+                    )?
+                    .is_none()
+                {
+                    return Err(self.numeric_method_missing(
+                        &type_name,
+                        &format!("conversion to '{name}'"),
+                        "numeric_to_numeric",
+                        span,
+                    ));
+                }
+                Ok(Value::Custom {
+                    type_name: name.clone(),
+                    instance: target,
+                })
+            }
+            TypeExpr::Scalar { base, width, .. } => {
+                let (method, wrap) = match base {
+                    ScalarBase::Int if is_star_width(width) => ("numeric_to_unbounded", None),
+                    ScalarBase::Int => ("numeric_to_int", Some((width_bits(width, 32), true))),
+                    ScalarBase::Uint => ("numeric_to_uint", Some((width_bits(width, 32), false))),
+                    ScalarBase::Longint => ("numeric_to_longint", Some((64, true))),
+                    ScalarBase::Longuint => ("numeric_to_longuint", Some((64, false))),
+                    ScalarBase::Real => ("numeric_to_real", None),
+                    ScalarBase::String => ("numeric_to_string", None),
+                    _ => {
+                        return Err(self.error(
+                            "E0402",
+                            format!("cannot cast a '{}' value to {}", type_name, base.name()),
+                            span,
+                        ));
+                    }
+                };
+                let converted = if method == "numeric_to_string" {
+                    // The string conversion is numeric_to_string's
+                    // radix query; the plain `as_a(string)` reading is
+                    // the decimal radix.
+                    self.call_numeric_method(
+                        instance,
+                        method,
+                        vec![Self::numeric_radix_dec()],
+                        span,
+                    )?
+                } else {
+                    self.call_numeric_method(instance, method, Vec::new(), span)?
+                };
+                let Some(converted) = converted else {
+                    return Err(self.numeric_method_missing(
+                        &type_name,
+                        &format!("conversion to '{}'", base.name()),
+                        method,
+                        span,
+                    ));
+                };
+                match (converted, wrap) {
+                    (Value::Int(v), Some((bits, signed))) => {
+                        Ok(Value::Int(wrap_to_width(v, bits, signed)))
+                    }
+                    (value, _) => Ok(value),
+                }
+            }
+            _ => Err(self.error(
+                "E0402",
+                format!("cannot cast a '{type_name}' value to this type"),
+                span,
+            )),
+        }
+    }
+
+    /// Format one value for the message surfaces (`out`, `print`,
+    /// `append`, `dut_error`, `message`): a custom numeric value
+    /// renders through its struct's `numeric_to_string(dec)` (T7.3 —
+    /// `dec` is the default radix); a struct without the method is the
+    /// runtime `E0418`.
+    fn format_value_checked(
+        &mut self,
+        value: &Value,
+        span: crate::ast::Span,
+    ) -> Result<String, Diagnostic> {
+        if let Value::Custom {
+            type_name,
+            instance,
+        } = value
+        {
+            let rendered = self
+                .call_numeric_method(
+                    *instance,
+                    "numeric_to_string",
+                    vec![Self::numeric_radix_dec()],
+                    span,
+                )?
+                .ok_or_else(|| {
+                    self.numeric_method_missing(type_name, "output", "numeric_to_string", span)
+                })?;
+            let Value::Str(text) = rendered else {
+                return Err(self.error("E0402", "numeric_to_string must return a string", span));
+            };
+            return Ok(text);
+        }
+        Ok(self.format_value(value))
+    }
+
+    /// The checked form of the message paths' formatting loop.
+    fn format_values_checked(
+        &mut self,
+        values: &[Value],
+        span: crate::ast::Span,
+    ) -> Result<String, Diagnostic> {
+        let mut text = String::new();
+        for value in values {
+            text.push_str(&self.format_value_checked(value, span)?);
+        }
+        Ok(text)
     }
 
     /// The 27.4.17/27.4.20/27.5.4-27.5.6 aggregate pseudo-methods with
@@ -6665,7 +7391,9 @@ impl<'a> Interp<'a> {
                         ('x', Value::Int(i)) => format!("{i:x}"),
                         ('X', Value::Int(i)) => format!("{i:X}"),
                         ('d', Value::Int(i)) => format!("{i}"),
-                        (_, value) => self.format_value(value),
+                        // A custom numeric argument renders through
+                        // numeric_to_string(dec) (T7.3).
+                        (_, value) => self.format_value_checked(value, span)?,
                     });
                 }
                 None => rendered.push('%'),
@@ -8412,6 +9140,19 @@ impl<'a> Interp<'a> {
                             {
                                 Ok(Value::Str(self.format_value(&value)))
                             }
+                            // A custom numeric value has no directly
+                            // callable methods (T7.1): operators,
+                            // conversions and message rendering
+                            // dispatch to its struct's numeric_i
+                            // methods internally; struct-field access
+                            // goes through as_a to the struct.
+                            Value::Custom { type_name, .. } => Err(self.error(
+                                "E0402",
+                                format!(
+                                    "cannot call method '{name}' on a '{type_name}' value (operators and as_a dispatch to the implementing struct)"
+                                ),
+                                *span,
+                            )),
                             _ => Err(self.error(
                                 "E0402",
                                 format!("cannot call method '{name}' on this value"),
@@ -8522,9 +9263,15 @@ impl<'a> Interp<'a> {
                     Ok(Value::Bool(r))
                 }
                 _ => {
+                    // The 5.6.3 precision context reads the operands'
+                    // *static* types before evaluation; the values then
+                    // compute inside it (apply_binary).
+                    let lhs_ty = self.static_type_of(lhs, frame, me);
+                    let rhs_ty = self.static_type_of(rhs, frame, me);
+                    let precision = precision_context(lhs_ty.as_ref(), rhs_ty.as_ref());
                     let l = self.eval(lhs, frame, me)?;
                     let r = self.eval(rhs, frame, me)?;
-                    self.apply_binary(*op, l, r, *span)
+                    self.apply_binary(*op, l, r, *span, &precision)
                 }
             },
             Expr::Unary {
@@ -8539,6 +9286,14 @@ impl<'a> Interp<'a> {
                     (UnaryOp::Negate, Value::Real(r)) => Ok(Value::Real(-r)),
                     (UnaryOp::Plus, value @ (Value::Int(_) | Value::Real(_))) => Ok(value),
                     (UnaryOp::BitNot, Value::Int(i)) => Ok(Value::Int(!i)),
+                    // The clause 31 unary shapes on a custom numeric
+                    // value (T7.3): numeric_unary_minus/plus/bit_not
+                    // write into a fresh result instance. A logical
+                    // `!` has no numeric_i method — the operand error.
+                    (
+                        unary @ (UnaryOp::Negate | UnaryOp::Plus | UnaryOp::BitNot),
+                        Value::Custom { type_name, instance },
+                    ) => self.custom_unary(*unary, &type_name, instance, *span),
                     _ => Err(self.error("E0402", "invalid operand for unary operator", *span)),
                 }
             }
@@ -8558,12 +9313,18 @@ impl<'a> Interp<'a> {
                     self.eval(else_expr, frame, me)
                 }
             }
-            Expr::CastAs { expr, ty, .. } => {
+            Expr::CastAs { expr, ty, span } => {
                 // Casts are value-preserving in this subset: integers,
                 // enumerals and booleans flow through unchanged — an
                 // integer cast to an enumeral type maps its value to
                 // the enumerand at that index (5.10.2).
                 let value = self.eval(expr, frame, me)?;
+                // A custom numeric source converts through the clause
+                // 31 pairs (T7.3) before the value-preserving fallback
+                // below.
+                if matches!(value, Value::Custom { .. }) {
+                    return self.custom_numeric_as_a(value, ty, *span);
+                }
                 if let (Value::Int(index), TypeExpr::Named { name, .. }) = (&value, ty) {
                     let types: &[crate::elab::ElaboratedType] = self.types;
                     if let Some(declared) = types.iter().find(|t| t.name == *name)
@@ -8674,7 +9435,13 @@ impl<'a> Interp<'a> {
                         for item in items {
                             let item_value = self.eval(item, frame, me)?;
                             if matches!(
-                                self.apply_binary(BinaryOp::Eq, value.clone(), item_value, *span)?,
+                                self.apply_binary(
+                                    BinaryOp::Eq,
+                                    value.clone(),
+                                    item_value,
+                                    *span,
+                                    &Precision::unbounded(),
+                                )?,
                                 Value::Bool(true)
                             ) {
                                 found = true;
@@ -8739,7 +9506,8 @@ impl<'a> Interp<'a> {
                                             BinaryOp::Eq,
                                             value.clone(),
                                             item,
-                                            *span
+                                            *span,
+                                            &Precision::unbounded(),
                                         )?,
                                         Value::Bool(true)
                                     ) {
@@ -9293,7 +10061,13 @@ impl<'a> Interp<'a> {
                     return Err(self.error("E0412", "in_table element type mismatch", span));
                 }
                 Ok(matches!(
-                    self.apply_binary(BinaryOp::Eq, value.clone(), other, span)?,
+                    self.apply_binary(
+                        BinaryOp::Eq,
+                        value.clone(),
+                        other,
+                        span,
+                        &Precision::unbounded(),
+                    )?,
                     Value::Bool(true)
                 ))
             }
@@ -9304,7 +10078,13 @@ impl<'a> Interp<'a> {
                         return Err(self.error("E0412", "in_table element type mismatch", span));
                     }
                     if matches!(
-                        self.apply_binary(BinaryOp::Eq, value.clone(), item_value, span)?,
+                        self.apply_binary(
+                            BinaryOp::Eq,
+                            value.clone(),
+                            item_value,
+                            span,
+                            &Precision::unbounded(),
+                        )?,
                         Value::Bool(true)
                     ) {
                         return Ok(true);
@@ -9394,6 +10174,7 @@ impl<'a> Interp<'a> {
         lhs: Value,
         rhs: Value,
         span: crate::ast::Span,
+        precision: &Precision,
     ) -> Result<Value, Diagnostic> {
         use BinaryOp::*;
         let err = |kind: &str| {
@@ -9403,10 +10184,27 @@ impl<'a> Interp<'a> {
                 span,
             )
         };
+        // A custom numeric operand dispatches to its struct's numeric_i
+        // methods (5.2.15, clause 31 — T7.3); the 5.6.3 precision
+        // context does not apply to method-dispatched operators.
+        if matches!(lhs, Value::Custom { .. }) || matches!(rhs, Value::Custom { .. }) {
+            return self.apply_custom_binary(op, lhs, rhs, span);
+        }
         match op {
             Eq | NotEq | IdentityEq | IdentityNe => {
                 let equal = match (&lhs, &rhs) {
-                    (Value::Int(a), Value::Int(b)) => a == b,
+                    // The 5.6.3 context casts both operands into its
+                    // width and signedness before the comparison — a
+                    // ≤32-bit/64-bit unsigned context reads a negative
+                    // value as its two's-complement bit pattern.
+                    (Value::Int(a), Value::Int(b)) => {
+                        let (a, b) = if precision.bits().is_some() {
+                            (precision.cast_operand(*a), precision.cast_operand(*b))
+                        } else {
+                            (*a, *b)
+                        };
+                        a == b
+                    }
                     (Value::Real(a), Value::Real(b)) => a == b,
                     (Value::Int(a), Value::Real(b)) | (Value::Real(b), Value::Int(a)) => {
                         *a as f64 == *b
@@ -9475,7 +10273,17 @@ impl<'a> Interp<'a> {
             Lt | Le | Gt | Ge => {
                 use std::cmp::Ordering::*;
                 let ordering = match (&lhs, &rhs) {
-                    (Value::Int(a), Value::Int(b)) => a.cmp(b),
+                    // The context cast applies to comparisons as well
+                    // (5.6.3): rule (b)'s unsigned 64-bit context makes
+                    // `longint -1 < longuint 1` FALSE.
+                    (Value::Int(a), Value::Int(b)) => {
+                        let (a, b) = if precision.bits().is_some() {
+                            (precision.cast_operand(*a), precision.cast_operand(*b))
+                        } else {
+                            (*a, *b)
+                        };
+                        a.cmp(&b)
+                    }
                     (Value::Real(a), Value::Real(b)) => {
                         a.partial_cmp(b).ok_or_else(|| err("comparison"))?
                     }
@@ -9498,13 +10306,21 @@ impl<'a> Interp<'a> {
             }
             Add | Sub | Mul => match (&lhs, &rhs) {
                 (Value::Int(a), Value::Int(b)) => {
+                    // A ≤32-bit/64-bit context computes and truncates at
+                    // its width (5.6.3's rules (a)/(b)); unbounded keeps
+                    // the full i128 result.
+                    let (a, b) = if precision.bits().is_some() {
+                        (precision.cast_operand(*a), precision.cast_operand(*b))
+                    } else {
+                        (*a, *b)
+                    };
                     let value = match op {
-                        Add => a.wrapping_add(*b),
-                        Sub => a.wrapping_sub(*b),
-                        Mul => a.wrapping_mul(*b),
+                        Add => a.wrapping_add(b),
+                        Sub => a.wrapping_sub(b),
+                        Mul => a.wrapping_mul(b),
                         _ => unreachable!(),
                     };
-                    Ok(Value::Int(value))
+                    Ok(Value::Int(precision.cast_operand(value)))
                 }
                 _ => {
                     let Some(a) = as_f64(&lhs) else {
@@ -9524,11 +10340,19 @@ impl<'a> Interp<'a> {
             },
             Div | Mod => match (&lhs, &rhs) {
                 (Value::Int(a), Value::Int(b)) => {
-                    if *b == 0 {
+                    // The context cast lands before the operation, so a
+                    // wrapped-around unsigned dividend divides as its
+                    // bit pattern (5.6.3's "operands are cast").
+                    let (a, b) = if precision.bits().is_some() {
+                        (precision.cast_operand(*a), precision.cast_operand(*b))
+                    } else {
+                        (*a, *b)
+                    };
+                    if b == 0 {
                         return Err(self.error("E0403", "division by zero", span));
                     }
                     let value = if op == Div { a / b } else { a % b };
-                    Ok(Value::Int(value))
+                    Ok(Value::Int(precision.cast_operand(value)))
                 }
                 _ => {
                     let Some(a) = as_f64(&lhs) else {
@@ -9547,15 +10371,20 @@ impl<'a> Interp<'a> {
                 if *b < 0 || *b >= 128 {
                     return Err(self.error("E0402", "shift amount out of range", span));
                 }
+                let (a, b) = if precision.bits().is_some() {
+                    (precision.cast_operand(*a), *b)
+                } else {
+                    (*a, *b)
+                };
                 let value = match op {
                     BitAnd => a & b,
                     BitOr => a | b,
                     BitXor => a ^ b,
-                    ShiftLeft => a.wrapping_shl(*b as u32),
-                    ShiftRight => a.wrapping_shr(*b as u32),
+                    ShiftLeft => a.wrapping_shl(b as u32),
+                    ShiftRight => a.wrapping_shr(b as u32),
                     _ => unreachable!(),
                 };
-                Ok(Value::Int(value))
+                Ok(Value::Int(precision.cast_operand(value)))
             }
             Match | NotMatch => {
                 let (Value::Str(text), Value::Str(pattern)) = (&lhs, &rhs) else {
@@ -9888,25 +10717,30 @@ impl<'a> Interp<'a> {
                     return self.write_port_value(&port, value, me, span);
                 }
                 if frame.locals.contains_key(name) {
+                    let declared = frame.local_types.get(name).cloned();
+                    let value = self.bind_slot_value(value, declared.as_ref(), span)?;
                     frame.locals.insert(name.clone(), value);
                     return Ok(());
                 }
-                if let Some(index) = me
-                    && self.instances[index].set(name, value.clone())
-                {
-                    return Ok(());
-                }
-                // A static field named bare (T2.1): the write lands in
-                // the declaring type's store entry — the same
-                // resolution the read side uses.
-                if let Some(owner) = self.bare_static_field_owner(me, name) {
-                    self.statics
-                        .entry(owner)
-                        .or_default()
-                        .insert(name.clone(), value);
-                    return Ok(());
-                }
-                if me.is_some() {
+                if let Some(index) = me {
+                    // The field's declared type binds the value (T7.1's
+                    // value semantics: a custom numeric copies, a
+                    // scalar converts through numeric_from_*).
+                    let declared = self.declared_type_of(name, false, frame, index);
+                    let value = self.bind_slot_value(value, declared.as_ref(), span)?;
+                    if self.instances[index].set(name, value.clone()) {
+                        return Ok(());
+                    }
+                    // A static field named bare (T2.1): the write lands
+                    // in the declaring type's store entry — the same
+                    // resolution the read side uses.
+                    if let Some(owner) = self.bare_static_field_owner(me, name) {
+                        self.statics
+                            .entry(owner)
+                            .or_default()
+                            .insert(name.clone(), value);
+                        return Ok(());
+                    }
                     return Err(self.error("E0401", format!("unknown field '{name}'"), span));
                 }
                 Err(self.error("E0401", format!("unknown identifier '{name}'"), span))
@@ -9929,6 +10763,14 @@ impl<'a> Interp<'a> {
                 let Value::Object(index) = object_value else {
                     return Err(self.error("E0402", "member assignment requires an object", span));
                 };
+                let owner_type = self.instances[index].type_name.clone();
+                let declared: Option<TypeExpr> = self
+                    .types
+                    .iter()
+                    .find(|t| t.name == owner_type)
+                    .and_then(|t| t.fields.iter().find(|f| f.name == *name))
+                    .map(|f| f.ty.clone());
+                let value = self.bind_slot_value(value, declared.as_ref(), span)?;
                 if self.instances[index].set(name, value) {
                     Ok(())
                 } else {
@@ -9976,6 +10818,12 @@ impl<'a> Interp<'a> {
                     let field_span = *field_span;
                     self.materialize_qualified_field(index, view, field, field_span)?;
                 }
+                let declared: Option<TypeExpr> = view
+                    .fields
+                    .iter()
+                    .find(|f| f.name == *field)
+                    .map(|f| f.ty.clone());
+                let value = self.bind_slot_value(value, declared.as_ref(), span)?;
                 self.instances[index].set(field, value);
                 Ok(())
             }
@@ -9984,7 +10832,15 @@ impl<'a> Interp<'a> {
             } => {
                 // `Type::field = value` (clause 4.17.4): the write lands
                 // in the declaring type's store entry — the one shared
-                // occurrence, visible to every instance.
+                // occurrence, visible to every instance. The member's
+                // declared type still binds the value (T7.1).
+                let declared: Option<TypeExpr> = self
+                    .types
+                    .iter()
+                    .find(|t| t.name == *type_name)
+                    .and_then(|t| t.fields.iter().find(|f| f.name == *member))
+                    .map(|f| f.ty.clone());
+                let value = self.bind_slot_value(value, declared.as_ref(), span)?;
                 if let Some(fields) = self.statics.get_mut(type_name) {
                     fields.insert(member.clone(), value);
                     Ok(())
@@ -10087,6 +10943,24 @@ impl<'a> Interp<'a> {
                 format!("[{}]", parts.join(", "))
             }
             Value::Set(intervals) => render_set(intervals),
+            // A custom numeric value renders through its struct's
+            // `numeric_to_string(dec)` on the checked message paths
+            // (`out`, `print`, `append` — `format_values_checked`).
+            // This infallible renderer is the fallback for contexts
+            // that cannot report an E0418 (nested struct-field
+            // rendering): it prints the implementing-struct instance,
+            // the same shape an `as_a` back to the struct shows.
+            Value::Custom { instance, .. } => {
+                let instance = &self.instances[*instance];
+                let parts: Vec<String> = instance
+                    .fields
+                    .iter()
+                    .map(|(name, value)| {
+                        format!("{name}: {}", self.format_value_bounded(value, depth + 1))
+                    })
+                    .collect();
+                format!("{}{{{}}}", instance.type_name, parts.join(", "))
+            }
             Value::Object(index) => {
                 let instance = &self.instances[*index];
                 let parts: Vec<String> = instance
@@ -10136,6 +11010,7 @@ impl<'a> Interp<'a> {
             Value::Port { .. } => "a port",
             Value::Table(_) => "a table",
             Value::TableRow { .. } => "a table row",
+            Value::Custom { .. } => "a custom numeric value",
             Value::Void => "void",
         }
     }
@@ -10368,6 +11243,199 @@ fn scalar_range(base: ScalarBase, width: &Option<Box<Expr>>) -> Option<(i128, i1
         ScalarBase::Nibble => Some((0, 15)),
         ScalarBase::Bool => Some((0, 1)),
         ScalarBase::Real | ScalarBase::String | ScalarBase::Time => None,
+    }
+}
+
+/// The arithmetic precision context of one binary operator or comparison
+/// (clause 5.6.3): the rule reads the operands' *static* types and picks
+/// the width and signedness the operation computes at.
+///
+/// The consequence the plan's test exercises: `longint -1 < longuint 1`
+/// is FALSE — rule (b)'s context is unsigned because one operand is
+/// `longuint`, so the -1 casts to MAX_LONGUINT — while
+/// `int(bits:64) -1 < uint(bits:64) 1` is TRUE, because rule (c)
+/// computes unbounded and -1 stays -1. Before this context existed the
+/// interpreter computed every integer operation on untruncated i128
+/// values; the unbounded mode keeps exactly that behavior, so only the
+/// ≤32-bit and 64-bit modes change results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Precision {
+    /// (a) every operand type is at most 32 bits: compute in 32 bits,
+    /// unsigned when any operand is unsigned.
+    Bits32 { unsigned: bool },
+    /// (b) some operand is `longint`/`longuint` and every other operand
+    /// is a ≤32-bit scalar or a long type: compute in 64 bits, unsigned
+    /// when any operand is `longuint`.
+    Bits64 { unsigned: bool },
+    /// (c) some operand other than the long types is wider than 32 bits
+    /// (`int(bits:64)`, `uint(bits:64)`, `int(bits:*)`): unbounded
+    /// precision, operands sign/zero-extended — the i128 path,
+    /// untruncated.
+    Unbounded,
+    /// (d) some operand is `real`: double precision (the f64 path).
+    Real,
+}
+
+impl Precision {
+    /// The context for sites with no expression-level type information
+    /// (set membership checks, constraint atoms): the unbounded mode —
+    /// the behavior those sites always had.
+    fn unbounded() -> Self {
+        Precision::Unbounded
+    }
+
+    /// The width this context computes at (`None` for the unbounded and
+    /// real modes, where values are not wrapped).
+    fn bits(self) -> Option<u32> {
+        match self {
+            Precision::Bits32 { .. } => Some(32),
+            Precision::Bits64 { .. } => Some(64),
+            Precision::Unbounded | Precision::Real => None,
+        }
+    }
+
+    fn unsigned(self) -> bool {
+        match self {
+            Precision::Bits32 { unsigned } | Precision::Bits64 { unsigned } => unsigned,
+            Precision::Unbounded | Precision::Real => false,
+        }
+    }
+
+    /// Cast one operand into the context: truncate to the width and
+    /// interpret it signed or unsigned (5.6.3's "operands are cast").
+    /// The unbounded and real modes keep the value as is.
+    fn cast_operand(self, value: i128) -> i128 {
+        match self.bits() {
+            None => value,
+            Some(bits) => wrap_to_width(value, bits, self.unsigned()),
+        }
+    }
+}
+
+/// One operand's numeric classification for the 5.6.3 context rules:
+/// its bit width and signedness, or a non-integer shape.
+#[derive(Debug, Clone, Copy)]
+enum OperandClass {
+    Real,
+    /// A Table 17 long type: 64 bits, signed or unsigned.
+    Long {
+        signed: bool,
+    },
+    /// An `int(bits: *)`-style unbounded-width integer (5.2.3.1).
+    Unbounded,
+    /// Any other scalar integer type with its width and signedness. The
+    /// predefined widths are Table 17's: `bit` 1 unsigned, `nibble` 4
+    /// unsigned, `byte` 8 signed, `time` 32 unsigned, `int`/`uint` 32.
+    Int {
+        bits: u32,
+        signed: bool,
+    },
+    /// No static type (a literal, a call result, an operator result):
+    /// the rule's literal shapes are 32-bit signed decimal, so an
+    /// unknown operand never widens or unsigns the context — it takes
+    /// the context the other operand (or the fallback) selects.
+    Unknown,
+}
+
+fn operand_class(ty: Option<&TypeExpr>) -> OperandClass {
+    let Some(TypeExpr::Scalar { base, width, .. }) = ty else {
+        return OperandClass::Unknown;
+    };
+    match base {
+        ScalarBase::Real => OperandClass::Real,
+        ScalarBase::Longint => OperandClass::Long { signed: true },
+        ScalarBase::Longuint => OperandClass::Long { signed: false },
+        // The star width (the `int(bits: *)` marker the parser records)
+        // names the unbounded-width integer: rule (c)'s wide shape.
+        _ if is_star_width(width) => OperandClass::Unbounded,
+        ScalarBase::Int | ScalarBase::Uint => OperandClass::Int {
+            bits: width_bits(width, 32),
+            signed: *base == ScalarBase::Int,
+        },
+        ScalarBase::Bit => OperandClass::Int {
+            bits: 1,
+            signed: false,
+        },
+        ScalarBase::Byte => OperandClass::Int {
+            bits: 8,
+            signed: true,
+        },
+        ScalarBase::Nibble => OperandClass::Int {
+            bits: 4,
+            signed: false,
+        },
+        ScalarBase::Time => OperandClass::Int {
+            bits: 32,
+            signed: false,
+        },
+        // A `bool` or `string` operand is not an arithmetic context
+        // member; the evaluator reports its own operand error for those.
+        ScalarBase::Bool | ScalarBase::String => OperandClass::Unknown,
+    }
+}
+
+/// The parser's `int(bits: *)` marker width.
+fn is_star_width(width: &Option<Box<Expr>>) -> bool {
+    matches!(
+        width.as_deref(),
+        Some(Expr::Ident { name, .. }) if name == "*"
+    )
+}
+
+/// The 5.6.3 context type set from the operands' static types — the
+/// four rules (a)–(d), tried in order.
+fn precision_context(lhs: Option<&TypeExpr>, rhs: Option<&TypeExpr>) -> Precision {
+    use OperandClass::*;
+    let (l, r) = (operand_class(lhs), operand_class(rhs));
+    // No operand carries a static type (two literals, call results,
+    // member chains the type walk cannot resolve): no context type set
+    // exists — the unbounded path the interpreter ran before 5.6.3's
+    // sizing. A typed operand next to an unknown one keeps its own
+    // context: the unknown side is the literal shape the rules read.
+    if matches!(l, Unknown) && matches!(r, Unknown) {
+        return Precision::Unbounded;
+    }
+    // (d) any real operand: double precision.
+    if matches!(l, Real) || matches!(r, Real) {
+        return Precision::Real;
+    }
+    // (b) any longint/longuint, the rest ≤ 32 bits or long: 64 bits,
+    // unsigned if any longuint.
+    if matches!(l, Long { .. }) || matches!(r, Long { .. }) {
+        let unsigned = matches!(l, Long { signed: false }) || matches!(r, Long { signed: false });
+        return Precision::Bits64 { unsigned };
+    }
+    // (c) any other type wider than 32 bits (`int(bits:64)`,
+    // `uint(bits:64)`, `int(bits:*)`): unbounded.
+    let wide =
+        |c: &OperandClass| matches!(c, Unbounded) || matches!(c, Int { bits, .. } if *bits > 32);
+    if wide(&l) || wide(&r) {
+        return Precision::Unbounded;
+    }
+    // (a) every type is ≤ 32 bits: 32-bit compute, unsigned if any
+    // operand is unsigned.
+    let unsigned = matches!(l, Int { signed: false, .. }) || matches!(r, Int { signed: false, .. });
+    Precision::Bits32 { unsigned }
+}
+
+/// Truncate `value` to `bits`, interpreted signed or unsigned — the
+/// wrap-around the 32- and 64-bit contexts of rules (a) and (b) compute
+/// at (clause 5.6.3).
+fn wrap_to_width(value: i128, bits: u32, unsigned: bool) -> i128 {
+    if bits == 0 || bits >= 127 {
+        return value;
+    }
+    let modulus = 1i128 << bits;
+    let wrapped = value.rem_euclid(modulus);
+    if unsigned {
+        wrapped
+    } else {
+        let half = 1i128 << (bits - 1);
+        if wrapped >= half {
+            wrapped - modulus
+        } else {
+            wrapped
+        }
     }
 }
 

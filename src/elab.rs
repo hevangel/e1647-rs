@@ -1517,6 +1517,13 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             });
         }
     }
+    // The clause 31 predefined numeric names (T7.2): the two template
+    // interfaces and the `numeric_format_kind` enumerand type,
+    // synthesized as elaborated types. Appended after the declared and
+    // monomorphized types, so they join no when-synthesis or
+    // monomorphization worklist; a file-declared name of the same kind
+    // shadows the builtin (the synthesized entry is skipped).
+    compose_builtin_numeric_interfaces(&mut types);
     Elaborated {
         types,
         defines,
@@ -1528,6 +1535,324 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         static_methods: static_registry(declarations),
         static_events: static_registry(declarations),
         static_ons: static_registry(declarations),
+    }
+}
+
+/// The clause 31 predefined numeric names (T7.2), synthesized as
+/// elaborated types:
+///
+/// - `base_numeric_i` — the conversion and radix-query interface every
+///   custom numeric type realizes (clause 31.3's signatures).
+/// - `numeric_i of (<me'type>, <signed'exp>: bool, <bits'exp>: int)`
+///   like `base_numeric_i` — the operator interface a
+///   `numeric_type`'s implementing struct realizes (clause 31.4). The
+///   synthesized type is the declaration view under the template's own
+///   name; the per-struct instance an `implementing numeric_i of
+///   (...)` clause names carries its substituted actuals in the
+///   composed implements set, and the interpreter's dispatch reads the
+///   implementing struct's own methods (the names, not the signatures,
+///   are what the dispatch needs).
+/// - `numeric_format_kind` — the radix enumerand type of
+///   `numeric_to_string` (clause 31.3).
+///
+/// Only names the file does not declare itself are synthesized — a
+/// user declaration shadows the builtin.
+fn compose_builtin_numeric_interfaces(types: &mut Vec<ElaboratedType>) {
+    use crate::ast::{MethodDecl, Param, ScalarBase};
+    let zero = crate::lexer::Position {
+        byte: 0,
+        line: 0,
+        column: 0,
+    };
+    let builtin_span = (zero, zero);
+    let named = |name: &str| TypeExpr::Named {
+        name: name.to_owned(),
+        span: builtin_span,
+    };
+    let scalar = |base: ScalarBase| TypeExpr::Scalar {
+        base,
+        width: None,
+        span: builtin_span,
+    };
+    let unbounded_int = TypeExpr::Scalar {
+        base: ScalarBase::Int,
+        // The `int(bits: *)` marker width (5.2.3.1) the width helpers
+        // and the 5.6.3 operand classification read.
+        width: Some(Box::new(crate::ast::Expr::Ident {
+            name: "*".to_owned(),
+            span: builtin_span,
+        })),
+        span: builtin_span,
+    };
+    let list_of_bit = TypeExpr::List {
+        element: Box::new(scalar(ScalarBase::Bit)),
+        key: None,
+        span: builtin_span,
+    };
+    // One signature of a synthesized interface: a body-less method with
+    // the given (name, type) parameters and optional return type.
+    let signature =
+        |name: &str, params: &[(String, Option<TypeExpr>)], ret: Option<TypeExpr>| -> MethodDecl {
+            MethodDecl {
+                name: name.to_owned(),
+                name_span: builtin_span,
+                params: params
+                    .iter()
+                    .map(|(param_name, ty)| Param {
+                        name: (*param_name).to_owned(),
+                        name_span: builtin_span,
+                        ty: ty.clone(),
+                    })
+                    .collect(),
+                return_type: ret,
+                tcm_event: None,
+                modifier: None,
+                is_static: false,
+                annotations: Vec::new(),
+                body: Vec::new(),
+                span: builtin_span,
+            }
+        };
+    let untyped = |name: &str| (name.to_owned(), None);
+    let typed = |name: &str, ty: TypeExpr| (name.to_owned(), Some(ty));
+    if !types.iter().any(|t| t.name == "base_numeric_i") {
+        let methods = vec![
+            signature("set_initial_value", &[], None),
+            signature(
+                "numeric_to_string",
+                &[typed("radix", named("numeric_format_kind"))],
+                Some(scalar(ScalarBase::String)),
+            ),
+            signature(
+                "numeric_from_string",
+                &[typed("value", scalar(ScalarBase::String))],
+                None,
+            ),
+            signature(
+                "numeric_to_longuint",
+                &[],
+                Some(scalar(ScalarBase::Longuint)),
+            ),
+            signature(
+                "numeric_from_longuint",
+                &[typed("value", scalar(ScalarBase::Longuint))],
+                None,
+            ),
+            signature("numeric_to_longint", &[], Some(scalar(ScalarBase::Longint))),
+            signature(
+                "numeric_from_longint",
+                &[typed("value", scalar(ScalarBase::Longint))],
+                None,
+            ),
+            signature("numeric_to_unbounded", &[], Some(unbounded_int.clone())),
+            signature(
+                "numeric_from_unbounded",
+                &[typed("value", unbounded_int.clone())],
+                None,
+            ),
+            signature("numeric_to_real", &[], Some(scalar(ScalarBase::Real))),
+            signature(
+                "numeric_from_real",
+                &[typed("value", scalar(ScalarBase::Real))],
+                None,
+            ),
+            signature("numeric_to_uint", &[], Some(scalar(ScalarBase::Uint))),
+            signature(
+                "numeric_from_uint",
+                &[typed("value", scalar(ScalarBase::Uint))],
+                None,
+            ),
+            signature("numeric_to_int", &[], Some(scalar(ScalarBase::Int))),
+            signature(
+                "numeric_from_int",
+                &[typed("value", scalar(ScalarBase::Int))],
+                None,
+            ),
+            signature(
+                "numeric_to_numeric",
+                &[typed("other", named("base_numeric_i"))],
+                None,
+            ),
+        ];
+        types.push(ElaboratedType {
+            kind: DeclarationKind::Interface,
+            name: "base_numeric_i".to_owned(),
+            base: None,
+            fields: Vec::new(),
+            constraints: Vec::new(),
+            methods,
+            whens: Vec::new(),
+            ons: Vec::new(),
+            covers: Vec::new(),
+            expects: Vec::new(),
+            when_of: Vec::new(),
+            events: Vec::new(),
+            underlying: None,
+            ports: Vec::new(),
+            unit_attributes: Vec::new(),
+            implements: Vec::new(),
+            interface_bases: Vec::new(),
+            enumerals: Vec::new(),
+            span: builtin_span,
+        });
+    }
+    if !types.iter().any(|t| t.name == "numeric_i") {
+        // `numeric_i`'s own operator signatures (clause 31.4), with the
+        // inherited `base_numeric_i` members folded in front of them —
+        // the composed form an interface elaborates to.
+        let own = [
+            signature("numeric_assign", &[untyped("other")], None),
+            signature(
+                "numeric_compare",
+                &[untyped("other")],
+                Some(scalar(ScalarBase::Int)),
+            ),
+            signature("numeric_bit_and", &[untyped("other"), untyped("res")], None),
+            signature("numeric_bit_or", &[untyped("other"), untyped("res")], None),
+            signature("numeric_bit_xor", &[untyped("other"), untyped("res")], None),
+            signature(
+                "numeric_multiply",
+                &[untyped("other"), untyped("res")],
+                None,
+            ),
+            signature("numeric_divide", &[untyped("other"), untyped("res")], None),
+            signature("numeric_modulo", &[untyped("other"), untyped("res")], None),
+            signature("numeric_add", &[untyped("other"), untyped("res")], None),
+            signature(
+                "numeric_subtract",
+                &[untyped("other"), untyped("res")],
+                None,
+            ),
+            signature(
+                "numeric_shift_right",
+                &[typed("n", scalar(ScalarBase::Int)), untyped("res")],
+                None,
+            ),
+            signature(
+                "numeric_shift_left",
+                &[typed("n", scalar(ScalarBase::Int)), untyped("res")],
+                None,
+            ),
+            signature("numeric_bit_not", &[untyped("res")], None),
+            signature("numeric_unary_minus", &[untyped("res")], None),
+            signature("numeric_unary_plus", &[untyped("res")], None),
+            signature(
+                "numeric_extract_bits",
+                &[
+                    typed("from", scalar(ScalarBase::Int)),
+                    typed("to", scalar(ScalarBase::Int)),
+                    typed("buffer", list_of_bit.clone()),
+                ],
+                None,
+            ),
+            signature(
+                "numeric_extract_bits_assign",
+                &[
+                    typed("from", scalar(ScalarBase::Int)),
+                    typed("to", scalar(ScalarBase::Int)),
+                    typed("values", list_of_bit.clone()),
+                ],
+                None,
+            ),
+            signature("numeric_floor", &[untyped("res")], None),
+            signature("numeric_ceil", &[untyped("res")], None),
+            signature("numeric_round", &[untyped("res")], None),
+            signature("numeric_log", &[untyped("res")], None),
+            signature("numeric_log10", &[untyped("res")], None),
+            signature("numeric_pow", &[untyped("exponent"), untyped("res")], None),
+            signature("numeric_sqrt", &[untyped("res")], None),
+            signature("numeric_exp", &[untyped("res")], None),
+            signature("numeric_sin", &[untyped("res")], None),
+            signature("numeric_cos", &[untyped("res")], None),
+            signature("numeric_tan", &[untyped("res")], None),
+            signature("numeric_asin", &[untyped("res")], None),
+            signature("numeric_acos", &[untyped("res")], None),
+            signature("numeric_atan", &[untyped("res")], None),
+            signature("numeric_sinh", &[untyped("res")], None),
+            signature("numeric_cosh", &[untyped("res")], None),
+            signature("numeric_tanh", &[untyped("res")], None),
+            signature("numeric_asinh", &[untyped("res")], None),
+            signature("numeric_acosh", &[untyped("res")], None),
+            signature("numeric_atanh", &[untyped("res")], None),
+            signature("numeric_atan2", &[untyped("other"), untyped("res")], None),
+            signature("numeric_hypot", &[untyped("other"), untyped("res")], None),
+            signature("numeric_is_nan", &[], Some(scalar(ScalarBase::Bool))),
+            signature("numeric_is_finite", &[], Some(scalar(ScalarBase::Bool))),
+            signature("numeric_is_pos_inf", &[], Some(scalar(ScalarBase::Bool))),
+            signature("numeric_is_neg_inf", &[], Some(scalar(ScalarBase::Bool))),
+            signature("numeric_abs", &[untyped("res")], None),
+            signature("numeric_odd", &[], Some(scalar(ScalarBase::Bool))),
+            signature("numeric_even", &[], Some(scalar(ScalarBase::Bool))),
+            signature("numeric_ilog2", &[untyped("res")], None),
+            signature("numeric_ilog10", &[untyped("res")], None),
+            signature("numeric_ipow", &[untyped("other"), untyped("res")], None),
+            signature("numeric_isqrt", &[untyped("res")], None),
+            signature(
+                "numeric_div_round_up",
+                &[untyped("other"), untyped("res")],
+                None,
+            ),
+        ];
+        let mut methods: Vec<MethodDecl> = types
+            .iter()
+            .find(|t| t.name == "base_numeric_i")
+            .map(|base| base.methods.clone())
+            .unwrap_or_default();
+        methods.extend(own);
+        types.push(ElaboratedType {
+            kind: DeclarationKind::Interface,
+            name: "numeric_i".to_owned(),
+            base: None,
+            fields: Vec::new(),
+            constraints: Vec::new(),
+            methods,
+            whens: Vec::new(),
+            ons: Vec::new(),
+            covers: Vec::new(),
+            expects: Vec::new(),
+            when_of: Vec::new(),
+            events: Vec::new(),
+            underlying: None,
+            ports: Vec::new(),
+            unit_attributes: Vec::new(),
+            implements: Vec::new(),
+            interface_bases: vec!["base_numeric_i".to_owned()],
+            enumerals: Vec::new(),
+            span: builtin_span,
+        });
+    }
+    if !types
+        .iter()
+        .any(|t| t.name == "numeric_format_kind" && t.kind == DeclarationKind::Type)
+    {
+        types.push(ElaboratedType {
+            kind: DeclarationKind::Type,
+            name: "numeric_format_kind".to_owned(),
+            base: None,
+            fields: Vec::new(),
+            constraints: Vec::new(),
+            methods: Vec::new(),
+            whens: Vec::new(),
+            ons: Vec::new(),
+            covers: Vec::new(),
+            expects: Vec::new(),
+            when_of: Vec::new(),
+            events: Vec::new(),
+            underlying: None,
+            ports: Vec::new(),
+            unit_attributes: Vec::new(),
+            implements: Vec::new(),
+            interface_bases: Vec::new(),
+            enumerals: crate::builtins::NUMERIC_FORMAT_KIND
+                .iter()
+                .map(|name| crate::ast::Enumeral {
+                    name: (*name).to_owned(),
+                    name_span: builtin_span,
+                    value: None,
+                })
+                .collect(),
+            span: builtin_span,
+        });
     }
 }
 
