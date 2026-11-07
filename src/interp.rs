@@ -243,13 +243,59 @@ pub enum Value {
     /// value into a slot, passing it as an argument or copying a field
     /// mints a fresh instance and runs the struct's `numeric_assign`
     /// (a per-field deep copy when the struct does not define one) —
-    /// see [`Interp::bind_slot_value`]. Operations on the value
-    /// dispatch to the struct's `numeric_*` methods (T7.3).
+    /// values have value semantics even though operations are struct
+    /// methods.
     Custom {
         type_name: String,
         instance: usize,
     },
+    /// An `instance_iterator` value (32.2, T11.2): the shared state
+    /// behind one iteration over the instance field tree. Cloning the
+    /// value aliases the same iterator (a `copy()` mints an independent
+    /// one positioned identically); `start()`/`start_all()` compute the
+    /// full walk once and `next()` moves along it.
+    InstanceIterator(Rc<RefCell<InstanceIteratorState>>),
+    /// An `instance_path_item` value (32.2): one step of the path an
+    /// `instance_iterator` reports. The items are immutable snapshots
+    /// handed out by the iterator — `new instance_path_item` is the
+    /// construction stub (E0419, clause 32.2).
+    InstancePathItem(Rc<InstancePathItem>),
     Void,
+}
+
+/// One step of an `instance_iterator`'s path (32.2): the instance the
+/// step arrived at, the instance field it came through and — when that
+/// field is a list (nested lists recurse) — the index chain of the
+/// item. The iteration root's step has no field and no indices; its
+/// path string is the root's own spelling (`sys` for the run's root
+/// unit).
+#[derive(Debug, Clone)]
+pub struct InstancePathItem {
+    instance: usize,
+    field: Option<String>,
+    list_indices: Vec<usize>,
+}
+
+/// The state of one `instance_iterator` (32.2, T11.2): the full
+/// depth-first visit order computed once by `start()`/`start_all()` —
+/// each visit carrying its path from the iteration root — the spelling
+/// the root renders by, and the cursor the `next()`/`get_current_*`
+/// methods move and read. The walk snapshots the tree at start time;
+/// fields created or re-bound afterwards are not picked up (a
+/// documented approximation).
+#[derive(Debug, Clone)]
+pub struct InstanceIteratorState {
+    visits: Vec<Rc<Vec<InstancePathItem>>>,
+    /// How the root step spells (`sys` for the run's root unit).
+    root_label: String,
+    /// FALSE before the first `start()`/`start_all()` and after
+    /// `finish()`.
+    started: bool,
+    /// The position of the current visit: `Some(0)` right after
+    /// `start()` (the root is current without a `next()`), advanced by
+    /// `next()`, `None` while never started, after the walk ran past
+    /// the last visit, and after `finish()`.
+    cursor: Option<usize>,
 }
 
 /// The storage of a [`Value::List`] (`list of <t>`, 5.2.11). The items
@@ -680,6 +726,22 @@ const WAIT_BUDGET: u64 = 5_000;
 /// low because the success scan walks the whole log each cycle.
 const TEMPORAL_WAIT_CYCLES: u64 = 1_000;
 
+/// The instance-iterator walk's descent cap (32.2, T11.2) — the same
+/// shape as the phase-method field tree's cap: hitting it means a
+/// cyclic field structure, and that branch stops descending.
+const INSTANCE_WALK_MAX_DEPTH: u32 = 64;
+
+/// The nested-list index chain a single iterator path step records at
+/// most (`grid[0][2]` chains) — a list stored inside itself cannot
+/// extend a chain forever.
+const INSTANCE_WALK_MAX_INDICES: usize = 16;
+
+/// The argument-count ceiling a stub entry without a plan-stated
+/// signature claims: no signature is asserted for a name whose clause
+/// this stage does not model, so any practical argument count reaches
+/// the E0419 message instead of an invented arity check.
+const MAX_STUB_ARGS: usize = usize::MAX;
+
 /// The recognised 2019 predefined-library names this stage does not
 /// implement (T8): a call resolves to the table (so the parser accepts
 /// it), the arity is checked where the migration plan states a
@@ -718,6 +780,142 @@ const UNIMPLEMENTED_2019: &[(&str, &str, (usize, usize))] = &[
     ("get_attached_annotations_list", "35.4", (1, 1)),
     ("get_definition_element", "35.4", (0, 0)),
     ("is_applicable", "35.4", (1, 1)),
+    // ----------------------------------------------------------------
+    // The clause 32.1 reflection catalogue (T11.1): recognised names
+    // with no reflection model — the catalogue is
+    // docs/REFLECTION_2019.md, the type names live in
+    // builtins::RECOGNIZED_REFLECTION_TYPES. Arity is claimed only
+    // where the migration plan states an argument shape; the other
+    // entries accept any argument count (`(0, MAX_STUB_ARGS)` — no
+    // signature is claimed for a name whose clause this stage does not
+    // model). A user-defined method of the same name always wins: the
+    // table is consulted only when nothing else resolves.
+    // ----------------------------------------------------------------
+    // 32.1.2.3 rf_object (base of rf_struct and rf_interface).
+    ("is_contained_in", "32.1.2.3", (0, MAX_STUB_ARGS)),
+    ("is_instance_of_me", "32.1.2.3", (0, MAX_STUB_ARGS)),
+    // 32.1.2.5.2 rf_struct_member.
+    ("is_static", "32.1.2.5.2", (0, MAX_STUB_ARGS)),
+    // 32.1.2.5.4 rf_range_generated_field (the value forms beside the
+    // implemented clause 29.13 routines rgf_was_generated /
+    // rgf_get_range / rgf_was_reduced).
+    ("was_generated", "32.1.2.5.4", (0, MAX_STUB_ARGS)),
+    ("was_reduced", "32.1.2.5.4", (0, MAX_STUB_ARGS)),
+    ("get_range", "32.1.2.5.4", (0, MAX_STUB_ARGS)),
+    ("rgf_assign_value", "32.1.2.5.4", (0, MAX_STUB_ARGS)),
+    ("rgf_assign_value_unsafe", "32.1.2.5.4", (0, MAX_STUB_ARGS)),
+    // 32.1.2.5.8-32.1.2.5.10 the on-method descriptors.
+    (
+        "get_triggering_event",
+        "32.1.2.5.8-32.1.2.5.10",
+        (0, MAX_STUB_ARGS),
+    ),
+    (
+        "get_triggering_event_string",
+        "32.1.2.5.8-32.1.2.5.10",
+        (0, MAX_STUB_ARGS),
+    ),
+    // 32.1.2.5.11 rf_event.
+    ("on_method", "32.1.2.5.11", (0, MAX_STUB_ARGS)),
+    // 32.1.2.5.13 rf_check (get_relevant_check_actions is the 2019
+    // rename).
+    ("get_check_actions", "32.1.2.5.13", (0, MAX_STUB_ARGS)),
+    (
+        "get_relevant_check_actions",
+        "32.1.2.5.13",
+        (0, MAX_STUB_ARGS),
+    ),
+    // 32.1.2.6-32.1.2.7 rf_interface / rf_interface_member /
+    // rf_interface_method.
+    ("get_methods", "32.1.2.6-32.1.2.7", (0, MAX_STUB_ARGS)),
+    (
+        "get_declared_methods",
+        "32.1.2.6-32.1.2.7",
+        (0, MAX_STUB_ARGS),
+    ),
+    ("get_method", "32.1.2.6-32.1.2.7", (0, MAX_STUB_ARGS)),
+    (
+        "get_base_interfaces",
+        "32.1.2.6-32.1.2.7",
+        (0, MAX_STUB_ARGS),
+    ),
+    (
+        "get_direct_sub_interfaces",
+        "32.1.2.6-32.1.2.7",
+        (0, MAX_STUB_ARGS),
+    ),
+    (
+        "get_all_sub_interfaces",
+        "32.1.2.6-32.1.2.7",
+        (0, MAX_STUB_ARGS),
+    ),
+    ("get_implementors", "32.1.2.6-32.1.2.7", (0, MAX_STUB_ARGS)),
+    (
+        "get_declaring_interface",
+        "32.1.2.6-32.1.2.7",
+        (0, MAX_STUB_ARGS),
+    ),
+    ("get_result_type", "32.1.2.6-32.1.2.7", (0, MAX_STUB_ARGS)),
+    ("get_parameters", "32.1.2.6-32.1.2.7", (0, MAX_STUB_ARGS)),
+    (
+        "get_implementing_methods",
+        "32.1.2.6-32.1.2.7",
+        (0, MAX_STUB_ARGS),
+    ),
+    ("invoke", "32.1.2.6-32.1.2.7", (0, MAX_STUB_ARGS)),
+    ("invoke_unsafe", "32.1.2.6-32.1.2.7", (0, MAX_STUB_ARGS)),
+    // 32.1.2.8.5 rf_like_struct.
+    ("get_interfaces", "32.1.2.8.5", (0, MAX_STUB_ARGS)),
+    // 32.1.2.10 rf_scalar / rf_numeric / rf_custom_numeric (the
+    // set-of-values queries moved from rf_numeric to rf_scalar in
+    // 2019; the clause 5.10.5/5.10.6 routines stay implemented).
+    ("get_set_of_values", "32.1.2.10", (0, MAX_STUB_ARGS)),
+    ("get_full_set_of_values", "32.1.2.10", (0, MAX_STUB_ARGS)),
+    ("get_bit_size_modified", "32.1.2.10", (1, 1)),
+    ("get_range_string", "32.1.2.10", (0, MAX_STUB_ARGS)),
+    ("is_longint", "32.1.2.10", (0, MAX_STUB_ARGS)),
+    ("get_implementing_struct", "32.1.2.10", (0, MAX_STUB_ARGS)),
+    // 32.1.2.14 the template family's value/parameter queries.
+    ("get_type", "32.1.2.14", (0, MAX_STUB_ARGS)),
+    ("get_template_parameter", "32.1.2.14", (0, MAX_STUB_ARGS)),
+    ("get_value", "32.1.2.14", (0, MAX_STUB_ARGS)),
+    // 32.1.2.17 rf_manager queries (the bare-call spellings route
+    // through call_builtin; the member-call form lands here too).
+    (
+        "get_annotation_type_by_name",
+        "32.1.2.17",
+        (0, MAX_STUB_ARGS),
+    ),
+    ("get_template_type_by_name", "32.1.2.17", (0, MAX_STUB_ARGS)),
+    ("get_template_by_name", "32.1.2.17", (0, MAX_STUB_ARGS)),
+    (
+        "get_template_interface_by_name",
+        "32.1.2.17",
+        (0, MAX_STUB_ARGS),
+    ),
+    ("get_user_template_types", "32.1.2.17", (0, MAX_STUB_ARGS)),
+    ("get_user_templates", "32.1.2.17", (0, MAX_STUB_ARGS)),
+    // 32.1.3 definition elements, layers, modules.
+    ("get_source_lines_count", "32.1.3", (0, MAX_STUB_ARGS)),
+    ("get_added_interfaces", "32.1.3", (0, MAX_STUB_ARGS)),
+    ("get_exact_subtype", "32.1.3", (0, MAX_STUB_ARGS)),
+    ("get_instance_layers", "32.1.3", (0, MAX_STUB_ARGS)),
+    ("get_layers", "32.1.3", (0, MAX_STUB_ARGS)),
+    ("get_template_layer", "32.1.3", (0, MAX_STUB_ARGS)),
+    ("get_actual_importer", "32.1.3", (0, MAX_STUB_ARGS)),
+    ("is_top_module", "32.1.3", (0, MAX_STUB_ARGS)),
+    ("get_full_file_name", "32.1.3", (0, MAX_STUB_ARGS)),
+    ("get_file_age", "32.1.3", (0, MAX_STUB_ARGS)),
+    // 32.1.4 value and manager utilities.
+    ("value_to_type", "32.1.4", (2, 2)),
+    ("eval_exp_string", "32.1.4", (1, 1)),
+    ("insert_list_element", "32.1.4", (0, MAX_STUB_ARGS)),
+    ("insert_list_element_unsafe", "32.1.4", (0, MAX_STUB_ARGS)),
+    ("delete_list_element", "32.1.4", (0, MAX_STUB_ARGS)),
+    ("delete_list_element_unsafe", "32.1.4", (0, MAX_STUB_ARGS)),
+    ("get_field_of_unit_instance", "32.1.4.6", (1, 1)),
+    ("get_list_indices_of_unit_instance", "32.1.4.6", (1, 1)),
+    ("get_list_index_of_unit_instance", "32.1.4.6", (1, 1)),
 ];
 
 /// Instantiate the built-in `sys` unit and execute its `run()` methods.
@@ -1559,6 +1757,17 @@ impl<'a> Interp<'a> {
                 // The 32.3 table types have no default value: a table
                 // var's default is NULL, like an interface pointer.
                 if matches!(name.as_str(), "table" | "table_row" | "table_manager") {
+                    return Value::Void;
+                }
+                // The 32.2 instance iterator and the recognised
+                // reflection types (T11.1/T11.2) default to NULL too:
+                // an unstarted iterator and an unmodeled rf_* value are
+                // both the null reference, and a default must never
+                // construct (`new` on the reflection stubs reports
+                // E0419 instead).
+                if name == "instance_iterator"
+                    || crate::builtins::is_recognized_reflection_type(name)
+                {
                     return Value::Void;
                 }
                 let types: &[crate::elab::ElaboratedType] = self.types;
@@ -5698,6 +5907,446 @@ impl<'a> Interp<'a> {
     }
 
     // -----------------------------------------------------------------
+    // The 32.2 instance iterator (T11.2) — the one reflection surface
+    // implemented for real. `start(root)` / `start_all()` compute the
+    // full depth-first walk over the instance field tree once; `next()`
+    // moves along it and the `get_current_*` queries read the recorded
+    // walk. Lists flatten in index order (nested lists recurse), an
+    // already-visited object is not revisited, and only struct
+    // instances reached through instance fields are visited (no port
+    // traversal — the with_ports hook is a stub). Catalogue:
+    // docs/REFLECTION_2019.md. Documented approximations: the walk is
+    // a start-time snapshot; the descent is capped at
+    // INSTANCE_WALK_MAX_DEPTH like the phase-method field tree; the
+    // current path counts from the iteration root (the root's depth is
+    // 0) and its string spells the root by its e_path when the root is
+    // in the field tree under sys (`sys` for the run's root unit), by
+    // its type name otherwise.
+    // -----------------------------------------------------------------
+
+    /// The `instance_iterator` methods (32.2).
+    fn call_instance_iterator_method(
+        &mut self,
+        handle: Rc<RefCell<InstanceIteratorState>>,
+        name: &str,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        match (name, values.as_slice()) {
+            ("start", [Value::Object(root)]) => {
+                let root = *root;
+                let root_label = self.iterator_root_label(root);
+                let visits = self.walk_instance_tree(root);
+                *handle.borrow_mut() = InstanceIteratorState {
+                    visits,
+                    root_label,
+                    started: true,
+                    cursor: Some(0),
+                };
+                Ok(Value::Void)
+            }
+            ("start", _) => Err(self.error(
+                "E0402",
+                "'start' expects the root instance to iterate from",
+                span,
+            )),
+            ("start_all", []) => {
+                // `start_all()` roots the walk at the run's root unit —
+                // the whole field tree under sys.
+                let sys_index = self.sys_instance();
+                let Some(root) = sys_index else {
+                    return Err(self.error(
+                        "E0402",
+                        "'start_all' has no root sys instance to iterate from",
+                        span,
+                    ));
+                };
+                let visits = self.walk_instance_tree(root);
+                *handle.borrow_mut() = InstanceIteratorState {
+                    visits,
+                    root_label: "sys".to_owned(),
+                    started: true,
+                    cursor: Some(0),
+                };
+                Ok(Value::Void)
+            }
+            ("start_all", _) => Err(self.error(
+                "E0402",
+                format!("'start_all' expects no arguments, got {}", values.len()),
+                span,
+            )),
+            ("finish", []) => {
+                // `finish()` ends the iteration: the cursor is dropped,
+                // the current-instance queries report from here on.
+                let mut state = handle.borrow_mut();
+                state.started = false;
+                state.cursor = None;
+                Ok(Value::Void)
+            }
+            ("finish", _) => Err(self.error(
+                "E0402",
+                format!("'finish' expects no arguments, got {}", values.len()),
+                span,
+            )),
+            ("next", []) => {
+                // Advance one visit; TRUE while the iterator points at
+                // an instance afterwards. The root visited by `start()`
+                // is current without a `next()` — the first `next()`
+                // moves past it.
+                let mut state = handle.borrow_mut();
+                if !state.started {
+                    return Err(self.error(
+                        "E0402",
+                        "the instance iterator has not been started — call start(root) or start_all() first (clause 32.2)",
+                        span,
+                    ));
+                }
+                let Some(cursor) = state.cursor.as_mut() else {
+                    return Ok(Value::Bool(false));
+                };
+                *cursor += 1;
+                if *cursor < state.visits.len() {
+                    Ok(Value::Bool(true))
+                } else {
+                    state.cursor = None;
+                    Ok(Value::Bool(false))
+                }
+            }
+            ("next", _) => Err(self.error(
+                "E0402",
+                format!("'next' expects no arguments, got {}", values.len()),
+                span,
+            )),
+            ("get_current_instance", []) => {
+                let item = self.iterator_current_item(&handle, span)?;
+                Ok(Value::Object(item.instance))
+            }
+            ("get_current_depth", []) => {
+                let path = self.iterator_current_path(&handle, span)?;
+                // The depth is the field-step count from the iteration
+                // root: the root itself is depth 0, a list item shares
+                // its field's depth.
+                Ok(Value::Int((path.len() as i128).saturating_sub(1)))
+            }
+            ("get_current_path", []) => {
+                let path = self.iterator_current_path(&handle, span)?;
+                let items = path
+                    .iter()
+                    .map(|item| Value::InstancePathItem(Rc::new(item.clone())))
+                    .collect();
+                Ok(Value::List(ListValue {
+                    items: Rc::new(RefCell::new(items)),
+                    element: Some("instance_path_item".to_owned()),
+                }))
+            }
+            ("get_current_path_item", []) => {
+                let path = self.iterator_current_path(&handle, span)?;
+                let item = path.last().expect("a current path is never empty");
+                Ok(Value::InstancePathItem(Rc::new(item.clone())))
+            }
+            ("get_path_item_by_index", [Value::Int(index)]) => {
+                let path = self.iterator_current_path(&handle, span)?;
+                if *index < 0 || *index >= path.len() as i128 {
+                    return Err(self.error(
+                        "E0404",
+                        format!(
+                            "path item index {index} out of range (path length {})",
+                            path.len()
+                        ),
+                        span,
+                    ));
+                }
+                let item = &path[*index as usize];
+                Ok(Value::InstancePathItem(Rc::new(item.clone())))
+            }
+            ("get_path_item_by_index", _) => Err(self.error(
+                "E0402",
+                "'get_path_item_by_index' expects the 0-based item index",
+                span,
+            )),
+            ("get_current_path_string", []) => {
+                let path = self.iterator_current_path(&handle, span)?;
+                let state = handle.borrow();
+                Ok(Value::Str(render_iterator_path(&path, &state.root_label)))
+            }
+            ("get_current_path_string", _) => Err(self.error(
+                "E0402",
+                format!(
+                    "'get_current_path_string' expects no arguments, got {}",
+                    values.len()
+                ),
+                span,
+            )),
+            // The 32.2 user-extension hooks: skip_field takes an
+            // rf_struct_member (no reflection model), skip_instance and
+            // with_ports are methods a user extends the iterator type
+            // with — extending a built-in type is not supported in this
+            // stage. Recognised, E0419.
+            ("skip_field" | "skip_instance" | "with_ports", _) => Err(self.error(
+                "E0419",
+                format!("'{name}()' is recognised (clause 32.2) but not implemented in this stage"),
+                span,
+            )),
+            _ => Err(self.error(
+                "E0405",
+                format!("method '{name}' is not supported on instance_iterator"),
+                span,
+            )),
+        }
+    }
+
+    /// The run's root `sys` instance index, if the run has one.
+    fn sys_instance(&self) -> Option<usize> {
+        self.instances
+            .iter()
+            .position(|instance| instance.type_name == "sys")
+    }
+
+    /// The spelling the iterator's path strings use for the iteration
+    /// root: its e_path when the root is in the field tree under sys
+    /// (`sys` for the root unit itself), its type name otherwise (a
+    /// struct created by `new` is outside the field tree).
+    fn iterator_root_label(&self, root: usize) -> String {
+        if self.sys_instance() == Some(root) {
+            return "sys".to_owned();
+        }
+        if let Ok(Value::Str(path)) = self.instance_e_path(root, (origin(), origin())) {
+            return path;
+        }
+        self.instances[root].type_name.clone()
+    }
+
+    /// The full depth-first visit order over `root`'s instance field
+    /// tree: pre-order (an instance before its descendants), instance
+    /// fields in declaration order, list items flattened in index
+    /// order (nested lists recurse), an already-visited object
+    /// skipped. Each visit records its full path from the root.
+    fn walk_instance_tree(&self, root: usize) -> Vec<Rc<Vec<InstancePathItem>>> {
+        let mut visits = Vec::new();
+        let mut visited = BTreeSet::new();
+        let root_path = Rc::new(vec![InstancePathItem {
+            instance: root,
+            field: None,
+            list_indices: Vec::new(),
+        }]);
+        self.collect_instance_walk(root, root_path, &mut visits, &mut visited, 0);
+        visits
+    }
+
+    fn collect_instance_walk(
+        &self,
+        index: usize,
+        path: Rc<Vec<InstancePathItem>>,
+        visits: &mut Vec<Rc<Vec<InstancePathItem>>>,
+        visited: &mut BTreeSet<usize>,
+        depth: u32,
+    ) {
+        if depth > INSTANCE_WALK_MAX_DEPTH || !visited.insert(index) {
+            return;
+        }
+        visits.push(path.clone());
+        // Snapshot the field values: the walk never holds a borrow (a
+        // list's shared storage may be aliased elsewhere).
+        let fields: Vec<(String, Value)> = self.instances[index]
+            .fields
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        for (field_name, value) in fields {
+            self.walk_field_value(&path, &field_name, &value, visits, visited, depth);
+        }
+    }
+
+    /// Descend one field value of the walk: an instance field's object
+    /// is one child step; a list contributes one child step per
+    /// contained object, in index order (nested lists recurse, the
+    /// index chain extending: `grid[0][2]`).
+    fn walk_field_value(
+        &self,
+        path: &Rc<Vec<InstancePathItem>>,
+        field_name: &str,
+        value: &Value,
+        visits: &mut Vec<Rc<Vec<InstancePathItem>>>,
+        visited: &mut BTreeSet<usize>,
+        depth: u32,
+    ) {
+        match value {
+            Value::Object(child) => {
+                let mut child_path = (**path).clone();
+                child_path.push(InstancePathItem {
+                    instance: *child,
+                    field: Some(field_name.to_owned()),
+                    list_indices: Vec::new(),
+                });
+                self.collect_instance_walk(*child, Rc::new(child_path), visits, visited, depth + 1);
+            }
+            Value::List(list) => {
+                let items = list.items.borrow().clone();
+                self.walk_list_items(path, field_name, &items, Vec::new(), visits, visited, depth);
+            }
+            _ => {}
+        }
+    }
+
+    /// The list arm of [`walk_field_value`]: `chain` carries the index
+    /// chain of the enclosing list items (empty for the field's own
+    /// list). The chain is length-capped — a list stored inside itself
+    /// cannot recurse forever.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_list_items(
+        &self,
+        path: &Rc<Vec<InstancePathItem>>,
+        field_name: &str,
+        items: &[Value],
+        chain: Vec<usize>,
+        visits: &mut Vec<Rc<Vec<InstancePathItem>>>,
+        visited: &mut BTreeSet<usize>,
+        depth: u32,
+    ) {
+        for (position, item) in items.iter().enumerate() {
+            let mut child_chain = chain.clone();
+            child_chain.push(position);
+            match item {
+                Value::Object(child) => {
+                    let mut child_path = (**path).clone();
+                    child_path.push(InstancePathItem {
+                        instance: *child,
+                        field: Some(field_name.to_owned()),
+                        list_indices: child_chain,
+                    });
+                    self.collect_instance_walk(
+                        *child,
+                        Rc::new(child_path),
+                        visits,
+                        visited,
+                        depth + 1,
+                    );
+                }
+                Value::List(nested) => {
+                    if child_chain.len() >= INSTANCE_WALK_MAX_INDICES {
+                        continue;
+                    }
+                    let nested_items = nested.items.borrow().clone();
+                    self.walk_list_items(
+                        path,
+                        field_name,
+                        &nested_items,
+                        child_chain,
+                        visits,
+                        visited,
+                        depth,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The current visit's path; the diagnostic names the iterator's
+    /// state (not started / iteration over) when there is none.
+    fn iterator_current_path(
+        &self,
+        handle: &Rc<RefCell<InstanceIteratorState>>,
+        span: crate::ast::Span,
+    ) -> Result<Vec<InstancePathItem>, Diagnostic> {
+        let state = handle.borrow();
+        if !state.started {
+            return Err(self.error(
+                "E0402",
+                "the instance iterator has not been started — call start(root) or start_all() first (clause 32.2)",
+                span,
+            ));
+        }
+        let Some(cursor) = state.cursor else {
+            return Err(self.error(
+                "E0402",
+                "the instance iterator's walk is over — no current instance remains",
+                span,
+            ));
+        };
+        Ok(state.visits[cursor].as_ref().clone())
+    }
+
+    /// Like [`iterator_current_path`], as the current path's last item.
+    fn iterator_current_item(
+        &self,
+        handle: &Rc<RefCell<InstanceIteratorState>>,
+        span: crate::ast::Span,
+    ) -> Result<InstancePathItem, Diagnostic> {
+        Ok(self
+            .iterator_current_path(handle, span)?
+            .pop()
+            .expect("a recorded visit's path is never empty"))
+    }
+
+    /// The `instance_path_item` methods (32.2): the descriptors of one
+    /// step of an iterator path. The items are handed out by the
+    /// iterator; constructing one directly is the E0419 stub.
+    fn call_instance_path_item_method(
+        &self,
+        item: Rc<InstancePathItem>,
+        name: &str,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        match (name, values.as_slice()) {
+            ("get_instance", []) => Ok(Value::Object(item.instance)),
+            ("get_instance", _) => Err(self.error(
+                "E0402",
+                format!("'get_instance' expects no arguments, got {}", values.len()),
+                span,
+            )),
+            ("get_field", []) => match &item.field {
+                // The root step has no field: NULL.
+                Some(field) => Ok(Value::Str(field.clone())),
+                None => Ok(Value::Void),
+            },
+            ("get_field", _) => Err(self.error(
+                "E0402",
+                format!("'get_field' expects no arguments, got {}", values.len()),
+                span,
+            )),
+            ("get_list_index", []) => match item.list_indices.last() {
+                Some(index) => Ok(Value::Int(*index as i128)),
+                // Not a list step: NULL.
+                None => Ok(Value::Void),
+            },
+            ("get_list_index", _) => Err(self.error(
+                "E0402",
+                format!(
+                    "'get_list_index' expects no arguments, got {}",
+                    values.len()
+                ),
+                span,
+            )),
+            ("get_list_indices", []) => {
+                let indices = item
+                    .list_indices
+                    .iter()
+                    .map(|index| Value::Int(*index as i128))
+                    .collect();
+                Ok(Value::List(ListValue {
+                    items: Rc::new(RefCell::new(indices)),
+                    element: Some("int".to_owned()),
+                }))
+            }
+            ("get_list_indices", _) => Err(self.error(
+                "E0402",
+                format!(
+                    "'get_list_indices' expects no arguments, got {}",
+                    values.len()
+                ),
+                span,
+            )),
+            _ => Err(self.error(
+                "E0405",
+                format!("method '{name}' is not supported on instance_path_item"),
+                span,
+            )),
+        }
+    }
+
+    // -----------------------------------------------------------------
     // The 32.3 procedural table API (T9.3): the `table_manager`
     // singleton, the methods on a `table` value and on a `table_row`
     // value. Rows are numbered from 0, columns from 1 (column 0 is the
@@ -6291,6 +6940,15 @@ impl<'a> Interp<'a> {
                 table: None,
                 row: Rc::new(RefCell::new(row.borrow().clone())),
             }),
+            // An iterator copy (32.2, T11.2): an independent iterator
+            // positioned identically — the same recorded walk, its own
+            // cursor.
+            Value::InstanceIterator(handle) => {
+                let state = handle.borrow().clone();
+                Ok(Value::InstanceIterator(Rc::new(RefCell::new(state))))
+            }
+            // A path item is an immutable snapshot: the copy shares it.
+            Value::InstancePathItem(item) => Ok(Value::InstancePathItem(item.clone())),
             Value::List(list) => {
                 let items = list.items.borrow().clone();
                 let mut copies = Vec::with_capacity(items.len());
@@ -9130,6 +9788,14 @@ impl<'a> Interp<'a> {
                             Value::TableRow { table, row } => {
                                 self.call_table_row_value_method(table, row, name, values, *span)
                             }
+                            // The 32.2 instance iterator (T11.2) and
+                            // the path items it hands out.
+                            Value::InstanceIterator(handle) => {
+                                self.call_instance_iterator_method(handle, name, values, *span)
+                            }
+                            Value::InstancePathItem(item) => {
+                                self.call_instance_path_item_method(item, name, values, *span)
+                            }
                             // `to_string()` on scalars (the DAC macro
                             // shapes: `set.min().to_string()`).
                             value @ (Value::Int(_)
@@ -9694,6 +10360,32 @@ impl<'a> Interp<'a> {
                 };
                 if self.depth > 100 {
                     return Ok(Value::Void);
+                }
+                // The 32.2 instance iterator (T11.2): `new
+                // instance_iterator` mints an unstarted iterator — the
+                // one reflection surface constructed for real. `start()`
+                // / `start_all()` root it afterwards.
+                if new_name == "instance_iterator" {
+                    return Ok(Value::InstanceIterator(Rc::new(RefCell::new(
+                        InstanceIteratorState {
+                            visits: Vec::new(),
+                            root_label: String::new(),
+                            started: false,
+                            cursor: None,
+                        },
+                    ))));
+                }
+                // The recognised clause 32.1/32.2 reflection types
+                // (T11.1): the construction stub — recognised, with the
+                // clause in the message, instead of an unknown-type
+                // error. Only the base instance_iterator above is
+                // constructed for real.
+                if let Some(clause) = crate::builtins::reflection_type_clause(&new_name) {
+                    return Err(self.error(
+                        "E0419",
+                        format!("'{new_name}' is recognised (clause {clause}) but not implemented in this stage"),
+                        *span,
+                    ));
                 }
                 // Clause 5.2.9: no object is *of* an interface type — an
                 // interface-typed value points at an instance of a
@@ -10990,6 +11682,30 @@ impl<'a> Interp<'a> {
                 let cells: Vec<String> = row.cells.clone();
                 format!("[{}]", cells.join(", "))
             }
+            // An instance iterator (32.2, T11.2) renders by its walk
+            // state; a path item by its field and index chain.
+            Value::InstanceIterator(handle) => {
+                let state = handle.borrow();
+                if !state.started {
+                    "instance_iterator(not started)".to_owned()
+                } else {
+                    match state.cursor {
+                        Some(cursor) => format!(
+                            "instance_iterator({} of {})",
+                            cursor + 1,
+                            state.visits.len()
+                        ),
+                        None => "instance_iterator(finished)".to_owned(),
+                    }
+                }
+            }
+            Value::InstancePathItem(item) => {
+                let mut rendered = item.field.clone().unwrap_or_else(|| "<root>".to_owned());
+                for index in &item.list_indices {
+                    rendered.push_str(&format!("[{index}]"));
+                }
+                format!("instance_path_item({rendered})")
+            }
             // Clause 5.4.4.4: `Value::Void` doubles as the null
             // reference — an interface-typed variable with no instance
             // prints NULL (T3.5). A struct-typed interface value prints
@@ -11011,6 +11727,8 @@ impl<'a> Interp<'a> {
             Value::Table(_) => "a table",
             Value::TableRow { .. } => "a table row",
             Value::Custom { .. } => "a custom numeric value",
+            Value::InstanceIterator(_) => "an instance iterator",
+            Value::InstancePathItem(_) => "an instance path item",
             Value::Void => "void",
         }
     }
@@ -11023,6 +11741,26 @@ impl<'a> Interp<'a> {
     ) -> Diagnostic {
         Diagnostic::new(code, message, span.0, span.1)
     }
+}
+
+/// The `get_current_path_string()` rendering (32.2, T11.2): the root's
+/// label, then `.field` per step, each list step's index chain
+/// appended (`sys.a`, `sys.lst[0]`, `sys.grid[0][2]`) — the `e_path`
+/// shapes. The root step itself renders as the label alone.
+fn render_iterator_path(path: &[InstancePathItem], root_label: &str) -> String {
+    let mut rendered = String::new();
+    for (position, item) in path.iter().enumerate() {
+        if position == 0 {
+            rendered.push_str(root_label);
+            continue;
+        }
+        rendered.push('.');
+        rendered.push_str(item.field.as_deref().unwrap_or(""));
+        for index in &item.list_indices {
+            rendered.push_str(&format!("[{index}]"));
+        }
+    }
+    rendered
 }
 
 /// Bits of a width specification: the literal value, or the given default
