@@ -34,6 +34,27 @@
 //! the enclosing type's when-block constraints stay unenforced. Every
 //! run takes an explicit seed and is fully deterministic per backend.
 //!
+//! The clause 10.5.8 `target chosen_from read_only(list)` keep form is
+//! applied when its target — a simple generative struct field path — is
+//! generated (`gen <path>;` or the field's turn inside `gen` of the
+//! enclosing instance): the list elements are substituted into the target
+//! slot one by one, the other constraints on paths through the target
+//! (declared in the structs along the path) are evaluated with each
+//! candidate bound, and one satisfying element is picked uniformly with
+//! the seeded RNG. An empty list, or no satisfying element, is a
+//! generation contradiction (`E0417`). Pointer-equality constraints on
+//! the target are an unsupported shape (`E0402`); there is no ICFS
+//! machinery in this stage for the target to participate in.
+//!
+//! Range-generated (`~`) fields (clause 6.9.7) are excluded from that
+//! sampling like `!` fields: after the other fields are concrete, each
+//! receives a reduced set of values (10.3.13) — the intersection of the
+//! intervals its supported constraint shapes imply — and the set's
+//! minimum as its concrete value (deterministic; implementation-defined
+//! per the standard). The set is kept as per-instance metadata that the
+//! clause 29.13 routines (`rgf_was_generated`/`rgf_get_range`/
+//! `rgf_was_reduced`) and the `rgf=` operator (18.6) read.
+//!
 //! ## Diagnostic codes
 //!
 //! - `E0401` unknown identifier, field or method at run time
@@ -53,6 +74,14 @@
 //! - `E0413` a subtype-qualified field access (4.17.3) on an instance
 //!   that does not currently match the qualifiers' subtype — the field
 //!   is not present on it
+//! - `E0415` an `rgf=` value (18.6) outside the field's generated
+//!   reduced set (10.3.13)
+//! - `E0416` an rgf query or assign before the field was generated
+//! - `E0417` `chosen_from` contradiction (10.5.8): the read-only list is
+//!   empty, or none of its elements satisfies the other constraints on
+//!   paths through the target
+//! - `E0317` a constraint involving a range-generated field whose shape
+//!   the reduced-set pass does not support (10.3.13; raised from `gen`)
 //! - `E0419` a call to a recognised 2019 predefined-library name that
 //!   is not implemented in this stage (see [`UNIMPLEMENTED_2019`])
 //! - `E0420` `do_bind()` outside the connect_ports() generation
@@ -246,6 +275,20 @@ struct ObjectInstance {
     fields: Vec<(String, Value)>,
     /// `simple_port` members: port name → HDL location for the bridge.
     ports: Vec<(String, String)>,
+    /// Range-generated (`~`) field metadata (clause 6.9.7, 10.3.13):
+    /// field name → generated state, present once `gen` has produced
+    /// the field's reduced set. The clause 29.13 rgf routines and the
+    /// `rgf=` operator (18.6) read it.
+    rgf: BTreeMap<String, RgfState>,
+}
+
+/// The generated state of one range-generated field: the reduced set as
+/// canonical intervals, and whether the set is smaller than the
+/// declared type's full set (`rgf_was_reduced`, clause 29.13).
+#[derive(Debug, Clone)]
+struct RgfState {
+    ranges: Vec<(i128, i128)>,
+    reduced: bool,
 }
 
 impl ObjectInstance {
@@ -1361,6 +1404,7 @@ impl<'a> Interp<'a> {
             type_name: type_name.to_owned(),
             fields,
             ports,
+            rgf: BTreeMap::new(),
         });
         // A subtype view instance carries its determinant values (6.7):
         // the view's (field id, value) pairs hold from instantiation on,
@@ -1545,9 +1589,13 @@ impl<'a> Interp<'a> {
             }
             // `typeof()`/`typeof_item()` placeholders resolve during
             // elaboration (5.9); reaching the interpreter with one means
-            // the static type was undetermined — no value.
+            // the static type was undetermined — no value. A value
+            // actual and a width-qualified formal are template shapes
+            // that never reach the interpreter as types.
             TypeExpr::TypeOf { .. } | TypeExpr::TypeOfItem { .. } => Value::Void,
-            TypeExpr::Formal { .. } => Value::Void,
+            TypeExpr::Formal { .. } | TypeExpr::FormalWidth { .. } | TypeExpr::Value { .. } => {
+                Value::Void
+            }
         }
     }
 
@@ -2039,6 +2087,14 @@ impl<'a> Interp<'a> {
                     frame.local_types.insert(name.clone(), ty.clone());
                 }
                 frame.locals.insert(name.clone(), value);
+                Ok(Flow::Normal)
+            }
+            Stmt::RgfAssign {
+                target,
+                value,
+                span,
+            } => {
+                self.exec_rgf_assign(target, value, frame, me, *span)?;
                 Ok(Flow::Normal)
             }
             Stmt::Assign { target, value, .. } => {
@@ -2561,11 +2617,21 @@ impl<'a> Interp<'a> {
         me: Option<usize>,
         span: crate::ast::Span,
     ) -> Result<Flow, Diagnostic> {
-        let Expr::Ident { name, .. } = expr else {
-            return Err(self.error("E0402", "gen target must be a variable", span));
-        };
         let Some(me_index) = me else {
             return Err(self.error("E0402", "gen requires an enclosing instance", span));
+        };
+        // A simple member path (`h.p`) — the clause 10.5.8 chosen_from
+        // target spelling among others.
+        if let Expr::MemberAccess { .. } = expr {
+            self.exec_gen_field_path(expr, frame, me_index, span)?;
+            return Ok(Flow::Normal);
+        }
+        let Expr::Ident { name, .. } = expr else {
+            return Err(self.error(
+                "E0402",
+                "gen target must be a variable or a simple field path",
+                span,
+            ));
         };
         let slot_is_local = frame.locals.contains_key(name);
         let current = if slot_is_local {
@@ -2576,6 +2642,29 @@ impl<'a> Interp<'a> {
         let Some(current) = current else {
             return Err(self.error("E0401", format!("unknown variable '{name}' in gen"), span));
         };
+        // A clause 10.5.8 chosen_from whose target is exactly this field
+        // governs the generation: the field is assigned a pointer to a
+        // list element instead of being sampled. Only a field can be
+        // governed — a constraint's identifiers are checked against the
+        // type's fields, so a local variable is never a constraint
+        // target.
+        if !slot_is_local
+            && let Some((instance, remaining, list)) =
+                self.find_governing_chosen_from(me_index, std::slice::from_ref(name))?
+        {
+            let Value::Object(_) = current else {
+                return Err(self.error(
+                    "E0402",
+                    format!(
+                        "chosen_from target '{name}' must be a generative struct field (10.5.8)"
+                    ),
+                    span,
+                ));
+            };
+            let other = self.chosen_from_other_constraints(instance, &remaining);
+            self.gen_chosen_from(instance, &remaining, &list, &other, span)?;
+            return Ok(Flow::Normal);
+        }
         // A struct instance is randomized in place, recursively — under
         // the enclosing instance's constraints that reference it
         // (10.3.6-10.3.7's connected field sets, v1: depth-2 paths).
@@ -2619,7 +2708,10 @@ impl<'a> Interp<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        // Solver-backed path (feature `solver-pumpkin`).
+        // Solver-backed path (feature `solver-pumpkin`). A chosen_from
+        // constraint assigns its own target when that is generated; it is
+        // not a predicate over this scalar, so it stays out of the
+        // translated problem.
         #[cfg(feature = "solver-pumpkin")]
         {
             let bounds: std::collections::BTreeMap<String, (i64, i64)> =
@@ -2627,8 +2719,13 @@ impl<'a> Interp<'a> {
                     .map(|b| (name.clone(), b))
                     .into_iter()
                     .collect();
+            let solver_constraints: Vec<Expr> = constraints
+                .iter()
+                .filter(|constraint| !matches!(**constraint, Expr::ChosenFrom { .. }))
+                .cloned()
+                .collect();
             if !bounds.is_empty()
-                && let Ok(problem) = crate::solve::translate(&constraints, &bounds)
+                && let Ok(problem) = crate::solve::translate(&solver_constraints, &bounds)
             {
                 match crate::solve::solve(&problem, self.seed) {
                     crate::solve::SolveOutcome::Solved(mut assignment) => {
@@ -2660,6 +2757,11 @@ impl<'a> Interp<'a> {
             self.store(slot_is_local, name, candidate, frame, me_index, span)?;
             let mut pass = true;
             for constraint in &constraints {
+                // A chosen_from constraint is not a predicate here: it
+                // assigns its own target when that field is generated.
+                if matches!(constraint, Expr::ChosenFrom { .. }) {
+                    continue;
+                }
                 match self.eval(constraint, frame, Some(me_index))? {
                     Value::Bool(true) => {}
                     Value::Bool(false) => {
@@ -2690,6 +2792,378 @@ impl<'a> Interp<'a> {
             ));
         }
         Ok(Flow::Normal)
+    }
+
+    /// `gen <path>;` — the target is a simple member path: a bare
+    /// identifier root (the enclosing instance, one of its fields, or a
+    /// local) followed by field names. A clause 10.5.8 chosen_from
+    /// governing the path assigns a list element to the target slot;
+    /// without one, a struct-typed final field is randomized in place
+    /// under the parent type's constraints that reference it (10.3.6 to
+    /// 10.3.7's connected field sets, v1: depth-2 paths).
+    fn exec_gen_field_path(
+        &mut self,
+        expr: &Expr,
+        frame: &mut Frame,
+        me_index: usize,
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        let Some(segments) = expr_path_segments(expr) else {
+            return Err(self.error("E0402", "gen target must be a simple field path", span));
+        };
+        let [root, rest @ ..] = segments.as_slice() else {
+            return Err(self.error("E0402", "gen target must be a simple field path", span));
+        };
+        enum Root {
+            /// `gen me.p` — the path starts at the enclosing instance.
+            Me,
+            /// `gen h.p` with `h` a local variable holding the instance.
+            Local,
+            /// `gen h.p` with `h` a field of the enclosing instance — the
+            /// path may be referenced by the enclosing type's constraints.
+            Field,
+        }
+        let root_kind = if root == "me" || root == "self" {
+            Root::Me
+        } else if frame.locals.contains_key(root.as_str()) {
+            Root::Local
+        } else if self.instances[me_index].get(root).is_some() {
+            Root::Field
+        } else {
+            return Err(self.error("E0401", format!("unknown variable '{root}' in gen"), span));
+        };
+        let base = match root_kind {
+            Root::Me => me_index,
+            Root::Local | Root::Field => {
+                let root_value = if matches!(root_kind, Root::Local) {
+                    frame.locals.get(root.as_str()).cloned()
+                } else {
+                    self.instances[me_index].get(root).cloned()
+                };
+                let Some(Value::Object(base)) = root_value else {
+                    return Err(self.error(
+                        "E0402",
+                        format!("gen target root '{root}' is not a struct instance"),
+                        span,
+                    ));
+                };
+                base
+            }
+        };
+        // Where the constraint walk starts: a field root extends the
+        // written path one level up (the enclosing type may declare the
+        // governing chosen_from and constraints on the full path); `me`
+        // and a local root start at the root object itself.
+        let (walk_instance, walk_remaining) = match root_kind {
+            Root::Field => (me_index, segments.clone()),
+            Root::Me => (base, rest.to_vec()),
+            Root::Local => (base, rest.to_vec()),
+        };
+        if let Some((instance, remaining, list)) =
+            self.find_governing_chosen_from(walk_instance, &walk_remaining)?
+        {
+            let other = self.chosen_from_other_constraints(walk_instance, &walk_remaining);
+            self.gen_chosen_from(instance, &remaining, &list, &other, span)?;
+            return Ok(());
+        }
+        // Plain generation of the final field: single-segment paths only —
+        // the deeper enclosing-constraint scoping needs full CFS support.
+        let [field] = rest else {
+            return Err(self.error(
+                "E0402",
+                "gen of a field path deeper than one segment is only supported for a chosen_from target (10.5.8)",
+                span,
+            ));
+        };
+        let Some(Value::Object(target_index)) = self.instances[base].get(field).cloned() else {
+            return Err(self.error(
+                "E0402",
+                format!("gen of field '{field}' requires a struct-typed field"),
+                span,
+            ));
+        };
+        let parent_type_name = self.instances[base].type_name.clone();
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let enclosing: Vec<Expr> = types
+            .iter()
+            .find(|t| t.name == parent_type_name)
+            .map(|t| {
+                t.constraints
+                    .iter()
+                    .filter(|c| !c.is_bind)
+                    .map(|c| c.expr.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rebased = rebase_constraints(&enclosing, field);
+        self.gen_object(target_index, &rebased)?;
+        Ok(())
+    }
+
+    /// Walk a gen target path outermost-first, looking for the clause
+    /// 10.5.8 chosen_from constraint that governs it: at each instance
+    /// along the path the remaining segments name the target relative to
+    /// that instance's type, and a non-bind chosen_from whose target path
+    /// is exactly those segments governs. The constraint may live in the
+    /// target's own struct or in any struct enclosing it along the path.
+    /// Returns the slot (instance and remaining segments), where the
+    /// element is assigned, and the chosen_from's list expression.
+    fn find_governing_chosen_from(
+        &self,
+        start_instance: usize,
+        start_remaining: &[String],
+    ) -> Result<Option<(usize, Vec<String>, Expr)>, Diagnostic> {
+        let mut instance = start_instance;
+        let mut remaining: Vec<String> = start_remaining.to_vec();
+        loop {
+            let type_name = self.instances[instance].type_name.clone();
+            let Some(ty) = self.types.iter().find(|t| t.name == type_name) else {
+                return Ok(None);
+            };
+            for constraint in &ty.constraints {
+                if constraint.is_bind {
+                    continue;
+                }
+                let Expr::ChosenFrom { target, list, .. } = &constraint.expr else {
+                    continue;
+                };
+                // 10.5.8: a chosen_from constraint is not allowed under a
+                // `when` subtype; the declaring type of the governing
+                // constraint is where that is visible.
+                if !ty.when_of.is_empty() {
+                    return Err(self.error(
+                        "E0402",
+                        "chosen_from is not allowed under a when subtype (10.5.8)",
+                        constraint.span,
+                    ));
+                }
+                if constraint_path_segments(target).as_deref() == Some(remaining.as_slice()) {
+                    return Ok(Some((instance, remaining, list.as_ref().clone())));
+                }
+            }
+            if remaining.len() <= 1 {
+                return Ok(None);
+            }
+            let Some(Value::Object(next)) = self.instances[instance].get(&remaining[0]).cloned()
+            else {
+                return Ok(None);
+            };
+            instance = next;
+            remaining.remove(0);
+        }
+    }
+
+    /// The constraints that gate a clause 10.5.8 chosen_from choice: every
+    /// non-bind, non-chosen_from constraint declared in the types along
+    /// the target path — the declaring struct and the structs it reaches
+    /// through — that constrains a path extending the target path,
+    /// evaluated in each declaring instance's context. Constraints in
+    /// descendants of the target are never collected (10.5.8).
+    fn chosen_from_other_constraints(
+        &self,
+        start_instance: usize,
+        start_remaining: &[String],
+    ) -> Vec<(usize, Expr)> {
+        let mut other: Vec<(usize, Expr)> = Vec::new();
+        let mut instance = start_instance;
+        let mut remaining: Vec<String> = start_remaining.to_vec();
+        loop {
+            let type_name = self.instances[instance].type_name.clone();
+            if let Some(ty) = self.types.iter().find(|t| t.name == type_name) {
+                for constraint in &ty.constraints {
+                    if constraint.is_bind || matches!(constraint.expr, Expr::ChosenFrom { .. }) {
+                        continue;
+                    }
+                    if expr_extends_path(&constraint.expr, &remaining) {
+                        other.push((instance, constraint.expr.clone()));
+                    }
+                }
+            }
+            if remaining.len() <= 1 {
+                return other;
+            }
+            let Some(Value::Object(next)) = self.instances[instance].get(&remaining[0]).cloned()
+            else {
+                return other;
+            };
+            instance = next;
+            remaining.remove(0);
+        }
+    }
+
+    /// Apply one clause 10.5.8 `target chosen_from read_only(list)`
+    /// constraint: the list elements are substituted into the target slot
+    /// (`slot_instance.slot_remaining`) one by one, the other constraints
+    /// on paths through the target (`(instance, constraint)` pairs, each
+    /// evaluated in its declaring instance's context) must all hold with
+    /// the candidate bound, and one satisfying element is picked uniformly
+    /// with the seeded RNG. An empty list, or no satisfying element, is a
+    /// generation contradiction (`E0417`).
+    fn gen_chosen_from(
+        &mut self,
+        slot_instance: usize,
+        slot_remaining: &[String],
+        list_expr: &Expr,
+        other: &[(usize, Expr)],
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        let target_text = slot_remaining.join(".");
+        self.check_chosen_from_target(slot_instance, slot_remaining, &target_text, span)?;
+        let list_text = expr_text(list_expr);
+        let list_value = self.eval(list_expr, &mut Frame::default(), Some(slot_instance))?;
+        let Value::List(list) = list_value else {
+            return Err(self.error(
+                "E0402",
+                format!("chosen_from list '{list_text}' does not denote a list"),
+                span,
+            ));
+        };
+        let items = list.items.borrow().clone();
+        // Pointer-equality (and the other whole-object identity and
+        // type-narrowing comparisons) on the target are unsupported
+        // 10.5.8 shapes — reported instead of silently ignored.
+        for (_, constraint) in other {
+            if let Some(shape) = constraint_compares_target_whole(constraint, slot_remaining) {
+                return Err(self.error(
+                    "E0402",
+                    format!(
+                        "chosen_from: a {shape} constraint on the target '{target_text}' is not supported (10.5.8)"
+                    ),
+                    span,
+                ));
+            }
+        }
+        let mut satisfying: Vec<Value> = Vec::new();
+        for candidate in &items {
+            if !self.set_field_path(slot_instance, slot_remaining, candidate.clone()) {
+                return Err(self.error("E0401", format!("unknown field '{target_text}'"), span));
+            }
+            let mut pass = true;
+            for (instance, constraint) in other {
+                match self.eval(constraint, &mut Frame::default(), Some(*instance))? {
+                    Value::Bool(true) => {}
+                    Value::Bool(false) => {
+                        pass = false;
+                        break;
+                    }
+                    _ => {
+                        return Err(self.error(
+                            "E0402",
+                            "constraint did not evaluate to a boolean",
+                            span,
+                        ));
+                    }
+                }
+            }
+            if pass {
+                satisfying.push(candidate.clone());
+            }
+        }
+        if satisfying.is_empty() {
+            return Err(self.error(
+                "E0417",
+                format!(
+                    "chosen_from: no element of '{list_text}' satisfies the constraints on '{target_text}'"
+                ),
+                span,
+            ));
+        }
+        // 10.5.8: one of the satisfying elements, chosen uniformly.
+        let pick = self.rng.below(satisfying.len() as u128) as usize;
+        let chosen = satisfying[pick].clone();
+        if !self.set_field_path(slot_instance, slot_remaining, chosen) {
+            return Err(self.error("E0401", format!("unknown field '{target_text}'"), span));
+        }
+        Ok(())
+    }
+
+    /// The 10.5.8 target-shape rules checked where the type information
+    /// lives: every segment names a field, no `!` field on the path, and
+    /// the target itself is a generative struct field (not `!`, `%`,
+    /// `const`, `static` or unit-typed — units are instantiated, never
+    /// generated).
+    fn check_chosen_from_target(
+        &self,
+        slot_instance: usize,
+        slot_remaining: &[String],
+        target_text: &str,
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        let mut instance = slot_instance;
+        let last = slot_remaining.len() - 1;
+        for (position, segment) in slot_remaining.iter().enumerate() {
+            let type_name = self.instances[instance].type_name.clone();
+            let Some(ty) = self.types.iter().find(|t| t.name == type_name) else {
+                return Err(self.error(
+                    "E0401",
+                    format!("unknown type '{type_name}' in chosen_from target '{target_text}'"),
+                    span,
+                ));
+            };
+            let Some(field) = ty.fields.iter().find(|field| &field.name == segment) else {
+                return Err(self.error(
+                    "E0401",
+                    format!("unknown field '{segment}' in chosen_from target '{target_text}'"),
+                    span,
+                ));
+            };
+            if position < last {
+                if field.no_gen {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "chosen_from target '{target_text}' goes through a '!' field (10.5.8)"
+                        ),
+                        span,
+                    ));
+                }
+                let Some(Value::Object(next)) = self.instances[instance].get(segment).cloned()
+                else {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "chosen_from target '{target_text}' must go through struct instances"
+                        ),
+                        span,
+                    ));
+                };
+                instance = next;
+            } else {
+                let not_generative = field.no_gen
+                    || field.physical
+                    || field.is_const
+                    || field.is_static
+                    || self.is_unit_typed(&field.ty)
+                    || matches!(field.ty, TypeExpr::List { .. });
+                if not_generative {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "chosen_from target '{target_text}' must be a generative struct field (10.5.8)"
+                        ),
+                        span,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Assign `value` to the slot named by a dotted field path: every
+    /// segment except the last must currently hold a struct instance.
+    fn set_field_path(&mut self, instance: usize, remaining: &[String], value: Value) -> bool {
+        let mut instance = instance;
+        let last = remaining.len() - 1;
+        for (position, segment) in remaining.iter().enumerate() {
+            if position == last {
+                return self.instances[instance].set(segment, value);
+            }
+            let Some(Value::Object(next)) = self.instances[instance].get(segment).cloned() else {
+                return false;
+            };
+            instance = next;
+        }
+        false
     }
 
     fn declared_type_of(
@@ -2735,6 +3209,201 @@ impl<'a> Interp<'a> {
     /// the type's top-level `keep` constraints must all hold.
     /// Whether the type expression names a unit (instance) type — those
     /// fields are instantiated, never generated.
+    /// `field rgf= exp;` (clause 18.6): assign a concrete value to an
+    /// already-generated range-generated field. The value must belong to
+    /// the field's generated reduced set (10.3.13) — `E0415` otherwise,
+    /// and there is no automatic width cast: a value that does not fit
+    /// the field's type is simply outside the set. The field must have
+    /// been generated (`E0416`); a non-rgf target is `E0130` (the
+    /// well-formedness pass reports it too — this is the unchecked-parse
+    /// path).
+    fn exec_rgf_assign(
+        &mut self,
+        target: &Expr,
+        value: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        let (instance, field) = self.rgf_target_instance_field(target, frame, me, span)?;
+        let field_decl = self.rgf_field_declaration(instance, &field, span)?;
+        if !field_decl.range_gen {
+            return Err(self.error("E0130", "rgf= target is not a range-generated field", span));
+        }
+        let type_name = self.instances[instance].type_name.clone();
+        let Some(state) = self.instances[instance].rgf.get(&field).cloned() else {
+            return Err(self.error(
+                "E0416",
+                format!(
+                    "rgf query/assign before generation: field '{field}' of '{type_name}' was not generated"
+                ),
+                span,
+            ));
+        };
+        let value = self.eval(value, frame, me)?;
+        let numeric = match &value {
+            Value::Int(v) => *v,
+            Value::Bool(b) => *b as i128,
+            Value::Enum { type_name, name } => {
+                self.enumeral_index(type_name, name).ok_or_else(|| {
+                    self.error(
+                        "E0402",
+                        format!("'{name}' is not an enumerand of '{type_name}'"),
+                        span,
+                    )
+                })?
+            }
+            other => {
+                return Err(self.error(
+                    "E0402",
+                    format!(
+                        "rgf= expects a scalar value, got {}",
+                        self.value_kind(other)
+                    ),
+                    span,
+                ));
+            }
+        };
+        if !state
+            .ranges
+            .iter()
+            .any(|(low, high)| *low <= numeric && numeric <= *high)
+        {
+            return Err(self.error(
+                "E0415",
+                format!(
+                    "value {numeric} is outside the generated range {} of '{field}'",
+                    render_set(&state.ranges)
+                ),
+                span,
+            ));
+        }
+        let concrete = self.rgf_concrete_value(&field_decl.ty, numeric, span)?;
+        self.instances[instance].set(&field, concrete);
+        Ok(())
+    }
+
+    /// The clause 29.13 rgf routines, intercepted before the generic
+    /// call path so the field argument arrives as a path (its instance
+    /// and field name), not as an evaluated value.
+    /// `Ok(None)` — not an rgf routine; the caller dispatches normally.
+    fn call_rgf_routine(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<Option<Value>, Diagnostic> {
+        if !matches!(
+            name,
+            "rgf_was_generated" | "rgf_get_range" | "rgf_was_reduced"
+        ) {
+            return Ok(None);
+        }
+        let [arg] = args else {
+            return Err(self.error(
+                "E0402",
+                format!("'{name}' expects one field argument, got {}", args.len()),
+                span,
+            ));
+        };
+        let (instance, field) = self.rgf_target_instance_field(arg, frame, me, span)?;
+        let field_decl = self.rgf_field_declaration(instance, &field, span)?;
+        if !field_decl.range_gen {
+            return Err(self.error(
+                "E0130",
+                format!("'{name}' target is not a range-generated field"),
+                span,
+            ));
+        }
+        let type_name = self.instances[instance].type_name.clone();
+        let state = self.instances[instance].rgf.get(&field).cloned();
+        if name == "rgf_was_generated" {
+            // TRUE iff the solver generated the field; a query on a
+            // generated-yet field is FALSE, not an error (clause 29.13).
+            return Ok(Some(Value::Bool(state.is_some())));
+        }
+        let Some(state) = state else {
+            return Err(self.error(
+                "E0416",
+                format!(
+                    "rgf query/assign before generation: field '{field}' of '{type_name}' was not generated"
+                ),
+                span,
+            ));
+        };
+        match name {
+            "rgf_get_range" => Ok(Some(Value::Set(state.ranges))),
+            "rgf_was_reduced" => Ok(Some(Value::Bool(state.reduced))),
+            _ => unreachable!("routine name matched above"),
+        }
+    }
+
+    /// The declared field one rgf target names: the (instance, field)
+    /// path resolved, the field looked up in its instance's type.
+    fn rgf_field_declaration(
+        &self,
+        instance: usize,
+        field: &str,
+        span: crate::ast::Span,
+    ) -> Result<crate::ast::Field, Diagnostic> {
+        let type_name = self.instances[instance].type_name.clone();
+        let types: &[crate::elab::ElaboratedType] = self.types;
+        let Some(ty) = types.iter().find(|t| t.name == type_name) else {
+            return Err(self.error("E0401", format!("unknown type '{type_name}'"), span));
+        };
+        ty.fields
+            .iter()
+            .find(|f| f.name == field)
+            .cloned()
+            .ok_or_else(|| self.error("E0401", format!("unknown field '{field}'"), span))
+    }
+
+    /// The (instance, field) an rgf target names: a member path whose
+    /// prefix evaluates to an instance and whose last segment is the
+    /// field; a bare name is a field of the enclosing instance (`me`).
+    fn rgf_target_instance_field(
+        &mut self,
+        target: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<(usize, String), Diagnostic> {
+        match target {
+            Expr::MemberAccess { object, name, .. } => {
+                let base = self.eval(object, frame, me)?;
+                match base {
+                    Value::Object(index) => Ok((index, name.clone())),
+                    other => Err(self.error(
+                        "E0402",
+                        format!(
+                            "rgf target is not an instance field, got {}",
+                            self.value_kind(&other)
+                        ),
+                        span,
+                    )),
+                }
+            }
+            Expr::Ident { name, .. } => {
+                if frame.locals.contains_key(name) {
+                    return Err(self.error(
+                        "E0402",
+                        format!("'{name}' is not a field of the enclosing instance"),
+                        span,
+                    ));
+                }
+                match me {
+                    Some(index) => Ok((index, name.clone())),
+                    None => {
+                        Err(self.error("E0402", "rgf target requires an enclosing instance", span))
+                    }
+                }
+            }
+            _ => Err(self.error("E0402", "rgf target must be a field path", span)),
+        }
+    }
+
     fn is_unit_typed(&self, ty: &TypeExpr) -> bool {
         match ty {
             TypeExpr::Named { name, .. } => self
@@ -2811,6 +3480,17 @@ impl<'a> Interp<'a> {
             ));
         };
         let type_span = ty.span;
+        // The range-generated (`~`) fields (clause 6.9.7), declaration
+        // order. They are excluded from sampling below exactly like `!`
+        // fields: their values come from the reduced-set pass after the
+        // other fields are concrete (10.3.13).
+        let rgf_fields: Vec<(String, TypeExpr)> = ty
+            .fields
+            .iter()
+            .filter(|field| field.range_gen && !field.is_static)
+            .map(|field| (field.name.clone(), field.ty.clone()))
+            .collect();
+        let rgf_names: BTreeSet<String> = rgf_fields.iter().map(|(name, _)| name.clone()).collect();
         // `!` fields keep their value; instance (unit-typed) fields are
         // not generated — they are instantiated structurally. A `const`
         // field keeps its value too: it is initialised once (by its init
@@ -2818,12 +3498,14 @@ impl<'a> Interp<'a> {
         // generation must not overwrite it. A static field is not an
         // instance member at all (clause 6.9.3) and is never generated.
         // A subtype view's determinant fields are fixed by the view
-        // (6.7) and are not sampled.
+        // (6.7) and are not sampled. A `~` field is not sampled either —
+        // see the reduced-set pass below.
         let field_types: Vec<(String, TypeExpr)> = ty
             .fields
             .iter()
             .filter(|field| {
                 !field.no_gen
+                    && !field.range_gen
                     && !field.is_const
                     && !field.is_static
                     && !self.is_unit_typed(&field.ty)
@@ -2838,14 +3520,92 @@ impl<'a> Interp<'a> {
             .map(|constraint| constraint.expr.clone())
             .collect();
         constraints.extend(enclosing.iter().cloned());
+        // The clause 10.5.8 chosen_from constraints of this type: each
+        // must target one of the type's own generative fields (a deeper
+        // target path is applied by generating the field path explicitly,
+        // `gen h.p`; there is no ICFS machinery in this stage for the
+        // target to participate in). A chosen_from declared under a
+        // `when` subtype, or with a target that is not a simple field
+        // path of this type, is an unsupported shape.
+        let mut chosen_specs: Vec<(String, Expr)> = Vec::new();
+        for constraint in &constraints {
+            // The bind constraints are filtered out at the collection
+            // site; every entry here is a plain constraint expression.
+            let Expr::ChosenFrom { target, list, .. } = constraint else {
+                continue;
+            };
+            if !ty.when_of.is_empty() {
+                return Err(self.error(
+                    "E0402",
+                    "chosen_from is not allowed under a when subtype (10.5.8)",
+                    constraint.span(),
+                ));
+            }
+            let Some(segments) = constraint_path_segments(target) else {
+                return Err(self.error(
+                    "E0402",
+                    "chosen_from target must be a simple field path (10.5.8)",
+                    constraint.span(),
+                ));
+            };
+            let [field] = segments.as_slice() else {
+                return Err(self.error(
+                    "E0402",
+                    format!(
+                        "chosen_from target '{}' must be a field of '{type_name}' (10.5.8); deeper target paths are applied by generating the field path",
+                        segments.join(".")
+                    ),
+                    constraint.span(),
+                ));
+            };
+            chosen_specs.push((field.clone(), list.as_ref().clone()));
+        }
+        let chosen_names: std::collections::BTreeSet<String> = chosen_specs
+            .iter()
+            .map(|(field, _)| field.clone())
+            .collect();
+        // The constraint split (10.3.13): constraints referencing an rgf
+        // field drive that field's reduced set; the rest gate the
+        // sampling of the non-rgf fields as before.
+        let mut rgf_constraints: Vec<Expr> = Vec::new();
+        let mut plain_constraints: Vec<Expr> = Vec::new();
+        for constraint in &constraints {
+            if rgf_field_refs(constraint, &rgf_names).is_empty() {
+                plain_constraints.push(constraint.clone());
+            } else {
+                rgf_constraints.push(constraint.clone());
+            }
+        }
+        // Every rgf-involving constraint must match a supported reduced-
+        // set shape (10.3.13), checked before anything is generated so an
+        // unsupported shape is a deterministic E0317.
+        let rgf_order: Vec<String> = rgf_fields.iter().map(|(name, _)| name.clone()).collect();
+        for constraint in &rgf_constraints {
+            if let Err(field) = rgf_constraint_shape(constraint, &rgf_names, &rgf_order) {
+                return Err(self.error(
+                    "E0317",
+                    format!("unsupported constraint shape for range-generated field '{field}'"),
+                    type_span,
+                ));
+            }
+        }
+        // The per-field constraint bookkeeping: each rgf-involving
+        // constraint carries exactly one rgf atom (the shape check); the
+        // map groups them by the field that atom constrains.
+        let mut per_field: BTreeMap<String, Vec<Expr>> = BTreeMap::new();
+        for constraint in &rgf_constraints {
+            if let Ok(Some(field)) = rgf_constraint_atom_field(constraint, &rgf_names, &rgf_order) {
+                per_field.entry(field).or_default().push(constraint.clone());
+            }
+        }
         // Simple range/equality constraints narrow the per-field sampling
         // domains; everything else is enforced by the rejection predicate.
-        let domains = self.constraint_domains(&constraints, &field_types);
+        let domains = self.constraint_domains(&plain_constraints, &field_types);
         // Solver-backed path (feature `solver-pumpkin`): the integer
         // scalar fields are solved, the remaining fields are sampled.
         #[cfg(feature = "solver-pumpkin")]
         if let Some(assignment) =
-            self.try_solve_fields(&field_types, &constraints, &type_name, type_span)?
+            self.try_solve_fields(&field_types, &plain_constraints, &type_name, type_span)?
         {
             for (name, field_ty) in &field_types {
                 match assignment.iter().find(|(assigned, _)| assigned == name) {
@@ -2853,15 +3613,43 @@ impl<'a> Interp<'a> {
                         self.instances[index].set(name, Value::Int(*value));
                     }
                     None => {
+                        // A chosen_from target is assigned a list element
+                        // below, not sampled.
+                        if chosen_names.contains(name) {
+                            continue;
+                        }
                         let value = self.sample_type(field_ty)?;
                         self.instances[index].set(name, value);
                     }
                 }
             }
-            return Ok(());
+            for (field, list_expr) in &chosen_specs {
+                let other = self.chosen_from_other_constraints(index, std::slice::from_ref(field));
+                let mut other = other;
+                other.extend(
+                    enclosing
+                        .iter()
+                        .filter(|expr| expr_extends_path(expr, std::slice::from_ref(field)))
+                        .map(|expr| (index, expr.clone())),
+                );
+                self.gen_chosen_from(
+                    index,
+                    std::slice::from_ref(field),
+                    list_expr,
+                    &other,
+                    type_span,
+                )?;
+            }
+            return self.generate_rgf_fields(index, &rgf_fields, &per_field, &type_name, type_span);
         }
         for _ in 0..1000 {
             for (name, field_ty) in &field_types {
+                // A chosen_from target is assigned a list element after
+                // the other fields are sampled (so co-constraints see
+                // their values), not sampled here.
+                if chosen_names.contains(name) {
+                    continue;
+                }
                 let value = match domains.get(name) {
                     Some(domain) => self.sample_int_in(field_ty, *domain),
                     None => self.sample_type(field_ty)?,
@@ -2870,7 +3658,7 @@ impl<'a> Interp<'a> {
                 // A `keep list.size() == N` constraint drives the list
                 // length: fill the sampled (empty) list with generated
                 // elements so the constraint can pass.
-                if let Some(length) = self.required_list_size(name, &constraints)
+                if let Some(length) = self.required_list_size(name, &plain_constraints)
                     && let Value::List(list) = self.instances[index]
                         .get(name)
                         .cloned()
@@ -2891,8 +3679,29 @@ impl<'a> Interp<'a> {
                     *list.items.borrow_mut() = filled;
                 }
             }
+            // Clause 10.5.8: assign each chosen_from target now — the
+            // other fields carry their sampled values, so the constraints
+            // co-constraining paths through the target and another field
+            // evaluate meaningfully.
+            for (field, list_expr) in &chosen_specs {
+                let other = self.chosen_from_other_constraints(index, std::slice::from_ref(field));
+                let mut other = other;
+                other.extend(
+                    enclosing
+                        .iter()
+                        .filter(|expr| expr_extends_path(expr, std::slice::from_ref(field)))
+                        .map(|expr| (index, expr.clone())),
+                );
+                self.gen_chosen_from(
+                    index,
+                    std::slice::from_ref(field),
+                    list_expr,
+                    &other,
+                    type_span,
+                )?;
+            }
             let mut pass = true;
-            for constraint in &constraints {
+            for constraint in &plain_constraints {
                 // HDL-binding constraints (`keep x.hdl_path() == "…"`,
                 // `keep x.delayed() == FALSE`, the event-port
                 // `keep x.edge() == …` attribute of 9.7.3) and the unit
@@ -2914,6 +3723,11 @@ impl<'a> Interp<'a> {
                 ) {
                     continue;
                 }
+                // A chosen_from constraint assigns its target above; it
+                // is not itself a predicate.
+                if matches!(constraint, Expr::ChosenFrom { .. }) {
+                    continue;
+                }
                 match self.eval(constraint, &mut Frame::default(), Some(index))? {
                     Value::Bool(true) => {}
                     Value::Bool(false) => {
@@ -2930,7 +3744,13 @@ impl<'a> Interp<'a> {
                 }
             }
             if pass {
-                return Ok(());
+                return self.generate_rgf_fields(
+                    index,
+                    &rgf_fields,
+                    &per_field,
+                    &type_name,
+                    type_span,
+                );
             }
         }
         Err(self.error(
@@ -2938,6 +3758,340 @@ impl<'a> Interp<'a> {
             format!("no solution found for the constraints of '{type_name}' after 1000 attempts"),
             type_span,
         ))
+    }
+
+    /// The reduced-set pass (10.3.13) over one generated instance's `~`
+    /// fields, after every non-rgf field holds its concrete value.
+    ///
+    /// Algorithm v1 (per the 2019 migration plan, T5.2): for each rgf
+    /// field, the generated set is the intersection over the field's
+    /// applicable constraints of the value sets those constraints imply.
+    /// A constraint's implication is computed on the constraint's shape
+    /// tree — `lhs && rhs` intersects the sides' contributions, `lhs ||
+    /// rhs` unions them, `bool-exp => atom` contributes the atom's set
+    /// when the guard evaluates TRUE and the field type's full set when
+    /// it evaluates FALSE — and an atom `f relop exp` (or `f in set`,
+    /// `f not in set`) with the rgf side a bare field reference and the
+    /// other side rgf-free contributes the interval(s) that `rel-op`
+    /// implies with `exp` evaluated to a constant against the already
+    /// generated field values. The concrete value is the set's minimum
+    /// (the first interval's lower bound) — deterministic, and per the
+    /// standard implementation-defined. Because a supported shape has
+    /// at most one rgf atom (two atoms naming different fields are
+    /// E0317), no constraint couples two rgf fields and the per-field
+    /// passes are independent.
+    fn generate_rgf_fields(
+        &mut self,
+        index: usize,
+        rgf_fields: &[(String, TypeExpr)],
+        per_field: &BTreeMap<String, Vec<Expr>>,
+        type_name: &str,
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        for (name, field_ty) in rgf_fields {
+            let Some(full_range) = self.type_value_range(field_ty) else {
+                return Err(self.error(
+                    "E0402",
+                    format!("range-generated field '{name}' has no representable value range"),
+                    span,
+                ));
+            };
+            let full_set = vec![full_range];
+            let mut set = full_set.clone();
+            for constraint in per_field.get(name).into_iter().flatten() {
+                let contribution =
+                    self.rgf_contribution(constraint, name, index, &full_set, span)?;
+                set = intersect_interval_sets(&set, &contribution);
+            }
+            if set.is_empty() {
+                return Err(self.error(
+                    "E0407",
+                    format!(
+                        "the constraints of '{type_name}' leave no value for range-generated field '{name}'"
+                    ),
+                    span,
+                ));
+            }
+            let reduced = set != full_set;
+            let concrete = self.rgf_concrete_value(field_ty, set[0].0, span)?;
+            self.instances[index].set(name, concrete);
+            self.instances[index].rgf.insert(
+                name.clone(),
+                RgfState {
+                    ranges: set,
+                    reduced,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// The value set one supported constraint shape contributes to rgf
+    /// field `field`, with the instance's other fields concrete. The
+    /// shape was validated by [`rgf_constraint_shape`]; every node that
+    /// does not involve the field is rgf-free and evaluates as a Boolean
+    /// constant here.
+    fn rgf_contribution(
+        &mut self,
+        expr: &Expr,
+        field: &str,
+        index: usize,
+        full_set: &[(i128, i128)],
+        span: crate::ast::Span,
+    ) -> Result<Vec<(i128, i128)>, Diagnostic> {
+        match expr {
+            Expr::Paren { expr, .. } => self.rgf_contribution(expr, field, index, full_set, span),
+            Expr::Binary {
+                op: BinaryOp::LogicalAnd,
+                lhs,
+                rhs,
+                ..
+            } => {
+                let left = self.rgf_contribution(lhs, field, index, full_set, span)?;
+                let right = self.rgf_contribution(rhs, field, index, full_set, span)?;
+                Ok(intersect_interval_sets(&left, &right))
+            }
+            Expr::Binary {
+                op: BinaryOp::LogicalOr,
+                lhs,
+                rhs,
+                ..
+            } => {
+                let left = self.rgf_contribution(lhs, field, index, full_set, span)?;
+                let right = self.rgf_contribution(rhs, field, index, full_set, span)?;
+                Ok(union_interval_sets(&left, &right))
+            }
+            // An implication whose antecedent is FALSE contributes the
+            // full type range (the constraint is vacuously satisfied).
+            Expr::Binary {
+                op: BinaryOp::Imply,
+                lhs,
+                rhs,
+                ..
+            } => match self.eval(lhs, &mut Frame::default(), Some(index))? {
+                Value::Bool(true) => self.rgf_contribution(rhs, field, index, full_set, span),
+                Value::Bool(false) => Ok(full_set.to_vec()),
+                other => Err(self.error(
+                    "E0402",
+                    format!(
+                        "constraint guard did not evaluate to a boolean, got {}",
+                        self.value_kind(&other)
+                    ),
+                    span,
+                )),
+            },
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr: inner,
+                ..
+            } => {
+                // The `not in` spelling (the parser wraps the membership
+                // in a unary `not`; parentheses unwrap); any other `not`
+                // over rgf-free operands is a Boolean constant.
+                if let Some((element, set)) = rgf_inset_parts(inner)
+                    && rgf_bare_ref(element, field)
+                {
+                    let contained = self.rgf_set_contribution(set, index, span)?;
+                    return Ok(complement_interval_set(&contained, full_set[0]));
+                }
+                match self.eval(expr, &mut Frame::default(), Some(index))? {
+                    Value::Bool(true) => Ok(full_set.to_vec()),
+                    Value::Bool(false) => Ok(Vec::new()),
+                    other => Err(self.error(
+                        "E0402",
+                        format!(
+                            "constraint did not evaluate to a boolean, got {}",
+                            self.value_kind(&other)
+                        ),
+                        span,
+                    )),
+                }
+            }
+            Expr::Binary { op, lhs, rhs, .. }
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::NotEq
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                ) && (rgf_bare_ref(lhs, field) || rgf_bare_ref(rhs, field)) =>
+            {
+                // One side is the bare rgf reference (shape-checked); the
+                // other evaluates to a constant scalar.
+                let (value, rgf_is_lhs) = if rgf_bare_ref(lhs, field) {
+                    (self.rgf_scalar_operand(rhs, index, span)?, true)
+                } else {
+                    (self.rgf_scalar_operand(lhs, index, span)?, false)
+                };
+                let interval = match (op, rgf_is_lhs) {
+                    (BinaryOp::Eq, _) => (value, value),
+                    (BinaryOp::NotEq, _) => {
+                        return Ok(complement_interval_set(&[(value, value)], full_set[0]));
+                    }
+                    (BinaryOp::Lt, true) | (BinaryOp::Gt, false) => {
+                        (i128::MIN, value.saturating_sub(1))
+                    }
+                    (BinaryOp::Le, true) | (BinaryOp::Ge, false) => (i128::MIN, value),
+                    (BinaryOp::Gt, true) | (BinaryOp::Lt, false) => {
+                        (value.saturating_add(1), i128::MAX)
+                    }
+                    (BinaryOp::Ge, true) | (BinaryOp::Le, false) => (value, i128::MAX),
+                    _ => unreachable!("relation op matched above"),
+                };
+                Ok(vec![interval])
+            }
+            Expr::InSet { element, set, .. } if rgf_bare_ref(element, field) => {
+                let contained = self.rgf_set_contribution(set, index, span)?;
+                Ok(contained)
+            }
+            // Any node that does not involve the field is rgf-free (the
+            // shape check guarantees at most one rgf atom per
+            // constraint): it evaluates to a Boolean constant — TRUE
+            // contributes the full range, FALSE the empty set.
+            _ => match self.eval(expr, &mut Frame::default(), Some(index))? {
+                Value::Bool(true) => Ok(full_set.to_vec()),
+                Value::Bool(false) => Ok(Vec::new()),
+                other => Err(self.error(
+                    "E0402",
+                    format!(
+                        "constraint did not evaluate to a boolean, got {}",
+                        self.value_kind(&other)
+                    ),
+                    span,
+                )),
+            },
+        }
+    }
+
+    /// The value set an `in` right side contributes: a bracket literal
+    /// (items or range) with constant bounds, or a general set
+    /// expression evaluated to a set value.
+    fn rgf_set_contribution(
+        &mut self,
+        set: &crate::ast::InSetExpr,
+        index: usize,
+        span: crate::ast::Span,
+    ) -> Result<Vec<(i128, i128)>, Diagnostic> {
+        match set {
+            crate::ast::InSetExpr::Range(low, high) => {
+                let low = self.rgf_scalar_operand(low, index, span)?;
+                let high = self.rgf_scalar_operand(high, index, span)?;
+                Ok(vec![(low, high)])
+            }
+            crate::ast::InSetExpr::Items(items) => {
+                let mut intervals = Vec::with_capacity(items.len());
+                for item in items {
+                    let value = self.rgf_scalar_operand(item, index, span)?;
+                    intervals.push((value, value));
+                }
+                Ok(canonical_set(intervals))
+            }
+            crate::ast::InSetExpr::Expr(expr) => {
+                let value = self.eval(expr, &mut Frame::default(), Some(index))?;
+                let Value::Set(intervals) = value else {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "constraint set expression does not evaluate to a set, got {}",
+                            self.value_kind(&value)
+                        ),
+                        span,
+                    ));
+                };
+                Ok(intervals)
+            }
+        }
+    }
+
+    /// The scalar constant one non-rgf constraint operand evaluates to
+    /// against the generated field values: an integer, a boolean (0/1)
+    /// or an enumerand (its index).
+    fn rgf_scalar_operand(
+        &mut self,
+        expr: &Expr,
+        index: usize,
+        span: crate::ast::Span,
+    ) -> Result<i128, Diagnostic> {
+        let value = self.eval(expr, &mut Frame::default(), Some(index))?;
+        match &value {
+            Value::Int(v) => Ok(*v),
+            Value::Bool(b) => Ok(*b as i128),
+            Value::Enum { type_name, name } => {
+                self.enumeral_index(type_name, name).ok_or_else(|| {
+                    self.error(
+                        "E0402",
+                        format!("'{name}' is not an enumerand of '{type_name}'"),
+                        span,
+                    )
+                })
+            }
+            other => Err(self.error(
+                "E0402",
+                format!(
+                    "constraint operand is not a scalar value, got {}",
+                    self.value_kind(other)
+                ),
+                span,
+            )),
+        }
+    }
+
+    /// The concrete value an rgf field takes: the set's minimum (the
+    /// first canonical interval's lower bound), mapped to the field's
+    /// type — an integer, a boolean, or the enumerand at that index.
+    fn rgf_concrete_value(
+        &mut self,
+        ty: &TypeExpr,
+        minimum: i128,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        match ty {
+            TypeExpr::Scalar {
+                base: ScalarBase::Bool,
+                ..
+            } => Ok(Value::Bool(minimum != 0)),
+            TypeExpr::Scalar { .. } => Ok(Value::Int(minimum)),
+            TypeExpr::Named { name, .. } => {
+                let values = self.enumeral_values(name);
+                if values.is_empty() {
+                    return Ok(Value::Int(minimum));
+                }
+                let Some(pick) = values
+                    .get(minimum.unsigned_abs() as usize)
+                    .filter(|_| minimum >= 0)
+                else {
+                    return Err(self.error(
+                        "E0402",
+                        format!("index {minimum} is not an enumerand of '{name}'"),
+                        span,
+                    ));
+                };
+                Ok(Value::Enum {
+                    type_name: name.clone(),
+                    name: pick.clone(),
+                })
+            }
+            TypeExpr::InlineEnum { names, .. } => {
+                let Some(pick) = names
+                    .get(minimum.unsigned_abs() as usize)
+                    .filter(|_| minimum >= 0)
+                else {
+                    return Err(self.error(
+                        "E0402",
+                        format!("index {minimum} is not an enumerand of the inline enumeral list"),
+                        span,
+                    ));
+                };
+                Ok(Value::Enum {
+                    type_name: inline_enum_key(names),
+                    name: pick.clone(),
+                })
+            }
+            TypeExpr::WhenQualified { base, .. } => self.rgf_concrete_value(base, minimum, span),
+            _ => Ok(Value::Int(minimum)),
+        }
     }
 
     /// Translate the type's `keep` constraints over its integer scalar
@@ -2959,7 +4113,15 @@ impl<'a> Interp<'a> {
         if bounds.is_empty() {
             return Ok(None);
         }
-        let problem = match crate::solve::translate(constraints, &bounds) {
+        // A chosen_from constraint assigns its own target when that is
+        // generated; it is not a linear predicate, and its presence must
+        // not push the type's other fields off the solver.
+        let solver_constraints: Vec<Expr> = constraints
+            .iter()
+            .filter(|constraint| !matches!(**constraint, Expr::ChosenFrom { .. }))
+            .cloned()
+            .collect();
+        let problem = match crate::solve::translate(&solver_constraints, &bounds) {
             Ok(problem) => problem,
             Err(_) => return Ok(None),
         };
@@ -3187,6 +4349,10 @@ impl<'a> Interp<'a> {
                 }
                 Some((low, high))
             }
+            // A general set expression's span is not statically known
+            // here; the row keeps its full projection (the narrowing for
+            // this position is dropped, like a non-constant element's).
+            crate::ast::TableElem::Set(crate::ast::InSetExpr::Expr(_)) => None,
             crate::ast::TableElem::TypeSet { ty, .. } => self.type_value_range(ty),
         }
     }
@@ -3422,9 +4588,13 @@ impl<'a> Interp<'a> {
             }
             // `typeof()`/`typeof_item()` placeholders resolve during
             // elaboration (5.9); reaching the sampler with one means the
-            // static type was undetermined — nothing to generate.
+            // static type was undetermined — nothing to generate. The
+            // template shapes (a formal, a width-qualified formal, a
+            // value actual) never sample.
             TypeExpr::TypeOf { .. } | TypeExpr::TypeOfItem { .. } => Ok(Value::Void),
-            TypeExpr::Formal { .. } => Ok(Value::Void),
+            TypeExpr::Formal { .. } | TypeExpr::FormalWidth { .. } | TypeExpr::Value { .. } => {
+                Ok(Value::Void)
+            }
         }
     }
 
@@ -5154,6 +6324,23 @@ impl<'a> Interp<'a> {
                 let high = self.set_literal_bound(high, frame, me, span)?;
                 intervals.push((low, high));
             }
+            // A general set expression (clause 4.11.6's set-exp) records
+            // no literal bounds: it evaluates to a set value whose
+            // canonical intervals are the result.
+            crate::ast::InSetExpr::Expr(expr) => {
+                let value = self.eval(expr, frame, me)?;
+                let Value::Set(evaluated) = value else {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "set expression does not evaluate to a set, got {}",
+                            self.value_kind(&value)
+                        ),
+                        span,
+                    ));
+                };
+                intervals = evaluated;
+            }
         }
         Ok(Value::Set(canonical_set(intervals)))
     }
@@ -5262,6 +6449,23 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 Ok((low..=high).map(Value::Int).collect())
+            }
+            // A general set expression: its set value's elements in order
+            // (intervals expanded; the iteration cap of the range arm
+            // does not apply — the set is already materialized).
+            crate::ast::InSetExpr::Expr(expr) => {
+                let value = self.eval(expr, frame, me)?;
+                let Value::Set(intervals) = value else {
+                    return Err(self.error(
+                        "E0402",
+                        "for-each expects a set expression to evaluate to a set",
+                        span,
+                    ));
+                };
+                Ok(intervals
+                    .iter()
+                    .flat_map(|(lo, hi)| (*lo..=*hi).map(Value::Int))
+                    .collect())
             }
         }
     }
@@ -6682,6 +7886,14 @@ impl<'a> Interp<'a> {
             }
             Expr::BoolLiteral { value, .. } => Ok(Value::Bool(*value)),
             Expr::StringLiteral { value, .. } => Ok(Value::Str(unescape(value))),
+            // A template value formal substitutes to a constant at
+            // instantiation (8.5.2); reaching the evaluator with one
+            // means the substitution never bound it — no value.
+            Expr::Formal { name, span } => Err(self.error(
+                "E0402",
+                format!("template value parameter <{name}> is not substituted"),
+                *span,
+            )),
             Expr::Ident { name, span } => {
                 if name == "me" || name == "self" {
                     return match me {
@@ -6705,6 +7917,12 @@ impl<'a> Interp<'a> {
                 // inline subset.
                 if name == "TEST_DONE" {
                     return Ok(Value::Int(0));
+                }
+                // The predefined numeric constants (clause 4.1's named
+                // constants; the select-choice evaluator resolves them
+                // too): MAX_UINT, MAX_INT, MIN_INT.
+                if let Some(value) = predefined_constant(name) {
+                    return Ok(Value::Int(value));
                 }
                 if let Some(value) = frame.locals.get(name) {
                     return Ok(value.clone());
@@ -6852,6 +8070,15 @@ impl<'a> Interp<'a> {
                 self.read_qualified_field(index, qualifiers, field, *field_span, *span)
             }
             Expr::Call { callee, args, span } => {
+                // The clause 29.13 rgf routines read their field argument
+                // as a path (its instance and field name), not as a
+                // value: the interception runs before the generic
+                // argument evaluation.
+                if let Expr::Ident { name, .. } = callee.as_ref()
+                    && let Some(result) = self.call_rgf_routine(name, args, frame, me, *span)?
+                {
+                    return Ok(result);
+                }
                 // The 27.4.17/27.4.20/27.5.4-27.5.6 aggregates read their
                 // receiver before the arguments: the per-item expression
                 // (`l.sum(it)`) names `it`, which is not a value outside
@@ -7327,6 +8554,60 @@ impl<'a> Interp<'a> {
                         };
                         low_v <= *v && *v <= high_v
                     }
+                    // A general set expression (4.11.6's set-exp): the
+                    // operand evaluates to a set — membership over its
+                    // intervals — or to a list, whose items are compared
+                    // item-by-item.
+                    crate::ast::InSetExpr::Expr(set_expr) => {
+                        let container = self.eval(set_expr, frame, me)?;
+                        match container {
+                            Value::Set(intervals) => match &value {
+                                Value::Int(v) => {
+                                    intervals.iter().any(|(lo, hi)| *lo <= *v && *v <= *hi)
+                                }
+                                Value::Bool(b) => {
+                                    let v = *b as i128;
+                                    intervals.iter().any(|(lo, hi)| *lo <= v && v <= *hi)
+                                }
+                                _ => {
+                                    return Err(self.error(
+                                        "E0402",
+                                        "set membership expects an integer, boolean or enumerand",
+                                        *span,
+                                    ));
+                                }
+                            },
+                            Value::List(list) => {
+                                let items = list.items.borrow().clone();
+                                let mut found = false;
+                                for item in items {
+                                    if matches!(
+                                        self.apply_binary(
+                                            BinaryOp::Eq,
+                                            value.clone(),
+                                            item,
+                                            *span
+                                        )?,
+                                        Value::Bool(true)
+                                    ) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                found
+                            }
+                            other => {
+                                return Err(self.error(
+                                    "E0402",
+                                    format!(
+                                        "'in' expects a set or list, got {}",
+                                        self.value_kind(&other)
+                                    ),
+                                    *span,
+                                ));
+                            }
+                        }
+                    }
                 };
                 Ok(Value::Bool(contained))
             }
@@ -7534,6 +8815,15 @@ impl<'a> Interp<'a> {
                 // member is a static method used as a value.
                 self.read_static_field(type_name, member, *span)
             }
+            // A 10.5.8 chosen_from constraint is not an evaluatable
+            // expression: it is applied by `gen` when its target is
+            // generated. Reaching evaluation means it fired outside that
+            // protocol (an unsupported shape, or outside a keep).
+            Expr::ChosenFrom { span, .. } => Err(self.error(
+                "E0402",
+                "chosen_from is only a keep-constraint form (10.5.8); it is applied when its target is generated",
+                *span,
+            )),
         }
     }
 
@@ -7617,7 +8907,11 @@ impl<'a> Interp<'a> {
                 "'is a' against an unresolved typeof() type is not supported",
                 *span,
             )),
-            TypeExpr::Formal { .. } => Ok(false),
+            // A formal, a width-qualified formal or a value actual never
+            // reaches a resolved `is a` check.
+            TypeExpr::Formal { .. } | TypeExpr::FormalWidth { .. } | TypeExpr::Value { .. } => {
+                Ok(false)
+            }
             TypeExpr::InlineEnum { .. } => Err(self.error(
                 "E0402",
                 "'is a' with an inline enumeral type is not supported",
@@ -7853,6 +9147,23 @@ impl<'a> Interp<'a> {
                 };
                 Ok(low <= *v && *v <= high)
             }
+            // A general set expression: evaluate it to a set and test the
+            // membership over its intervals (the item-wise shape's set
+            // counterpart).
+            crate::ast::TableElem::Set(crate::ast::InSetExpr::Expr(set_expr)) => {
+                let container = self.eval(set_expr, frame, me)?;
+                let Value::Set(intervals) = container else {
+                    return Err(self.error(
+                        "E0402",
+                        "in_table set element does not evaluate to a set",
+                        span,
+                    ));
+                };
+                let Value::Int(v) = value else {
+                    return Err(self.error("E0412", "in_table element type mismatch", span));
+                };
+                Ok(intervals.iter().any(|(lo, hi)| lo <= v && v <= hi))
+            }
             crate::ast::TableElem::TypeSet { ty, .. } => self.type_set_contains(ty, value, span),
         }
     }
@@ -7946,6 +9257,11 @@ impl<'a> Interp<'a> {
                     // The regular `==` on lists is item-by-item (4.11.4's
                     // contrast with `list_ptr==`).
                     (Value::List(a), Value::List(b)) => lists_equal(a, b, 0),
+                    // Set equality (5.2.12): the same canonical
+                    // intervals — whatever produced each set (a literal,
+                    // the set algebra, or the clause 29.13 rgf_get_range
+                    // query).
+                    (Value::Set(a), Value::Set(b)) => a == b,
                     _ => return Err(err("comparison")),
                 };
                 // `===`/`!==` are treated as `==`/`!=` in this subset: value
@@ -8825,6 +10141,19 @@ fn value_holds(value: &Value, word: &str) -> bool {
 /// The MAX_UINT predefined constant (the 28.5 guards' bound).
 const MAX_UINT_VALUE: i128 = (1i128 << 32) - 1;
 
+/// The predefined named numeric constants resolvable as ordinary
+/// expression identifiers: MAX_UINT (2^32-1), MAX_INT (2^31-1) and
+/// MIN_INT (-2^31). The select-choice evaluator resolves the same names
+/// over its recorded tokens.
+fn predefined_constant(name: &str) -> Option<i128> {
+    match name {
+        "MAX_UINT" => Some((1i128 << 32) - 1),
+        "MAX_INT" => Some((1i128 << 31) - 1),
+        "MIN_INT" => Some(-(1i128 << 31)),
+        _ => None,
+    }
+}
+
 /// The inclusive value range of a scalar type from its base and width.
 fn scalar_range(base: ScalarBase, width: &Option<Box<Expr>>) -> Option<(i128, i128)> {
     match base {
@@ -8844,6 +10173,465 @@ fn scalar_range(base: ScalarBase, width: &Option<Box<Expr>>) -> Option<(i128, i1
         ScalarBase::Nibble => Some((0, 15)),
         ScalarBase::Bool => Some((0, 1)),
         ScalarBase::Real | ScalarBase::String | ScalarBase::Time => None,
+    }
+}
+
+/// Intersection of two canonical interval sets (sorted, disjoint): a
+/// two-pointer sweep; the result is canonical again.
+fn intersect_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
+    let mut result = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < a.len() && j < b.len() {
+        let low = a[i].0.max(b[j].0);
+        let high = a[i].1.min(b[j].1);
+        if low <= high {
+            result.push((low, high));
+        }
+        if a[i].1 < b[j].1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    result
+}
+
+/// Union of two canonical interval sets: concatenation plus the
+/// canonicalization merge.
+fn union_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
+    let mut all = a.to_vec();
+    all.extend_from_slice(b);
+    canonical_set(all)
+}
+
+/// The complement of a canonical interval set within `domain` (the
+/// field type's full range): the gaps between the set's intervals.
+fn complement_interval_set(set: &[(i128, i128)], domain: (i128, i128)) -> Vec<(i128, i128)> {
+    let mut result = Vec::new();
+    let mut cursor = domain.0;
+    for &(low, high) in set {
+        if high < cursor || low > domain.1 {
+            continue;
+        }
+        if low > cursor {
+            result.push((cursor, low.saturating_sub(1)));
+        }
+        match high.checked_add(1) {
+            Some(next) if next <= domain.1 => cursor = next.max(cursor),
+            _ => return result,
+        }
+    }
+    if cursor <= domain.1 {
+        result.push((cursor, domain.1));
+    }
+    result
+}
+
+/// The rgf fields a constraint expression references (10.3.13's split):
+/// bare identifiers naming an rgf field of the generated type, and
+/// `me`/`self`-rooted paths ending at one. Deeper member paths belong
+/// to nested instances and are not this generation scope's rgf
+/// references. The walk covers the shapes a constraint can combine;
+/// nodes it does not model (a `select` distribution, `evaluate`, `new`,
+/// table tests) do not descend — a reference hidden inside one is
+/// caught by the shape check's atom rules instead.
+fn rgf_field_refs(expr: &Expr, rgf: &BTreeSet<String>) -> Vec<String> {
+    match expr {
+        Expr::Ident { name, .. } => {
+            if rgf.contains(name) {
+                vec![name.clone()]
+            } else {
+                Vec::new()
+            }
+        }
+        Expr::MemberAccess { object, name, .. } => {
+            let mut refs = rgf_field_refs(object, rgf);
+            if matches!(
+                object.as_ref(),
+                Expr::Ident { name: root, .. } if root == "me" || root == "self"
+            ) && rgf.contains(name)
+            {
+                refs.push(name.clone());
+            }
+            refs
+        }
+        Expr::Paren { expr, .. } => rgf_field_refs(expr, rgf),
+        Expr::Unary { expr, .. } => rgf_field_refs(expr, rgf),
+        Expr::Binary { lhs, rhs, .. } => {
+            let mut refs = rgf_field_refs(lhs, rgf);
+            refs.extend(rgf_field_refs(rhs, rgf));
+            refs
+        }
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            let mut refs = rgf_field_refs(cond, rgf);
+            refs.extend(rgf_field_refs(then_expr, rgf));
+            refs.extend(rgf_field_refs(else_expr, rgf));
+            refs
+        }
+        Expr::InSet { element, set, .. } => {
+            let mut refs = rgf_field_refs(element, rgf);
+            refs.extend(rgf_inset_refs(set, rgf));
+            refs
+        }
+        Expr::Call { callee, args, .. } => {
+            let mut refs = rgf_field_refs(callee, rgf);
+            for arg in args {
+                refs.extend(rgf_field_refs(arg, rgf));
+            }
+            refs
+        }
+        Expr::Index { base, index, .. } => {
+            let mut refs = rgf_field_refs(base, rgf);
+            refs.extend(rgf_field_refs(index, rgf));
+            refs
+        }
+        Expr::CastAs { expr, .. } => rgf_field_refs(expr, rgf),
+        Expr::BitSlice {
+            base, high, low, ..
+        } => {
+            let mut refs = rgf_field_refs(base, rgf);
+            refs.extend(rgf_field_refs(high, rgf));
+            refs.extend(rgf_field_refs(low, rgf));
+            refs
+        }
+        Expr::ListConcat { items, .. } => {
+            let mut refs = Vec::new();
+            for item in items {
+                refs.extend(rgf_field_refs(item, rgf));
+            }
+            refs
+        }
+        Expr::SetLiteral { items, .. } => rgf_inset_refs(items, rgf),
+        _ => Vec::new(),
+    }
+}
+
+/// The rgf references of an `in` right side (bounds, items or a general
+/// set expression).
+fn rgf_inset_refs(set: &crate::ast::InSetExpr, rgf: &BTreeSet<String>) -> Vec<String> {
+    match set {
+        crate::ast::InSetExpr::Items(items) => {
+            let mut refs = Vec::new();
+            for item in items {
+                refs.extend(rgf_field_refs(item, rgf));
+            }
+            refs
+        }
+        crate::ast::InSetExpr::Range(low, high) => {
+            let mut refs = rgf_field_refs(low, rgf);
+            refs.extend(rgf_field_refs(high, rgf));
+            refs
+        }
+        crate::ast::InSetExpr::Expr(expr) => rgf_field_refs(expr, rgf),
+    }
+}
+
+/// Whether the expression is a bare reference to rgf field `field`: the
+/// identifier itself (parentheses unwrapped) or a `me`/`self`-rooted
+/// path ending at the field.
+fn rgf_bare_ref(expr: &Expr, field: &str) -> bool {
+    match expr {
+        Expr::Ident { name, .. } => name == field,
+        Expr::Paren { expr, .. } => rgf_bare_ref(expr, field),
+        Expr::MemberAccess { object, name, .. } => {
+            matches!(
+                object.as_ref(),
+                Expr::Ident { name: root, .. } if root == "me" || root == "self"
+            ) && name == field
+        }
+        _ => false,
+    }
+}
+
+/// The `(element, set)` of an `in` membership, parentheses unwrapped —
+/// the `not in` spelling wraps the membership in a unary `not`.
+fn rgf_inset_parts(expr: &Expr) -> Option<(&Expr, &crate::ast::InSetExpr)> {
+    match expr {
+        Expr::InSet { element, set, .. } => Some((element, set)),
+        Expr::Paren { expr, .. } => rgf_inset_parts(expr),
+        _ => None,
+    }
+}
+
+/// Whether the non-rgf operand side of a supported atom is evaluable to
+/// a constant: no rgf references, no `select` distribution (10.3.12.3's
+/// sampler does not reduce a set) and no generative bitwise operators.
+fn rgf_exp_side_ok(expr: &Expr, rgf: &BTreeSet<String>) -> bool {
+    rgf_field_refs(expr, rgf).is_empty() && !rgf_exp_generative(expr)
+}
+
+/// Whether the expression contains a `select` distribution or a
+/// generative bitwise operator anywhere in its expression tree.
+fn rgf_exp_generative(expr: &Expr) -> bool {
+    match expr {
+        Expr::Select { .. } => true,
+        Expr::Unary {
+            op: UnaryOp::BitNot,
+            ..
+        } => true,
+        Expr::Binary {
+            op:
+                BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight,
+            ..
+        } => true,
+        Expr::Paren { expr, .. } => rgf_exp_generative(expr),
+        Expr::Unary { expr, .. } => rgf_exp_generative(expr),
+        Expr::Binary { lhs, rhs, .. } => rgf_exp_generative(lhs) || rgf_exp_generative(rhs),
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            rgf_exp_generative(cond)
+                || rgf_exp_generative(then_expr)
+                || rgf_exp_generative(else_expr)
+        }
+        Expr::InSet { element, set, .. } => {
+            rgf_exp_generative(element)
+                || match set {
+                    crate::ast::InSetExpr::Items(items) => items.iter().any(rgf_exp_generative),
+                    crate::ast::InSetExpr::Range(low, high) => {
+                        rgf_exp_generative(low) || rgf_exp_generative(high)
+                    }
+                    crate::ast::InSetExpr::Expr(expr) => rgf_exp_generative(expr),
+                }
+        }
+        Expr::Call { callee, args, .. } => {
+            rgf_exp_generative(callee) || args.iter().any(rgf_exp_generative)
+        }
+        Expr::Index { base, index, .. } => rgf_exp_generative(base) || rgf_exp_generative(index),
+        Expr::CastAs { expr, .. } => rgf_exp_generative(expr),
+        Expr::BitSlice {
+            base, high, low, ..
+        } => rgf_exp_generative(base) || rgf_exp_generative(high) || rgf_exp_generative(low),
+        Expr::ListConcat { items, .. } => items.iter().any(rgf_exp_generative),
+        Expr::SetLiteral { items, .. } => match items {
+            crate::ast::InSetExpr::Items(items) => items.iter().any(rgf_exp_generative),
+            crate::ast::InSetExpr::Range(low, high) => {
+                rgf_exp_generative(low) || rgf_exp_generative(high)
+            }
+            crate::ast::InSetExpr::Expr(expr) => rgf_exp_generative(expr),
+        },
+        _ => false,
+    }
+}
+
+/// The first involved rgf field in declaration order — the field an
+/// E0317 names.
+fn rgf_first_in(order: &[String], refs: &[String]) -> String {
+    order
+        .iter()
+        .find(|name| refs.contains(name))
+        .cloned()
+        .unwrap_or_else(|| refs.first().cloned().unwrap_or_default())
+}
+
+/// The supported reduced-set constraint shapes (10.3.13), checked before
+/// generation: `keep [soft] [bool-exp bool-op] rgf-exp rel-op exp
+/// [bool-op bool-exp]` with `bool-op ∈ {&&, ||, =>}` and `rel-op ∈
+/// {==, !=, in, not in, >, >=, <, <=}`, where the rgf side is a bare
+/// field reference, the other side contains no rgf references, no
+/// `select` and no generative bitwise operators. At most one rgf atom
+/// appears in the whole constraint: two atoms naming different fields
+/// would couple the fields' sets, which the per-field pass cannot
+/// split (`a > 3 && b < 10` is E0317; two atoms for the same field
+/// intersect or union soundly and stay supported). `Err` carries the
+/// first involved rgf field in declaration order, for the E0317
+/// message.
+fn rgf_constraint_shape(
+    constraint: &Expr,
+    rgf: &BTreeSet<String>,
+    order: &[String],
+) -> Result<(), String> {
+    rgf_shape_node(constraint, rgf, order).map(|_| ())
+}
+
+/// The field whose single rgf atom the (already shape-checked)
+/// constraint carries, or `None` when it is rgf-free.
+fn rgf_constraint_atom_field(
+    constraint: &Expr,
+    rgf: &BTreeSet<String>,
+    order: &[String],
+) -> Result<Option<String>, String> {
+    rgf_shape_node(constraint, rgf, order)
+}
+
+/// One shape-walk outcome: rgf-free (`Ok(None)`), the one field the
+/// walk's rgf atom constrains (`Ok(Some(field))`), or unsupported
+/// (`Err(field)`).
+fn rgf_shape_node(
+    expr: &Expr,
+    rgf: &BTreeSet<String>,
+    order: &[String],
+) -> Result<Option<String>, String> {
+    match expr {
+        Expr::Paren { expr, .. } => rgf_shape_node(expr, rgf, order),
+        Expr::Binary {
+            op: BinaryOp::LogicalAnd | BinaryOp::LogicalOr,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let left = rgf_shape_node(lhs, rgf, order)?;
+            let right = rgf_shape_node(rhs, rgf, order)?;
+            match (left, right) {
+                (None, right) => Ok(right),
+                (left, None) => Ok(left),
+                (Some(left), Some(right)) => {
+                    if left == right {
+                        Ok(Some(left))
+                    } else {
+                        Err(rgf_first_in(order, &[left, right]))
+                    }
+                }
+            }
+        }
+        // The guard of an implication is a bool-exp: rgf-free.
+        Expr::Binary {
+            op: BinaryOp::Imply,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let guard_refs = rgf_field_refs(lhs, rgf);
+            if !guard_refs.is_empty() {
+                return Err(rgf_first_in(order, &guard_refs));
+            }
+            rgf_shape_node(rhs, rgf, order)
+        }
+        Expr::Binary {
+            op:
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let left_refs = rgf_field_refs(lhs, rgf);
+            let right_refs = rgf_field_refs(rhs, rgf);
+            match (left_refs.is_empty(), right_refs.is_empty()) {
+                (true, true) => Ok(None),
+                (false, true) => rgf_atom_side(lhs, &left_refs, rhs, rgf, order),
+                (true, false) => rgf_atom_side(rhs, &right_refs, lhs, rgf, order),
+                (false, false) => {
+                    let mut refs = left_refs;
+                    refs.extend(right_refs);
+                    Err(rgf_first_in(order, &refs))
+                }
+            }
+        }
+        // The `not in` spelling (and `!(f in set)`, parentheses
+        // unwrapped): the same atom rules as `in`.
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr: inner,
+            ..
+        } => {
+            if let Some((element, set)) = rgf_inset_parts(inner) {
+                let element_refs = rgf_field_refs(element, rgf);
+                let set_refs = rgf_inset_refs(set, rgf);
+                match element_refs.len() {
+                    0 => {
+                        if set_refs.is_empty() && !rgf_exp_generative_expr(set) {
+                            Ok(None)
+                        } else {
+                            Err(rgf_first_in(order, &set_refs))
+                        }
+                    }
+                    1 if rgf_bare_ref(element, &element_refs[0]) => {
+                        if set_refs.is_empty() && !rgf_exp_generative_expr(set) {
+                            Ok(Some(element_refs[0].clone()))
+                        } else {
+                            let mut refs = element_refs;
+                            refs.extend(set_refs);
+                            Err(rgf_first_in(order, &refs))
+                        }
+                    }
+                    _ => Err(rgf_first_in(order, &element_refs)),
+                }
+            } else {
+                let refs = rgf_field_refs(inner, rgf);
+                if refs.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(rgf_first_in(order, &refs))
+                }
+            }
+        }
+        Expr::InSet { element, set, .. } => {
+            let element_refs = rgf_field_refs(element, rgf);
+            let set_refs = rgf_inset_refs(set, rgf);
+            match element_refs.len() {
+                0 => {
+                    if set_refs.is_empty() && !rgf_exp_generative_expr(set) {
+                        Ok(None)
+                    } else {
+                        Err(rgf_first_in(order, &set_refs))
+                    }
+                }
+                1 if rgf_bare_ref(element, &element_refs[0]) => {
+                    if set_refs.is_empty() && !rgf_exp_generative_expr(set) {
+                        Ok(Some(element_refs[0].clone()))
+                    } else {
+                        let mut refs = element_refs;
+                        refs.extend(set_refs);
+                        Err(rgf_first_in(order, &refs))
+                    }
+                }
+                _ => Err(rgf_first_in(order, &element_refs)),
+            }
+        }
+        _ => {
+            let refs = rgf_field_refs(expr, rgf);
+            if refs.is_empty() {
+                Ok(None)
+            } else {
+                Err(rgf_first_in(order, &refs))
+            }
+        }
+    }
+}
+
+/// The generative check over an `in` right side (bounds, items or a
+/// general set expression).
+fn rgf_exp_generative_expr(set: &crate::ast::InSetExpr) -> bool {
+    match set {
+        crate::ast::InSetExpr::Items(items) => items.iter().any(rgf_exp_generative),
+        crate::ast::InSetExpr::Range(low, high) => {
+            rgf_exp_generative(low) || rgf_exp_generative(high)
+        }
+        crate::ast::InSetExpr::Expr(expr) => rgf_exp_generative(expr),
+    }
+}
+
+/// One comparison atom of the shape walk: the rgf side must be a single
+/// bare reference and the other side constant-evaluable.
+fn rgf_atom_side(
+    rgf_side: &Expr,
+    refs: &[String],
+    exp_side: &Expr,
+    rgf: &BTreeSet<String>,
+    order: &[String],
+) -> Result<Option<String>, String> {
+    if refs.len() == 1 && rgf_bare_ref(rgf_side, &refs[0]) && rgf_exp_side_ok(exp_side, rgf) {
+        Ok(Some(refs[0].clone()))
+    } else {
+        Err(rgf_first_in(order, refs))
     }
 }
 
@@ -8927,6 +10715,166 @@ fn render_set(intervals: &[(i128, i128)]) -> String {
 /// Rebase an enclosing instance's constraints onto a generated
 /// object's own field names (10.3.6-10.3.7's connected field sets, v1):
 /// `p.v == select { .. }` gating `gen p` becomes `v == select { .. }`.
+/// The dotted path an expression spells, when it is one: a bare
+/// identifier or a chain of member accesses rooted at one. Anything else
+/// (indexing, calls, literals, …) is not a simple path — `None`.
+fn expr_path_segments(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::Ident { name, .. } => Some(vec![name.clone()]),
+        Expr::MemberAccess { object, name, .. } => {
+            let mut segments = expr_path_segments(object)?;
+            segments.push(name.clone());
+            Some(segments)
+        }
+        _ => None,
+    }
+}
+
+/// The path a constraint spells, with a leading `me`/`self` segment
+/// stripped (constraint paths may be written me-relative).
+fn constraint_path_segments(expr: &Expr) -> Option<Vec<String>> {
+    let mut segments = expr_path_segments(expr)?;
+    if segments
+        .first()
+        .is_some_and(|name| name == "me" || name == "self")
+    {
+        segments.remove(0);
+    }
+    Some(segments)
+}
+
+/// Whether the expression contains a member path whose segments extend
+/// `prefix` (a chosen_from target path, `me`/`self`-normalized): the
+/// constraint then constrains a path through the target, so it gates the
+/// 10.5.8 element choice.
+fn expr_extends_path(expr: &Expr, prefix: &[String]) -> bool {
+    if let Some(segments) = constraint_path_segments(expr)
+        && segments.len() >= prefix.len()
+        && segments[..prefix.len()] == *prefix
+    {
+        return true;
+    }
+    match expr {
+        Expr::MemberAccess { object, .. } => expr_extends_path(object, prefix),
+        Expr::Call { callee, args, .. } => {
+            expr_extends_path(callee, prefix)
+                || args.iter().any(|arg| expr_extends_path(arg, prefix))
+        }
+        Expr::Index { base, index, .. } => {
+            expr_extends_path(base, prefix) || expr_extends_path(index, prefix)
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_extends_path(lhs, prefix) || expr_extends_path(rhs, prefix)
+        }
+        Expr::Unary { expr: inner, .. } | Expr::Paren { expr: inner, .. } => {
+            expr_extends_path(inner, prefix)
+        }
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            expr_extends_path(cond, prefix)
+                || expr_extends_path(then_expr, prefix)
+                || expr_extends_path(else_expr, prefix)
+        }
+        Expr::BitSlice {
+            base, high, low, ..
+        } => {
+            expr_extends_path(base, prefix)
+                || expr_extends_path(high, prefix)
+                || expr_extends_path(low, prefix)
+        }
+        Expr::CastAs { expr: inner, .. } => expr_extends_path(inner, prefix),
+        Expr::InSet { element, set, .. } => {
+            let set_has = match set {
+                crate::ast::InSetExpr::Items(items) => {
+                    items.iter().any(|item| expr_extends_path(item, prefix))
+                }
+                crate::ast::InSetExpr::Range(low, high) => {
+                    expr_extends_path(low, prefix) || expr_extends_path(high, prefix)
+                }
+                crate::ast::InSetExpr::Expr(expr) => expr_extends_path(expr, prefix),
+            };
+            expr_extends_path(element, prefix) || set_has
+        }
+        Expr::IsA { expr: inner, .. } => expr_extends_path(inner, prefix),
+        Expr::QualifiedField { base, .. } => expr_extends_path(base, prefix),
+        Expr::ListConcat { items, .. } => items.iter().any(|item| expr_extends_path(item, prefix)),
+        _ => false,
+    }
+}
+
+/// Whether the constraint compares the chosen_from target as a whole
+/// object — either operand of an equality, identity or list-identity
+/// comparison, or the tested expression of an `is a` — a
+/// pointer-equality or like-narrowing constraint on the target, which
+/// the 10.5.8 protocol of this stage does not support (E0402). Returns
+/// the unsupported family's name for the diagnostic; `None` when the
+/// constraint does not touch the target whole (paths *through* it,
+/// `p.x == q.y`, are ordinary constraints).
+fn constraint_compares_target_whole(expr: &Expr, target: &[String]) -> Option<&'static str> {
+    let whole_path =
+        |expr: &Expr| constraint_path_segments(expr).is_some_and(|segments| segments == target);
+    match expr {
+        Expr::Binary { op, lhs, rhs, .. } => {
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::IdentityEq
+                    | BinaryOp::IdentityNe
+                    | BinaryOp::ListPtrEq
+                    | BinaryOp::ListPtrNe
+            ) && (whole_path(lhs) || whole_path(rhs))
+            {
+                return Some("pointer-equality");
+            }
+            constraint_compares_target_whole(lhs, target)
+                .or_else(|| constraint_compares_target_whole(rhs, target))
+        }
+        Expr::IsA { expr: inner, .. } => {
+            if whole_path(inner) {
+                return Some("type-narrowing");
+            }
+            constraint_compares_target_whole(inner, target)
+        }
+        Expr::Unary { expr: inner, .. } | Expr::Paren { expr: inner, .. } => {
+            constraint_compares_target_whole(inner, target)
+        }
+        _ => None,
+    }
+}
+
+/// Render an expression for a diagnostic message: the common
+/// constraint shapes verbatim, a placeholder for anything else.
+fn expr_text(expr: &Expr) -> String {
+    match expr {
+        Expr::Ident { name, .. } => name.clone(),
+        Expr::MemberAccess { object, name, .. } => format!("{}.{}", expr_text(object), name),
+        Expr::Call { callee, args, .. } => format!(
+            "{}({})",
+            expr_text(callee),
+            args.iter().map(expr_text).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Paren { expr: inner, .. } => format!("({})", expr_text(inner)),
+        Expr::Index { base, index, .. } => format!("{}[{}]", expr_text(base), expr_text(index)),
+        Expr::IntLiteral { text, .. }
+        | Expr::RealLiteral { text, .. }
+        | Expr::BitLiteral { text, .. } => text.clone(),
+        Expr::BoolLiteral { value, .. } => {
+            if *value {
+                "TRUE".to_owned()
+            } else {
+                "FALSE".to_owned()
+            }
+        }
+        Expr::StringLiteral { value, .. } => format!("\"{value}\""),
+        _ => "list".to_owned(),
+    }
+}
+
 /// A constraint rebases only when every path it references is rooted
 /// at the generated object (depth two — `prefix.field`); anything else
 /// (other roots, deeper paths, whole-object equalities) drops, because
@@ -9362,8 +11310,12 @@ pub(crate) fn expr_calls_any(expr: &Expr, names: &[&str]) -> bool {
                 crate::ast::InSetExpr::Range(low, high) => {
                     expr_calls_any(low, names) || expr_calls_any(high, names)
                 }
+                crate::ast::InSetExpr::Expr(expr) => expr_calls_any(expr, names),
             };
             expr_calls_any(element, names) || set_has
+        }
+        Expr::ChosenFrom { target, list, .. } => {
+            expr_calls_any(target, names) || expr_calls_any(list, names)
         }
         _ => false,
     }
@@ -9455,6 +11407,7 @@ fn expr_has_untyped_evaluate(expr: &Expr) -> bool {
                 crate::ast::InSetExpr::Range(low, high) => {
                     expr_has_untyped_evaluate(low) || expr_has_untyped_evaluate(high)
                 }
+                crate::ast::InSetExpr::Expr(expr) => expr_has_untyped_evaluate(expr),
             };
             expr_has_untyped_evaluate(element) || set_has
         }
@@ -9468,6 +11421,9 @@ fn expr_has_untyped_evaluate(expr: &Expr) -> bool {
                         }
                         crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
                             expr_has_untyped_evaluate(low) || expr_has_untyped_evaluate(high)
+                        }
+                        crate::ast::TableElem::Set(crate::ast::InSetExpr::Expr(expr)) => {
+                            expr_has_untyped_evaluate(expr)
                         }
                         crate::ast::TableElem::TypeSet { .. } => false,
                     })
@@ -9525,6 +11481,11 @@ fn values_equal_bounded(a: &Value, b: &Value, depth: usize) -> bool {
         ) => type_x == type_y && name_x == name_y,
         (Value::Object(x), Value::Object(y)) => x == y,
         (Value::List(x), Value::List(y)) => lists_equal(x, y, depth),
+        // Set equality (5.2.12): same canonical intervals — the sets
+        // denote the same value collection regardless of how each was
+        // built (a literal, a set algebra result, or a clause 29.13
+        // rgf_get_range query).
+        (Value::Set(x), Value::Set(y)) => x == y,
         _ => false,
     }
 }
