@@ -182,6 +182,23 @@ fn sync_type(name: &str) -> bool {
     matches!(name, "semaphore" | "rdv_semaphore" | "locker")
 }
 
+/// The predefined members the runtime accepts on any instance without a
+/// per-type declaration: the 7.4 any_unit queries, 23's `hdl_path()`,
+/// the 9.7.3 port attributes and the 7.3.4/7.3.5 unit attributes. The
+/// unknown-member rule stays silent for them (they resolve at
+/// elaboration or in the runtime's predefined dispatch).
+const PREDEFINED_MEMBERS: &[&str] = &[
+    "e_path",
+    "get_children",
+    "get_ports",
+    "get_ports_recursively",
+    "hdl_path",
+    "delayed",
+    "edge",
+    "pack_options",
+    "per_inst_cover",
+];
+
 /// The statement/expression checker for one method body.
 struct TypeChecker<'a> {
     types: &'a [ElaboratedType],
@@ -543,6 +560,10 @@ impl<'a> TypeChecker<'a> {
         if !t.whens.is_empty() {
             return Ty::Unknown;
         }
+        // The predefined any-instance members are not declared per type.
+        if PREDEFINED_MEMBERS.contains(&name) {
+            return Ty::Unknown;
+        }
         self.diagnostics.push(self.error(
             "E0221",
             format!("'{type_name}' has no field or method '{name}'"),
@@ -845,14 +866,37 @@ fn type_name_of(ty: &Ty) -> &str {
     }
 }
 
-/// The type-check pass over every composed type's method bodies. The
-/// diagnostics join the elaboration diagnostics (the CLI prints both).
+/// One field's init value against its declared type (6.9.1/6.9.4).
+fn check_field_inits(checker: &mut TypeChecker, fields: &[crate::ast::Field]) {
+    for field in fields {
+        let Some(init) = &field.init else {
+            continue;
+        };
+        let value = checker.infer(init);
+        let target = checker.type_of(&field.ty);
+        checker.check_assignable(&value, &target, init.span(), "field init value");
+    }
+}
+
+/// The type-check pass over every composed type's members — method
+/// bodies, field init values, `keep` constraints and `on` bodies. The
+/// `when` blocks' members are checked through their synthesized
+/// when-view types (which carry the block's fields as ordinary fields,
+/// so sibling access resolves). The diagnostics join the elaboration
+/// diagnostics (the CLI prints both).
 pub fn check_types(elaborated: &Elaborated) -> Vec<Diagnostic> {
     let mut checker = TypeChecker::new(&elaborated.types);
     for t in &elaborated.types {
+        checker.me_type = Some(&t.name);
+        check_field_inits(&mut checker, &t.fields);
+        for constraint in &t.constraints {
+            checker.infer(&constraint.expr);
+        }
+        for on in &t.ons {
+            checker.check_body(&on.body);
+        }
         for method in &t.methods {
             checker.return_ty = method.return_type.as_ref();
-            checker.me_type = Some(&t.name);
             checker.check_body(&method.body);
         }
     }

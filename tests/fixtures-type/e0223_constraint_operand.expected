@@ -1,0 +1,1 @@
+3:10: error[E0223]: the left operand of the arithmetic operator is 'string' — a number is required
