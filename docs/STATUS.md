@@ -68,6 +68,24 @@ Recognised-but-unimplemented 2019 library names (the full list sits in
 **E0419** with their clause at run time instead of failing as unknown
 names.
 
+## Tests and the two revisions
+
+The suite targets **2019 only** — there is no 2016 mode and no
+per-revision test split. Coverage comes from two layers: the
+pre-migration tests (authored against 2016-era behavior) pin the
+**shared subset**, valid because the 2019 revision is almost purely
+additive; the `tests/fixtures/s2019_*` fixtures and the migration's
+tests pin the **2019-only additions**. The 2016-era corpus files under
+the verification log's regression set (etl, cover-edges, the golden
+testbenches) act as the legacy-behavior check — they were re-run on
+every migration merge. Where a rule genuinely changed between the
+revisions (the migration plan's §1.2 items: `extend global`'s wording,
+bool in `set_of_values`, the numeric list aggregates, set iteration,
+`deep_copy`'s generality, the phase naming, the 64-bit precision
+rules), the pinning tests carry a "differential reading" comment
+saying what 2016 did differently; the tool implements the 2019
+reading, nothing else.
+
 ## What does not work yet
 
 - Full type checking and name resolution (checking is per-construct
