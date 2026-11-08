@@ -2,14 +2,22 @@
 //!
 //! `translate` turns the top-level `keep` constraints of one type, over the
 //! integer fields of that type, into a [`Problem`]: bounded-integer
-//! variables plus a conjunction of linear comparisons. Range membership
-//! (`x in [lo..hi]`) translates to the two comparisons; item-list
-//! membership (`x in [a, b]`) needs a disjunction and is not translated.
-//! The translation is
+//! variables plus a boolean tree of linear comparisons — conjunction
+//! ([`BoolNode::All`]), disjunction ([`BoolNode::Any`]) and their negation
+//! (`not` flips every comparison and swaps the connective, De Morgan).
+//! Range membership (`x in [lo..hi]`) translates to the two comparisons;
+//! item-list membership (`x in [a, b]`) translates to the disjunction of
+//! its equalities. The translation is
 //! deliberately conservative — anything outside the supported shape
-//! (non-integer fields, method calls, `||`, `!`, non-linear arithmetic)
+//! (non-integer fields, method calls, non-linear arithmetic)
 //! reports [`TranslationError::Unsupported`] and the caller falls back to
 //! the evaluation-based rejection sampler in [`crate::interp`].
+//!
+//! The solver backends are conjunction solvers: [`solve`] expands each
+//! `Any` into its branch combinations (bounded — beyond the cap the
+//! outcome is [`SolveOutcome::Unsupported`]), solves every combination as
+//! a plain conjunction, and picks seeded among the satisfying
+//! combinations, so runs stay deterministic per seed.
 //!
 //! Backends:
 //! - **pumpkin** (default-off cargo feature `solver-pumpkin`): the
@@ -53,11 +61,14 @@ pub struct Linear {
     pub cmp: Cmp,
 }
 
-/// A conjunction of linear atoms (`||` and `!` are not translated).
+/// A boolean tree of linear atoms. The backends post `Atom` and `All`
+/// directly; `Any` is expanded by [`solve`] into branch combinations
+/// before posting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoolNode {
     Atom(Linear),
     All(Vec<BoolNode>),
+    Any(Vec<BoolNode>),
 }
 
 /// A translatable `gen` problem.
@@ -156,6 +167,11 @@ fn translate_bool(
     expr: &Expr,
     bounds: &BTreeMap<String, (i64, i64)>,
 ) -> Result<BoolNode, TranslationError> {
+    // A parenthesized constraint shape (`keep (a < 1 || a > 2);`) is
+    // transparent here; the paren group's inner shape decides.
+    if let Expr::Paren { expr: inner, .. } = expr {
+        return translate_bool(inner, bounds);
+    }
     if let Expr::Binary {
         op: crate::ast::BinaryOp::LogicalAnd,
         lhs,
@@ -169,10 +185,31 @@ fn translate_bool(
             translate_bool(rhs, bounds)?,
         ]));
     }
-    // `x in [lo..hi]` is the conjunction `x >= lo && x <= hi` — no
-    // disjunction needed. Item-list membership (`x in [a, b]`) would
-    // need one and is not translated; the rejection sampler enforces it
-    // by evaluation.
+    if let Expr::Binary {
+        op: crate::ast::BinaryOp::LogicalOr,
+        lhs,
+        rhs,
+        ..
+    } = expr
+    {
+        return Ok(BoolNode::Any(vec![
+            translate_bool(lhs, bounds)?,
+            translate_bool(rhs, bounds)?,
+        ]));
+    }
+    // `not`/`!` flips every comparison and swaps the connective (De
+    // Morgan); a doubly negated shape collapses back through the flip
+    // table. The `a not in [..]` parse wraps the membership in this
+    // unary, so negated membership is handled here too.
+    if let Expr::Unary {
+        op: crate::ast::UnaryOp::Not,
+        expr: inner,
+        ..
+    } = expr
+    {
+        return translate_bool(inner, bounds).and_then(negate_node);
+    }
+    // `x in [lo..hi]` is the conjunction `x >= lo && x <= hi`.
     if let Expr::InSet {
         element,
         set: crate::ast::InSetExpr::Range(low, high),
@@ -184,16 +221,54 @@ fn translate_bool(
             BoolNode::Atom(linear_comparison(Cmp::Le, element, high, bounds)?),
         ]));
     }
+    // `x in [a, b, c]` is the disjunction `x == a || x == b || x == c`;
+    // each item goes through the same affine translation as a comparison
+    // side, so affine item expressions translate too.
     if let Expr::InSet {
-        set: crate::ast::InSetExpr::Items(_),
+        element,
+        set: crate::ast::InSetExpr::Items(items),
         ..
     } = expr
     {
-        return Err(TranslationError::Unsupported(
-            "set membership over an item list",
-        ));
+        let branches = items
+            .iter()
+            .map(|item| linear_comparison(Cmp::Eq, element, item, bounds).map(BoolNode::Atom))
+            .collect::<Result<Vec<_>, TranslationError>>()?;
+        return Ok(BoolNode::Any(branches));
     }
     translate_atom(expr, bounds).map(BoolNode::Atom)
+}
+
+/// Negate one translated boolean tree: every comparison flips
+/// (`Lt`↔`Ge`, `Le`↔`Gt`, `Eq`↔`Ne`) and `All`/`Any` swap (De Morgan).
+fn negate_node(node: BoolNode) -> Result<BoolNode, TranslationError> {
+    match node {
+        BoolNode::Atom(linear) => Ok(BoolNode::Atom(Linear {
+            cmp: match linear.cmp {
+                Cmp::Eq => Cmp::Ne,
+                Cmp::Ne => Cmp::Eq,
+                Cmp::Lt => Cmp::Ge,
+                Cmp::Le => Cmp::Gt,
+                Cmp::Gt => Cmp::Le,
+                Cmp::Ge => Cmp::Lt,
+            },
+            ..linear
+        })),
+        BoolNode::All(children) => {
+            let negated = children
+                .into_iter()
+                .map(negate_node)
+                .collect::<Result<Vec<_>, TranslationError>>()?;
+            Ok(BoolNode::Any(negated))
+        }
+        BoolNode::Any(children) => {
+            let negated = children
+                .into_iter()
+                .map(negate_node)
+                .collect::<Result<Vec<_>, TranslationError>>()?;
+            Ok(BoolNode::All(negated))
+        }
+    }
 }
 
 fn translate_atom(
@@ -375,12 +450,82 @@ fn affine_of(
     }
 }
 
-/// Solve a problem with the best available backend. With the
-/// `solver-pumpkin` feature this is the Pumpkin CP solver (seeded,
-/// deterministic); without it the outcome is always
-/// [`SolveOutcome::Unsupported`] and the caller falls back to rejection
-/// sampling.
+/// Branch combinations expand beyond this and [`solve`] reports
+/// [`SolveOutcome::Unsupported`] — the rejection sampler enforces such a
+/// constraint list by evaluation instead, and the exponential blowup is
+/// not worth solving.
+const MAX_BRANCH_COMBINATIONS: usize = 64;
+
+/// Solve a problem with the best available backend. The IR's disjunctions
+/// (`Any`) are expanded into their branch combinations — capped at
+/// [`MAX_BRANCH_COMBINATIONS`]; every combination is solved as a plain
+/// conjunction, and one satisfying combination is picked seeded, so runs
+/// stay deterministic per seed. `Unsat` is reported only when every
+/// combination is unsatisfiable; if any combination exceeds the backend's
+/// domain and nothing is satisfiable, the outcome is `Unsupported` (the
+/// caller falls back to rejection sampling). Without the `solver-pumpkin`
+/// feature the outcome is always [`SolveOutcome::Unsupported`].
 pub fn solve(problem: &Problem, seed: u64) -> SolveOutcome {
+    let mut combos: Vec<Vec<BoolNode>> = vec![Vec::new()];
+    for constraint in &problem.constraints {
+        let alternatives = branch_alternatives(constraint);
+        let mut next = Vec::with_capacity(combos.len() * alternatives.len());
+        for combo in &combos {
+            for alternative in &alternatives {
+                let mut expanded = combo.clone();
+                expanded.extend(alternative.iter().cloned());
+                next.push(expanded);
+            }
+        }
+        combos = next;
+        if combos.len() > MAX_BRANCH_COMBINATIONS {
+            return SolveOutcome::Unsupported;
+        }
+    }
+    let mut satisfying: Vec<Vec<i128>> = Vec::new();
+    let mut any_unsupported = false;
+    for combo in &combos {
+        let flattened = Problem {
+            vars: problem.vars.clone(),
+            constraints: combo.clone(),
+        };
+        match solve_conjunction(&flattened, seed) {
+            SolveOutcome::Solved(values) => satisfying.push(values),
+            SolveOutcome::Unsat => {}
+            SolveOutcome::Unsupported => any_unsupported = true,
+        }
+    }
+    if !satisfying.is_empty() {
+        let values = &satisfying[seed as usize % satisfying.len()];
+        return SolveOutcome::Solved(values.clone());
+    }
+    if any_unsupported {
+        SolveOutcome::Unsupported
+    } else {
+        SolveOutcome::Unsat
+    }
+}
+
+/// The conjunction lists implied by one node: an atom is its own single
+/// alternative, an `All` contributes its children unchanged, and an `Any`
+/// contributes the union of its branches' alternatives (recursively, so
+/// nested disjunctions flatten into the same product).
+fn branch_alternatives(node: &BoolNode) -> Vec<Vec<BoolNode>> {
+    match node {
+        BoolNode::Atom(atom) => vec![vec![BoolNode::Atom(atom.clone())]],
+        BoolNode::All(children) => vec![children.clone()],
+        BoolNode::Any(branches) => {
+            let mut alternatives = Vec::new();
+            for branch in branches {
+                alternatives.extend(branch_alternatives(branch));
+            }
+            alternatives
+        }
+    }
+}
+
+/// Solve one flattened conjunction with the best available backend.
+fn solve_conjunction(problem: &Problem, seed: u64) -> SolveOutcome {
     #[cfg(feature = "solver-pumpkin")]
     {
         solve_with_pumpkin(problem, seed)
@@ -471,6 +616,10 @@ mod pumpkin_backend {
                 Ok(())
             }
             BoolNode::Atom(linear) => post_atom(solver, variables, bounds, linear),
+            // `solve` expands every `Any` into branch combinations before
+            // the backend sees a problem; reaching one here is a bug, and
+            // the caller falls back to rejection sampling for it.
+            BoolNode::Any(_) => Err(()),
         }
     }
 

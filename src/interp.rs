@@ -23,8 +23,10 @@
 //! `return`, `print`, the built-in `out` routine, and `gen`.
 //!
 //! `gen` is backed by [`crate::solve`]: with the `solver-pumpkin` feature
-//! the type's conjunctive linear `keep` constraints are solved (seeded,
-//! deterministic Pumpkin CP solve) and unsupported shapes fall back to the
+//! the type's linear `keep` constraints — conjunctive, disjunctive
+//! (`||`), and their negation — are solved (seeded, deterministic Pumpkin
+//! CP solve; disjunctions expand into bounded branch combinations) and
+//! unsupported shapes fall back to the
 //! rejection sampler, **not** a general constraint solver: fields are
 //! sampled inside their declared bounds, a candidate is accepted only when
 //! every top-level `keep` constraint of the enclosing type evaluates to

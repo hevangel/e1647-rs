@@ -32,8 +32,10 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   `quit`/`finalize`. `emit` feeds an event log; temporal waits
   re-evaluate against it; `expect`/`assume` rules check at quit.
 - **Randomization.** `gen` is a seeded rejection sampler by default;
-  with the `solver-pumpkin` cargo feature it solves conjunctive linear
-  `keep` constraints instead. `select` distributions
+  with the `solver-pumpkin` cargo feature it solves linear `keep`
+  constraints instead — conjunctive, disjunctive (`||`, `not`, item-set
+  membership via bounded branch enumeration) as well as plain
+  conjunctions. `select` distributions
   (weights/min/max/edges/others/normal) bias the sampler; every run is
   deterministic per seed.
 - **Observability.** Coverage groups (clause 14) collect basic-item
@@ -92,9 +94,11 @@ reading, nothing else.
   well-formedness, not a type system).
 - Event-driven temporal evaluation (temporal expressions evaluate over
   explicit finite paths, not live streams).
-- Non-linear or disjunctive constraint solving (`gen` handles the
-  conjunctive linear subset; `chosen_from` and the rgf reduced sets are
-  the sampling-side exceptions).
+- Non-linear constraint solving (`gen` handles the conjunctive and
+  disjunctive linear subsets — `||`, `not`, item-set membership — via
+  bounded branch enumeration; non-linear arithmetic is still unsolved;
+  `chosen_from` and the rgf reduced sets are the sampling-side
+  exceptions).
 - General testbench execution (sequences run inline; the e↔HDL event
   ordering is not implemented; the VHDL backend is unwritten).
 - The out-of-scope list of the 2019 migration plan (TLM sockets, Excel
