@@ -24,12 +24,13 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   monomorphize (actuals substitute for formals, method bodies included)
   and `template extend` blocks apply to the instances whose actuals
   match; static members register per type. After composition, the
-  conservative type check ([`typing`]) walks every method body and
-  reports definite mismatches only: a value that cannot be the target
-  it is stored into (E0220), a member a known when-less receiver does
-  not have (E0221), indexing a non-list (E0222), an operator on
-  incompatible operand kinds (E0223) — anything uncertain stays
-  silent.
+  conservative type check ([`typing`]) walks every method body, field
+  init value, `keep` constraint, `on` body and synthesized `when`
+  view, and reports definite mismatches only: a value that cannot be
+  the target it is stored into (E0220), a member a known when-less
+  receiver does not have (E0221), indexing a non-list (E0222), an
+  operator on incompatible operand kinds (E0223) — anything uncertain
+  stays silent.
 - **Execution.** `e1647 run` executes the built-in `sys` unit through
   the Table 1 phases — `setup`, generation (with `pre_generate`/
   `post_generate` and the `connect_pointers`/`connect_ports`/
@@ -107,9 +108,11 @@ reading, nothing else.
 ## What does not work yet
 
 - A full type system (the [`typing`] conservative pass reports definite
-  mismatches in method bodies; there is no general type inference, no
-  name-resolution pass beyond it, and constraints/init values/`when`/
-  `on` bodies are not walked).
+  mismatches across method bodies, field init values, `keep`
+  constraints, `on` bodies and the synthesized `when` views; there is
+  no general type inference across untyped variables, no
+  name-resolution pass beyond it, and `cover` group expressions are
+  not walked).
 - Temporal value history (each rule streams through a per-event
   monitor that holds its obligation state incrementally, but a rule's
   propositions evaluate with the values current when a state arrives —

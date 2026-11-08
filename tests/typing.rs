@@ -65,7 +65,10 @@ fn type_fixture_diagnostics_match_expected() {
 
 /// The fail-open contract: a body the checker cannot pin down must not
 /// produce diagnostics. Unknown locals, template types, casts, `table`
-/// receivers and `when`-guarded members all stay silent.
+/// receivers and `when`-guarded members all stay silent — and the
+/// newly-walked surfaces (constraints, when views, on bodies) accept
+/// their legitimate shapes: when-view siblings, determinant references,
+/// the predefined any-instance members.
 #[test]
 fn uncertain_constructs_stay_silent() {
     let source = "\
@@ -75,14 +78,15 @@ interface shape_i {\n    area(): real;\n};\n\
 struct impl_s implementing shape_i {\n    area(): real is { return 1.0; };\n};\n\
 type colors: [red, green, blue];\n\
 template box_t of (T: type) {\n    item: T;\n};\n\
-struct whened_s {\n    kind: colors;\n    when red'kind {\n        tone: uint;\n    };\n};\n\
-extend sys {\n    run() is also {\n        // Enumerals coerce to ints.\n        var c: colors = red;\n        var n: int = c + 1;\n\
+struct whened_s {\n    kind: colors;\n    tone: uint;\n    when red'kind {\n        depth: uint;\n        show() is {\n            // The when view's own fields and the base's fields resolve.\n            tone = depth + 1;\n        };\n    };\n    on ev_reset {\n        tone = 0;\n    };\n};\n\
+extend sys {\n    ev_reset: event;\n    run() is also {\n        // Enumerals coerce to ints.\n        var c: colors = red;\n        var n: int = c + 1;\n\
         // NULL unifies with object kinds.\n        var d: derived_s;\n        d = NULL;\n\
         // The like chain accepts the derived value in the base slot.\n        var b: base_s = new derived_s;\n\
         // An interface-typed slot takes the implementing struct.\n        var s: shape_i = new impl_s;\n\
         // A when-only member is conditionally present: silent.\n        var w: whened_s;\n        var t: uint = w.tone;\n\
+        // The predefined any-instance members are not declared per type.\n        me.get_children();\n        var p: string = me.hdl_path();\n\
         // Template instances, untyped vars and unknown routines.\n        var boxed: box_t of (uint) = new box_t of (uint);\n        var mystery = unknown_thing(\"arg\");\n\
-        print n, t, boxed, mystery;\n    };\n};\n";
+        print n, t, p, boxed, mystery;\n    };\n};\n";
     let parsed = e1647::parser::parse(source);
     let elaborated = e1647::elab::elaborate(&parsed.declarations);
     let type_diagnostics = e1647::typing::check_types(&elaborated);
