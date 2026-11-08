@@ -1,0 +1,1 @@
+4:16: error[E0220]: assignment: a value of kind 'int' cannot be stored into 'string'

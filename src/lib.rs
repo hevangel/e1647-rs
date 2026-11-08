@@ -16,7 +16,9 @@
 //! clause 21 preprocessor applies `#define` replacement rules as a
 //! token pre-pass ([`preproc`]), and the clause 26 `table … with { … }`
 //! construct expands as the pre-pass between it and the macro engine
-//! ([`tables`]). See docs/ROADMAP.md for what is
+//! ([`tables`]). The conservative per-expression type check over the
+//! composed types reports definite mismatches only ([`typing`]).
+//! See docs/ROADMAP.md for what is
 //! deliberately not implemented yet.
 
 pub mod ast;
@@ -34,3 +36,4 @@ pub mod preproc;
 pub mod solve;
 pub mod tables;
 pub mod temporal;
+pub mod typing;

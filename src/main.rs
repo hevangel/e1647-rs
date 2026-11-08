@@ -114,7 +114,16 @@ fn run(command: &str, path: &str, seed: u64, coverage_flag: bool) -> ExitCode {
             for diagnostic in &elaborated.diagnostics {
                 eprintln!("{path}:{}", diagnostic.render());
             }
-            if result.diagnostics.is_empty() && elaborated.diagnostics.is_empty() {
+            // The conservative type check over the composed method
+            // bodies (definite mismatches only — see src/typing.rs).
+            let type_diagnostics = e1647::typing::check_types(&elaborated);
+            for diagnostic in &type_diagnostics {
+                eprintln!("{path}:{}", diagnostic.render());
+            }
+            if result.diagnostics.is_empty()
+                && elaborated.diagnostics.is_empty()
+                && type_diagnostics.is_empty()
+            {
                 for elaborated_type in &elaborated.types {
                     print_elaborated_type(elaborated_type);
                 }
@@ -136,6 +145,17 @@ fn run(command: &str, path: &str, seed: u64, coverage_flag: bool) -> ExitCode {
                 eprintln!("{path}:{}", diagnostic.render());
             }
             if !elaborated.diagnostics.is_empty() {
+                return ExitCode::FAILURE;
+            }
+            // The conservative type check gates the run like the
+            // well-formedness pass: a definite mismatch would misbehave
+            // at run time, so it fails the invocation before the phases
+            // start.
+            let type_diagnostics = e1647::typing::check_types(&elaborated);
+            for diagnostic in &type_diagnostics {
+                eprintln!("{path}:{}", diagnostic.render());
+            }
+            if !type_diagnostics.is_empty() {
                 return ExitCode::FAILURE;
             }
             let show_coverage = coverage_flag;

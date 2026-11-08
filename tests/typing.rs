@@ -1,0 +1,97 @@
+use std::fs;
+use std::path::Path;
+
+/// Golden diagnostic fixtures for the conservative type check: every
+/// `tests/fixtures-type/*.e` must produce exactly the diagnostics
+/// listed in its `.expected` file (empty input expected is written as
+/// `OK`) through the full `parse → elaborate → typing::check_types`
+/// pipeline — the same stages the CLI's `run`/`elab` commands apply.
+/// This is the byte-exact contract for the E0220–E0223 family; the
+/// `tests/fixtures/` harness above covers the parser's own contract.
+#[test]
+fn type_fixture_diagnostics_match_expected() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures-type");
+    let mut entries: Vec<_> = fs::read_dir(&dir)
+        .expect("type fixtures directory exists")
+        .collect::<Result<_, _>>()
+        .expect("type fixtures directory is readable");
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut checked = 0usize;
+    let mut failures = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("e") {
+            continue;
+        }
+        let expected_path = path.with_extension("expected");
+        let expected = fs::read_to_string(&expected_path)
+            .unwrap_or_else(|_| panic!("missing expected file for {}", path.display()));
+        let source = fs::read_to_string(&path).expect("fixture is readable");
+        let parsed = e1647::parser::parse(&source);
+        let elaborated = e1647::elab::elaborate(&parsed.declarations);
+        let mut diagnostics = parsed.diagnostics;
+        diagnostics.extend(e1647::typing::check_types(&elaborated));
+        diagnostics.extend(elaborated.diagnostics);
+        let mut actual = String::new();
+        if diagnostics.is_empty() {
+            actual.push_str("OK\n");
+        } else {
+            for diagnostic in &diagnostics {
+                actual.push_str(&diagnostic.render());
+                actual.push('\n');
+            }
+        }
+        checked += 1;
+        if actual != expected {
+            failures.push(format!(
+                "--- {} (relative: tests/fixtures-type/{})\nexpected:\n{}actual:\n{}",
+                path.display(),
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                expected,
+                actual
+            ));
+        }
+    }
+    assert!(checked > 0, "no type fixtures were found");
+    assert!(
+        failures.is_empty(),
+        "{} type fixture(s) mismatched:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// The fail-open contract: a body the checker cannot pin down must not
+/// produce diagnostics. Unknown locals, template types, casts, `table`
+/// receivers and `when`-guarded members all stay silent.
+#[test]
+fn uncertain_constructs_stay_silent() {
+    let source = "\
+struct base_s {\n    common: uint;\n};\n\
+struct derived_s like base_s {\n    extra: list of uint;\n};\n\
+interface shape_i {\n    area(): real;\n};\n\
+struct impl_s implementing shape_i {\n    area(): real is { return 1.0; };\n};\n\
+type colors: [red, green, blue];\n\
+template box_t of (T: type) {\n    item: T;\n};\n\
+struct whened_s {\n    kind: colors;\n    when red'kind {\n        tone: uint;\n    };\n};\n\
+extend sys {\n    run() is also {\n        // Enumerals coerce to ints.\n        var c: colors = red;\n        var n: int = c + 1;\n\
+        // NULL unifies with object kinds.\n        var d: derived_s;\n        d = NULL;\n\
+        // The like chain accepts the derived value in the base slot.\n        var b: base_s = new derived_s;\n\
+        // An interface-typed slot takes the implementing struct.\n        var s: shape_i = new impl_s;\n\
+        // A when-only member is conditionally present: silent.\n        var w: whened_s;\n        var t: uint = w.tone;\n\
+        // Template instances, untyped vars and unknown routines.\n        var boxed: box_t of (uint) = new box_t of (uint);\n        var mystery = unknown_thing(\"arg\");\n\
+        print n, t, boxed, mystery;\n    };\n};\n";
+    let parsed = e1647::parser::parse(source);
+    let elaborated = e1647::elab::elaborate(&parsed.declarations);
+    let type_diagnostics = e1647::typing::check_types(&elaborated);
+    assert!(
+        type_diagnostics.is_empty(),
+        "the checker must stay silent on the uncertain subset: {:?}",
+        type_diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}
