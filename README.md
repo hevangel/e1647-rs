@@ -15,7 +15,7 @@
 > tokenizes, parses and elaborates a declared subset of the language and
 > executes it: `e1647 run` generates seeded-random data under `keep`
 > constraints, drives the Table 1 execution phases, runs TCMs on the
-> clause 13 scheduler, checks temporal `expect`/`assume` rules and
+> clause 13 scheduler, monitors temporal `expect`/`assume` rules and
 > collects coverage. The IEEE 1647-2019 feature set runs: static
 > members, interfaces, the template rework, range-generated fields,
 > `chosen_from`, custom numeric types, tables, annotations, the clause

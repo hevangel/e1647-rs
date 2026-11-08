@@ -517,6 +517,38 @@ pub fn rule_failed(
     }
 }
 
+/// Whether an `expect`/`assume` rule's failure is already certain over
+/// the run-log prefix, at a cycle boundary before the run ends. Only
+/// the invariant shapes are prefix-certain: `not te` / `fail te`
+/// forbid a behavior, so its occurrence exhausts every possibility at
+/// that cycle (12.2.17, 12.2.13). The obligation shapes keep their
+/// windows open while the run continues — a yield whose rhs has not
+/// succeeded yet may still succeed later, and `eventually` likewise —
+/// so pronouncing them failed mid-run would be premature; they stay
+/// silent until the quit pass closes the windows over the full log
+/// ([`rule_failed`]). Every other success-required shape cannot be
+/// pronounced failed before the run ends either. An evaluation error
+/// propagates: the caller reports the gap and retires the rule.
+pub fn rule_prefix_failed(
+    te: &TemporalExpr,
+    log: &[State],
+    callbacks: &EvalCallbacks,
+) -> Result<bool, EvalError> {
+    if log.is_empty() {
+        return Ok(false);
+    }
+    match te {
+        crate::ast::TemporalExpr::Not(inner) | crate::ast::TemporalExpr::Fail(inner) => {
+            succeeded_somewhere(inner, log, callbacks)
+        }
+        // Open windows: not yet certain, whatever the prefix shows.
+        crate::ast::TemporalExpr::Yield { .. } | crate::ast::TemporalExpr::Eventually(_) => {
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// Collect the proposition (`true(exp)`) and numeric repeat-bound
 /// expressions appearing in `te`, in evaluation order — the caller
 /// evaluates them once (the values the callbacks will supply for every
