@@ -408,10 +408,12 @@ mod pumpkin {
 
     #[test]
     fn combinations_beyond_the_cap_fall_back_to_unsupported() {
-        // Seven chained `||` terms expand to 2^7 = 128 branch
-        // combinations — beyond MAX_BRANCH_COMBINATIONS — so the outcome
-        // defers to the rejection sampler rather than exploding.
-        let source = "a == 1 || a == 2 || a == 3 || a == 4 || a == 5 || a == 6 || a == 7";
+        // Seven separate two-branch disjunctions multiply to 2^7 = 128
+        // branch combinations — beyond MAX_BRANCH_COMBINATIONS — so the
+        // outcome defers to the rejection sampler rather than exploding.
+        // (A chained `||` flattens to N alternatives, not 2^N; the cap is
+        // about the product of independent disjunctions.)
+        let source = "a == 1 || a == 2\na == 1 || a == 2\na == 1 || a == 2\na == 1 || a == 2\na == 1 || a == 2\na == 1 || a == 2\na == 1 || a == 2";
         let exprs = parse_exprs(source);
         let problem = translate(&exprs, &bounds_from(&[("a", (0, 15))])).expect("translatable");
         assert_eq!(solve(&problem, 1), SolveOutcome::Unsupported);
