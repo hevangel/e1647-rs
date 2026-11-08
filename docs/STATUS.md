@@ -36,11 +36,12 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   `check_generation` sub-phases), the clause 13.2.2 scheduler running
   `start`ed TCMs concurrently, `run`, then `extract` → `check` →
   `quit`/`finalize`. `emit` feeds an event log; temporal waits
-  re-evaluate against it; `expect`/`assume` rules monitor live — at
-  every scheduler cycle boundary an invariant rule (`not`/`fail`)
-  whose forbidden behavior occurred fires at that cycle, and the
-  obligation rules (`=>`, `eventually`) re-check at quit when their
-  windows close. The
+  re-evaluate against it; `expect`/`assume` rules stream through
+  per-rule monitors ([`temporal::RuleMonitor`]) — at every scheduler
+  cycle boundary the monitor consumes the newly finalized states, an
+  invariant rule (`not`/`fail`) whose forbidden behavior occurred
+  fires at that cycle, and the obligation rules (`=>`, `eventually`)
+  report their end-of-run verdicts when their windows close. The
   clause 33 blocking TCMs (`up()`/`down()`/`lock()`) yield at the call
   and park blocked calls on a per-object FIFO wake pass.
 - **Randomization.** `gen` is a seeded rejection sampler by default;
@@ -109,10 +110,13 @@ reading, nothing else.
   mismatches in method bodies; there is no general type inference, no
   name-resolution pass beyond it, and constraints/init values/`when`/
   `on` bodies are not walked).
-- Streaming temporal evaluation (the engine re-matches each rule and
-  wait over the finite run log at every cycle boundary; invariant
-  rules fire live, but there is no incremental matcher following
-  events as they occur, and obligation windows close only at quit).
+- Temporal value history (each rule streams through a per-event
+  monitor that holds its obligation state incrementally, but a rule's
+  propositions evaluate with the values current when a state arrives —
+  there is no per-cycle value snapshot to re-read; edge samples
+  (`change/rise/fall`) are unsupported for the same reason).
+  Unbounded obligation windows exhaust when the run ends — that is the
+  12.3.3 semantics, not a limitation.
 - Constraint solving beyond bounded shapes (`gen` handles the linear
   and bounded-enumerable non-linear subsets — polynomial products of
   total degree ≤ 4 over capped domain products; wide domains, division

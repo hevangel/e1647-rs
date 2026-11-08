@@ -1343,6 +1343,12 @@ fn run_inner(
         .flat_map(|t| t.expects.iter())
         .collect();
     let mut expect_fired = vec![false; expects.len()];
+    // One streaming monitor per rule: the live passes feed it the run
+    // log incrementally and the quit pass reads its end-of-run verdict.
+    let mut rule_monitors: Vec<crate::temporal::RuleMonitor> = expects
+        .iter()
+        .map(|rule| crate::temporal::RuleMonitor::new(&rule.te))
+        .collect();
     while !interp.coroutines.is_empty() && !interp.stop_requested {
         // The clause 33 wake pass: a blocking call parked a coroutine on
         // a sync object; service the oldest waiter whose condition
@@ -1374,7 +1380,13 @@ fn run_inner(
             // unsatisfiable over the log prefix fires here — the failure
             // is reported (else body runs, DUT error counted) at the
             // cycle it became certain, not deferred to quit.
-            check_expect_rules(&mut interp, &expects, &mut expect_fired, sys_index);
+            check_expect_rules(
+                &mut interp,
+                &expects,
+                &mut expect_fired,
+                &mut rule_monitors,
+                sys_index,
+            );
             let mut expired = Vec::new();
             for (position, co) in interp.coroutines.iter_mut().enumerate() {
                 if co.suspended_temporal {
@@ -1446,46 +1458,18 @@ fn run_inner(
         // monitoring did not already fire.
         interp.run_phase_on_tree(sys_index, "check", &mut diagnostics);
     }
-    // 11.4: the quit-time re-check over the run log of the rules the
-    // live passes did not already fire (12.3.3 — the rule fails where
-    // all possibilities to satisfy it are exhausted). The `else` body
-    // (usually a `dut_error` call) runs on the sys instance; without
-    // one, the failure itself is the check error. Rules whose TE cannot
-    // be evaluated over the log report the gap honestly.
-    for (rule_index, expect_rule) in expects.iter().enumerate() {
-        if expect_fired[rule_index] || interp.stop_requested {
-            continue;
-        }
-        let kind = format!("{:?}", expect_rule.kind).to_lowercase();
-        let (booleans, numerics) =
-            interp.evaluate_temporal_exprs(&expect_rule.te, &mut Frame::default(), Some(sys_index));
-        let callbacks = temporal_callbacks(&booleans, &numerics);
-        match crate::temporal::rule_failed(&expect_rule.te, &interp.temporal_log, &callbacks) {
-            Ok(true) => {
-                if expect_rule.else_body.is_empty() {
-                    // No `dut_error` clause: the failure itself is the
-                    // check error (11.4 — the tool prints the rule).
-                    interp.dut_errors += 1;
-                    interp.output.push_str(&format!(
-                        "{kind} rule failed: temporal property not satisfied, no else body\n"
-                    ));
-                } else {
-                    let mut frame = Frame::default();
-                    if let Err(diagnostic) =
-                        interp.exec_block(&expect_rule.else_body, &mut frame, Some(sys_index))
-                    {
-                        interp
-                            .output
-                            .push_str(&format!("{kind} rule else body: {}\n", diagnostic.render()));
-                    }
-                }
-            }
-            Ok(false) => {}
-            Err(err) => interp.output.push_str(&format!(
-                "{kind} rule cannot be evaluated over the run: {err:?}\n"
-            )),
-        }
-    }
+    // 11.4: the quit-time re-check of the rules the live passes did not
+    // already fire — the streaming monitors consume any log growth since
+    // the last boundary and report their end-of-run verdicts (12.3.3:
+    // the obligation windows exhaust when the run ends — the earliest
+    // sound closure point).
+    check_expect_rules_at_quit(
+        &mut interp,
+        &expects,
+        &mut expect_fired,
+        &mut rule_monitors,
+        sys_index,
+    );
     // The finalize phase (28.3.3.8): `quit()` then `finalize()` on every
     // live instance, depth-first, sys first.
     if !interp.stop_requested {
@@ -1532,6 +1516,7 @@ fn check_expect_rules(
     interp: &mut Interp,
     expects: &[&crate::ast::ExpectDecl],
     expect_fired: &mut [bool],
+    rule_monitors: &mut [crate::temporal::RuleMonitor],
     sys_index: usize,
 ) {
     for (rule_index, expect_rule) in expects.iter().enumerate() {
@@ -1542,35 +1527,100 @@ fn check_expect_rules(
         let (booleans, numerics) =
             interp.evaluate_temporal_exprs(&expect_rule.te, &mut Frame::default(), Some(sys_index));
         let callbacks = temporal_callbacks(&booleans, &numerics);
-        match crate::temporal::rule_prefix_failed(&expect_rule.te, &interp.temporal_log, &callbacks)
-        {
+        // The monitor consumes only FINALIZED states: the current
+        // cycle's state is still in progress (this cycle's emits record
+        // into it during turns), so it is handed over at the next
+        // boundary, after the cycle closed. The state index equals the
+        // cycle (pad_log keeps one state per cycle).
+        let final_len = (interp.cycle as usize).min(interp.temporal_log.len());
+        match rule_monitors[rule_index].observe(&interp.temporal_log[..final_len], &callbacks) {
             Ok(true) => {
+                // The live fire: the streaming monitor matched the
+                // forbidden behavior of an invariant rule — the same
+                // prefix-certain verdict the previous full-rescan pass
+                // computed, now incremental.
+                fire_expect_rule(interp, expect_rule, &kind, sys_index);
                 expect_fired[rule_index] = true;
-                if expect_rule.else_body.is_empty() {
-                    // No `dut_error` clause: the failure itself is the
-                    // check error (11.4 — the tool prints the rule).
-                    interp.dut_errors += 1;
-                    interp.output.push_str(&format!(
-                        "{kind} rule failed: temporal property not satisfied, no else body\n"
-                    ));
-                } else {
-                    let mut frame = Frame::default();
-                    if let Err(diagnostic) =
-                        interp.exec_block(&expect_rule.else_body, &mut frame, Some(sys_index))
-                    {
-                        interp
-                            .output
-                            .push_str(&format!("{kind} rule else body: {}\n", diagnostic.render()));
-                    }
-                }
             }
             Ok(false) => {}
             Err(err) => {
+                // The rule cannot be evaluated over the log: report the
+                // gap honestly, once, and retire the rule.
                 expect_fired[rule_index] = true;
                 interp.output.push_str(&format!(
                     "{kind} rule cannot be evaluated over the run: {err:?}\n"
                 ));
             }
+        }
+    }
+}
+
+/// Fire one expect/assume rule's failure: the `else` body runs on the
+/// sys instance (or, without one, the failure itself is the check
+/// error, 11.4).
+fn fire_expect_rule(
+    interp: &mut Interp,
+    expect_rule: &crate::ast::ExpectDecl,
+    kind: &str,
+    sys_index: usize,
+) {
+    if expect_rule.else_body.is_empty() {
+        // No `dut_error` clause: the failure itself is the check error
+        // (11.4 — the tool prints the rule).
+        interp.dut_errors += 1;
+        interp.output.push_str(&format!(
+            "{kind} rule failed: temporal property not satisfied, no else body\n"
+        ));
+    } else {
+        let mut frame = Frame::default();
+        if let Err(diagnostic) =
+            interp.exec_block(&expect_rule.else_body, &mut frame, Some(sys_index))
+        {
+            interp
+                .output
+                .push_str(&format!("{kind} rule else body: {}\n", diagnostic.render()));
+        }
+    }
+}
+
+/// The quit-time re-check of the expect/assume rules the live passes
+/// (one per scheduler cycle boundary) did not already fire — 12.3.3:
+/// the rule fails where all possibilities to satisfy it are exhausted.
+/// The `else` body (usually a `dut_error` call) runs on
+/// the sys instance; without one, the failure itself is the check
+/// error. Rules whose TE cannot be evaluated over the log report the
+/// gap honestly.
+fn check_expect_rules_at_quit(
+    interp: &mut Interp,
+    expects: &[&crate::ast::ExpectDecl],
+    expect_fired: &mut [bool],
+    rule_monitors: &mut [crate::temporal::RuleMonitor],
+    sys_index: usize,
+) {
+    for (rule_index, expect_rule) in expects.iter().enumerate() {
+        if expect_fired[rule_index] || interp.stop_requested {
+            continue;
+        }
+        let kind = format!("{:?}", expect_rule.kind).to_lowercase();
+        let (booleans, numerics) =
+            interp.evaluate_temporal_exprs(&expect_rule.te, &mut Frame::default(), Some(sys_index));
+        let callbacks = temporal_callbacks(&booleans, &numerics);
+        // The monitor catches any log growth since the last boundary,
+        // then its end-of-run verdict decides (equivalent to the
+        // previous whole-log `rule_failed` re-scan).
+        match rule_monitors[rule_index].observe(&interp.temporal_log, &callbacks) {
+            Ok(_) => {}
+            Err(err) => {
+                expect_fired[rule_index] = true;
+                interp.output.push_str(&format!(
+                    "{kind} rule cannot be evaluated over the run: {err:?}\n"
+                ));
+                continue;
+            }
+        }
+        if rule_monitors[rule_index].failed_at_end() {
+            fire_expect_rule(interp, expect_rule, &kind, sys_index);
+            expect_fired[rule_index] = true;
         }
     }
 }
