@@ -139,15 +139,104 @@ fn translate_range_membership_into_two_comparisons() {
 }
 
 #[test]
-fn translate_item_membership_is_unsupported() {
-    // Item-list membership needs a disjunction; the IR has none yet and
-    // the caller falls back to the evaluation-based rejection sampler.
+fn translate_item_membership_into_disjunction() {
+    // `a in [1, 5, 9]` is the disjunction of the equalities; each item
+    // goes through the same affine translation as a comparison side.
     let exprs = parse_exprs("a in [1, 5, 9]");
-    let error = translate(&exprs, &bounds_from(&[("a", (0, 255))])).expect_err("unsupported");
+    let problem = translate(&exprs, &bounds_from(&[("a", (0, 255))])).expect("translatable");
+    let e1647::solve::BoolNode::Any(branches) = &problem.constraints[0] else {
+        panic!("expected the item list to translate as a disjunction");
+    };
+    assert_eq!(branches.len(), 3);
+    let expected_rhs = [1, 5, 9];
+    for (branch, rhs) in branches.iter().zip(expected_rhs) {
+        let e1647::solve::BoolNode::Atom(linear) = branch else {
+            panic!("expected an equality atom");
+        };
+        assert_eq!(linear.terms, vec![("a".to_string(), 1)]);
+        assert_eq!(linear.rhs, rhs);
+        assert_eq!(linear.cmp, e1647::solve::Cmp::Eq);
+    }
+}
+
+#[test]
+fn translate_disjunction_into_any() {
+    let exprs = parse_exprs("a < 3 || a > 7");
+    let problem = translate(&exprs, &bounds_from(&[("a", (0, 9))])).expect("translatable");
+    let e1647::solve::BoolNode::Any(branches) = &problem.constraints[0] else {
+        panic!("expected the disjunction to translate as Any");
+    };
+    assert_eq!(branches.len(), 2);
+    let e1647::solve::BoolNode::Atom(low) = &branches[0] else {
+        panic!("expected the first branch atom");
+    };
+    assert_eq!(low.cmp, e1647::solve::Cmp::Lt);
+    assert_eq!(low.rhs, 3);
+    let e1647::solve::BoolNode::Atom(high) = &branches[1] else {
+        panic!("expected the second branch atom");
+    };
+    assert_eq!(high.cmp, e1647::solve::Cmp::Gt);
+    assert_eq!(high.rhs, 7);
+}
+
+#[test]
+fn translate_negated_membership_de_morgan() {
+    // `a not in [1..5]` parses as the unary `not` over the range
+    // membership: ¬(a >= 1 ∧ a <= 5) = a < 1 ∨ a > 5.
+    let exprs = parse_exprs("a not in [1..5]");
+    let problem = translate(&exprs, &bounds_from(&[("a", (0, 9))])).expect("translatable");
+    let e1647::solve::BoolNode::Any(branches) = &problem.constraints[0] else {
+        panic!("expected the negated range to translate as a disjunction");
+    };
+    assert_eq!(branches.len(), 2);
+    let e1647::solve::BoolNode::Atom(below) = &branches[0] else {
+        panic!("expected the below-range atom");
+    };
+    assert_eq!(below.cmp, e1647::solve::Cmp::Lt);
+    assert_eq!(below.rhs, 1);
+    let e1647::solve::BoolNode::Atom(above) = &branches[1] else {
+        panic!("expected the above-range atom");
+    };
+    assert_eq!(above.cmp, e1647::solve::Cmp::Gt);
+    assert_eq!(above.rhs, 5);
+}
+
+#[test]
+fn translate_negated_conjunction_swaps_the_connective() {
+    // ¬(a < 1 ∧ b < 2) = a >= 1 ∨ b >= 2 (De Morgan).
+    let exprs = parse_exprs("not (a < 1 && b < 2)");
+    let problem =
+        translate(&exprs, &bounds_from(&[("a", (0, 9)), ("b", (0, 9))])).expect("translatable");
+    let e1647::solve::BoolNode::Any(branches) = &problem.constraints[0] else {
+        panic!("expected the negated conjunction to translate as a disjunction");
+    };
+    assert_eq!(branches.len(), 2);
+    let e1647::solve::BoolNode::Atom(a) = &branches[0] else {
+        panic!("expected the first negated atom");
+    };
     assert_eq!(
-        error,
-        TranslationError::Unsupported("set membership over an item list")
+        a.terms,
+        vec![("a".to_string(), 1)],
+        "negation must not move the comparison's sides"
     );
+    assert_eq!(a.cmp, e1647::solve::Cmp::Ge);
+    assert_eq!(a.rhs, 1);
+    let e1647::solve::BoolNode::Atom(b) = &branches[1] else {
+        panic!("expected the second negated atom");
+    };
+    assert_eq!(b.cmp, e1647::solve::Cmp::Ge);
+    assert_eq!(b.rhs, 2);
+}
+
+#[test]
+fn translate_double_negation_restores_the_atom() {
+    let exprs = parse_exprs("not not (a == 4)");
+    let problem = translate(&exprs, &bounds_from(&[("a", (0, 9))])).expect("translatable");
+    let e1647::solve::BoolNode::Atom(linear) = &problem.constraints[0] else {
+        panic!("expected the doubly negated atom restored");
+    };
+    assert_eq!(linear.cmp, e1647::solve::Cmp::Eq);
+    assert_eq!(linear.rhs, 4);
 }
 
 #[test]
@@ -180,14 +269,6 @@ fn translate_range_with_expression_bounds() {
 #[test]
 fn translate_rejects_unsupported_shapes() {
     let bounds = bounds_from(&[("a", (0, 10))]);
-    // Disjunction.
-    let exprs = parse_exprs("a == 1 || a == 2");
-    assert_eq!(
-        translate(&exprs, &bounds),
-        Err(TranslationError::Unsupported(
-            "constraint operator is not a comparison"
-        ))
-    );
     // Non-linear multiplication.
     let exprs = parse_exprs("a * a == 4");
     assert!(matches!(
@@ -200,6 +281,15 @@ fn translate_rejects_unsupported_shapes() {
         translate(&exprs, &bounds),
         Err(TranslationError::Unsupported(_))
     ));
+    // A disjunct the affine translation cannot express (here a bare
+    // identifier, which is not a comparison).
+    let exprs = parse_exprs("a == 1 || zz");
+    assert_eq!(
+        translate(&exprs, &bounds),
+        Err(TranslationError::Unsupported(
+            "constraint is not a comparison"
+        ))
+    );
 }
 
 #[test]
@@ -269,5 +359,63 @@ mod pumpkin {
         let exprs = parse_exprs("a > 100");
         let problem = translate(&exprs, &bounds_from(&[("a", (0, 15))])).expect("translatable");
         assert_eq!(solve(&problem, 1), SolveOutcome::Unsat);
+    }
+
+    #[test]
+    fn solves_disjunction_and_is_deterministic() {
+        let source = "a == 1 || a == 2";
+        let bounds = bounds_from(&[("a", (0, 15))]);
+        let first = solved_values(source, bounds.clone(), 3);
+        let second = solved_values(source, bounds, 3);
+        assert_eq!(first, second, "same seed must pick the same branch");
+        assert!(
+            first == vec![1] || first == vec![2],
+            "the assignment must satisfy one branch: {first:?}"
+        );
+    }
+
+    #[test]
+    fn solves_item_membership() {
+        let values = solved_values("a in [1, 5, 9]", bounds_from(&[("a", (0, 15))]), 7);
+        assert!(
+            values == vec![1] || values == vec![5] || values == vec![9],
+            "the assignment must be one of the items: {values:?}"
+        );
+    }
+
+    #[test]
+    fn solves_disjunction_over_variables() {
+        // `a in [b, b + 1]` — item expressions go through the affine
+        // translation, so the disjunction stays linear.
+        let values = solved_values(
+            "a in [b, b + 1]",
+            bounds_from(&[("a", (0, 50)), ("b", (0, 50))]),
+            7,
+        );
+        let delta = values[0] - values[1];
+        assert!(
+            delta == 0 || delta == 1,
+            "a must equal b or b + 1: {values:?}"
+        );
+    }
+
+    #[test]
+    fn reports_unsat_when_every_branch_fails() {
+        let exprs = parse_exprs("a < 0 || a > 15");
+        let problem = translate(&exprs, &bounds_from(&[("a", (0, 15))])).expect("translatable");
+        assert_eq!(solve(&problem, 1), SolveOutcome::Unsat);
+    }
+
+    #[test]
+    fn combinations_beyond_the_cap_fall_back_to_unsupported() {
+        // Seven separate two-branch disjunctions multiply to 2^7 = 128
+        // branch combinations — beyond MAX_BRANCH_COMBINATIONS — so the
+        // outcome defers to the rejection sampler rather than exploding.
+        // (A chained `||` flattens to N alternatives, not 2^N; the cap is
+        // about the product of independent disjunctions.)
+        let source = "a == 1 || a == 2\na == 1 || a == 2\na == 1 || a == 2\na == 1 || a == 2\na == 1 || a == 2\na == 1 || a == 2\na == 1 || a == 2";
+        let exprs = parse_exprs(source);
+        let problem = translate(&exprs, &bounds_from(&[("a", (0, 15))])).expect("translatable");
+        assert_eq!(solve(&problem, 1), SolveOutcome::Unsupported);
     }
 }

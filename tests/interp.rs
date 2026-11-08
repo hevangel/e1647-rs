@@ -545,6 +545,53 @@ fn gen_respects_keep_constraints_and_is_deterministic() {
 }
 
 #[test]
+fn gen_enforces_a_disjunctive_keep_constraint() {
+    // The solver seam accepts disjunctions (branch enumeration): with the
+    // solver feature a satisfying branch is solved; without it the
+    // rejection sampler enforces the constraint by evaluation. Either
+    // way every value must satisfy the disjunction, both branches must
+    // stay reachable, and one seed must reproduce its run.
+    let source = "struct gated_s {\n    a: uint(bits: 8);\n    keep a == 1 or a == 200;\n};\nextend sys {\n    run() is also {\n        var p: gated_s;\n        gen p;\n        print p.a;\n    };\n};\n";
+    assert_eq!(clean_output(source, 4), clean_output(source, 4));
+    let mut seen = std::collections::BTreeSet::new();
+    for seed in 1..=40 {
+        let output = clean_output(source, seed);
+        let value: i128 = output.trim().parse().expect("integer output");
+        assert!(
+            value == 1 || value == 200,
+            "seed {seed} violated the disjunction: {value}"
+        );
+        seen.insert(value);
+    }
+    assert!(
+        seen.contains(&1) && seen.contains(&200),
+        "both branches must stay reachable: {seen:?}"
+    );
+}
+
+#[test]
+fn gen_enforces_negated_and_item_set_constraints() {
+    // `not in [lo..hi]` and item-list membership translate into the
+    // solver's disjunction IR; under the rejection sampler they are
+    // enforced by evaluation. The sampled values must satisfy both.
+    let source = "struct gated_s {\n    a: uint(bits: 8);\n    keep a not in [10..90];\n    keep a in [1, 100, 200];\n};\nextend sys {\n    run() is also {\n        var p: gated_s;\n        gen p;\n        print p.a;\n    };\n};\n";
+    let mut seen = std::collections::BTreeSet::new();
+    for seed in 1..=40 {
+        let output = clean_output(source, seed);
+        let value: i128 = output.trim().parse().expect("integer output");
+        assert!(
+            value == 1 || value == 100 || value == 200,
+            "seed {seed} left the item set: {value}"
+        );
+        seen.insert(value);
+    }
+    assert!(
+        seen.len() >= 2,
+        "the disjunctive domains must stay reachable: {seen:?}"
+    );
+}
+
+#[test]
 fn gen_of_struct_recurses_into_list_elements() {
     let output = clean_output(
         "struct pixel_s {\n    intensity: uint(bits: 8);\n};\nstruct frame_s {\n    pixels: list of pixel_s;\n    keep pixels.size() > 0;\n};\nextend sys {\n    run() is also {\n        var f: frame_s;\n        gen f;\n        print f.pixels[0].intensity;\n    };\n};\n",
