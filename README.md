@@ -76,11 +76,12 @@ docker compose run --rm toolchain  # interactive shell in the container
 
 `run` executes the built-in `sys` unit's `run()` methods. Every run takes
 an explicit `--seed` and is fully deterministic per backend. By default
-`gen` is a rejection sampler; with `solver-pumpkin` it solves linear
-`keep` constraints — conjunctive and disjunctive (`||`, `not`, item-set
-membership) — and falls back to rejection sampling for anything else
-(see `src/interp.rs` for the exact semantics and its honest
-limits).
+`gen` is a rejection sampler; translatable `keep` constraints solve
+instead — linear ones through the backend conjunction solver (the
+`solver-pumpkin` cargo feature), non-linear polynomial ones through a
+feature-independent bounded enumeration solver — and everything else
+falls back to rejection sampling (see `src/interp.rs` for the exact
+semantics and its honest limits).
 
 ## Repository layout
 

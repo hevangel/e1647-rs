@@ -3230,11 +3230,14 @@ impl<'a> Interp<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        // Solver-backed path (feature `solver-pumpkin`). A chosen_from
-        // constraint assigns its own target when that is generated; it is
-        // not a predicate over this scalar, so it stays out of the
-        // translated problem.
-        #[cfg(feature = "solver-pumpkin")]
+        // Solver-backed path: linear problems go to the backend
+        // conjunction solver (pumpkin with the cargo feature; without it
+        // the outcome is Unsupported and the rejection sampler below
+        // takes over), non-linear problems go to the bounded enumeration
+        // solver in every build (see [`crate::solve::solve`]). A
+        // chosen_from constraint assigns its own target when that is
+        // generated; it is not a predicate over this scalar, so it stays
+        // out of the translated problem.
         {
             let bounds: std::collections::BTreeMap<String, (i64, i64)> =
                 crate::solve::int_bounds(&declared_ty)
@@ -4141,9 +4144,10 @@ impl<'a> Interp<'a> {
         // Simple range/equality constraints narrow the per-field sampling
         // domains; everything else is enforced by the rejection predicate.
         let domains = self.constraint_domains(&plain_constraints, &field_types);
-        // Solver-backed path (feature `solver-pumpkin`): the integer
-        // scalar fields are solved, the remaining fields are sampled.
-        #[cfg(feature = "solver-pumpkin")]
+        // Solver-backed path: linear problems go to the backend
+        // conjunction solver (pumpkin with the cargo feature; without it
+        // the outcome is Unsupported), non-linear problems to the
+        // bounded enumeration solver in every build.
         if let Some(assignment) =
             self.try_solve_fields(&field_types, &plain_constraints, &type_name, type_span)?
         {
@@ -4635,10 +4639,11 @@ impl<'a> Interp<'a> {
     }
 
     /// Translate the type's `keep` constraints over its integer scalar
-    /// fields and solve them with the constraint-solver backend (pumpkin).
+    /// fields and solve them: linear problems via the backend
+    /// conjunction solver (pumpkin with the cargo feature), non-linear
+    /// problems via the bounded enumeration solver (every build).
     /// `Ok(None)` means the caller must use the rejection sampler:
     /// translation unsupported, backend unavailable, or search unknown.
-    #[cfg(feature = "solver-pumpkin")]
     fn try_solve_fields(
         &self,
         field_types: &[(String, TypeExpr)],
