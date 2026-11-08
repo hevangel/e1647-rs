@@ -2085,14 +2085,16 @@ fn computed_macro_result_variable_is_the_return_value() {
 
 #[test]
 fn set_of_values_builds_the_legal_value_set() {
-    // 5.10.5: the set of all legal values of a numeric or enumeral
-    // type — scalars from their width and signedness, enumerals as
-    // their indices.
+    // 5.10.5: the set of all legal values of a scalar type — scalars
+    // from their width and signedness, enumerals as their indices. The
+    // 2019 reading (the migration plan's C3) drops the 2016 word
+    // "numeric": `bool` applies too, and that is what this test pins.
     let output = clean_output(
         "type addr_t : int (bits : 8);\n\
          type color_t : [WHITE, BLACK, RED];\n\
          extend sys {\n    run() is also {\n            print set_of_values(addr_t);\n            \
-         print set_of_values(color_t);\n            print set_of_values(bit);\n        };\n};\n",
+         print set_of_values(color_t);\n            print set_of_values(bit);\n            \
+         print set_of_values(bool);\n        };\n};\n",
         1,
     );
     assert!(output.contains("[-128..127]"), "output: {output}");
@@ -3012,7 +3014,9 @@ fn table1_phase_order_setup_run_extract_check_finalize() {
     // T8.1 (Table 1, 28.3.3.6-28.3.3.8, 28.3.5.1): the extract, check
     // and finalize phases call the same-named method on every live
     // instance after the scheduler drains, in the field-tree DFS order
-    // run() uses; setup() runs before generation.
+    // run() uses; setup() runs before generation. The per-struct
+    // extract()/check() naming is the 2019 reading (the plan's C11);
+    // the 2016 Table 1 named only the sys-level hooks.
     let output = clean_output(
         "struct leaf { run() is also { out(\"leaf run\\n\"); }; \
          extract() is also { out(\"leaf extract\\n\"); }; \
@@ -3311,6 +3315,9 @@ fn numeric_list_aggregates_accept_real_and_exp_forms() {
     // max_value/min_value take any numeric item expression (reals
     // included) and return the expression's type; integer average
     // truncates (keeps the int type); empty product is 1, empty sum 0.
+    // Differential reading (the plan's C4): the 2016 clauses scoped
+    // these to integer lists; the 2019 text makes them numeric, and
+    // the real sums below pin that reading.
     let output = clean_output(
         "extend sys {\n    run() is also {\n        \
          out({1.5; 2.5}.sum(it), \"\\n\");\n        \
@@ -3348,7 +3355,9 @@ fn average_of_empty_list_is_an_honest_error() {
 fn deep_copy_mints_a_fresh_list_and_copies_values() {
     // T8.7 (29.2.2): a list deep copy returns a NEW list object whose
     // items are deep copies — the original is untouched by later
-    // modifications of the copy; scalars copy as themselves.
+    // modifications of the copy; scalars copy as themselves. 29.2.2's
+    // 2019 generalisation (the plan's C7) extends the routine to
+    // scalars/strings/sets/lists; the scalar arm below pins it.
     let output = clean_output(
         "extend sys {\n    run() is also {\n        \
          var l1: list of int = {1; 2; 3; 4};\n        \
@@ -3538,7 +3547,9 @@ fn user_transaction_handler_hooks_are_extendable_names() {
 #[test]
 fn for_each_over_an_enumerated_set_literal_iterates_the_enumerands() {
     // T8.11 (20.2.5): `for each (c) in [red..blue]` iterates the set's
-    // items in order — the enumerands of the enumeral type.
+    // items in order — the enumerands of the enumeral type. The 2019
+    // clause generalizes the iteration to any item type (the plan's
+    // C6); this enumeral case pins that reading.
     let output = clean_output(
         "type color: [red, green, blue];\n\
          extend sys {\n    run() is also {\n        \
@@ -5024,7 +5035,10 @@ fn precision_rules_64_bit_unbounded_and_real_contexts() {
     // computes the longint/longuint comparison at unsigned 64 bits
     // (-1 casts to MAX_LONGUINT, so `<` is FALSE); rule (d) computes
     // the real + unbounded-int sum in double precision; rule (a)
-    // wraps the uint subtraction at 32 unsigned bits.
+    // wraps the uint subtraction at 32 unsigned bits. The two `<`
+    // results diverging is itself the differential (the plan's C14):
+    // the 2019 64-bit rules make `longint -1 < longuint 1` FALSE while
+    // the >32-bit rule keeps `int(bits:64) -1 < uint(bits:64) 1` TRUE.
     let output = clean_output(
         "extend sys {\n    \
          run() is also {\n        \

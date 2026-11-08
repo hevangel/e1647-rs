@@ -1198,7 +1198,11 @@ fn bare_is_is_not_consumed_as_a_type_check() {
 #[test]
 fn extend_global_is_rejected() {
     // Clause 4.4.2.2: extensions of `global` are reserved for the
-    // implementation.
+    // implementation. Differential reading (the plan's C1): 2016
+    // prohibited the extension outright; 2019 rewords it as
+    // implementation-reserved, and this implementation keeps the
+    // rejection under either wording — only the message cites the
+    // 2019 clause.
     let result = parse("extend global {\n    helper: uint;\n};\n");
     assert!(result.declarations.is_empty());
     let rendered: Vec<String> = result.diagnostics.iter().map(|d| d.render()).collect();
