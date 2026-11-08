@@ -1,0 +1,1 @@
+3:12: error[E0223]: the comparison compares 'string' with 'int'
