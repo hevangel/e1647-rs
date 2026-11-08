@@ -18,11 +18,12 @@
 > clause 13 scheduler, checks temporal `expect`/`assume` rules and
 > collects coverage. The IEEE 1647-2019 feature set runs: static
 > members, interfaces, the template rework, range-generated fields,
-> `chosen_from`, custom numeric types, tables, annotations, and the
-> reflection catalogue with `instance_iterator`. Full type checking,
-> event-driven temporal evaluation, non-linear constraint solving and
-> general testbench execution do **not** exist yet, and no IEEE
-> conformance is claimed.
+> `chosen_from`, custom numeric types, tables, annotations, the clause
+> 33 resource-sharing structs (`semaphore`/`rdv_semaphore`/`locker`),
+> and the reflection catalogue with `instance_iterator`. Full type
+> checking, event-driven temporal evaluation, non-linear constraint
+> solving and general testbench execution do **not** exist yet, and no
+> IEEE conformance is claimed.
 
 ## From Slopman to Rustman
 

@@ -718,6 +718,270 @@ fn start_schedules_the_tcm_and_the_starter_continues() {
     assert!(main_pos < tcm_pos, "the starter continues first: {output}");
 }
 
+// --- Clause 33 resource-sharing structs ---
+
+#[test]
+fn semaphore_values_queries_and_transfers_run() {
+    // 31.2.3/31.2.4: a fresh semaphore starts at 0 available under a
+    // MAX_INT maximum; set_value/set_max_value configure it before any
+    // up()/down() was called; up()/down() transfer one resource each.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var a: semaphore = new semaphore;\n        \
+         out(\"value=\", a.get_value(), \" max=\", a.get_max_value(), \"\\n\");\n        \
+         a.set_value(2);\n        out(\"set=\", a.get_value(), \"\\n\");\n        \
+         var b: semaphore = new semaphore;\n        b.set_max_value(3);\n        \
+         out(\"max=\", b.get_max_value(), \"\\n\");\n        \
+         b.up();\n        b.up();\n        out(\"ups=\", b.get_value(), \"\\n\");\n        \
+         b.down();\n        out(\"down=\", b.get_value(), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(
+        output,
+        "value=0 max=2147483647\nset=2\nmax=3\nups=2\ndown=1\n"
+    );
+}
+
+#[test]
+fn try_up_and_try_down_never_block_and_report_the_change() {
+    // 31.2.2: try_down() on an empty semaphore is FALSE without
+    // blocking; after an up() it is TRUE and the value moved.
+    let output = clean_output(
+        "extend sys {\n    run() is also {\n        var s: semaphore = new semaphore;\n        \
+         if not s.try_down() { out(\"EMPTY\\n\"); };\n        s.up();\n        \
+         if s.try_down() { out(\"TOOK\\n\"); };\n        out(\"value=\", s.get_value(), \"\\n\");\n    };\n};\n",
+        1,
+    );
+    assert_eq!(output, "EMPTY\nTOOK\nvalue=0\n");
+}
+
+#[test]
+fn down_blocks_until_a_producer_ups() {
+    // 31.2.1: the consumer blocks at down() (no resource available);
+    // the producer's up() two cycles later makes it proceed. The
+    // blocking calls yield at the call (a TCM call is an interrupt
+    // point), so the producer announces the up() before making it —
+    // the consumer can only resume once the resource exists.
+    let output = clean_output(
+        "extend sys {\n    s: semaphore;\n    consumer() @sys.any is {\n        \
+         out(\"CONSUMER WAIT\\n\");\n        s.down();\n        out(\"CONSUMER GOT\\n\");\n    };\n    \
+         producer() @sys.any is {\n        wait [2]*cycle;\n        out(\"PRODUCER UP\\n\");\n        \
+         s.up();\n    };\n    run() is also {\n        s = new semaphore;\n        \
+         start consumer();\n        start producer();\n    };\n};\n",
+        1,
+    );
+    let wait_pos = output.find("CONSUMER WAIT").expect("consumer parked");
+    let up_pos = output.find("PRODUCER UP").expect("producer produced");
+    let got_pos = output.find("CONSUMER GOT").expect("consumer resumed");
+    assert!(wait_pos < up_pos, "the consumer blocks first: {output}");
+    assert!(
+        up_pos < got_pos,
+        "the consumer resumes after the up(): {output}"
+    );
+}
+
+#[test]
+fn blocked_consumers_are_serviced_fifo() {
+    // 31.2.1: blocked down() calls are serviced in their request order.
+    // Two consumers block; one up() services the first only; the second
+    // up() services the second.
+    let output = clean_output(
+        "extend sys {\n    s: semaphore;\n    c1() @sys.any is {\n        s.down();\n        \
+         out(\"C1\\n\");\n    };\n    c2() @sys.any is {\n        s.down();\n        \
+         out(\"C2\\n\");\n    };\n    producer() @sys.any is {\n        s.up();\n        \
+         wait cycle;\n        s.up();\n        out(\"PRODUCED\\n\");\n    };\n    \
+         run() is also {\n        s = new semaphore;\n        start c1();\n        start c2();\n        \
+         start producer();\n    };\n};\n",
+        1,
+    );
+    let c1 = output.find("C1").expect("first consumer served");
+    let c2 = output.find("C2").expect("second consumer served");
+    assert!(
+        c1 < c2,
+        "the first blocked consumer is serviced first: {output}"
+    );
+    assert!(
+        output.find("PRODUCED").is_some(),
+        "the producer completes: {output}"
+    );
+}
+
+#[test]
+fn try_never_beats_a_pending_blocked_call() {
+    // 31.2.2: "a try_up() shall never succeed if there are pending
+    // calls to up()" — symmetric for down. A blocked down() is pending;
+    // a try_down() must fail even though an up() just added a resource
+    // (the blocked call is serviced first).
+    let output = clean_output(
+        "extend sys {\n    s: semaphore;\n    consumer() @sys.any is {\n        s.down();\n        \
+         out(\"GOT\\n\");\n    };\n    prober() @sys.any is {\n        wait [2]*cycle;\n        \
+         s.up();\n        if s.try_down() { out(\"TRIED\\n\"); } else { out(\"DENIED\\n\"); };\n    };\n    \
+         run() is also {\n        s = new semaphore;\n        start consumer();\n        \
+         start prober();\n    };\n};\n",
+        1,
+    );
+    // The blocked consumer is serviced first; the prober's try_down()
+    // runs while no down() is pending anymore... — the resource went to
+    // the blocked call, so the try finds an empty semaphore: DENIED.
+    assert!(
+        output.contains("DENIED"),
+        "the blocked call wins the resource over the try: {output}"
+    );
+    assert!(
+        output.contains("GOT"),
+        "the blocked consumer completes: {output}"
+    );
+}
+
+#[test]
+fn set_value_after_a_transfer_is_e0422() {
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        var s: semaphore = new semaphore;\n        \
+         s.up();\n        s.set_value(1);\n    };\n};\n",
+        1,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E0422" && d.message.contains("set_value")),
+        "diagnostics: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn set_max_below_the_current_value_is_e0422() {
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        var s: semaphore = new semaphore;\n        \
+         s.set_value(3);\n        s.set_max_value(2);\n    };\n};\n",
+        1,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E0422" && d.message.contains("set_max_value")),
+        "diagnostics: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_blocking_call_outside_a_tcm_context_is_e0421() {
+    // down() on an empty semaphore inside run()'s main coroutine IS a
+    // coroutine — the block is legal there. Inside an inline (atomic)
+    // method it cannot suspend: E0421.
+    let result = run_source(
+        "struct helper_s {\n    s: semaphore;\n    take() is {\n        s.down();\n    };\n};\n\
+         extend sys {\n    run() is also {\n        var h: helper_s = new helper_s;\n        \
+         h.s = new semaphore;\n        h.take();\n    };\n};\n",
+        1,
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0421"),
+        "diagnostics: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn locker_mutual_exclusion_and_fifo_grant() {
+    // 31.2.5: the first lock() holds; the second blocks; release()
+    // hands the lock to the waiting TCM, in request order. The blocking
+    // calls yield at the call, so each TCM announces the action before
+    // making it — the waiter's acquire print proves the grant happened
+    // after the holder announced its release.
+    let output = clean_output(
+        "extend sys {\n    l: locker;\n    t1() @sys.any is {\n        l.lock();\n        \
+         out(\"F-LOCKED\\n\");\n        wait [2]*cycle;\n        out(\"F-RELEASING\\n\");\n        \
+         l.release();\n    };\n    t2() @sys.any is {\n        wait cycle;\n        \
+         l.lock();\n        out(\"S-LOCKED\\n\");\n        l.release();\n        \
+         out(\"S-DONE\\n\");\n    };\n    run() is also {\n        l = new locker;\n        \
+         start t1();\n        start t2();\n    };\n};\n",
+        1,
+    );
+    let f_locked = output.find("F-LOCKED").expect("first acquires");
+    let f_releasing = output.find("F-RELEASING").expect("first announces release");
+    let s_locked = output
+        .find("S-LOCKED")
+        .expect("second acquires after release");
+    let s_done = output.find("S-DONE").expect("second finishes");
+    assert!(f_locked < s_locked, "the first lock wins: {output}");
+    assert!(
+        f_releasing < s_locked,
+        "the second acquires only after the release is announced: {output}"
+    );
+    assert!(s_locked < s_done, "the second releases: {output}");
+}
+
+#[test]
+fn release_by_an_entity_that_does_not_hold_is_e0423() {
+    let result = run_source(
+        "extend sys {\n    l: locker;\n    run() is also {\n        l = new locker;\n        \
+         l.release();\n    };\n};\n",
+        1,
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0423"),
+        "diagnostics: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn rdv_semaphore_pairs_up_and_down_up_first() {
+    // 31.2.1: an rdv_semaphore has no resources; up() and down() block
+    // until they coincide, and the paired up() thread always runs
+    // first, followed immediately by the down() thread.
+    let output = clean_output(
+        "extend sys {\n    r: rdv_semaphore;\n    producer() @sys.any is {\n        \
+         out(\"P-BLOCK\\n\");\n        r.up();\n        out(\"P-MET\\n\");\n    };\n    \
+         consumer() @sys.any is {\n        wait [2]*cycle;\n        r.down();\n        \
+         out(\"C-MET\\n\");\n    };\n    run() is also {\n        r = new rdv_semaphore;\n        \
+         start producer();\n        start consumer();\n    };\n};\n",
+        1,
+    );
+    let p_block = output.find("P-BLOCK").expect("producer parked");
+    let p_met = output.find("P-MET").expect("producer met");
+    let c_met = output.find("C-MET").expect("consumer met");
+    assert!(p_block < p_met, "the producer blocks first: {output}");
+    assert!(p_met < c_met, "the paired up() thread runs first: {output}");
+}
+
+#[test]
+fn rdv_semaphore_value_stays_zero() {
+    let result = run_source(
+        "extend sys {\n    run() is also {\n        var r: rdv_semaphore = new rdv_semaphore;\n        \
+         r.set_value(1);\n    };\n};\n",
+        1,
+    );
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == "E0422"),
+        "diagnostics: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.render())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn temporal_wait_in_a_tcm_observes_emissions_made_while_suspended() {
     // The marquee clause 13.2.2 behavior: the waiter suspends at

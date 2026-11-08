@@ -119,7 +119,8 @@ pub fn is_builtin_base(name: &str) -> bool {
 /// `r: table_row` — the 32.3 table API; `table_manager` is the
 /// singleton receiver's type; `it: instance_iterator` — the 32.2
 /// instance iterator, the one reflection surface implemented for real
-/// (T11.2)).
+/// (T11.2); `s: semaphore`, `s: rdv_semaphore`, `l: locker` — the
+/// clause 33 resource-sharing structs).
 pub const BUILTIN_TYPES: &[&str] = &[
     "file",
     "event",
@@ -128,6 +129,12 @@ pub const BUILTIN_TYPES: &[&str] = &[
     "table_row",
     "table_manager",
     "instance_iterator",
+    // The clause 33 resource-sharing structs: constructed with `new
+    // semaphore` / `new rdv_semaphore` / `new locker`; the blocking
+    // up()/down()/lock() surface dispatches on the value.
+    "semaphore",
+    "rdv_semaphore",
+    "locker",
     // The clause 31 `numeric_format_kind` enumerand type — the radix
     // parameter of `numeric_to_string` (T7.2). The enumerands are
     // [`NUMERIC_FORMAT_KIND`]; the elaborator synthesizes the type.
