@@ -44,12 +44,14 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   clause 33 blocking TCMs (`up()`/`down()`/`lock()`) yield at the call
   and park blocked calls on a per-object FIFO wake pass.
 - **Randomization.** `gen` is a seeded rejection sampler by default;
-  with the `solver-pumpkin` cargo feature it solves linear `keep`
-  constraints instead — conjunctive, disjunctive (`||`, `not`, item-set
-  membership via bounded branch enumeration) as well as plain
-  conjunctions. `select` distributions
-  (weights/min/max/edges/others/normal) bias the sampler; every run is
-  deterministic per seed.
+  for translatable `keep` constraints it solves instead: linear
+  problems through the backend conjunction solver (the
+  `solver-pumpkin` cargo feature), non-linear polynomial problems
+  (`a * b == c`, squares) through a feature-independent bounded
+  enumeration solver — disjunctive shapes (`||`, `not`, item-set
+  membership) translate in both paths, and every run is deterministic
+  per seed. `select` distributions
+  (weights/min/max/edges/others/normal) bias the sampler.
 - **Observability.** Coverage groups (clause 14) collect basic-item
   buckets and grades on their sampling event (`run --coverage` reports
   them); `print`/`out` and the message hooks produce the run log.
@@ -111,11 +113,11 @@ reading, nothing else.
   wait over the finite run log at every cycle boundary; invariant
   rules fire live, but there is no incremental matcher following
   events as they occur, and obligation windows close only at quit).
-- Non-linear constraint solving (`gen` handles the conjunctive and
-  disjunctive linear subsets — `||`, `not`, item-set membership — via
-  bounded branch enumeration; non-linear arithmetic is still unsolved;
-  `chosen_from` and the rgf reduced sets are the sampling-side
-  exceptions).
+- Constraint solving beyond bounded shapes (`gen` handles the linear
+  and bounded-enumerable non-linear subsets — polynomial products of
+  total degree ≤ 4 over capped domain products; wide domains, division
+  and modulo still defer to rejection sampling; `chosen_from` and the
+  rgf reduced sets are the sampling-side exceptions).
 - General testbench execution (sequences run inline; the e↔HDL event
   ordering is not implemented; the VHDL backend is unwritten).
 - The remaining out-of-scope list of the 2019 migration plan (TLM

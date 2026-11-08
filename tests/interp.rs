@@ -592,6 +592,32 @@ fn gen_enforces_negated_and_item_set_constraints() {
 }
 
 #[test]
+fn gen_solves_a_nonlinear_constraint_by_enumeration() {
+    // a² == 2500 over 0..255 has the unique solution 50; the bounded
+    // enumeration solver (feature-independent) finds it in every build
+    // and every seed, where the rejection sampler used to give up after
+    // 1000 attempts.
+    let source = "struct square_s {\n    a: uint(bits: 8);\n    keep a * a == 2500;\n};\nextend sys {\n    run() is also {\n        var p: square_s;\n        gen p;\n        print p.a;\n    };\n};\n";
+    for seed in [1u64, 7, 123] {
+        let output = clean_output(source, seed);
+        assert_eq!(output.trim(), "50", "seed {seed}");
+    }
+}
+
+#[test]
+fn gen_solves_a_product_constraint_and_is_deterministic() {
+    // a·b == 6 with a < b: the seeded enumeration pick satisfies both
+    // constraints and reproduces per seed.
+    let source = "struct pair_s {\n    a: uint(bits: 4);\n    b: uint(bits: 4);\n    keep a * b == 6;\n    keep a < b;\n};\nextend sys {\n    run() is also {\n        var p: pair_s;\n        gen p;\n        print p.a * p.b, p.a < p.b;\n    };\n};\n";
+    let first = clean_output(source, 4);
+    let second = clean_output(source, 4);
+    assert_eq!(first, second, "the same seed must reproduce the run");
+    // `print` renders its arguments space-separated on one line.
+    let fields: Vec<&str> = first.split_whitespace().collect();
+    assert_eq!(fields, vec!["6", "TRUE"], "output: {first}");
+}
+
+#[test]
 fn gen_of_struct_recurses_into_list_elements() {
     let output = clean_output(
         "struct pixel_s {\n    intensity: uint(bits: 8);\n};\nstruct frame_s {\n    pixels: list of pixel_s;\n    keep pixels.size() > 0;\n};\nextend sys {\n    run() is also {\n        var f: frame_s;\n        gen f;\n        print f.pixels[0].intensity;\n    };\n};\n",

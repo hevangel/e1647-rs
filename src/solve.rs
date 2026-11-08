@@ -2,22 +2,31 @@
 //!
 //! `translate` turns the top-level `keep` constraints of one type, over the
 //! integer fields of that type, into a [`Problem`]: bounded-integer
-//! variables plus a boolean tree of linear comparisons — conjunction
+//! variables plus a boolean tree of comparisons — conjunction
 //! ([`BoolNode::All`]), disjunction ([`BoolNode::Any`]) and their negation
 //! (`not` flips every comparison and swaps the connective, De Morgan).
 //! Range membership (`x in [lo..hi]`) translates to the two comparisons;
 //! item-list membership (`x in [a, b]`) translates to the disjunction of
-//! its equalities. The translation is
-//! deliberately conservative — anything outside the supported shape
-//! (non-integer fields, method calls, non-linear arithmetic)
-//! reports [`TranslationError::Unsupported`] and the caller falls back to
-//! the evaluation-based rejection sampler in [`crate::interp`].
+//! its equalities. The atoms are linear ([`BoolNode::Atom`]) or — since
+//! multiplication of two non-constant sides no longer gives up — a
+//! polynomial ([`BoolNode::Poly`]): the product expands into monomials
+//! (total degree capped at 4).
 //!
-//! The solver backends are conjunction solvers: [`solve`] expands each
-//! `Any` into its branch combinations (bounded — beyond the cap the
-//! outcome is [`SolveOutcome::Unsupported`]), solves every combination as
-//! a plain conjunction, and picks seeded among the satisfying
-//! combinations, so runs stay deterministic per seed.
+//! Two solving paths sit behind [`solve`]:
+//! - **Linear problems** go to the backend conjunction solver: each `Any`
+//!   expands into its branch combinations (bounded — beyond the cap the
+//!   outcome is [`SolveOutcome::Unsupported`]), every combination is
+//!   solved as a plain conjunction, and one satisfying combination is
+//!   picked seeded, so runs stay deterministic per seed. With the
+//!   `solver-pumpkin` feature this is the Pumpkin CP solver; without it
+//!   the outcome is always [`SolveOutcome::Unsupported`] and the caller
+//!   falls back to the rejection sampler.
+//! - **Problems containing a [`BoolNode::Poly`]** go to the bounded
+//!   enumeration solver (feature-independent): the product of the
+//!   declared domains is capped, the tree is enumerated depth-first with
+//!   partial-assignment pruning, and the `seed`-th satisfying assignment
+//!   in enumeration order is the answer — deterministic per seed. A
+//!   domain product beyond the cap defers to the rejection sampler.
 //!
 //! Backends:
 //! - **pumpkin** (default-off cargo feature `solver-pumpkin`): the
@@ -61,14 +70,41 @@ pub struct Linear {
     pub cmp: Cmp,
 }
 
-/// A boolean tree of linear atoms. The backends post `Atom` and `All`
-/// directly; `Any` is expanded by [`solve`] into branch combinations
-/// before posting.
+/// `Σ (coefficient · monomial)  (cmp)  rhs` — a polynomial comparison
+/// over the problem variables; each monomial maps variables to positive
+/// exponents. A monomial with one variable at exponent 1 is linear, so
+/// `a * 2 == 10` stays a [`BoolNode::Atom`]; `a * b <= 100` and
+/// `a * a == 2500` arrive here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Polynomial {
+    pub terms: Vec<(BTreeMap<String, u32>, i64)>,
+    pub rhs: i64,
+    pub cmp: Cmp,
+}
+
+/// A boolean tree of comparison atoms. The backends post `Atom` and
+/// `All` directly; `Any` is expanded by [`solve`] into branch
+/// combinations before posting, and any [`BoolNode::Poly`] routes the
+/// whole problem to the bounded enumeration solver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoolNode {
     Atom(Linear),
+    Poly(Polynomial),
     All(Vec<BoolNode>),
     Any(Vec<BoolNode>),
+}
+
+impl BoolNode {
+    /// Whether the tree contains a polynomial atom.
+    fn has_polynomial(&self) -> bool {
+        match self {
+            BoolNode::Poly(_) => true,
+            BoolNode::Atom(_) => false,
+            BoolNode::All(children) | BoolNode::Any(children) => {
+                children.iter().any(BoolNode::has_polynomial)
+            }
+        }
+    }
 }
 
 /// A translatable `gen` problem.
@@ -236,7 +272,26 @@ fn translate_bool(
             .collect::<Result<Vec<_>, TranslationError>>()?;
         return Ok(BoolNode::Any(branches));
     }
-    translate_atom(expr, bounds).map(BoolNode::Atom)
+    translate_comparison(expr, bounds)
+}
+
+/// One comparison atom: the affine translation first (it subsumes every
+/// linear shape, which the backend posts directly); a comparison the
+/// affine translation cannot express falls to the polynomial
+/// translation, whose product expansion handles non-linear
+/// multiplication. The atom error is the more specific diagnostic, so a
+/// failed polynomial attempt reports it.
+fn translate_comparison(
+    expr: &Expr,
+    bounds: &BTreeMap<String, (i64, i64)>,
+) -> Result<BoolNode, TranslationError> {
+    match translate_atom(expr, bounds) {
+        Ok(linear) => Ok(BoolNode::Atom(linear)),
+        Err(atom_error) => match polynomial_comparison(expr, bounds) {
+            Ok(polynomial) => Ok(BoolNode::Poly(polynomial)),
+            Err(_) => Err(atom_error),
+        },
+    }
 }
 
 /// Negate one translated boolean tree: every comparison flips
@@ -244,15 +299,12 @@ fn translate_bool(
 fn negate_node(node: BoolNode) -> Result<BoolNode, TranslationError> {
     match node {
         BoolNode::Atom(linear) => Ok(BoolNode::Atom(Linear {
-            cmp: match linear.cmp {
-                Cmp::Eq => Cmp::Ne,
-                Cmp::Ne => Cmp::Eq,
-                Cmp::Lt => Cmp::Ge,
-                Cmp::Le => Cmp::Gt,
-                Cmp::Gt => Cmp::Le,
-                Cmp::Ge => Cmp::Lt,
-            },
+            cmp: flip_cmp(linear.cmp),
             ..linear
+        })),
+        BoolNode::Poly(polynomial) => Ok(BoolNode::Poly(Polynomial {
+            cmp: flip_cmp(polynomial.cmp),
+            ..polynomial
         })),
         BoolNode::All(children) => {
             let negated = children
@@ -268,6 +320,17 @@ fn negate_node(node: BoolNode) -> Result<BoolNode, TranslationError> {
                 .collect::<Result<Vec<_>, TranslationError>>()?;
             Ok(BoolNode::All(negated))
         }
+    }
+}
+
+fn flip_cmp(cmp: Cmp) -> Cmp {
+    match cmp {
+        Cmp::Eq => Cmp::Ne,
+        Cmp::Ne => Cmp::Eq,
+        Cmp::Lt => Cmp::Ge,
+        Cmp::Le => Cmp::Gt,
+        Cmp::Gt => Cmp::Le,
+        Cmp::Ge => Cmp::Lt,
     }
 }
 
@@ -322,6 +385,309 @@ fn linear_comparison(
         rhs: right.constant - left.constant,
         cmp,
     })
+}
+
+/// `lhs (cmp) rhs` as one polynomial comparison: both sides expand into
+/// monomials and the right side folds into the constant. The product
+/// expansion is what the affine translation refuses — two non-constant
+/// factors — so this is the non-linear path. The total degree per
+/// monomial is capped, and the value magnitude is bounded so the
+/// evaluator's `i128` arithmetic cannot overflow (both conservative:
+/// anything larger stays `Unsupported`).
+fn polynomial_comparison(
+    expr: &Expr,
+    bounds: &BTreeMap<String, (i64, i64)>,
+) -> Result<Polynomial, TranslationError> {
+    let Expr::Binary { op, lhs, rhs, .. } = expr else {
+        return Err(TranslationError::Unsupported(
+            "constraint is not a comparison",
+        ));
+    };
+    let cmp = match op {
+        crate::ast::BinaryOp::Eq | crate::ast::BinaryOp::IdentityEq => Cmp::Eq,
+        crate::ast::BinaryOp::NotEq | crate::ast::BinaryOp::IdentityNe => Cmp::Ne,
+        crate::ast::BinaryOp::Lt => Cmp::Lt,
+        crate::ast::BinaryOp::Le => Cmp::Le,
+        crate::ast::BinaryOp::Gt => Cmp::Gt,
+        crate::ast::BinaryOp::Ge => Cmp::Ge,
+        _ => {
+            return Err(TranslationError::Unsupported(
+                "constraint operator is not a comparison",
+            ));
+        }
+    };
+    let left = poly_of(lhs, bounds)?;
+    let right = poly_of(rhs, bounds)?;
+    // l (cmp) r  ⟺  Σ (l.terms - r.terms) (cmp) r.constant - l.constant
+    let mut merged: BTreeMap<BTreeMap<String, u32>, i64> = BTreeMap::new();
+    for (monomial, coefficient) in &left.terms {
+        *merged.entry(monomial.clone()).or_insert(0) += *coefficient;
+    }
+    for (monomial, coefficient) in &right.terms {
+        *merged.entry(monomial.clone()).or_insert(0) -= *coefficient;
+    }
+    let terms: Vec<(BTreeMap<String, u32>, i64)> = merged
+        .into_iter()
+        .filter(|(_, coefficient)| *coefficient != 0)
+        .collect();
+    let polynomial = Polynomial {
+        terms,
+        rhs: right.constant - left.constant,
+        cmp,
+    };
+    check_magnitude(&polynomial, bounds)?;
+    Ok(polynomial)
+}
+
+/// The per-monomial degree cap: `vmax^4` over the solver's `i32`
+/// variable domain stays inside `i128`; a fifth power need not.
+const MAX_POLY_DEGREE: u32 = 4;
+
+/// The value-magnitude ceiling for one polynomial's worth of monomials.
+const POLY_MAGNITUDE_LIMIT: i128 = 1 << 120;
+
+/// The variable-magnitude bound of one monomial:
+/// `|coefficient| · Π vmax^exponent`.
+fn monomial_magnitude(
+    monomial: &BTreeMap<String, u32>,
+    coefficient: i64,
+    bounds: &BTreeMap<String, (i64, i64)>,
+) -> Option<i128> {
+    let mut magnitude = i128::from(coefficient).abs();
+    for (name, exponent) in monomial {
+        let (lower, upper) = bounds.get(name)?;
+        let vmax = (*lower).abs().max((*upper).abs()) as i128;
+        magnitude = magnitude.checked_mul(vmax.checked_pow(*exponent)?)?;
+    }
+    Some(magnitude)
+}
+
+/// Reject polynomials whose evaluation could overflow the evaluator's
+/// `i128` arithmetic: each monomial's bound must exist and the sum of
+/// the bounds must stay under the ceiling.
+fn check_magnitude(
+    polynomial: &Polynomial,
+    bounds: &BTreeMap<String, (i64, i64)>,
+) -> Result<(), TranslationError> {
+    let mut total: i128 = i128::from(polynomial.rhs).abs();
+    for (monomial, coefficient) in &polynomial.terms {
+        if monomial.values().sum::<u32>() > MAX_POLY_DEGREE {
+            return Err(TranslationError::Unsupported(
+                "polynomial degree above the supported cap",
+            ));
+        }
+        let Some(magnitude) = monomial_magnitude(monomial, *coefficient, bounds) else {
+            return Err(TranslationError::Unsupported(
+                "polynomial coefficient magnitude out of range",
+            ));
+        };
+        total = total
+            .checked_add(magnitude)
+            .ok_or(TranslationError::Unsupported(
+                "polynomial value magnitude out of range",
+            ))?;
+        if total > POLY_MAGNITUDE_LIMIT {
+            return Err(TranslationError::Unsupported(
+                "polynomial value magnitude out of range",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A non-affine polynomial expression over the problem variables:
+/// monomials plus a constant.
+#[derive(Debug, Clone)]
+struct PolyExpr {
+    terms: BTreeMap<BTreeMap<String, u32>, i64>,
+    constant: i64,
+}
+
+impl PolyExpr {
+    fn constant(value: i64) -> Self {
+        Self {
+            terms: BTreeMap::new(),
+            constant: value,
+        }
+    }
+
+    fn variable(name: &str) -> Self {
+        let mut monomial = BTreeMap::new();
+        monomial.insert(name.to_owned(), 1);
+        let mut terms = BTreeMap::new();
+        terms.insert(monomial, 1);
+        Self { terms, constant: 0 }
+    }
+
+    fn add(&mut self, other: &PolyExpr) -> Result<(), TranslationError> {
+        for (monomial, coefficient) in &other.terms {
+            let slot = self.terms.entry(monomial.clone()).or_insert(0);
+            *slot = slot
+                .checked_add(*coefficient)
+                .ok_or(TranslationError::Unsupported(
+                    "polynomial coefficient overflow",
+                ))?;
+        }
+        self.constant =
+            self.constant
+                .checked_add(other.constant)
+                .ok_or(TranslationError::Unsupported(
+                    "polynomial constant overflow",
+                ))?;
+        Ok(())
+    }
+
+    fn subtract(&mut self, other: &PolyExpr) -> Result<(), TranslationError> {
+        for (monomial, coefficient) in &other.terms {
+            let slot = self.terms.entry(monomial.clone()).or_insert(0);
+            *slot = slot
+                .checked_sub(*coefficient)
+                .ok_or(TranslationError::Unsupported(
+                    "polynomial coefficient overflow",
+                ))?;
+        }
+        self.constant =
+            self.constant
+                .checked_sub(other.constant)
+                .ok_or(TranslationError::Unsupported(
+                    "polynomial constant overflow",
+                ))?;
+        Ok(())
+    }
+
+    /// The polynomial product: every monomial pair multiplies (exponent
+    /// maps merge, coefficients multiply), constants scale each side.
+    fn multiply(&self, other: &PolyExpr) -> Result<PolyExpr, TranslationError> {
+        let mut result = PolyExpr::constant(0);
+        for (left_monomial, left_coefficient) in &self.terms {
+            for (right_monomial, right_coefficient) in &other.terms {
+                let mut monomial = left_monomial.clone();
+                for (name, exponent) in right_monomial {
+                    *monomial.entry(name.clone()).or_insert(0) += exponent;
+                    if monomial.values().sum::<u32>() > MAX_POLY_DEGREE {
+                        return Err(TranslationError::Unsupported(
+                            "polynomial degree above the supported cap",
+                        ));
+                    }
+                }
+                let coefficient = left_coefficient.checked_mul(*right_coefficient).ok_or(
+                    TranslationError::Unsupported("polynomial coefficient overflow"),
+                )?;
+                *result.terms.entry(monomial).or_insert(0) += coefficient;
+            }
+            // left-term × right-constant
+            let scaled = left_coefficient.checked_mul(other.constant).ok_or(
+                TranslationError::Unsupported("polynomial coefficient overflow"),
+            )?;
+            if scaled != 0 {
+                let monomial = left_monomial.clone();
+                *result.terms.entry(monomial).or_insert(0) += scaled;
+            }
+        }
+        // left-constant × right-terms
+        if self.constant != 0 {
+            for (right_monomial, right_coefficient) in &other.terms {
+                let scaled = self.constant.checked_mul(*right_coefficient).ok_or(
+                    TranslationError::Unsupported("polynomial coefficient overflow"),
+                )?;
+                let monomial = right_monomial.clone();
+                *result.terms.entry(monomial).or_insert(0) += scaled;
+            }
+        }
+        result.constant =
+            self.constant
+                .checked_mul(other.constant)
+                .ok_or(TranslationError::Unsupported(
+                    "polynomial constant overflow",
+                ))?;
+        result.terms.retain(|_, coefficient| *coefficient != 0);
+        Ok(result)
+    }
+}
+
+/// The polynomial expansion of one comparison side.
+fn poly_of(
+    expr: &Expr,
+    bounds: &BTreeMap<String, (i64, i64)>,
+) -> Result<PolyExpr, TranslationError> {
+    match expr {
+        Expr::IntLiteral { text, .. } => {
+            let value = crate::interp::parse_int_literal(text)
+                .and_then(|v| i64::try_from(v).ok())
+                .ok_or(TranslationError::Unsupported(
+                    "integer literal out of range",
+                ))?;
+            Ok(PolyExpr::constant(value))
+        }
+        Expr::BitLiteral { text, .. } => {
+            let value = crate::interp::parse_int_literal(text)
+                .and_then(|v| i64::try_from(v).ok())
+                .ok_or(TranslationError::Unsupported("based literal out of range"))?;
+            Ok(PolyExpr::constant(value))
+        }
+        Expr::Ident { name, .. } => {
+            if bounds.contains_key(name) {
+                Ok(PolyExpr::variable(name))
+            } else {
+                Err(TranslationError::Unsupported(
+                    "constraint references a non-integer or unknown identifier",
+                ))
+            }
+        }
+        Expr::Paren { expr, .. } => poly_of(expr, bounds),
+        Expr::Unary {
+            op: crate::ast::UnaryOp::Negate,
+            expr,
+            ..
+        } => Ok(poly_of(expr, bounds)?.negated()),
+        Expr::Unary {
+            op: crate::ast::UnaryOp::Plus,
+            expr,
+            ..
+        } => poly_of(expr, bounds),
+        Expr::Binary {
+            op: crate::ast::BinaryOp::Add,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let mut left = poly_of(lhs, bounds)?;
+            left.add(&poly_of(rhs, bounds)?)?;
+            Ok(left)
+        }
+        Expr::Binary {
+            op: crate::ast::BinaryOp::Sub,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let mut left = poly_of(lhs, bounds)?;
+            left.subtract(&poly_of(rhs, bounds)?)?;
+            Ok(left)
+        }
+        Expr::Binary {
+            op: crate::ast::BinaryOp::Mul,
+            lhs,
+            rhs,
+            ..
+        } => poly_of(lhs, bounds)?.multiply(&poly_of(rhs, bounds)?),
+        _ => Err(TranslationError::Unsupported(
+            "constraint contains a non-arithmetic expression",
+        )),
+    }
+}
+
+impl PolyExpr {
+    fn negated(self) -> Self {
+        let mut terms = BTreeMap::new();
+        for (monomial, coefficient) in self.terms {
+            terms.insert(monomial, -coefficient);
+        }
+        Self {
+            terms,
+            constant: -self.constant,
+        }
+    }
 }
 
 /// An affine expression `Σ (coefficient · variable) + constant` over the
@@ -456,16 +822,28 @@ fn affine_of(
 /// not worth solving.
 const MAX_BRANCH_COMBINATIONS: usize = 64;
 
-/// Solve a problem with the best available backend. The IR's disjunctions
-/// (`Any`) are expanded into their branch combinations — capped at
+/// The bounded enumeration solver's domain-product cap: a problem over
+/// more candidate tuples defers to the rejection sampler instead of
+/// exploding.
+const MAX_ENUMERATION_STATES: u128 = 1 << 20;
+
+/// Solve a problem with the best available path. A problem containing a
+/// polynomial atom goes to the bounded enumeration solver
+/// (feature-independent): the domain product is capped, the tree is
+/// enumerated depth-first with partial-assignment pruning, and the
+/// `seed`-th satisfying assignment in enumeration order is the answer —
+/// deterministic per seed. Otherwise the IR's disjunctions (`Any`) are
+/// expanded into their branch combinations — capped at
 /// [`MAX_BRANCH_COMBINATIONS`]; every combination is solved as a plain
-/// conjunction, and one satisfying combination is picked seeded, so runs
-/// stay deterministic per seed. `Unsat` is reported only when every
-/// combination is unsatisfiable; if any combination exceeds the backend's
-/// domain and nothing is satisfiable, the outcome is `Unsupported` (the
-/// caller falls back to rejection sampling). Without the `solver-pumpkin`
-/// feature the outcome is always [`SolveOutcome::Unsupported`].
+/// conjunction by the backend, and one satisfying combination is picked
+/// seeded, so runs stay deterministic per seed. `Unsat` is reported only
+/// when every branch is unsatisfiable; a backend-less build (no
+/// `solver-pumpkin` feature) cannot solve linear problems and reports
+/// `Unsupported` for them, leaving them to the rejection sampler.
 pub fn solve(problem: &Problem, seed: u64) -> SolveOutcome {
+    if problem.constraints.iter().any(BoolNode::has_polynomial) {
+        return solve_by_enumeration(problem, seed);
+    }
     let mut combos: Vec<Vec<BoolNode>> = vec![Vec::new()];
     for constraint in &problem.constraints {
         let alternatives = branch_alternatives(constraint);
@@ -506,13 +884,242 @@ pub fn solve(problem: &Problem, seed: u64) -> SolveOutcome {
     }
 }
 
+/// The bounded enumeration solver: the declared domains' product is
+/// capped, the constraint tree is enumerated depth-first (variables in
+/// name order, values ascending — so the k-th solution is a stable
+/// choice), subtrees whose fully-assigned constraints already fail are
+/// pruned, and the `seed`-th satisfying assignment is the answer. Two
+/// passes over the capped space — count, then walk to the target index —
+/// keep the memory flat.
+fn solve_by_enumeration(problem: &Problem, seed: u64) -> SolveOutcome {
+    let mut domain_product: u128 = 1;
+    for var in &problem.vars {
+        let size = (var.upper - var.lower + 1) as u128;
+        domain_product = domain_product.saturating_mul(size);
+        if domain_product > MAX_ENUMERATION_STATES {
+            return SolveOutcome::Unsupported;
+        }
+    }
+    // Pass one: count the satisfying assignments.
+    let mut count: u128 = 0;
+    enumerate_solutions(problem, &mut |_, _| {
+        count = count.saturating_add(1);
+        true
+    });
+    if count == 0 {
+        return SolveOutcome::Unsat;
+    }
+    // Pass two: walk to the seed-th solution in enumeration order.
+    let target = u128::from(seed) % count;
+    let mut picked: Option<Vec<i128>> = None;
+    enumerate_solutions(problem, &mut |index, assignment| {
+        if index as u128 == target {
+            picked = Some(assignment.to_vec());
+            false
+        } else {
+            true
+        }
+    });
+    match picked {
+        Some(assignment) => SolveOutcome::Solved(assignment),
+        // The count pass found the target; the walk must too. A miss is
+        // an internal inconsistency — defer to the rejection sampler
+        // rather than report a wrong verdict.
+        None => SolveOutcome::Unsupported,
+    }
+}
+
+/// Depth-first enumeration over the declared domains in variable order.
+/// `visit` receives each satisfying assignment with its 0-based index in
+/// enumeration order and returns whether to continue; `true` continues,
+/// `false` stops the walk.
+fn enumerate_solutions(problem: &Problem, visit: &mut dyn FnMut(usize, &[i128]) -> bool) {
+    let vars = &problem.vars;
+    let mut assignment: Vec<i64> = vec![0; vars.len()];
+    let mut count: usize = 0;
+    walk(
+        0,
+        vars,
+        &problem.constraints,
+        &mut assignment,
+        &mut count,
+        visit,
+    );
+}
+
+fn walk(
+    depth: usize,
+    vars: &[BoundedInt],
+    constraints: &[BoolNode],
+    assignment: &mut [i64],
+    count: &mut usize,
+    visit: &mut dyn FnMut(usize, &[i128]) -> bool,
+) -> bool {
+    let Some(var) = vars.get(depth) else {
+        // Every variable assigned: the tree evaluates to a plain
+        // verdict (the partial evaluator resolves every atom now).
+        let map: BTreeMap<&str, i128> = vars
+            .iter()
+            .zip(assignment.iter())
+            .map(|(var, value)| (var.name.as_str(), i128::from(*value)))
+            .collect();
+        if matches!(eval_partial(constraints, &map), PartialEval::True) {
+            let index = *count;
+            *count += 1;
+            let snapshot: Vec<i128> = assignment.iter().map(|value| i128::from(*value)).collect();
+            return visit(index, &snapshot);
+        }
+        return false;
+    };
+    for value in var.lower..=var.upper {
+        assignment[depth] = value;
+        let map: BTreeMap<&str, i128> = vars
+            .iter()
+            .take(depth + 1)
+            .zip(assignment.iter())
+            .map(|(var, value)| (var.name.as_str(), i128::from(*value)))
+            .collect();
+        // Partial pruning: a subtree whose fully-assigned constraints
+        // already fail cannot produce a solution.
+        if matches!(eval_partial(constraints, &map), PartialEval::False) {
+            continue;
+        }
+        if walk(depth + 1, vars, constraints, assignment, count, visit) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The three-valued verdict of a constraint tree over a partial
+/// assignment: an atom whose variables are all assigned decides, a tree
+/// decides when its children do (conjunction/disjunction semantics),
+/// anything else stays unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartialEval {
+    True,
+    False,
+    Unknown,
+}
+
+fn eval_partial(nodes: &[BoolNode], map: &BTreeMap<&str, i128>) -> PartialEval {
+    // An empty constraint list is trivially true (a conjunction over
+    // nothing).
+    let mut all_true = true;
+    for node in nodes {
+        match eval_partial_node(node, map) {
+            PartialEval::True => {}
+            PartialEval::False => return PartialEval::False,
+            PartialEval::Unknown => all_true = false,
+        }
+    }
+    if all_true {
+        PartialEval::True
+    } else {
+        PartialEval::Unknown
+    }
+}
+
+fn eval_partial_node(node: &BoolNode, map: &BTreeMap<&str, i128>) -> PartialEval {
+    match node {
+        BoolNode::All(children) => {
+            let mut all_true = true;
+            for child in children {
+                match eval_partial_node(child, map) {
+                    PartialEval::True => {}
+                    PartialEval::False => return PartialEval::False,
+                    PartialEval::Unknown => all_true = false,
+                }
+            }
+            if all_true {
+                PartialEval::True
+            } else {
+                PartialEval::Unknown
+            }
+        }
+        BoolNode::Any(children) => {
+            let mut all_false = true;
+            for child in children {
+                match eval_partial_node(child, map) {
+                    PartialEval::True => return PartialEval::True,
+                    PartialEval::False => {}
+                    PartialEval::Unknown => all_false = false,
+                }
+            }
+            if all_false {
+                PartialEval::False
+            } else {
+                PartialEval::Unknown
+            }
+        }
+        BoolNode::Atom(linear) => match linear_value(linear, map) {
+            Some(value) => holds(linear.cmp, value),
+            None => PartialEval::Unknown,
+        },
+        BoolNode::Poly(polynomial) => match polynomial_value(polynomial, map) {
+            Some(value) => holds(polynomial.cmp, value),
+            None => PartialEval::Unknown,
+        },
+    }
+}
+
+fn holds(cmp: Cmp, value: i128) -> PartialEval {
+    match cmp {
+        Cmp::Eq => bool_eval(value == 0),
+        Cmp::Ne => bool_eval(value != 0),
+        Cmp::Lt => bool_eval(value < 0),
+        Cmp::Le => bool_eval(value <= 0),
+        Cmp::Gt => bool_eval(value > 0),
+        Cmp::Ge => bool_eval(value >= 0),
+    }
+}
+
+fn bool_eval(value: bool) -> PartialEval {
+    if value {
+        PartialEval::True
+    } else {
+        PartialEval::False
+    }
+}
+
+/// `Σ coefficient·variable - rhs` over the assigned variables; `None`
+/// when a variable is unassigned or the arithmetic overflows (the
+/// translation-time magnitude check makes the overflow unreachable in
+/// practice).
+fn linear_value(linear: &Linear, map: &BTreeMap<&str, i128>) -> Option<i128> {
+    let mut value = i128::from(-linear.rhs);
+    for (name, coefficient) in &linear.terms {
+        let assigned = map.get(name.as_str())?;
+        value = value.checked_add(i128::from(*coefficient).checked_mul(*assigned)?)?;
+    }
+    Some(value)
+}
+
+/// `Σ coefficient·Π variable^exponent - rhs`; `None` on an unassigned
+/// variable or an overflow.
+fn polynomial_value(polynomial: &Polynomial, map: &BTreeMap<&str, i128>) -> Option<i128> {
+    let mut value = i128::from(-polynomial.rhs);
+    for (monomial, coefficient) in &polynomial.terms {
+        let mut product = i128::from(*coefficient);
+        for (name, exponent) in monomial {
+            let assigned = map.get(name.as_str())?;
+            product = product.checked_mul(assigned.checked_pow(*exponent)?)?;
+        }
+        value = value.checked_add(product)?;
+    }
+    Some(value)
+}
+
 /// The conjunction lists implied by one node: an atom is its own single
 /// alternative, an `All` contributes its children unchanged, and an `Any`
 /// contributes the union of its branches' alternatives (recursively, so
-/// nested disjunctions flatten into the same product).
+/// nested disjunctions flatten into the same product). A polynomial
+/// never reaches the branch expansion — `solve` routes polynomial
+/// problems to the enumeration solver first.
 fn branch_alternatives(node: &BoolNode) -> Vec<Vec<BoolNode>> {
     match node {
         BoolNode::Atom(atom) => vec![vec![BoolNode::Atom(atom.clone())]],
+        BoolNode::Poly(_) => Vec::new(),
         BoolNode::All(children) => vec![children.clone()],
         BoolNode::Any(branches) => {
             let mut alternatives = Vec::new();
@@ -616,10 +1223,12 @@ mod pumpkin_backend {
                 Ok(())
             }
             BoolNode::Atom(linear) => post_atom(solver, variables, bounds, linear),
-            // `solve` expands every `Any` into branch combinations before
-            // the backend sees a problem; reaching one here is a bug, and
-            // the caller falls back to rejection sampling for it.
-            BoolNode::Any(_) => Err(()),
+            // `solve` expands every `Any` into branch combinations and
+            // routes every polynomial problem to the enumeration solver
+            // before the backend sees a problem; reaching one here is a
+            // bug, and the caller falls back to rejection sampling for
+            // it.
+            BoolNode::Any(_) | BoolNode::Poly(_) => Err(()),
         }
     }
 

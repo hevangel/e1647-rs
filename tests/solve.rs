@@ -269,8 +269,8 @@ fn translate_range_with_expression_bounds() {
 #[test]
 fn translate_rejects_unsupported_shapes() {
     let bounds = bounds_from(&[("a", (0, 10))]);
-    // Non-linear multiplication.
-    let exprs = parse_exprs("a * a == 4");
+    // Non-arithmetic division (no polynomial shape).
+    let exprs = parse_exprs("a / 2 == 4");
     assert!(matches!(
         translate(&exprs, &bounds),
         Err(TranslationError::Unsupported(_))
@@ -305,6 +305,141 @@ fn fallback_backend_reports_unsupported() {
         SolveOutcome::Unsupported => {}
         other => panic!("unexpected outcome: {other:?}"),
     }
+}
+
+// --- Non-linear arithmetic: the polynomial IR and the enumeration solver ---
+
+#[test]
+fn linear_products_stay_linear() {
+    // A constant factor is affine: the backend posts it directly.
+    let exprs = parse_exprs("2 * a == 10");
+    let problem = translate(&exprs, &bounds_from(&[("a", (0, 50))])).expect("translatable");
+    assert!(matches!(
+        problem.constraints.first(),
+        Some(e1647::solve::BoolNode::Atom(_))
+    ));
+}
+
+#[test]
+fn variable_products_translate_into_polynomials() {
+    let exprs = parse_exprs("a * b == 100");
+    let problem =
+        translate(&exprs, &bounds_from(&[("a", (0, 50)), ("b", (0, 50))])).expect("translatable");
+    let Some(e1647::solve::BoolNode::Poly(polynomial)) = problem.constraints.first() else {
+        panic!("expected a polynomial atom");
+    };
+    assert_eq!(
+        polynomial.terms,
+        vec![(
+            {
+                let mut monomial = std::collections::BTreeMap::new();
+                monomial.insert("a".to_string(), 1);
+                monomial.insert("b".to_string(), 1);
+                monomial
+            },
+            1
+        )]
+    );
+    assert_eq!(polynomial.rhs, 100);
+    assert_eq!(polynomial.cmp, e1647::solve::Cmp::Eq);
+}
+
+#[test]
+fn polynomial_expansion_spreads_the_product() {
+    // (a + 1) * (b - 2) == 0  ⟺  a·b - 2a + b == 2
+    let exprs = parse_exprs("(a + 1) * (b - 2) == 0");
+    let problem =
+        translate(&exprs, &bounds_from(&[("a", (0, 9)), ("b", (0, 9))])).expect("translatable");
+    let Some(e1647::solve::BoolNode::Poly(polynomial)) = problem.constraints.first() else {
+        panic!("expected a polynomial atom");
+    };
+    let monomial = |names: &[(&str, u32)]| -> std::collections::BTreeMap<String, u32> {
+        names
+            .iter()
+            .map(|(name, exponent)| (name.to_string(), *exponent))
+            .collect()
+    };
+    assert_eq!(
+        polynomial.terms,
+        vec![
+            (monomial(&[("a", 1)]), -2),
+            (monomial(&[("a", 1), ("b", 1)]), 1),
+            (monomial(&[("b", 1)]), 1),
+        ]
+    );
+    assert_eq!(polynomial.rhs, 2);
+}
+
+#[test]
+fn enumeration_solves_a_square_deterministically() {
+    // a² == 2500 has the unique solution a == 50 over 0..255: every seed
+    // picks it.
+    let exprs = parse_exprs("a * a == 2500");
+    for seed in [1u64, 7, 42] {
+        let problem = translate(&exprs, &bounds_from(&[("a", (0, 255))])).expect("translatable");
+        assert_eq!(solve(&problem, seed), SolveOutcome::Solved(vec![50]));
+    }
+}
+
+#[test]
+fn enumeration_reports_unsat_for_an_impossible_square() {
+    // 2501 sits strictly between 50² and 51²: no integer solution.
+    let exprs = parse_exprs("a * a == 2501");
+    let problem = translate(&exprs, &bounds_from(&[("a", (0, 255))])).expect("translatable");
+    assert_eq!(solve(&problem, 1), SolveOutcome::Unsat);
+}
+
+#[test]
+fn enumeration_handles_mixed_constraint_trees() {
+    // a·b == 6 with a < b over 1..6: exactly (1, 6) and (2, 3) satisfy
+    // the tree; every seed's pick must satisfy both constraints.
+    let exprs = parse_exprs("a * b == 6\na < b");
+    let bounds = bounds_from(&[("a", (1, 6)), ("b", (1, 6))]);
+    let problem = translate(&exprs, &bounds).expect("translatable");
+    for seed in [1u64, 2, 3, 99] {
+        match solve(&problem, seed) {
+            SolveOutcome::Solved(values) => {
+                let (a, b) = (values[0], values[1]);
+                assert_eq!(a * b, 6, "seed {seed}: {values:?}");
+                assert!(a < b, "seed {seed}: {values:?}");
+            }
+            other => panic!("seed {seed}: expected a solution, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn negated_nonlinear_constraint_enumerates() {
+    // ¬(a² == 4) over 0..9: every pick must avoid 2 (the domain is
+    // unsigned, so -2 is not a member anyway).
+    let exprs = parse_exprs("not (a * a == 4)");
+    let problem = translate(&exprs, &bounds_from(&[("a", (0, 9))])).expect("translatable");
+    for seed in [1u64, 5, 13] {
+        match solve(&problem, seed) {
+            SolveOutcome::Solved(values) => {
+                assert_ne!(values[0], 2, "seed {seed}: {values:?}");
+            }
+            other => panic!("seed {seed}: expected a solution, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn enumeration_defers_wide_domains() {
+    // 2001 × 2001 candidate tuples exceed the 2^20 enumeration cap:
+    // the outcome defers to the rejection sampler.
+    let exprs = parse_exprs("a * b == 100");
+    let problem = translate(&exprs, &bounds_from(&[("a", (0, 2000)), ("b", (0, 2000))]))
+        .expect("translatable");
+    assert_eq!(solve(&problem, 1), SolveOutcome::Unsupported);
+}
+
+#[test]
+fn polynomial_degree_above_the_cap_is_unsupported() {
+    let exprs = parse_exprs("a * a * a * a * a == 1");
+    let error = translate(&exprs, &bounds_from(&[("a", (0, 9))]))
+        .expect_err("a fifth power is above the degree cap");
+    assert!(matches!(error, TranslationError::Unsupported(_)));
 }
 
 #[cfg(feature = "solver-pumpkin")]
