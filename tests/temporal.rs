@@ -234,3 +234,92 @@ fn repeat_bounds_must_evaluate() {
     };
     assert_eq!(*kind, RepeatKind::Fixed);
 }
+
+#[test]
+fn monitor_fires_an_invariant_when_the_forbidden_event_occurs() {
+    let te = parse_temporal_expression("not @bad").expect("parses");
+    let empty_b: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+    let empty_n: std::collections::BTreeMap<String, i128> = std::collections::BTreeMap::new();
+    let cb = callbacks(&empty_b, &empty_n);
+    let mut monitor = e1647::temporal::RuleMonitor::new(&te);
+    // Three quiet states, then the forbidden occurrence.
+    let log = [
+        State::new(&[]),
+        State::new(&[]),
+        State::new(&[]),
+        State::new(&["bad"]),
+        State::new(&[]),
+    ];
+    // Observing the prefix without the occurrence: not yet violated.
+    assert!(!monitor.observe(&log[..3], &cb).expect("evaluates"));
+    // The occurrence state: certain now.
+    assert!(monitor.observe(&log[..4], &cb).expect("evaluates"));
+    assert!(monitor.failed_at_end());
+}
+
+#[test]
+fn monitor_matches_rule_failed_over_random_logs() {
+    // Property test: for a deterministic sample of temporal expressions
+    // and pseudo-random logs, the streaming monitor's end-of-run
+    // verdict equals the whole-log `rule_failed` verdict — and its
+    // incremental consumption (mixed one- and two-state steps) must not
+    // change the verdict.
+    let tes: Vec<TemporalExpr> = [
+        "@a => eventually @b",
+        "@a => @b",
+        "not @a",
+        "fail @a",
+        "eventually @a",
+        "{@a; @b}",
+        "@a and @b",
+        "@a or @b",
+        "{[2]*cycle; @b}",
+        "not (@a and @b)",
+        "@a => {[1]*cycle; @b} or @c",
+    ]
+    .iter()
+    .map(|text| parse_temporal_expression(text).expect("parses"))
+    .collect();
+    let empty_b: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+    let empty_n: std::collections::BTreeMap<String, i128> = std::collections::BTreeMap::new();
+    let cb = callbacks(&empty_b, &empty_n);
+    // A splitmix64-style LCG for reproducible logs.
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        state = state.wrapping_add(0xa076_1d64_7886_0a4d);
+        let z = state;
+        (z ^ (z >> 30).wrapping_mul(0xbf58_476d_1ce4_e5b9)) >> 11
+    };
+    for _case in 0..200 {
+        let length = (next() % 18) as usize + 1;
+        let log: Vec<State> = (0..length)
+            .map(|_| {
+                let pick = next() % 8;
+                match pick {
+                    0 => State::new(&["a"]),
+                    1 => State::new(&["b"]),
+                    2 => State::new(&["c"]),
+                    3 => State::new(&["a", "b"]),
+                    4 => State::new(&["b", "c"]),
+                    _ => State::new(&[]),
+                }
+            })
+            .collect();
+        for te in &tes {
+            let expected = e1647::temporal::rule_failed(te, &log, &cb).expect("evaluates");
+            let mut monitor = e1647::temporal::RuleMonitor::new(te);
+            let mut fed = 0usize;
+            while fed < log.len() {
+                let step = if next() % 2 == 0 { 1 } else { 2 };
+                let end = (fed + step).min(log.len());
+                monitor.observe(&log[..end], &cb).expect("evaluates");
+                fed = end;
+            }
+            let actual = monitor.failed_at_end();
+            assert_eq!(
+                actual, expected,
+                "monitor verdict diverged for {te:?} over log {log:?}"
+            );
+        }
+    }
+}

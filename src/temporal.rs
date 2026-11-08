@@ -2,12 +2,13 @@
 //! (12.1.4) and tight-satisfaction evaluation over finite paths
 //! (12.1.1.2, 12.3) for the parsed [`TemporalExpr`] trees.
 //!
-//! This module is a pure core the interpreter will drive: a path is an
+//! This module is a pure core the interpreter drives: a path is an
 //! explicit sequence of states (each state = the events that occurred in
 //! that sampling period), expressions are evaluated through caller
 //! supplied callbacks, and nothing here touches simulation time or the
-//! run loop — the `wait`/event-scheduler integration is a later
-//! milestone.
+//! run loop — the `wait`/scheduler integration and the clause 11.4
+//! rule monitoring ([`RuleMonitor`]) live in `interp.rs` and feed this
+//! core.
 //!
 //! Coverage of the grammar:
 //! - evaluated: event atoms, `cycle`, `true(exp)` (via the callbacks),
@@ -517,35 +518,180 @@ pub fn rule_failed(
     }
 }
 
-/// Whether an `expect`/`assume` rule's failure is already certain over
-/// the run-log prefix, at a cycle boundary before the run ends. Only
-/// the invariant shapes are prefix-certain: `not te` / `fail te`
-/// forbid a behavior, so its occurrence exhausts every possibility at
-/// that cycle (12.2.17, 12.2.13). The obligation shapes keep their
-/// windows open while the run continues — a yield whose rhs has not
-/// succeeded yet may still succeed later, and `eventually` likewise —
-/// so pronouncing them failed mid-run would be premature; they stay
-/// silent until the quit pass closes the windows over the full log
-/// ([`rule_failed`]). Every other success-required shape cannot be
-/// pronounced failed before the run ends either. An evaluation error
-/// propagates: the caller reports the gap and retires the rule.
-pub fn rule_prefix_failed(
-    te: &TemporalExpr,
-    log: &[State],
-    callbacks: &EvalCallbacks,
-) -> Result<bool, EvalError> {
-    if log.is_empty() {
-        return Ok(false);
+/// The streaming monitor of one `expect`/`assume` rule: it consumes the
+/// run log incrementally — each [`RuleMonitor::observe`] call matches
+/// only what the newly arrived states can start or complete — and
+/// carries the rule's per-run bookkeeping. The per-shape verdicts
+/// mirror [`rule_failed`] exactly (the equivalence is pinned by a
+/// property test), with the state held instead of recomputed:
+///
+/// - an invariant rule (`not te` / `fail te`) is violated the moment a
+///   tight match of the forbidden behavior arrives — this is the live
+///   fire the run loop reports at the cycle the failure became certain;
+/// - a yield rule tracks one pending obligation per lhs tight match,
+///   and closes it when a rhs tight match starts at or after the
+///   obligation's window; at the end of the run any still-pending
+///   obligation is the failure (12.2.14/12.3.3: the obligation's
+///   possibilities are exhausted only when the run ends — the earliest
+///   sound closure point);
+/// - every other shape succeeds if it succeeded anywhere; the failure
+///   is the absence at the end of the run.
+pub enum RuleMonitor {
+    Invariant {
+        te: TemporalExpr,
+        violated: bool,
+        consumed: usize,
+    },
+    Yield {
+        lhs: Box<TemporalExpr>,
+        rhs: Box<TemporalExpr>,
+        /// The window-start index of each still-pending obligation —
+        /// one past the last state of its lhs match, matching the
+        /// engine's `rhs succeeded somewhere in log[end..]` reading.
+        obligations: Vec<usize>,
+        consumed: usize,
+    },
+    SucceedRequired {
+        te: TemporalExpr,
+        succeeded: bool,
+        consumed: usize,
+    },
+}
+
+impl RuleMonitor {
+    /// The monitor for one rule's temporal expression, dispatching on
+    /// the shape exactly like [`rule_failed`]'s per-shape arms.
+    pub fn new(te: &TemporalExpr) -> Self {
+        match te {
+            crate::ast::TemporalExpr::Not(inner) | crate::ast::TemporalExpr::Fail(inner) => {
+                RuleMonitor::Invariant {
+                    te: (**inner).clone(),
+                    violated: false,
+                    consumed: 0,
+                }
+            }
+            crate::ast::TemporalExpr::Yield { lhs, rhs } => RuleMonitor::Yield {
+                lhs: Box::new((**lhs).clone()),
+                rhs: Box::new((**rhs).clone()),
+                obligations: Vec::new(),
+                consumed: 0,
+            },
+            crate::ast::TemporalExpr::Eventually(inner) => RuleMonitor::SucceedRequired {
+                te: (**inner).clone(),
+                succeeded: false,
+                consumed: 0,
+            },
+            _ => RuleMonitor::SucceedRequired {
+                te: te.clone(),
+                succeeded: false,
+                consumed: 0,
+            },
+        }
     }
-    match te {
-        crate::ast::TemporalExpr::Not(inner) | crate::ast::TemporalExpr::Fail(inner) => {
-            succeeded_somewhere(inner, log, callbacks)
+
+    /// Consume every state of `log` the monitor has not seen yet,
+    /// matching only suffixes that end at a newly arrived state. Returns
+    /// whether the rule's failure has become certain now (an invariant
+    /// whose forbidden behavior occurred, or a yield violation detected
+    /// mid-run — which cannot happen for unbounded windows, but the
+    /// verdict is computed the same way). Propositions and bounds
+    /// evaluate through the callbacks **at this call**, so a rule's
+    /// propositions see the values current when its states arrive.
+    pub fn observe(&mut self, log: &[State], callbacks: &EvalCallbacks) -> Result<bool, EvalError> {
+        let from = self.consumed_index();
+        for index in from..log.len() {
+            // A tight match ending at `index`: every start position.
+            let match_ends_here = |te: &TemporalExpr| -> Result<bool, EvalError> {
+                for start in 0..=index {
+                    if holds_tight(te, &log[start..=index], callbacks)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            };
+            match self {
+                RuleMonitor::Invariant { te, violated, .. } => {
+                    if match_ends_here(te)? {
+                        *violated = true;
+                    }
+                }
+                RuleMonitor::Yield {
+                    lhs,
+                    rhs,
+                    obligations,
+                    ..
+                } => {
+                    let mut rhs_starts: Vec<usize> = Vec::new();
+                    let mut lhs_matches_here = 0usize;
+                    for start in 0..=index {
+                        if holds_tight(rhs, &log[start..=index], callbacks)? {
+                            rhs_starts.push(start);
+                        }
+                        if holds_tight(lhs, &log[start..=index], callbacks)? {
+                            lhs_matches_here += 1;
+                        }
+                    }
+                    // A rhs match starting at `start` closes every
+                    // obligation whose window started at or before it —
+                    // the engine's `succeeded somewhere in log[end..]`
+                    // reading (the window slice begins at the lhs
+                    // match's last state).
+                    if !rhs_starts.is_empty() {
+                        obligations.retain(|window_start| {
+                            !rhs_starts
+                                .iter()
+                                .any(|match_start| window_start <= match_start)
+                        });
+                    }
+                    // An lhs match ending here opens one obligation
+                    // whose window starts at the next state — the
+                    // engine's `log[end..]` slice begins strictly after
+                    // the match's last state.
+                    for _ in 0..lhs_matches_here {
+                        obligations.push(index + 1);
+                    }
+                }
+                RuleMonitor::SucceedRequired { te, succeeded, .. } => {
+                    if match_ends_here(te)? {
+                        *succeeded = true;
+                    }
+                }
+            }
         }
-        // Open windows: not yet certain, whatever the prefix shows.
-        crate::ast::TemporalExpr::Yield { .. } | crate::ast::TemporalExpr::Eventually(_) => {
-            Ok(false)
+        self.set_consumed(log.len());
+        match self {
+            RuleMonitor::Invariant { violated, .. } => Ok(*violated),
+            RuleMonitor::Yield { .. } => Ok(false),
+            RuleMonitor::SucceedRequired { .. } => Ok(false),
         }
-        _ => Ok(false),
+    }
+
+    /// The end-of-run verdict: the obligation shapes' windows exhaust
+    /// only now (12.3.3) — a pending unclosed obligation or an expected
+    /// success that never happened. Equivalent to [`rule_failed`] over
+    /// the same full log (the property test pins it).
+    pub fn failed_at_end(&self) -> bool {
+        match self {
+            RuleMonitor::Invariant { violated, .. } => *violated,
+            RuleMonitor::Yield { obligations, .. } => !obligations.is_empty(),
+            RuleMonitor::SucceedRequired { succeeded, .. } => !succeeded,
+        }
+    }
+
+    fn consumed_index(&self) -> usize {
+        match self {
+            RuleMonitor::Invariant { consumed, .. }
+            | RuleMonitor::Yield { consumed, .. }
+            | RuleMonitor::SucceedRequired { consumed, .. } => *consumed,
+        }
+    }
+
+    fn set_consumed(&mut self, value: usize) {
+        match self {
+            RuleMonitor::Invariant { consumed, .. }
+            | RuleMonitor::Yield { consumed, .. }
+            | RuleMonitor::SucceedRequired { consumed, .. } => *consumed = value,
+        }
     }
 }
 
