@@ -30,7 +30,11 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   `check_generation` sub-phases), the clause 13.2.2 scheduler running
   `start`ed TCMs concurrently, `run`, then `extract` → `check` →
   `quit`/`finalize`. `emit` feeds an event log; temporal waits
-  re-evaluate against it; `expect`/`assume` rules check at quit. The
+  re-evaluate against it; `expect`/`assume` rules monitor live — at
+  every scheduler cycle boundary an invariant rule (`not`/`fail`)
+  whose forbidden behavior occurred fires at that cycle, and the
+  obligation rules (`=>`, `eventually`) re-check at quit when their
+  windows close. The
   clause 33 blocking TCMs (`up()`/`down()`/`lock()`) yield at the call
   and park blocked calls on a per-object FIFO wake pass.
 - **Randomization.** `gen` is a seeded rejection sampler by default;
@@ -95,8 +99,10 @@ reading, nothing else.
 
 - Full type checking and name resolution (checking is per-construct
   well-formedness, not a type system).
-- Event-driven temporal evaluation (temporal expressions evaluate over
-  explicit finite paths, not live streams).
+- Streaming temporal evaluation (the engine re-matches each rule and
+  wait over the finite run log at every cycle boundary; invariant
+  rules fire live, but there is no incremental matcher following
+  events as they occur, and obligation windows close only at quit).
 - Non-linear constraint solving (`gen` handles the conjunctive and
   disjunctive linear subsets — `||`, `not`, item-set membership — via
   bounded branch enumeration; non-linear arithmetic is still unsolved;

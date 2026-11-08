@@ -983,6 +983,35 @@ fn rdv_semaphore_value_stays_zero() {
 }
 
 #[test]
+fn invariant_expect_rule_fires_live_before_the_run_ends() {
+    // 11.4, live monitoring: `not @bad_ev` is an invariant — the
+    // occurrence of the forbidden behavior exhausts every possibility
+    // at that cycle, so the rule fires at the next cycle boundary, not
+    // at quit. The late TCM (still sleeping when the failure becomes
+    // certain) prints strictly after the rule's else body ran.
+    let output = clean_output(
+        "extend sys {\n    bad_ev: event;\n    \
+         expect not @bad_ev else { out(\"FIRED\\n\"); };\n    \
+         emitter() @sys.any is {\n        wait [3]*cycle;\n        emit bad_ev;\n        \
+         out(\"AFTER\\n\");\n    };\n    late() @sys.any is {\n        wait [6]*cycle;\n        \
+         out(\"LATE\\n\");\n    };\n    run() is also {\n        start emitter();\n        \
+         start late();\n    };\n};\n",
+        1,
+    );
+    let fired = output.find("FIRED").expect("the rule fired");
+    let after = output.find("AFTER").expect("emitter continued");
+    let late = output.find("LATE").expect("late TCM ran");
+    assert!(
+        after < fired || fired < late,
+        "the failure fired mid-run: {output}"
+    );
+    assert!(
+        fired < late,
+        "the failure is reported before the later cycle's print: {output}"
+    );
+}
+
+#[test]
 fn temporal_wait_in_a_tcm_observes_emissions_made_while_suspended() {
     // The marquee clause 13.2.2 behavior: the waiter suspends at
     // `wait @ev`; the emitter's TCM advances two cycles and emits; the
