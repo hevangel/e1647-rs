@@ -30,7 +30,9 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   `check_generation` sub-phases), the clause 13.2.2 scheduler running
   `start`ed TCMs concurrently, `run`, then `extract` → `check` →
   `quit`/`finalize`. `emit` feeds an event log; temporal waits
-  re-evaluate against it; `expect`/`assume` rules check at quit.
+  re-evaluate against it; `expect`/`assume` rules check at quit. The
+  clause 33 blocking TCMs (`up()`/`down()`/`lock()`) yield at the call
+  and park blocked calls on a per-object FIFO wake pass.
 - **Randomization.** `gen` is a seeded rejection sampler by default;
   with the `solver-pumpkin` cargo feature it solves linear `keep`
   constraints instead — conjunctive, disjunctive (`||`, `not`, item-set
@@ -61,6 +63,7 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
 | `repeat until`, the `do` sugar | 20 | |
 | Tables: `table … with { … }`, `csv_to_table`, the `table_manager` API | 26, 32.3 | token pre-pass between `#define` and macro expansion |
 | Annotations: `annotation @name`, attachments | 35 | recorded metadata, no semantic effect |
+| `semaphore` / `rdv_semaphore` / `locker`, the resource-sharing TCMs | 33 | blocking `up()`/`down()`/`lock()` park on a FIFO wake pass; `try_up()`/`try_down()` never switch; `set_value`/`set_max_value` rules enforced |
 | Reflection catalogue + `instance_iterator` | 32.1–32.2 | catalogue in [REFLECTION_2019.md](REFLECTION_2019.md); the base iterator walks the instance tree |
 | Set/list pseudo-method subsets, `set_of_values` | 28.5, 27 | the expression-taking forms are the documented gaps |
 | Simulator side | 23 | `rise/fall/change(HDL expression) @sim` events and `hdl_path()`-bound event ports sample each virtual cycle (a live xezim session, or an injected history); TCMs declared `@event` commence on the event |
@@ -101,9 +104,10 @@ reading, nothing else.
   exceptions).
 - General testbench execution (sequences run inline; the e↔HDL event
   ordering is not implemented; the VHDL backend is unwritten).
-- The out-of-scope list of the 2019 migration plan (TLM sockets, Excel
-  readers, coverage-database files, message-manager tables, encryption,
-  semaphores, the full reflection model).
+- The remaining out-of-scope list of the 2019 migration plan (TLM
+  sockets, Excel readers, coverage-database files, message-manager
+  tables, encryption, the full reflection model) — semaphores moved out
+  of it when the clause 33 structs landed.
 
 **No IEEE conformance is claimed.** Where this implementation's reading
 of a clause is an approximation, the approximation is documented in the

@@ -88,6 +88,15 @@
 //!   is not implemented in this stage (see [`UNIMPLEMENTED_2019`])
 //! - `E0420` `do_bind()` outside the connect_ports() generation
 //!   sub-phase (9.13.3)
+//! - `E0421` a blocking clause 33 call (`up()`/`down()`/`lock()`) that
+//!   must suspend but runs in a non-suspendable context (an atomic
+//!   region or a non-scheduled method)
+//! - `E0422` a clause 33 `set_value()`/`set_max_value()` violation: a
+//!   negative or over-limit value, a forbidden call after `up()`/`down()`
+//!   was called, or a non-zero value on an `rdv_semaphore`
+//! - `E0423` `locker.release()` by an entity that does not hold the lock,
+//!   or on a locker nothing holds (31.2.5: `lock()` and `release()` are
+//!   issued by the same entity)
 //!
 //! ## Execution phases (Table 1, 28.3; generation sub-phases 9.13)
 //!
@@ -262,7 +271,121 @@ pub enum Value {
     /// handed out by the iterator — `new instance_path_item` is the
     /// construction stub (E0419, clause 32.2).
     InstancePathItem(Rc<InstancePathItem>),
+    /// A clause 33 resource-sharing object (`semaphore`,
+    /// `rdv_semaphore` or `locker`): the shared state behind the
+    /// blocking `up()`/`down()`/`lock()` TCM calls. The value aliases
+    /// one object — copying it does not copy the synchronization state.
+    Sync(Rc<RefCell<SyncState>>),
     Void,
+}
+
+/// Which clause 33 predefined struct a [`Value::Sync`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncKind {
+    /// `semaphore`: value (available resources) 0 by default, maximum
+    /// MAX_INT.
+    Semaphore,
+    /// `rdv_semaphore`: the rendezvous semaphore — the value stays 0;
+    /// `up()` and `down()` block until they coincide, and the paired
+    /// `up()` thread always runs first, followed immediately by the
+    /// `down()` thread (31.2.1).
+    RdvSemaphore,
+    /// `locker`: FIFO-ordered mutual exclusion between TCMs (31.2.5).
+    Locker,
+}
+
+impl SyncKind {
+    fn name(self) -> &'static str {
+        match self {
+            SyncKind::Semaphore => "semaphore",
+            SyncKind::RdvSemaphore => "rdv_semaphore",
+            SyncKind::Locker => "locker",
+        }
+    }
+}
+
+/// Which blocking call one parked coroutine waits on. One entry of the
+/// sync object's FIFO waiter queue — the queue order is the blocked
+/// call order, and blocked calls are serviced in that order (31.2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncWaiter {
+    /// `up()` blocked at the maximum.
+    Up,
+    /// `down()` blocked with no resource available.
+    Down,
+    /// `locker.lock()` blocked while another entity holds the lock.
+    Lock,
+}
+
+/// The state of one clause 33 sync object. The blocking surface is the
+/// scheduler's wake pass: a parked coroutine carries the object and its
+/// queue serial, and each scheduler iteration services the oldest
+/// waiter whose condition holds, so blocked calls run in their request
+/// order (the documented FIFO reading of 31.2.1).
+#[derive(Debug)]
+pub struct SyncState {
+    kind: SyncKind,
+    /// Available resources (the value `get_value()` reads). Always 0 on
+    /// an `rdv_semaphore`; unused on a `locker`.
+    available: i128,
+    /// The maximum available resources (`get_max_value()`). 0 on an
+    /// `rdv_semaphore`; unused on a `locker`.
+    max_value: i128,
+    /// 31.2.3/31.2.4: `set_value()`/`set_max_value()` cannot be called
+    /// once `up()` or `down()` was called. Any `up`/`down`/`try_up`/
+    /// `try_down` call — blocked or not — sets this (the conservative
+    /// reading of "was previously called").
+    transfer_attempted: bool,
+    /// The blocked calls, front = oldest request.
+    waiters: std::collections::VecDeque<(u64, SyncWaiter)>,
+    /// Serial source for the waiter queue.
+    next_serial: u64,
+    /// `locker` only: the coroutine id of the entity that acquired the
+    /// lock, `None` while free.
+    holder: Option<u64>,
+}
+
+impl SyncState {
+    fn new(kind: SyncKind) -> Self {
+        // The default maximum is MAX_INT (31.1: "The maximum value ranges
+        // between 1 and MAX_INT"), the e int maximum.
+        let (available, max_value) = match kind {
+            SyncKind::Semaphore => (0, 2_147_483_647),
+            SyncKind::RdvSemaphore => (0, 0),
+            SyncKind::Locker => (0, 0),
+        };
+        Self {
+            kind,
+            available,
+            max_value,
+            transfer_attempted: false,
+            waiters: std::collections::VecDeque::new(),
+            next_serial: 0,
+            holder: None,
+        }
+    }
+}
+
+/// One clause 33 blocking call's outcome.
+enum SyncOutcome {
+    /// The call completed; the turn continues inside the statement.
+    Done(Value),
+    /// The turn ends at the call — a successful blocking call
+    /// yields (31.2.5's non-preemptive model interrupts at TCM
+    /// calls and release/lock requests) or a blocked one parks on
+    /// the waiter queue until the wake pass services it.
+    Yield,
+}
+
+impl SyncOutcome {
+    /// The call's value (`Done`'s payload; the blocking surface is
+    /// VOID, so a defensively-mapped `Yield` is VOID too).
+    fn value(self) -> Value {
+        match self {
+            SyncOutcome::Done(value) => value,
+            SyncOutcome::Yield => Value::Void,
+        }
+    }
 }
 
 /// One step of an `instance_iterator`'s path (32.2): the instance the
@@ -464,6 +587,9 @@ struct PendingSuspension {
     temporal: bool,
     span: crate::ast::Span,
     wait_start: Option<usize>,
+    /// A clause 33 sync wait riding the suspension (the blocking call
+    /// parks until the wake pass services it).
+    wake_sync: Option<(Rc<RefCell<SyncState>>, u64)>,
 }
 
 /// One concurrently scheduled execution (clause 13.2.2): the main
@@ -473,6 +599,10 @@ struct PendingSuspension {
 /// captured locals frame, and the cycle gate.
 struct Coroutine<'a> {
     kind: CoroutineKind<'a>,
+    /// The scheduler-wide identity of this coroutine — the locker's
+    /// holder identity (clause 33: `lock()`/`release()` by the same
+    /// entity).
+    id: u64,
     path: Vec<PathLevel>,
     frame: Frame,
     me: Option<usize>,
@@ -482,6 +612,11 @@ struct Coroutine<'a> {
     /// (17.1.2: "as if the action sync @event was added at the top").
     /// Cleared when the event fires.
     wake_event: Option<String>,
+    /// Set while the coroutine is parked on a clause 33 blocking call
+    /// (`up()` at the maximum, `down()` with no resource, `lock()` while
+    /// held): the object and this call's waiter serial. The wake pass
+    /// services the oldest waiter whose condition holds.
+    wake_sync: Option<(Rc<RefCell<SyncState>>, u64)>,
     /// Whether the coroutine is suspended at a temporal wait (drives
     /// the per-wait runaway guard).
     suspended_temporal: bool,
@@ -607,6 +742,15 @@ struct Interp<'a> {
     /// The suspension raised by the current turn's synchronization
     /// action, collected when the turn unwinds.
     pending_suspension: Option<PendingSuspension>,
+    /// The clause 33 sync wait raised by the current turn, collected
+    /// with the suspension: the object and this call's waiter serial.
+    pending_wake_sync: Option<(Rc<RefCell<SyncState>>, u64)>,
+    /// The id of the coroutine whose turn runs — the locker's holder
+    /// identity (`lock()` and `release()` are issued by the same
+    /// entity, 31.2.5).
+    current_coroutine_id: Option<u64>,
+    /// The serial source for coroutine ids.
+    next_coroutine_id: u64,
     /// The log start of a resumed temporal wait, restored before the
     /// wait statement re-executes.
     resume_wait_start: Option<usize>,
@@ -1021,6 +1165,9 @@ fn run_inner(
         atomic_depth: 0,
         exec_context: Vec::new(),
         pending_suspension: None,
+        pending_wake_sync: None,
+        current_coroutine_id: None,
+        next_coroutine_id: 0,
         resume_wait_start: None,
         coverage: crate::coverage::build(elaborated),
         stop_requested: false,
@@ -1172,25 +1319,32 @@ fn run_inner(
             blocks: run_blocks.iter().map(|b| b.body.as_slice()).collect(),
             next_block: 0,
         },
+        id: interp.next_coroutine_id,
         path: Vec::new(),
         frame: Frame::default(),
         me: Some(sys_index),
         eligible_at_cycle: 0,
         wake_event: None,
+        wake_sync: None,
         suspended_temporal: false,
         temporal_waited: 0,
         span: origin_span(),
         wait_start: None,
     });
+    interp.next_coroutine_id += 1;
     // Cycle 0's sample only establishes the monitored values' baseline —
     // no previous value, so no edge can fire on it.
     interp.sample_sim_events();
     while !interp.coroutines.is_empty() && !interp.stop_requested {
-        let Some(index) = interp
-            .coroutines
-            .iter()
-            .position(|c| c.eligible_at_cycle <= interp.cycle && c.wake_event.is_none())
-        else {
+        // The clause 33 wake pass: a blocking call parked a coroutine on
+        // a sync object; service the oldest waiter whose condition
+        // holds, before the turn pick — a resource produced in one
+        // coroutine's turn reaches its blocked consumer in this same
+        // scheduling round.
+        interp.service_sync_waiters();
+        let Some(index) = interp.coroutines.iter().position(|c| {
+            c.eligible_at_cycle <= interp.cycle && c.wake_event.is_none() && c.wake_sync.is_none()
+        }) else {
             // Nobody eligible: suspended coroutines wait for the next
             // occurrence of their sampling event — one cycle passes.
             if interp.wait_budget == 0 {
@@ -1233,6 +1387,8 @@ fn run_inner(
         let mut co = interp.coroutines.remove(index);
         interp.tracing = true;
         interp.exec_context.clear();
+        interp.pending_wake_sync = None;
+        interp.current_coroutine_id = Some(co.id);
         interp.resume_wait_start = co.wait_start.take();
         let name = match &co.kind {
             CoroutineKind::Main { .. } => "run".to_owned(),
@@ -1241,6 +1397,8 @@ fn run_inner(
         let outcome = interp.run_coroutine_turn(&mut co);
         interp.tracing = false;
         interp.exec_context.clear();
+        interp.pending_wake_sync = None;
+        interp.current_coroutine_id = None;
         interp.resume_wait_start = None;
         match outcome {
             TurnOutcome::Complete => {}
@@ -2431,6 +2589,16 @@ impl<'a> Interp<'a> {
                 }
             }
             Stmt::ExprStmt { expr, .. } => {
+                // A statement-position clause 33 blocking call
+                // (`p.up();`, `p.down();`, `l.lock();`, `l.release();`)
+                // ends the turn at the call: a successful one yields,
+                // a blocked one parks until the wake pass services it
+                // (31.2.5's non-preemptive model interrupts at TCM
+                // calls and release/lock requests). Any other spelling
+                // evaluates through the expression evaluator.
+                if let Some(flow) = self.sync_statement_call(expr, frame, me)? {
+                    return Ok(flow);
+                }
                 self.eval(expr, frame, me)?;
                 Ok(Flow::Normal)
             }
@@ -2790,6 +2958,7 @@ impl<'a> Interp<'a> {
                         args: values,
                         next_block: 0,
                     },
+                    id: self.next_coroutine_id,
                     path: Vec::new(),
                     frame: Frame::default(),
                     me: Some(instance),
@@ -2798,11 +2967,13 @@ impl<'a> Interp<'a> {
                     // fires instead.
                     eligible_at_cycle,
                     wake_event,
+                    wake_sync: None,
                     suspended_temporal: false,
                     temporal_waited: 0,
                     span: *span,
                     wait_start: None,
                 });
+                self.next_coroutine_id += 1;
                 Ok(Flow::Normal)
             }
             // `compute <call>;` — without TCM suspension, the call runs
@@ -3705,6 +3876,17 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// A predeclared value type gen cannot construct (`event`, `file`,
+    /// the clause 33 sync structs, ...): the field keeps its NULL
+    /// default until the program assigns it. A declared type of the
+    /// same name shadows the builtin and generates normally.
+    fn is_non_generatable_builtin(&self, ty: &TypeExpr) -> bool {
+        let TypeExpr::Named { name, .. } = ty else {
+            return false;
+        };
+        crate::builtins::is_builtin_type(name) && !self.types.iter().any(|t| &t.name == name)
+    }
+
     /// The fixed length demanded by a `keep <field>.size() == N`
     /// constraint, if any (only the equality form drives lengths here;
     /// ranges are a later milestone).
@@ -3797,6 +3979,7 @@ impl<'a> Interp<'a> {
                     && !field.is_const
                     && !field.is_static
                     && !self.is_unit_typed(&field.ty)
+                    && !self.is_non_generatable_builtin(&field.ty)
                     && !ty.when_of.iter().any(|(id, _)| id == &field.name)
             })
             .map(|field| (field.name.clone(), field.ty.clone()))
@@ -6349,6 +6532,567 @@ impl<'a> Interp<'a> {
     }
 
     // -----------------------------------------------------------------
+    // The clause 33 resource-sharing structs: `semaphore`,
+    // `rdv_semaphore` and `locker`. The blocking calls are TCM calls —
+    // a successful one yields to the scheduler like any TCM (31.2.5's
+    // non-preemptive model interrupts at TCM calls), a blocked one
+    // parks the coroutine on the object's FIFO waiter queue until the
+    // wake pass services it. `try_up()`/`try_down()` and the value
+    // queries never block and never switch.
+    // -----------------------------------------------------------------
+
+    /// A statement-position clause 33 blocking call returns the turn's
+    /// flow; any other spelling evaluates through the expression
+    /// evaluator (`None` here).
+    fn sync_statement_call(
+        &mut self,
+        expr: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Option<Flow>, Diagnostic> {
+        let Expr::Call { callee, args, span } = expr else {
+            return Ok(None);
+        };
+        if !args.is_empty() {
+            return Ok(None);
+        }
+        let Expr::MemberAccess { object, name, .. } = callee.as_ref() else {
+            return Ok(None);
+        };
+        if !matches!(name.as_str(), "up" | "down" | "lock" | "release") {
+            return Ok(None);
+        }
+        let Value::Sync(sync) = self.eval(object, frame, me)? else {
+            // Not a sync receiver: the generic call path produces its
+            // own (correct) error or method resolution.
+            return Ok(None);
+        };
+        let kind = sync.borrow().kind;
+        let blocking = match (kind, name.as_str()) {
+            (SyncKind::Locker, "lock" | "release") => true,
+            (SyncKind::Semaphore | SyncKind::RdvSemaphore, "up" | "down") => true,
+            // A blocking-spelled call on the wrong surface ("up" on a
+            // locker, "release" on a semaphore) is the generic path's
+            // no-such-method error.
+            _ => false,
+        };
+        if !blocking {
+            return Ok(None);
+        }
+        let outcome = match name.as_str() {
+            "up" => self.sync_transfer(sync, SyncWaiter::Up, *span, frame, true)?,
+            "down" => self.sync_transfer(sync, SyncWaiter::Down, *span, frame, true)?,
+            "lock" => self.sync_lock_acquire(sync, *span, frame, true)?,
+            _ => self.sync_lock_release(sync, *span, frame, true)?,
+        };
+        Ok(Some(match outcome {
+            SyncOutcome::Done(_) => Flow::Normal,
+            SyncOutcome::Yield => Flow::Suspend,
+        }))
+    }
+
+    /// One clause 33 method call reached through the expression
+    /// evaluator: the non-blocking surface plus the blocking calls run
+    /// inline (an expression is an atomic fragment — a call that would
+    /// block reports E0421 instead of suspending mid-expression).
+    fn call_sync_method(
+        &mut self,
+        sync: Rc<RefCell<SyncState>>,
+        name: &str,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+        frame: &Frame,
+    ) -> Result<Value, Diagnostic> {
+        let kind = sync.borrow().kind;
+        // Locker surface.
+        if kind == SyncKind::Locker {
+            match (name, values.as_slice()) {
+                ("lock", []) => {
+                    return self
+                        .sync_lock_acquire(sync, span, frame, false)
+                        .map(SyncOutcome::value);
+                }
+                ("lock", _) => {
+                    return Err(self.error("E0402", "'lock()' expects no arguments", span));
+                }
+                ("release", []) => {
+                    return self
+                        .sync_lock_release(sync, span, frame, false)
+                        .map(SyncOutcome::value);
+                }
+                ("release", _) => {
+                    return Err(self.error("E0402", "'release()' expects no arguments", span));
+                }
+                _ => {}
+            }
+        }
+        // Semaphore surfaces.
+        match (name, values.as_slice()) {
+            ("up", []) => self
+                .sync_transfer(sync, SyncWaiter::Up, span, frame, false)
+                .map(SyncOutcome::value),
+            ("up", _) => Err(self.error("E0402", "'up()' expects no arguments", span)),
+            ("down", []) => self
+                .sync_transfer(sync, SyncWaiter::Down, span, frame, false)
+                .map(SyncOutcome::value),
+            ("down", _) => Err(self.error("E0402", "'down()' expects no arguments", span)),
+            ("try_up", []) => self.sync_try(sync, SyncWaiter::Up),
+            ("try_up", _) => Err(self.error("E0402", "'try_up()' expects no arguments", span)),
+            ("try_down", []) => self.sync_try(sync, SyncWaiter::Down),
+            ("try_down", _) => Err(self.error("E0402", "'try_down()' expects no arguments", span)),
+            ("set_value", [Value::Int(new_value)]) => self.sync_set_value(sync, *new_value, span),
+            ("set_value", _) => Err(self.error("E0402", "'set_value()' expects the value", span)),
+            ("get_value", []) => Ok(Value::Int(sync.borrow().available)),
+            ("get_value", _) => {
+                Err(self.error("E0402", "'get_value()' expects no arguments", span))
+            }
+            ("set_max_value", [Value::Int(new_max)]) => {
+                self.sync_set_max_value(sync, *new_max, span)
+            }
+            ("set_max_value", _) => {
+                Err(self.error("E0402", "'set_max_value()' expects the maximum", span))
+            }
+            ("get_max_value", []) => Ok(Value::Int(sync.borrow().max_value)),
+            ("get_max_value", _) => {
+                Err(self.error("E0402", "'get_max_value()' expects no arguments", span))
+            }
+            _ => Err(self.error(
+                "E0405",
+                format!("'{}' has no method '{name}'", kind.name()),
+                span,
+            )),
+        }
+    }
+
+    /// One `up()`/`down()` call: the transfer, or the park. On an
+    /// `rdv_semaphore` both directions block until they coincide.
+    /// `statement_position` marks the statement-level call, which may
+    /// yield or park; an expression-position call runs inline.
+    #[allow(clippy::too_many_arguments)]
+    fn sync_transfer(
+        &mut self,
+        sync: Rc<RefCell<SyncState>>,
+        direction: SyncWaiter,
+        span: crate::ast::Span,
+        frame: &Frame,
+        statement_position: bool,
+    ) -> Result<SyncOutcome, Diagnostic> {
+        sync.borrow_mut().transfer_attempted = true;
+        let kind = sync.borrow().kind;
+        if kind == SyncKind::RdvSemaphore {
+            return self.sync_rdv_transfer(sync, direction, span, frame, statement_position);
+        }
+        let satisfiable = {
+            let state = sync.borrow();
+            // FIFO: a request queues behind any pending request of the
+            // same direction — blocked calls are serviced in request
+            // order (31.2.1), and a fresh call does not steal ahead.
+            let same_direction_pending =
+                state.waiters.iter().any(|(_, waiter)| *waiter == direction);
+            match direction {
+                SyncWaiter::Up => !same_direction_pending && state.available < state.max_value,
+                SyncWaiter::Down => !same_direction_pending && state.available > 0,
+                SyncWaiter::Lock => false,
+            }
+        };
+        if satisfiable {
+            match direction {
+                SyncWaiter::Up => sync.borrow_mut().available += 1,
+                SyncWaiter::Down => sync.borrow_mut().available -= 1,
+                SyncWaiter::Lock => {}
+            }
+            return self.yield_turn(span, frame, statement_position);
+        }
+        self.sync_block(sync, direction, span, frame, statement_position)
+    }
+
+    /// The `rdv_semaphore` transfer (31.2.1): `up()` and `down()` block
+    /// until they coincide, and the paired `up()` thread always runs
+    /// first, followed immediately by the `down()` thread. When a call
+    /// of the other direction is already parked, the pairing wakes that
+    /// parked half; the `up()` half runs this scheduling round and the
+    /// `down()` half the next — the documented deterministic reading of
+    /// the pairing order.
+    fn sync_rdv_transfer(
+        &mut self,
+        sync: Rc<RefCell<SyncState>>,
+        direction: SyncWaiter,
+        span: crate::ast::Span,
+        frame: &Frame,
+        statement_position: bool,
+    ) -> Result<SyncOutcome, Diagnostic> {
+        let partner = if direction == SyncWaiter::Up {
+            SyncWaiter::Down
+        } else {
+            SyncWaiter::Up
+        };
+        let paired_serial = {
+            let mut state = sync.borrow_mut();
+            state
+                .waiters
+                .iter()
+                .position(|(_, waiter)| *waiter == partner)
+                .and_then(|position| state.waiters.remove(position))
+                .map(|(serial, _)| serial)
+        };
+        if let Some(serial) = paired_serial {
+            // Wake the parked half. The pairing keeps the up() half
+            // ahead: the parked up() runs this round, the parked down()
+            // the next.
+            for co in self.coroutines.iter_mut() {
+                if let Some((other_sync, other_serial)) = &co.wake_sync
+                    && Rc::ptr_eq(other_sync, &sync)
+                    && *other_serial == serial
+                {
+                    co.wake_sync = None;
+                    co.eligible_at_cycle = if partner == SyncWaiter::Up {
+                        self.cycle
+                    } else {
+                        self.cycle + 1
+                    };
+                    co.suspended_temporal = false;
+                    break;
+                }
+            }
+            if direction == SyncWaiter::Up {
+                return self.yield_turn(span, frame, statement_position);
+            }
+            // The down() half follows one round later.
+            if !(statement_position && self.suspend_eligible()) {
+                return Err(self.error(
+                    "E0421",
+                    "the blocking call suspends this coroutine until the resource is available — it needs a TCM context (clause 33)",
+                    span,
+                ));
+            }
+            self.suspend_here(frame, span, true, self.cycle + 1, false, None)?;
+            Ok(SyncOutcome::Yield)
+        } else {
+            self.sync_block(sync, direction, span, frame, statement_position)
+        }
+    }
+
+    /// A `try_up()`/`try_down()`: never blocks, never switches (31.2.2).
+    /// The FIFO rule holds — a try fails while a pending call of its own
+    /// direction waits.
+    fn sync_try(
+        &mut self,
+        sync: Rc<RefCell<SyncState>>,
+        direction: SyncWaiter,
+    ) -> Result<Value, Diagnostic> {
+        sync.borrow_mut().transfer_attempted = true;
+        let kind = sync.borrow().kind;
+        let mut state = sync.borrow_mut();
+        let same_direction_pending = state.waiters.iter().any(|(_, waiter)| *waiter == direction);
+        let changed = match kind {
+            SyncKind::RdvSemaphore => false,
+            SyncKind::Semaphore => match direction {
+                SyncWaiter::Up => !same_direction_pending && state.available < state.max_value,
+                SyncWaiter::Down => !same_direction_pending && state.available > 0,
+                SyncWaiter::Lock => false,
+            },
+            SyncKind::Locker => false,
+        };
+        if changed {
+            match direction {
+                SyncWaiter::Up => state.available += 1,
+                SyncWaiter::Down => state.available -= 1,
+                SyncWaiter::Lock => {}
+            }
+        }
+        Ok(Value::Bool(changed))
+    }
+
+    /// `locker.lock()`: acquire when free; otherwise park (31.2.5, FIFO
+    /// order of grant).
+    fn sync_lock_acquire(
+        &mut self,
+        sync: Rc<RefCell<SyncState>>,
+        span: crate::ast::Span,
+        frame: &Frame,
+        statement_position: bool,
+    ) -> Result<SyncOutcome, Diagnostic> {
+        if sync.borrow().holder.is_none() {
+            let holder = self.current_coroutine_id;
+            sync.borrow_mut().holder = holder;
+            return self.yield_turn(span, frame, statement_position);
+        }
+        self.sync_block(sync, SyncWaiter::Lock, span, frame, statement_position)
+    }
+
+    /// `locker.release()` (31.2.5): `lock()` and `release()` are issued
+    /// by the same entity — releasing from another coroutine, or a
+    /// locker nothing holds, is E0423.
+    fn sync_lock_release(
+        &mut self,
+        sync: Rc<RefCell<SyncState>>,
+        span: crate::ast::Span,
+        frame: &Frame,
+        statement_position: bool,
+    ) -> Result<SyncOutcome, Diagnostic> {
+        let holder = self.current_coroutine_id;
+        if holder.is_some() && sync.borrow().holder == holder {
+            sync.borrow_mut().holder = None;
+            self.yield_turn(span, frame, statement_position)
+        } else {
+            Err(self.error(
+                "E0423",
+                "'release()' on a locker not held by the calling entity",
+                span,
+            ))
+        }
+    }
+
+    /// Park the coroutine on the object's waiter queue: the wake pass
+    /// services it when the condition holds. A call that would block
+    /// outside a statement-position suspendable context is E0421.
+    fn sync_block(
+        &mut self,
+        sync: Rc<RefCell<SyncState>>,
+        direction: SyncWaiter,
+        span: crate::ast::Span,
+        frame: &Frame,
+        statement_position: bool,
+    ) -> Result<SyncOutcome, Diagnostic> {
+        if !(statement_position && self.suspend_eligible()) {
+            return Err(self.error(
+                "E0421",
+                "the blocking call suspends this coroutine until the resource is available — it needs a TCM context (clause 33)",
+                span,
+            ));
+        }
+        let serial = {
+            let mut state = sync.borrow_mut();
+            let serial = state.next_serial;
+            state.next_serial += 1;
+            state.waiters.push_back((serial, direction));
+            serial
+        };
+        self.pending_wake_sync = Some((sync, serial));
+        self.suspend_here(frame, span, true, self.cycle + 1, false, None)?;
+        Ok(SyncOutcome::Yield)
+    }
+
+    /// The scheduler-side wake pass, run before every turn pick: service
+    /// the oldest waiter whose condition holds, until a full sweep makes
+    /// no progress. The queue front is the oldest request; the sweep
+    /// walks the parked coroutines in request order, so blocked calls
+    /// run in their blocked order (the FIFO reading of 31.2.1).
+    fn service_sync_waiters(&mut self) {
+        loop {
+            let mut progressed = false;
+            let mut waiters: Vec<(u64, usize, Rc<RefCell<SyncState>>)> = Vec::new();
+            for (position, co) in self.coroutines.iter().enumerate() {
+                if let Some((sync, serial)) = &co.wake_sync {
+                    waiters.push((*serial, position, Rc::clone(sync)));
+                }
+            }
+            waiters.sort_by_key(|(serial, _, _)| *serial);
+            for (_, position, sync) in waiters {
+                let Some(serial) = self.coroutines[position]
+                    .wake_sync
+                    .as_ref()
+                    .map(|(_, serial)| *serial)
+                else {
+                    continue;
+                };
+                let kind = sync.borrow().kind;
+                let Some((front_serial, front_waiter)) = sync.borrow().waiters.front().copied()
+                else {
+                    continue;
+                };
+                // FIFO: only the queue front is serviced this round.
+                if front_serial != serial {
+                    continue;
+                }
+                match kind {
+                    SyncKind::Semaphore => {
+                        let mut state = sync.borrow_mut();
+                        let serviceable = (front_waiter == SyncWaiter::Up
+                            && state.available < state.max_value)
+                            || (front_waiter == SyncWaiter::Down && state.available > 0);
+                        if serviceable {
+                            match front_waiter {
+                                SyncWaiter::Up => state.available += 1,
+                                _ => state.available -= 1,
+                            }
+                            state.waiters.pop_front();
+                            drop(state);
+                            self.wake_sync_waiter(&sync, serial, self.cycle);
+                            progressed = true;
+                        }
+                    }
+                    SyncKind::Locker => {
+                        let mut state = sync.borrow_mut();
+                        if state.holder.is_none() {
+                            state.holder = Some(self.coroutines[position].id);
+                            state.waiters.pop_front();
+                            drop(state);
+                            self.wake_sync_waiter(&sync, serial, self.cycle);
+                            progressed = true;
+                        }
+                    }
+                    // The rendezvous: pair the front with the oldest
+                    // opposite-direction waiter. The pairing keeps the
+                    // up() half ahead: it runs this round, the down()
+                    // half the next (see `sync_rdv_transfer`).
+                    SyncKind::RdvSemaphore => {
+                        let partner = if front_waiter == SyncWaiter::Up {
+                            SyncWaiter::Down
+                        } else {
+                            SyncWaiter::Up
+                        };
+                        let partner_position = {
+                            let state = sync.borrow();
+                            state
+                                .waiters
+                                .iter()
+                                .enumerate()
+                                .skip(1)
+                                .find(|(_, (_, waiter))| *waiter == partner)
+                                .map(|(queue_position, _)| queue_position)
+                        };
+                        let Some(queue_position) = partner_position else {
+                            continue;
+                        };
+                        let partner_serial = sync
+                            .borrow_mut()
+                            .waiters
+                            .remove(queue_position)
+                            .map(|(serial, _)| serial);
+                        let Some(partner_serial) = partner_serial else {
+                            continue;
+                        };
+                        sync.borrow_mut().waiters.pop_front();
+                        // The up() half of the pairing runs this round,
+                        // the down() half the next.
+                        let (front_eligible, partner_eligible) = if front_waiter == SyncWaiter::Up {
+                            (self.cycle, self.cycle + 1)
+                        } else {
+                            (self.cycle + 1, self.cycle)
+                        };
+                        self.wake_sync_waiter(&sync, serial, front_eligible);
+                        self.wake_sync_waiter(&sync, partner_serial, partner_eligible);
+                        progressed = true;
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    /// Wake one parked waiter of `sync` at the given eligibility.
+    fn wake_sync_waiter(
+        &mut self,
+        sync: &Rc<RefCell<SyncState>>,
+        serial: u64,
+        eligible_at_cycle: u64,
+    ) {
+        for co in self.coroutines.iter_mut() {
+            if let Some((other_sync, other_serial)) = &co.wake_sync
+                && Rc::ptr_eq(other_sync, sync)
+                && *other_serial == serial
+            {
+                co.wake_sync = None;
+                co.eligible_at_cycle = eligible_at_cycle;
+                co.suspended_temporal = false;
+                break;
+            }
+        }
+    }
+
+    /// The scheduler-side yield of a successful blocking call: the turn
+    /// ends at the call (31.2.5's non-preemptive model interrupts at
+    /// TCM calls); the coroutine rejoins the round-robin this cycle,
+    /// resuming after the statement. An expression-position (inline,
+    /// atomic) call runs without the switch.
+    fn yield_turn(
+        &mut self,
+        span: crate::ast::Span,
+        frame: &Frame,
+        statement_position: bool,
+    ) -> Result<SyncOutcome, Diagnostic> {
+        if statement_position && self.suspend_eligible() {
+            self.suspend_here(frame, span, true, self.cycle, false, None)?;
+            return Ok(SyncOutcome::Yield);
+        }
+        Ok(SyncOutcome::Done(Value::Void))
+    }
+
+    /// 31.2.3: `set_value()` — non-negative, within the maximum, and
+    /// forbidden once `up()`/`down()` was called; an `rdv_semaphore`
+    /// stays at 0.
+    fn sync_set_value(
+        &mut self,
+        sync: Rc<RefCell<SyncState>>,
+        new_value: i128,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let (kind, transfer_attempted, max_value) = {
+            let state = sync.borrow();
+            (state.kind, state.transfer_attempted, state.max_value)
+        };
+        if transfer_attempted {
+            return Err(self.error(
+                "E0422",
+                "'set_value()' cannot be called after 'up()' or 'down()' was called (31.2.3)",
+                span,
+            ));
+        }
+        let valid = match kind {
+            SyncKind::RdvSemaphore => new_value == 0,
+            _ => new_value >= 0 && new_value <= max_value,
+        };
+        if !valid {
+            return Err(self.error(
+                "E0422",
+                format!("'set_value({new_value})' is outside the semaphore's value range (31.2.3)"),
+                span,
+            ));
+        }
+        sync.borrow_mut().available = new_value;
+        Ok(Value::Void)
+    }
+
+    /// 31.2.4: `set_max_value()` — positive, not smaller than the
+    /// current value, forbidden once `up()`/`down()` was called; an
+    /// `rdv_semaphore`'s maximum stays 0.
+    fn sync_set_max_value(
+        &mut self,
+        sync: Rc<RefCell<SyncState>>,
+        new_max: i128,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let (kind, transfer_attempted, available) = {
+            let state = sync.borrow();
+            (state.kind, state.transfer_attempted, state.available)
+        };
+        if transfer_attempted {
+            return Err(self.error(
+                "E0422",
+                "'set_max_value()' cannot be called after 'up()' or 'down()' was called (31.2.4)",
+                span,
+            ));
+        }
+        let valid = match kind {
+            SyncKind::RdvSemaphore => new_max == 0,
+            _ => new_max > 0 && new_max >= available,
+        };
+        if !valid {
+            return Err(self.error(
+                "E0422",
+                format!(
+                    "'set_max_value({new_max})' is outside the semaphore's maximum range (31.2.4)"
+                ),
+                span,
+            ));
+        }
+        sync.borrow_mut().max_value = new_max;
+        Ok(Value::Void)
+    }
+
     // The 32.3 procedural table API (T9.3): the `table_manager`
     // singleton, the methods on a `table` value and on a `table_row`
     // value. Rows are numbered from 0, columns from 1 (column 0 is the
@@ -6930,6 +7674,9 @@ impl<'a> Interp<'a> {
             | Value::Set(_)
             | Value::Void
             | Value::Port { .. } => Ok(value.clone()),
+            // A clause 33 sync object deep copies as the same object:
+            // the synchronization state is identity, not value.
+            Value::Sync(_) => Ok(value.clone()),
             // A custom numeric value deep copies by value (T7.1): a
             // fresh implementing-struct instance through the same
             // copy rule a slot binding uses (`numeric_assign` when the
@@ -8404,6 +9151,7 @@ impl<'a> Interp<'a> {
             temporal,
             span,
             wait_start,
+            wake_sync: self.pending_wake_sync.take(),
         });
         Ok(Flow::Suspend)
     }
@@ -9798,6 +10546,12 @@ impl<'a> Interp<'a> {
                             Value::InstancePathItem(item) => {
                                 self.call_instance_path_item_method(item, name, values, *span)
                             }
+                            // The clause 33 resource-sharing structs:
+                            // up()/down()/try_up()/try_down()/set_value()/
+                            // get_value()/set_max_value()/get_max_value()
+                            // on a semaphore or rdv_semaphore; lock()/
+                            // release() on a locker.
+                            Value::Sync(sync) => self.call_sync_method(sync, name, values, *span, frame),
                             // `to_string()` on scalars (the DAC macro
                             // shapes: `set.min().to_string()`).
                             value @ (Value::Int(_)
@@ -10376,6 +11130,28 @@ impl<'a> Interp<'a> {
                             cursor: None,
                         },
                     ))));
+                }
+                // The clause 33 resource-sharing structs: `new
+                // semaphore` / `new rdv_semaphore` / `new locker` mint
+                // the sync object — a semaphore carries 0 available
+                // resources under a MAX_INT maximum, an rdv_semaphore
+                // stays at 0/0, a locker starts free. They have no
+                // members to initialize.
+                let sync_kind = match new_name.as_str() {
+                    "semaphore" => Some(SyncKind::Semaphore),
+                    "rdv_semaphore" => Some(SyncKind::RdvSemaphore),
+                    "locker" => Some(SyncKind::Locker),
+                    _ => None,
+                };
+                if let Some(kind) = sync_kind {
+                    if !inits.is_empty() {
+                        return Err(self.error(
+                            "E0402",
+                            format!("'{new_name}' has no members to initialize"),
+                            *span,
+                        ));
+                    }
+                    return Ok(Value::Sync(Rc::new(RefCell::new(SyncState::new(kind)))));
                 }
                 // The recognised clause 32.1/32.2 reflection types
                 // (T11.1): the construction stub — recognised, with the
@@ -11708,6 +12484,9 @@ impl<'a> Interp<'a> {
                 }
                 format!("instance_path_item({rendered})")
             }
+            // A clause 33 sync object renders by its struct name — the
+            // state is identity, not value.
+            Value::Sync(sync) => sync.borrow().kind.name().to_owned(),
             // Clause 5.4.4.4: `Value::Void` doubles as the null
             // reference — an interface-typed variable with no instance
             // prints NULL (T3.5). A struct-typed interface value prints
@@ -11731,6 +12510,7 @@ impl<'a> Interp<'a> {
             Value::Custom { .. } => "a custom numeric value",
             Value::InstanceIterator(_) => "an instance iterator",
             Value::InstancePathItem(_) => "an instance path item",
+            Value::Sync(_) => "a resource-sharing object",
             Value::Void => "void",
         }
     }
@@ -13801,6 +14581,7 @@ impl<'a> Interp<'a> {
                 co.suspended_temporal = suspension.temporal;
                 co.span = suspension.span;
                 co.wait_start = suspension.wait_start;
+                co.wake_sync = suspension.wake_sync;
                 TurnOutcome::Suspended
             }
             None => TurnOutcome::Error(self.error(
