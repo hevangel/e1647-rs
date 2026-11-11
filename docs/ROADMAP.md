@@ -226,8 +226,14 @@ not imply full language support or IEEE conformance.
       coverage items, including synthesized when views. E0220–E0223
       report definite incompatible values, missing members, non-list
       indexing and invalid operands; unknown types stay silent.
-      Coverage options remain unchecked raw tokens; general type
-      inference and full name resolution are still missing
+      Declared parameters bind within each method; local `var x := e`
+      declarations propagate known initializer kinds, homogeneous list
+      element kinds and equal-kind conditional branches (clause 18).
+      Scalar/list aliases resolve with bounded recursion. Unknown or
+      ambiguous kinds and custom numeric dispatch remain conservative;
+      there is no flow-sensitive or interprocedural inference. Coverage
+      options remain unchecked raw tokens and full name resolution is
+      still missing
 - [ ] Differential corpus against an authorized reference simulator where
       available (started: Specman reference runs via EDA Playground are
       recorded in docs/VERIFICATION.md; no automated differential harness yet)

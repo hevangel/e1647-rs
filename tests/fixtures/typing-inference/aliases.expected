@@ -1,0 +1,1 @@
+8:27: error[E0220]: variable initialization: a value of kind 'string' cannot be stored into 'int'

@@ -21,7 +21,8 @@
 > `chosen_from`, custom numeric types, tables, annotations, the clause
 > 33 resource-sharing structs (`semaphore`/`rdv_semaphore`/`locker`),
 > and the reflection catalogue with `instance_iterator`. A full type
-> system (a conservative definite-mismatch check includes coverage items),
+> system (a conservative definite-mismatch check includes coverage items,
+> typed parameters and inferred locals),
 > temporal value history, general constraint solving and general testbench
 > execution do **not** exist yet, and no
 > IEEE conformance is claimed.
