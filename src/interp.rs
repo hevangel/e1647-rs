@@ -154,20 +154,23 @@
 //! `sort`/`sort_by_field` (27.4.23/27.4.24), `first`/`last`
 //! (27.4.6/27.4.13), `first_index`/`last_index` (27.4.7/27.4.14),
 //! `all_different` (27.4.1), `unique` (27.4.28), `split` (27.4.25), the
-//! `exp`-parameter forms of `min`/`max`/`min_index`/`max_index`
-//! (27.4.15-27.4.19) and of the boolean 27.5 aggregates
+//! expression forms of the boolean 27.5 aggregates
 //! `and_all`/`or_all`. The 27.4.17/27.4.20/27.5.4-27.5.6 aggregates
 //! (`max_value`, `min_value`, `product`, `sum`, `average`) DO take a
 //! per-item expression — they intercept before the argument evaluation
 //! ([`Interp::call_list_aggregate`]); their empty-list `average` and
 //! `max_value`/`min_value` results are the honest `E0402` (UNDEF and
-//! Table 54 are not in the value model).
-//! `has`, `count`, `all` and `all_indices` evaluate one boolean
-//! expression per item with a scoped `it` binding (27.4.10/4/29/30).
-//! `has` stops at the first match; the other queries preserve list order.
-//! Their receiver is snapshotted before evaluation, so mutation during a
-//! predicate does not change the traversal. Implicit index bindings are
-//! not modeled. Also not
+//! Table 54 are not in the value model). `min`/`max`/`min_index`/
+//! `max_index` (27.4.15–27.4.19) accept an optional key expression
+//! evaluated with `it` bound to each item. They select the original
+//! item/index, with the latest tie winning; numeric and string keys
+//! follow the runtime's relational ordering. Traversal snapshots the
+//! receiver; implicit index bindings remain unsupported. `has`, `count`,
+//! `all` and `all_indices` evaluate one boolean expression per item with
+//! a scoped `it` binding (27.4.10/4/29/30). `has` stops at the first
+//! match; the others preserve order. Their receiver is snapshotted before
+//! evaluation, so mutation during a predicate does not change traversal.
+//! Implicit index bindings are not modeled. Also not
 //! modeled: `resize` (27.3.16 — the
 //! `filler`/`keep_old` parameters are expressions and new items need the
 //! element type's default value), `get_indices` (27.4.9 — the prose does
@@ -507,10 +510,20 @@ impl ObjectInstance {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct Frame {
     locals: std::collections::HashMap<String, Value>,
     local_types: std::collections::HashMap<String, TypeExpr>,
+}
+
+#[derive(Debug, Clone)]
+struct StatementCall {
+    receiver: usize,
+    name: String,
+    args: Vec<Value>,
+    block: usize,
+    frame: Frame,
+    span: crate::ast::Span,
 }
 
 enum Flow {
@@ -546,6 +559,9 @@ enum Flow {
 /// the conservative run-to-completion model.
 #[derive(Debug, Clone)]
 enum Child {
+    /// A statement-position call, with its own locals and once-evaluated
+    /// receiver/arguments. Further path levels descend into its body.
+    Call(Box<StatementCall>),
     /// A `while` body mid-iteration — the condition is re-checked only
     /// when the iteration completes.
     WhileBody,
@@ -2320,6 +2336,9 @@ impl<'a> Interp<'a> {
             ));
         }
         match (statement, child) {
+            (Stmt::Compute { .. } | Stmt::ExprStmt { .. }, Child::Call(call)) => {
+                self.exec_statement_call(call.as_ref().clone(), frame, Some(rest))
+            }
             (Stmt::While { cond, body, .. }, Child::WhileBody) => {
                 let first_flow = self.exec_block_resumable(body, frame, me, rest)?;
                 self.while_loop(cond, body, frame, me, first_flow)
@@ -2723,6 +2742,9 @@ impl<'a> Interp<'a> {
                 if let Some(flow) = self.sync_statement_call(expr, frame, me)? {
                     return Ok(flow);
                 }
+                if let Some(flow) = self.declared_statement_call(expr, frame, me)? {
+                    return Ok(flow);
+                }
                 self.eval(expr, frame, me)?;
                 Ok(Flow::Normal)
             }
@@ -3120,6 +3142,9 @@ impl<'a> Interp<'a> {
                                 *span,
                             ));
                         };
+                        if self.suspend_eligible() {
+                            return self.begin_statement_call(index, name, values, *span, frame);
+                        }
                         self.call_method(index, name, values, *span)?;
                     }
                     Expr::MemberAccess { object, name, .. } => {
@@ -3127,6 +3152,9 @@ impl<'a> Interp<'a> {
                         let Value::Object(index) = object_value else {
                             return Err(self.error("E0402", "compute requires an object", *span));
                         };
+                        if self.suspend_eligible() {
+                            return self.begin_statement_call(index, name, values, *span, frame);
+                        }
                         self.call_method(index, name, values, *span)?;
                     }
                     // See `start`: a static method is not a TCM.
@@ -5211,6 +5239,270 @@ impl<'a> Interp<'a> {
     ) -> Result<Vec<&MethodDecl>, Diagnostic> {
         let type_name = self.instances[object_index].type_name.clone();
         resolve_method_blocks(self.types, &type_name, name, span)
+    }
+
+    fn peek_statement_receiver(
+        &self,
+        expr: &Expr,
+        frame: &Frame,
+        me: Option<usize>,
+    ) -> Option<usize> {
+        match expr {
+            Expr::Ident { name, .. } if name == "me" || name == "self" => me,
+            Expr::Ident { name, .. } => match frame
+                .locals
+                .get(name)
+                .or_else(|| me.and_then(|index| self.instances[index].get(name)))
+            {
+                Some(Value::Object(index)) => Some(*index),
+                _ => None,
+            },
+            Expr::MemberAccess { object, name, .. } => {
+                let index = self.peek_statement_receiver(object, frame, me)?;
+                match self.instances[index].get(name) {
+                    Some(Value::Object(index)) => Some(*index),
+                    _ => None,
+                }
+            }
+            Expr::Paren { expr, .. } => self.peek_statement_receiver(expr, frame, me),
+            _ => None,
+        }
+    }
+
+    fn statement_type_name(ty: &TypeExpr) -> Option<String> {
+        match ty {
+            TypeExpr::Named { name, .. } => Some(name.clone()),
+            TypeExpr::WhenQualified { value, base, .. } => when_view_name(value, base),
+            TypeExpr::TemplateRef { name, args, .. } => {
+                Some(crate::ast::template_instance_name(name, args))
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve receiver kinds without evaluating a receiver or argument.
+    /// The later call preparation evaluates each expression exactly once.
+    fn statement_receiver_type(
+        &self,
+        expr: &Expr,
+        frame: &Frame,
+        me: Option<usize>,
+    ) -> Option<String> {
+        if let Some(index) = self.peek_statement_receiver(expr, frame, me) {
+            return Some(self.instances[index].type_name.clone());
+        }
+        if let Some(ty) = self.static_type_of(expr, frame, me) {
+            return Self::statement_type_name(&ty);
+        }
+        match expr {
+            Expr::Paren { expr, .. } => self.statement_receiver_type(expr, frame, me),
+            Expr::New { ty: Some(ty), .. } | Expr::CastAs { ty, .. } => {
+                Self::statement_type_name(ty)
+            }
+            Expr::Index { base, .. } => match self.static_type_of(base, frame, me)? {
+                TypeExpr::List { element, .. } => Self::statement_type_name(&element),
+                _ => None,
+            },
+            Expr::Call { callee, .. } => {
+                let (owner, name) = match callee.as_ref() {
+                    Expr::Ident { name, .. } => (self.instances[me?].type_name.clone(), name),
+                    Expr::MemberAccess { object, name, .. } => {
+                        (self.statement_receiver_type(object, frame, me)?, name)
+                    }
+                    _ => return None,
+                };
+                let method = self
+                    .types
+                    .iter()
+                    .find(|ty| ty.name == owner)?
+                    .methods
+                    .iter()
+                    .find(|method| method.name == *name)?;
+                Self::statement_type_name(method.return_type.as_ref()?)
+            }
+            _ => None,
+        }
+    }
+
+    /// A whole call used as a statement can carry a suspension without
+    /// an expression-value continuation. Builtins and unresolved value
+    /// receivers keep their ordinary expression dispatch.
+    fn declared_statement_call(
+        &mut self,
+        expr: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Option<Flow>, Diagnostic> {
+        if !self.suspend_eligible() {
+            return Ok(None);
+        }
+        let Expr::Call { callee, args, span } = expr else {
+            return Ok(None);
+        };
+        let (type_name, name) = match callee.as_ref() {
+            Expr::Ident { name, .. } if !crate::builtins::is_builtin_routine(name) => {
+                let Some(index) = me else {
+                    return Ok(None);
+                };
+                (self.instances[index].type_name.clone(), name)
+            }
+            Expr::MemberAccess { object, name, .. } => {
+                let Some(type_name) = self.statement_receiver_type(object, frame, me) else {
+                    return Ok(None);
+                };
+                (type_name, name)
+            }
+            _ => return Ok(None),
+        };
+        if !self.types.iter().any(|ty| {
+            ty.name == type_name
+                && ty.methods.iter().any(|method| {
+                    method.name == *name && !method.is_static && method.tcm_event.is_some()
+                })
+        }) {
+            return Ok(None);
+        }
+        let hints = self.call_arg_hints(callee, args.len(), frame, me);
+        let mut values = Vec::with_capacity(args.len());
+        for (index, arg) in args.iter().enumerate() {
+            values.push(self.eval_with_hint(
+                hints.get(index).cloned().flatten(),
+                arg,
+                frame,
+                me,
+            )?);
+        }
+        let receiver = match callee.as_ref() {
+            Expr::Ident { .. } => me.expect("enclosing instance was checked"),
+            Expr::MemberAccess { object, .. } => match self.eval(object, frame, me)? {
+                Value::Object(index) => index,
+                _ => return Err(self.error("E0402", "method call requires an object", *span)),
+            },
+            _ => unreachable!("callee shape was checked"),
+        };
+        self.begin_statement_call(receiver, name, values, *span, frame)
+            .map(Some)
+    }
+
+    fn begin_statement_call(
+        &mut self,
+        receiver: usize,
+        name: &str,
+        args: Vec<Value>,
+        span: crate::ast::Span,
+        caller: &Frame,
+    ) -> Result<Flow, Diagnostic> {
+        let declared = self
+            .resolve_method(receiver, name, span)
+            .is_ok_and(|blocks| blocks.iter().any(|block| !block.is_static));
+        if !declared {
+            self.call_method(receiver, name, args, span)?;
+            return Ok(Flow::Normal);
+        }
+        self.exec_statement_call(
+            StatementCall {
+                receiver,
+                name: name.to_owned(),
+                args,
+                block: 0,
+                frame: Frame::default(),
+                span,
+            },
+            caller,
+            None,
+        )
+    }
+
+    /// Carry one method call through all its composed blocks. The path
+    /// stores each callee's locals at its call boundary; the scheduler's
+    /// outer frame always remains the caller's frame.
+    fn exec_statement_call(
+        &mut self,
+        mut call: StatementCall,
+        caller: &Frame,
+        mut resume: Option<&[PathLevel]>,
+    ) -> Result<Flow, Diagnostic> {
+        if self.depth > 200 {
+            return Err(self.error("E0406", "recursion too deep", call.span));
+        }
+        self.depth += 1;
+        let result = (|| {
+            let types = self.types;
+            let type_name = self.instances[call.receiver].type_name.clone();
+            let blocks = resolve_method_blocks(types, &type_name, &call.name, call.span)?;
+            let call_level = self.exec_context.len().checked_sub(1).ok_or_else(|| {
+                self.error(
+                    "E0402",
+                    "internal: method continuation without a caller",
+                    call.span,
+                )
+            })?;
+            while call.block < blocks.len() {
+                let block = blocks[call.block];
+                if call.args.len() != block.params.len() {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "method '{}' expects {} argument(s), got {}",
+                            call.name,
+                            block.params.len(),
+                            call.args.len()
+                        ),
+                        call.span,
+                    ));
+                }
+                let mut frame = if resume.is_some() {
+                    call.frame.clone()
+                } else {
+                    let mut frame = Frame::default();
+                    for (param, arg) in block.params.iter().zip(&call.args) {
+                        if let Some(ty) = &param.ty {
+                            frame.local_types.insert(param.name.clone(), ty.clone());
+                        }
+                        let value =
+                            self.bind_slot_value(arg.clone(), param.ty.as_ref(), call.span)?;
+                        frame.locals.insert(param.name.clone(), value);
+                    }
+                    frame
+                };
+                call.frame = frame.clone();
+                self.exec_context[call_level].child = Some(Child::Call(Box::new(call.clone())));
+                let flow = match resume.take() {
+                    Some(path) => self.exec_block_resumable(
+                        &block.body,
+                        &mut frame,
+                        Some(call.receiver),
+                        path,
+                    )?,
+                    None => self.exec_block(&block.body, &mut frame, Some(call.receiver))?,
+                };
+                match flow {
+                    Flow::Suspend => {
+                        let Some(pending) = self.pending_suspension.as_mut() else {
+                            return Err(self.error(
+                                "E0402",
+                                "internal: method suspension without state",
+                                call.span,
+                            ));
+                        };
+                        call.frame = pending.frame.clone();
+                        pending.path[call_level].child = Some(Child::Call(Box::new(call)));
+                        pending.frame = caller.clone();
+                        return Ok(Flow::Suspend);
+                    }
+                    Flow::Stop => {
+                        self.stop_requested = true;
+                        return Ok(Flow::Stop);
+                    }
+                    Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_) => {
+                        call.block += 1;
+                    }
+                }
+            }
+            Ok(Flow::Normal)
+        })();
+        self.depth -= 1;
+        result
     }
 
     fn call_method(
@@ -8517,9 +8809,82 @@ impl<'a> Interp<'a> {
         Ok(text)
     }
 
-    /// Predicate list queries (27.4.4/10/29/30). The snapshot keeps
-    /// borrows out of predicate evaluation and defines this subset's
-    /// traversal when a predicate mutates an alias of the receiver.
+    /// Evaluate a per-item expression with a temporary `it` binding.
+    /// Restore both the value and its type metadata, including on error.
+    fn eval_list_item(
+        &mut self,
+        expr: &Expr,
+        item: &Value,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Value, Diagnostic> {
+        let previous = frame.locals.insert("it".to_owned(), item.clone());
+        let previous_type = frame.local_types.remove("it");
+        let result = self.eval(expr, frame, me);
+        match previous {
+            Some(value) => {
+                frame.locals.insert("it".to_owned(), value);
+            }
+            None => {
+                frame.locals.remove("it");
+            }
+        }
+        if let Some(ty) = previous_type {
+            frame.local_types.insert("it".to_owned(), ty);
+        } else {
+            frame.local_types.remove("it");
+        }
+        result
+    }
+
+    /// Keyed list extrema (27.4.15/16/18/19). Keys choose an item;
+    /// unlike max_value/min_value the result is not the key itself.
+    fn call_list_extreme(
+        &mut self,
+        list: &ListValue,
+        name: &str,
+        args: &[Expr],
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        if args.len() > 1 {
+            return Err(self.error(
+                "E0402",
+                format!("'{name}' expects at most one item expression"),
+                span,
+            ));
+        }
+        let items = list.items.borrow().clone();
+        let Some(expr) = args.first() else {
+            return self.list_extreme(&items, name, span);
+        };
+        if items.is_empty() {
+            return Err(self.error("E0402", format!("{name} of an empty list"), span));
+        }
+        let mut keys = Vec::with_capacity(items.len());
+        for item in &items {
+            let key = self.eval_list_item(expr, item, frame, me)?;
+            // Validate singleton keys too; comparing only subsequent
+            // keys would silently accept a single object or boolean.
+            if compare_values(&key, &key).is_none() {
+                return Err(self.error(
+                    "E0402",
+                    format!("{name}() key is not orderable"),
+                    expr.span(),
+                ));
+            }
+            keys.push(key);
+        }
+        let best = self.list_extreme_index(&keys, name, span)?;
+        Ok(if name.ends_with("_index") {
+            Value::Int(best as i128)
+        } else {
+            items[best].clone()
+        })
+    }
+
+    /// Predicate list queries (27.4.4/10/29/30), with receiver snapshot.
     fn call_list_query(
         &mut self,
         list: &ListValue,
@@ -8540,23 +8905,7 @@ impl<'a> Interp<'a> {
         let mut matches = Vec::new();
         let mut count = 0;
         for (index, item) in items.into_iter().enumerate() {
-            let previous = frame.locals.insert("it".to_owned(), item.clone());
-            let previous_type = frame.local_types.remove("it");
-            let result = self.eval(predicate, frame, me);
-            match previous {
-                Some(value) => {
-                    frame.locals.insert("it".to_owned(), value);
-                }
-                None => {
-                    frame.locals.remove("it");
-                }
-            }
-            if let Some(ty) = previous_type {
-                frame.local_types.insert("it".to_owned(), ty);
-            } else {
-                frame.local_types.remove("it");
-            }
-            let Value::Bool(selected) = result? else {
+            let Value::Bool(selected) = self.eval_list_item(predicate, &item, frame, me)? else {
                 return Err(self.error(
                     "E0402",
                     format!("{name}() expects a boolean item expression"),
@@ -8631,20 +8980,7 @@ impl<'a> Interp<'a> {
             let value = if args.is_empty() {
                 item.clone()
             } else {
-                // `it` shadows any outer binding for the item
-                // expression's evaluation, then the outer state
-                // returns.
-                let previous = frame.locals.insert("it".to_owned(), item.clone());
-                let result = self.eval(&args[0], frame, me);
-                match previous {
-                    Some(outer) => {
-                        frame.locals.insert("it".to_owned(), outer);
-                    }
-                    None => {
-                        frame.locals.remove("it");
-                    }
-                }
-                result?
+                self.eval_list_item(&args[0], item, frame, me)?
             };
             count += 1;
             if matches!(name, "max_value" | "min_value") {
@@ -9564,9 +9900,8 @@ impl<'a> Interp<'a> {
     /// arithmetic. `None` when the name is not one of this subset (the
     /// caller reports `E0405`).
     ///
-    /// The methods taking a per-item expression cannot pass through
-    /// this value-only dispatch. Queries and numeric aggregates intercept
-    /// before it; `apply` and `sort` remain gaps — see the
+    /// The methods taking a per-item expression (`apply`, `sort`, `all`,
+    /// `has`, ...) cannot pass through this value-only dispatch — see the
     /// documented gaps in the module docs.
     fn call_list_pseudo_method(
         &mut self,
@@ -9586,9 +9921,7 @@ impl<'a> Interp<'a> {
             ("exists", [Value::Int(index)]) => {
                 Ok(Value::Bool(*index >= 0 && (*index as usize) < items.len()))
             }
-            ("exists", _) => {
-                Err(self.error("E0402", "exists() expects an integer index", span))
-            }
+            ("exists", _) => Err(self.error("E0402", "exists() expects an integer index", span)),
             // 27.4.3 copy(): a copy of the list — the list case of
             // exp.copy() (28.5.1). A fresh list object mints a new handle
             // (a `list_ptr==` mismatch, 4.11.4); struct items stay shared
@@ -9703,11 +10036,9 @@ impl<'a> Interp<'a> {
                 grown.insert(at, item.clone());
                 return Some(self.store_list(list, grown, Value::Void));
             }
-            ("insert", _) => Err(self.error(
-                "E0402",
-                "insert expects an integer index and an item",
-                span,
-            )),
+            ("insert", _) => {
+                Err(self.error("E0402", "insert expects an integer index and an item", span))
+            }
             // 27.3.6 delete(index): removes item number index (indexes
             // start counting from 0) and renumbers sequentially; an index
             // that does not exist is an error (the prose's exception).
@@ -9758,7 +10089,7 @@ impl<'a> Interp<'a> {
                                 "E0402",
                                 "and_all() expects a list of booleans",
                                 span,
-                            )))
+                            )));
                         }
                     }
                 }
@@ -9776,7 +10107,7 @@ impl<'a> Interp<'a> {
                                 "E0402",
                                 "or_all() expects a list of booleans",
                                 span,
-                            )))
+                            )));
                         }
                     }
                 }
@@ -9794,7 +10125,7 @@ impl<'a> Interp<'a> {
                                 "E0402",
                                 "product() expects a list of integers",
                                 span,
-                            )))
+                            )));
                         }
                     }
                 }
@@ -9812,7 +10143,7 @@ impl<'a> Interp<'a> {
                                 "E0402",
                                 "sum() expects a list of integers",
                                 span,
-                            )))
+                            )));
                         }
                     }
                 }
@@ -9823,14 +10154,7 @@ impl<'a> Interp<'a> {
             // is an error (the prose's exception).
             // 27.4.16 max_index() / 27.4.19 min_index(): the same scan,
             // returning the winning index.
-            ("max" | "min" | "max_index" | "min_index", []) => {
-                self.list_extreme(items, name, span)
-            }
-            ("max" | "min" | "max_index" | "min_index", _) => Err(self.error(
-                "E0402",
-                "the no-argument form of min/max is the supported one (the exp form is a documented gap)",
-                span,
-            )),
+            ("max" | "min" | "max_index" | "min_index", []) => self.list_extreme(items, name, span),
             // 27.4.11 is_a_permutation(): TRUE when the argument holds
             // the same items with the same multiplicities (order
             // irrelevant); struct items compare by instance index — the
@@ -9855,11 +10179,9 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Bool(permutation && remaining.is_empty()))
             }
-            ("is_a_permutation", _) => Err(self.error(
-                "E0402",
-                "is_a_permutation expects a list argument",
-                span,
-            )),
+            ("is_a_permutation", _) => {
+                Err(self.error("E0402", "is_a_permutation expects a list argument", span))
+            }
             _ => return None,
         };
         Some(result)
@@ -9933,11 +10255,24 @@ impl<'a> Interp<'a> {
         name: &str,
         span: crate::ast::Span,
     ) -> Result<Value, Diagnostic> {
+        let best = self.list_extreme_index(items, name, span)?;
+        Ok(if name.ends_with("_index") {
+            Value::Int(best as i128)
+        } else {
+            items[best].clone()
+        })
+    }
+
+    fn list_extreme_index(
+        &self,
+        items: &[Value],
+        name: &str,
+        span: crate::ast::Span,
+    ) -> Result<usize, Diagnostic> {
         if items.is_empty() {
             return Err(self.error("E0402", format!("{name} of an empty list"), span));
         }
         let want_max = name.starts_with("max");
-        let want_index = name.ends_with("_index");
         let mut best = 0usize;
         for (i, item) in items.iter().enumerate().skip(1) {
             let ordering = compare_values(item, &items[best]).ok_or_else(|| {
@@ -9954,11 +10289,7 @@ impl<'a> Interp<'a> {
                 best = i;
             }
         }
-        if want_index {
-            Ok(Value::Int(best as i128))
-        } else {
-            Ok(items[best].clone())
-        }
+        Ok(best)
     }
 
     /// Evaluate a temporal expression's propositions (`true(exp)` —
@@ -10560,9 +10891,10 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(result);
                 }
-                // Predicate queries bind `it` during traversal, before
-                // the ordinary value-only argument evaluation below.
-                let mut query_receiver = None;
+                // Key expressions need a per-item `it` binding, before
+                // ordinary value-only argument evaluation. Preserve a
+                // non-list receiver for same-named struct methods.
+                let mut extreme_receiver = None;
                 if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
                     && matches!(name.as_str(), "has" | "count" | "all" | "all_indices")
                 {
@@ -10570,13 +10902,19 @@ impl<'a> Interp<'a> {
                     if let Value::List(list) = receiver {
                         return self.call_list_query(&list, name, args, frame, me, *span);
                     }
-                    // A struct's same-named ordinary method keeps its
-                    // evaluated receiver; do not repeat its side effects.
-                    query_receiver = Some(receiver);
+                    extreme_receiver = Some(receiver);
                 }
-                // Numeric aggregates likewise evaluate per-item
-                // expressions. Their existing non-list fallback goes
-                // through ordinary method dispatch.
+                if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
+                    && matches!(name.as_str(), "min" | "max" | "min_index" | "max_index")
+                {
+                    let receiver = self.eval(object, frame, me)?;
+                    if let Value::List(list) = receiver {
+                        return self.call_list_extreme(&list, name, args, frame, me, *span);
+                    }
+                    extreme_receiver = Some(receiver);
+                }
+                // Numeric aggregates also evaluate per-item expressions;
+                // their existing non-list fallback uses ordinary dispatch.
                 if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
                     && matches!(
                         name.as_str(),
@@ -10660,7 +10998,7 @@ impl<'a> Interp<'a> {
                         // dispatched before the argument evaluation
                         // above; every other member call evaluates its
                         // arguments to values first.
-                        let object_value = match query_receiver {
+                        let object_value = match extreme_receiver {
                             Some(value) => value,
                             None => self.eval(object, frame, me)?,
                         };

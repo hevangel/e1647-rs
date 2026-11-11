@@ -305,7 +305,8 @@ not imply full language support or IEEE conformance.
       `push`/`push0`/`add`/`add0`/`pop`/`pop0`/`insert`/`delete`/
       `fast_delete`/`clear`, the no-argument general forms
       `size`/`is_empty`/`exists`/`copy`/`reverse`/`top`/`top0`, the
-      no-argument `min`/`max`/`min_index`/`max_index` extremes, the
+      `min`/`max`/`min_index`/`max_index` extremes with optional per-item
+      key expressions, the
       no-argument `sum`/`product`/`and_all`/`or_all` aggregates with
       their stated empty-list results, and `is_a_permutation`; the
       numeric expression aggregates and the predicate queries `has`,
@@ -387,13 +388,15 @@ not imply full language support or IEEE conformance.
       sets, and `as_a` to an enumeral type maps the integer index to
       the enumerand (5.10.2). The clause 27 list pseudo-methods run the
       no-expression subset on list values (the 27.3 modifiers, the
-      no-argument general forms, extremes and aggregates, numeric
-      expression aggregates, and `has`/`count`/`all`/`all_indices`
-      with one boolean expression bound to `it`. These queries preserve
-      order, snapshot the traversal and return fresh filtered/index
-      lists; implicit index bindings are not modeled. Other
-      expression-taking forms, `resize`, the 27.6 CRC family and 27.7
-      keyed lists are documented gaps in `src/interp.rs`). Set literals
+      no-argument general forms and aggregates, numeric expression
+      aggregates, and extrema with optional key expressions bound to
+      `it`. Keyed extrema select the original item/index, prefer the
+      latest tied item and snapshot traversal; implicit index bindings
+      remain unsupported. `has`/`count`/`all`/`all_indices` accept one
+      boolean expression bound to `it`, preserve order and return fresh
+      filtered/index lists; implicit index bindings are not modeled.
+      Other expression-taking forms, `resize`, the 27.6 CRC family and
+      27.7 keyed lists are documented gaps in `src/interp.rs`). Set literals
       in expressions, range
       modifiers on declared types (so `full_set_of_values` can
       differ), and bare scalar keywords as type arguments

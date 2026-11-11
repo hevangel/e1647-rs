@@ -3592,6 +3592,38 @@ merge of #49):
   pass of the same change.
 
 
+## 2026-11-11 — Keyed list extrema (IEEE 1647-2019 clause 27)
+
+Implemented optional item-key expressions for `max`, `max_index`,
+`min` and `min_index` (27.4.15, 27.4.16, 27.4.18, 27.4.19). The key
+evaluates with a temporary `it` binding; the result selects an original
+item or its zero-based index, and the latest tied item wins. The
+conservative type checker scopes `it` to the list element kind and
+infers the item/index result kind.
+
+Independently authored fixtures under `tests/fixtures/list-extrema/`
+pin integer/real/string keys, ties, nested bindings, shared object
+identity, snapshot traversal under receiver mutation, ordinary
+same-named methods evaluated once, empty lists, unorderable singleton
+keys and propagation of key-expression errors. Type fixtures under
+`tests/fixtures/typing-list-extrema/` pin E0220/E0221/E0223 output.
+The arity/error matrix covers all four methods.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed without warnings.
+- `cargo test --all-targets` — 442 passed, 0 failed.
+- `cargo test --test list_extrema --test typing` — 6 passed, 0 failed.
+- `git diff --check` — passed.
+
+No Specman reference runs were performed. This is implementation
+regression evidence, not differential qualification or conformance.
+Keys use the runtime's integer/real/string ordering; enumeral/custom
+numeric keys and implicit index bindings are not modeled. The receiver
+is snapshotted before key evaluation, so mutation does not change which
+items are visited. General expression-taking list routines remain gaps.
+
 ## 2026-11-11 — Predicate list queries (IEEE 1647-2019 clause 27)
 
 Implemented `has`, `count`, `all` and `all_indices` with one boolean
@@ -3600,9 +3632,9 @@ item expression and a scoped `it` binding (27.4.10, 27.4.4,
 `tests/fixtures/list-queries/` pin order, duplicate matches, empty
 results, nested bindings, shallow object identity, fresh result lists,
 short-circuit `has`, snapshot traversal during receiver mutation,
-ordinary same-named methods and E0402 diagnostics. The type fixtures
-under `tests/fixtures/typing-list-queries/` pin predicate/result kinds
-and E0220/E0221/E0223 diagnostics.
+ordinary same-named methods and E0402 diagnostics. Type fixtures under
+`tests/fixtures/typing-list-queries/` pin predicate/result kinds and
+E0220/E0221/E0223 diagnostics.
 
 Verification:
 
@@ -3618,4 +3650,3 @@ claim. The supported forms require exactly one boolean expression;
 implicit index bindings remain unsupported. Traversal snapshots the
 receiver before predicate evaluation, so mutation does not change the
 items visited. Other expression-taking list methods remain gaps.
-

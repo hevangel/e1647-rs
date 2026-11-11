@@ -19,6 +19,11 @@ fn coverage_type_fixture_diagnostics_match_expected() {
 }
 
 #[test]
+fn list_extrema_type_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures/typing-list-extrema");
+}
+
+#[test]
 fn list_query_type_fixture_diagnostics_match_expected() {
     check_fixture_directory("fixtures/typing-list-queries");
 }
