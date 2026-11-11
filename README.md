@@ -26,6 +26,10 @@
 > execution do **not** exist yet, and no
 > IEEE conformance is claimed.
 
+List extrema `min`, `max`, `min_index` and `max_index` accept an optional
+per-item key expression such as `it.score`. They return the selected
+original item or its index; the latest item wins a tie.
+
 ## From Slopman to Rustman
 
 In keeping with this repository's policy of honest staged claims, the

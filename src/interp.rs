@@ -155,14 +155,18 @@
 //! (27.4.29/27.4.30), `has` (27.4.10), `count` (27.4.4), `first`/`last`
 //! (27.4.6/27.4.13), `first_index`/`last_index` (27.4.7/27.4.14),
 //! `all_different` (27.4.1), `unique` (27.4.28), `split` (27.4.25), the
-//! `exp`-parameter forms of `min`/`max`/`min_index`/`max_index`
-//! (27.4.15-27.4.19) and of the boolean 27.5 aggregates
+//! expression forms of the boolean 27.5 aggregates
 //! `and_all`/`or_all`. The 27.4.17/27.4.20/27.5.4-27.5.6 aggregates
 //! (`max_value`, `min_value`, `product`, `sum`, `average`) DO take a
 //! per-item expression — they intercept before the argument evaluation
 //! ([`Interp::call_list_aggregate`]); their empty-list `average` and
 //! `max_value`/`min_value` results are the honest `E0402` (UNDEF and
-//! Table 54 are not in the value model). Also not
+//! Table 54 are not in the value model). `min`/`max`/`min_index`/
+//! `max_index` (27.4.15–27.4.19) accept an optional key expression
+//! evaluated with `it` bound to each item. They select the original
+//! item/index, with the latest tie winning; numeric and string keys
+//! follow the runtime's relational ordering. Traversal snapshots the
+//! receiver; implicit index bindings remain unsupported. Also not
 //! modeled: `resize` (27.3.16 — the
 //! `filler`/`keep_old` parameters are expressions and new items need the
 //! element type's default value), `get_indices` (27.4.9 — the prose does
@@ -8512,6 +8516,81 @@ impl<'a> Interp<'a> {
         Ok(text)
     }
 
+    /// Evaluate a per-item expression with a temporary `it` binding.
+    /// Restore both the value and its type metadata, including on error.
+    fn eval_list_item(
+        &mut self,
+        expr: &Expr,
+        item: &Value,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Value, Diagnostic> {
+        let previous = frame.locals.insert("it".to_owned(), item.clone());
+        let previous_type = frame.local_types.remove("it");
+        let result = self.eval(expr, frame, me);
+        match previous {
+            Some(value) => {
+                frame.locals.insert("it".to_owned(), value);
+            }
+            None => {
+                frame.locals.remove("it");
+            }
+        }
+        if let Some(ty) = previous_type {
+            frame.local_types.insert("it".to_owned(), ty);
+        } else {
+            frame.local_types.remove("it");
+        }
+        result
+    }
+
+    /// Keyed list extrema (27.4.15/16/18/19). Keys choose an item;
+    /// unlike max_value/min_value the result is not the key itself.
+    fn call_list_extreme(
+        &mut self,
+        list: &ListValue,
+        name: &str,
+        args: &[Expr],
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        if args.len() > 1 {
+            return Err(self.error(
+                "E0402",
+                format!("'{name}' expects at most one item expression"),
+                span,
+            ));
+        }
+        let items = list.items.borrow().clone();
+        let Some(expr) = args.first() else {
+            return self.list_extreme(&items, name, span);
+        };
+        if items.is_empty() {
+            return Err(self.error("E0402", format!("{name} of an empty list"), span));
+        }
+        let mut keys = Vec::with_capacity(items.len());
+        for item in &items {
+            let key = self.eval_list_item(expr, item, frame, me)?;
+            // Validate singleton keys too; comparing only subsequent
+            // keys would silently accept a single object or boolean.
+            if compare_values(&key, &key).is_none() {
+                return Err(self.error(
+                    "E0402",
+                    format!("{name}() key is not orderable"),
+                    expr.span(),
+                ));
+            }
+            keys.push(key);
+        }
+        let best = self.list_extreme_index(&keys, name, span)?;
+        Ok(if name.ends_with("_index") {
+            Value::Int(best as i128)
+        } else {
+            items[best].clone()
+        })
+    }
+
     /// The 27.4.17/27.4.20/27.5.4-27.5.6 aggregate pseudo-methods with
     /// a per-item expression: `l.sum(it)`, `l.product(it * it)`,
     /// `l.average(it)`, `l.max_value(it)`, `l.min_value(it)` — and
@@ -8554,20 +8633,7 @@ impl<'a> Interp<'a> {
             let value = if args.is_empty() {
                 item.clone()
             } else {
-                // `it` shadows any outer binding for the item
-                // expression's evaluation, then the outer state
-                // returns.
-                let previous = frame.locals.insert("it".to_owned(), item.clone());
-                let result = self.eval(&args[0], frame, me);
-                match previous {
-                    Some(outer) => {
-                        frame.locals.insert("it".to_owned(), outer);
-                    }
-                    None => {
-                        frame.locals.remove("it");
-                    }
-                }
-                result?
+                self.eval_list_item(&args[0], item, frame, me)?
             };
             count += 1;
             if matches!(name, "max_value" | "min_value") {
@@ -9508,9 +9574,7 @@ impl<'a> Interp<'a> {
             ("exists", [Value::Int(index)]) => {
                 Ok(Value::Bool(*index >= 0 && (*index as usize) < items.len()))
             }
-            ("exists", _) => {
-                Err(self.error("E0402", "exists() expects an integer index", span))
-            }
+            ("exists", _) => Err(self.error("E0402", "exists() expects an integer index", span)),
             // 27.4.3 copy(): a copy of the list — the list case of
             // exp.copy() (28.5.1). A fresh list object mints a new handle
             // (a `list_ptr==` mismatch, 4.11.4); struct items stay shared
@@ -9625,11 +9689,9 @@ impl<'a> Interp<'a> {
                 grown.insert(at, item.clone());
                 return Some(self.store_list(list, grown, Value::Void));
             }
-            ("insert", _) => Err(self.error(
-                "E0402",
-                "insert expects an integer index and an item",
-                span,
-            )),
+            ("insert", _) => {
+                Err(self.error("E0402", "insert expects an integer index and an item", span))
+            }
             // 27.3.6 delete(index): removes item number index (indexes
             // start counting from 0) and renumbers sequentially; an index
             // that does not exist is an error (the prose's exception).
@@ -9680,7 +9742,7 @@ impl<'a> Interp<'a> {
                                 "E0402",
                                 "and_all() expects a list of booleans",
                                 span,
-                            )))
+                            )));
                         }
                     }
                 }
@@ -9698,7 +9760,7 @@ impl<'a> Interp<'a> {
                                 "E0402",
                                 "or_all() expects a list of booleans",
                                 span,
-                            )))
+                            )));
                         }
                     }
                 }
@@ -9716,7 +9778,7 @@ impl<'a> Interp<'a> {
                                 "E0402",
                                 "product() expects a list of integers",
                                 span,
-                            )))
+                            )));
                         }
                     }
                 }
@@ -9734,7 +9796,7 @@ impl<'a> Interp<'a> {
                                 "E0402",
                                 "sum() expects a list of integers",
                                 span,
-                            )))
+                            )));
                         }
                     }
                 }
@@ -9745,14 +9807,7 @@ impl<'a> Interp<'a> {
             // is an error (the prose's exception).
             // 27.4.16 max_index() / 27.4.19 min_index(): the same scan,
             // returning the winning index.
-            ("max" | "min" | "max_index" | "min_index", []) => {
-                self.list_extreme(items, name, span)
-            }
-            ("max" | "min" | "max_index" | "min_index", _) => Err(self.error(
-                "E0402",
-                "the no-argument form of min/max is the supported one (the exp form is a documented gap)",
-                span,
-            )),
+            ("max" | "min" | "max_index" | "min_index", []) => self.list_extreme(items, name, span),
             // 27.4.11 is_a_permutation(): TRUE when the argument holds
             // the same items with the same multiplicities (order
             // irrelevant); struct items compare by instance index — the
@@ -9777,11 +9832,9 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Bool(permutation && remaining.is_empty()))
             }
-            ("is_a_permutation", _) => Err(self.error(
-                "E0402",
-                "is_a_permutation expects a list argument",
-                span,
-            )),
+            ("is_a_permutation", _) => {
+                Err(self.error("E0402", "is_a_permutation expects a list argument", span))
+            }
             _ => return None,
         };
         Some(result)
@@ -9855,11 +9908,24 @@ impl<'a> Interp<'a> {
         name: &str,
         span: crate::ast::Span,
     ) -> Result<Value, Diagnostic> {
+        let best = self.list_extreme_index(items, name, span)?;
+        Ok(if name.ends_with("_index") {
+            Value::Int(best as i128)
+        } else {
+            items[best].clone()
+        })
+    }
+
+    fn list_extreme_index(
+        &self,
+        items: &[Value],
+        name: &str,
+        span: crate::ast::Span,
+    ) -> Result<usize, Diagnostic> {
         if items.is_empty() {
             return Err(self.error("E0402", format!("{name} of an empty list"), span));
         }
         let want_max = name.starts_with("max");
-        let want_index = name.ends_with("_index");
         let mut best = 0usize;
         for (i, item) in items.iter().enumerate().skip(1) {
             let ordering = compare_values(item, &items[best]).ok_or_else(|| {
@@ -9876,11 +9942,7 @@ impl<'a> Interp<'a> {
                 best = i;
             }
         }
-        if want_index {
-            Ok(Value::Int(best as i128))
-        } else {
-            Ok(items[best].clone())
-        }
+        Ok(best)
     }
 
     /// Evaluate a temporal expression's propositions (`true(exp)` —
@@ -10482,13 +10544,21 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(result);
                 }
-                // The 27.4.17/27.4.20/27.5.4-27.5.6 aggregates read their
-                // receiver before the arguments: the per-item expression
-                // (`l.sum(it)`) names `it`, which is not a value outside
-                // the per-item evaluation, so the arguments cannot be
-                // pre-evaluated for this dispatch. A non-list receiver
-                // (a struct with a same-named method) falls through to
-                // the ordinary dispatch below, which re-evaluates it.
+                // Key expressions need a per-item `it` binding, before
+                // ordinary value-only argument evaluation. Preserve a
+                // non-list receiver for same-named struct methods.
+                let mut extreme_receiver = None;
+                if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
+                    && matches!(name.as_str(), "min" | "max" | "min_index" | "max_index")
+                {
+                    let receiver = self.eval(object, frame, me)?;
+                    if let Value::List(list) = receiver {
+                        return self.call_list_extreme(&list, name, args, frame, me, *span);
+                    }
+                    extreme_receiver = Some(receiver);
+                }
+                // Numeric aggregates also evaluate per-item expressions;
+                // their existing non-list fallback uses ordinary dispatch.
                 if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
                     && matches!(
                         name.as_str(),
@@ -10572,7 +10642,10 @@ impl<'a> Interp<'a> {
                         // dispatched before the argument evaluation
                         // above; every other member call evaluates its
                         // arguments to values first.
-                        let object_value = self.eval(object, frame, me)?;
+                        let object_value = match extreme_receiver {
+                            Some(value) => value,
+                            None => self.eval(object, frame, me)?,
+                        };
                         match object_value {
                             Value::Object(index) => {
                                 // Clause 6.13 dynamic dispatch: a call
