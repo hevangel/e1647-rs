@@ -623,6 +623,28 @@ impl<'a> TypeChecker<'a> {
                 ..
             } => {
                 let object_ty = self.infer(object);
+                if let Ty::List(element) = &object_ty
+                    && matches!(name.as_str(), "has" | "count" | "all" | "all_indices")
+                {
+                    self.push_scope();
+                    self.bind_local("it", element.as_ref().clone());
+                    for arg in args {
+                        let predicate_ty = self.infer(arg);
+                        self.check_assignable(
+                            &predicate_ty,
+                            &Ty::Bool,
+                            arg.span(),
+                            "list predicate",
+                        );
+                    }
+                    self.pop_scope();
+                    return match name.as_str() {
+                        "has" => Ty::Bool,
+                        "count" => Ty::Int,
+                        "all_indices" => Ty::List(Box::new(Ty::Int)),
+                        _ => object_ty,
+                    };
+                }
                 for arg in args {
                     self.infer(arg);
                 }

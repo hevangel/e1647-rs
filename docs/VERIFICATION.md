@@ -3592,3 +3592,30 @@ merge of #49):
   pass of the same change.
 
 
+## 2026-11-11 — Predicate list queries (IEEE 1647-2019 clause 27)
+
+Implemented `has`, `count`, `all` and `all_indices` with one boolean
+item expression and a scoped `it` binding (27.4.10, 27.4.4,
+27.4.29–27.4.30). Independently authored fixtures under
+`tests/fixtures/list-queries/` pin order, duplicate matches, empty
+results, nested bindings, shallow object identity, fresh result lists,
+short-circuit `has`, snapshot traversal during receiver mutation,
+ordinary same-named methods and E0402 diagnostics. The type fixtures
+under `tests/fixtures/typing-list-queries/` pin predicate/result kinds
+and E0220/E0221/E0223 diagnostics.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 442 passed, 0 failed.
+- `cargo test --test list_queries --test typing` — 6 passed, 0 failed.
+- `git diff --check` — passed.
+
+No Specman reference runs were performed. This is implementation
+regression evidence, not differential qualification or a conformance
+claim. The supported forms require exactly one boolean expression;
+implicit index bindings remain unsupported. Traversal snapshots the
+receiver before predicate evaluation, so mutation does not change the
+items visited. Other expression-taking list methods remain gaps.
+
