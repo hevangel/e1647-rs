@@ -113,11 +113,13 @@ reading, nothing else.
   views; there is no general type inference across untyped variables, no
   name-resolution pass beyond it, and coverage options recorded as raw
   tokens are not checked).
-- Temporal value history (each rule streams through a per-event
-  monitor that holds its obligation state incrementally, but a rule's
-  propositions evaluate with the values current when a state arrives —
-  there is no per-cycle value snapshot to re-read; edge samples
-  (`change/rise/fall`) are unsupported for the same reason).
+- Temporal edge expressions (`change/rise/fall`) still lack raw sampled
+  value history. Propositions and repeat bounds now retain their sampled
+  values: rules sample before each global cycle closes and at quit;
+  waits sample when checked, with a separate context for each suspended
+  wait. Rescans use those recorded values, including through mutable
+  list references. This is expression-result history, not an arbitrary
+  snapshot of every variable or an event-specific/per-instance timeline.
   Unbounded obligation windows exhaust when the run ends — that is the
   12.3.3 semantics, not a limitation.
 - Constraint solving beyond bounded shapes (`gen` handles the linear

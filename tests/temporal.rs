@@ -11,6 +11,7 @@ fn callbacks<'a>(
     numerics: &'a std::collections::BTreeMap<String, i128>,
 ) -> EvalCallbacks<'a> {
     EvalCallbacks {
+        context: None,
         boolean: Box::new(|expr| match expr {
             e1647::ast::Expr::Ident { name, .. } => booleans.get(name).copied(),
             _ => None,
@@ -233,6 +234,56 @@ fn repeat_bounds_must_evaluate() {
         panic!("expected the repeat");
     };
     assert_eq!(*kind, RepeatKind::Fixed);
+}
+
+#[test]
+fn recorded_propositions_survive_rescans_and_monitor_clones() {
+    let te = parse_temporal_expression("{true(flag); true(not flag)}").unwrap();
+    let mut propositions = Vec::new();
+    let mut bounds = Vec::new();
+    e1647::temporal::collect_exprs(&te, &mut propositions, &mut bounds);
+    let mut states = [State::default(), State::default()];
+    for (index, state) in states.iter_mut().enumerate() {
+        state.record_boolean(7, propositions[0], Some(index == 0));
+        state.record_boolean(7, propositions[1], Some(index == 1));
+        state.record_boolean(8, propositions[0], Some(false));
+        state.record_boolean(8, propositions[1], Some(false));
+    }
+    let mut cb = EvalCallbacks {
+        context: Some(7),
+        boolean: Box::new(|_| Some(false)),
+        numeric: Box::new(|_| None),
+    };
+    assert!(holds_tightly(&te, &states, &cb).unwrap());
+    let mut monitor = e1647::temporal::RuleMonitor::new(&te);
+    assert!(!monitor.observe(&states[..1], &cb).unwrap());
+    assert!(!monitor.observe(&states, &cb).unwrap());
+    assert!(!monitor.failed_at_end());
+    cb.context = Some(8);
+    assert!(!holds_tightly(&te, &states, &cb).unwrap());
+    cb.context = Some(9);
+    cb.boolean = Box::new(|_| Some(true));
+    assert!(
+        !holds_tightly(&te, &states, &cb).unwrap(),
+        "missing history must not use current values"
+    );
+}
+
+#[test]
+fn recorded_repeat_bound_uses_the_starting_state() {
+    let te = parse_temporal_expression("[n]*cycle").unwrap();
+    let mut propositions = Vec::new();
+    let mut bounds = Vec::new();
+    e1647::temporal::collect_exprs(&te, &mut propositions, &mut bounds);
+    let mut states = [State::default(), State::default()];
+    states[0].record_numeric(1, bounds[0], Some(2));
+    states[1].record_numeric(1, bounds[0], Some(9));
+    let cb = EvalCallbacks {
+        context: Some(1),
+        boolean: Box::new(|_| None),
+        numeric: Box::new(|_| Some(9)),
+    };
+    assert!(holds_tightly(&te, &states, &cb).unwrap());
 }
 
 #[test]

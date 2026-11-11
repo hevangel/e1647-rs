@@ -2,3 +2,4 @@
 # verbatim; a Windows checkout with autocrlf would rewrite these to
 # CRLF and fail the comparison.
 *.expected text eol=lf
+*.out text eol=lf

@@ -22,9 +22,13 @@
 > 33 resource-sharing structs (`semaphore`/`rdv_semaphore`/`locker`),
 > and the reflection catalogue with `instance_iterator`. A full type
 > system (a conservative definite-mismatch check includes coverage items),
-> temporal value history, general constraint solving and general testbench
+> temporal edge expressions, general constraint solving and general testbench
 > execution do **not** exist yet, and no
 > IEEE conformance is claimed.
+
+Temporal rules and waits retain sampled proposition and repeat-bound
+values, so later state matching uses the recorded values. Raw temporal
+`change`/`rise`/`fall` expressions remain unsupported.
 
 ## From Slopman to Rustman
 

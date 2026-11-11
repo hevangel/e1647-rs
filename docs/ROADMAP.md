@@ -4,7 +4,7 @@ The IEEE 1647-2019 migration phases below are complete; the broader
 milestones remain partial. Recent work adds conservative type checking
 (now including coverage items), bounded polynomial constraint solving
 and streaming temporal rule monitors. Remaining work includes full name
-resolution/type inference, temporal value history, call-stack
+resolution/type inference, temporal edge expressions, call-stack
 continuations for suspended TCM calls, the remaining coverage options,
 general constraint solving, differential qualification, HDL event
 ordering and a browser sandbox API. Completed migration checkboxes do
@@ -344,8 +344,12 @@ not imply full language support or IEEE conformance.
       when violated, and obligation verdicts finalize when their windows
       close (12.3.3). A failed rule runs its `else` body (or prints the
       failure when there is none) as a check error. One global
-      timeline, and propositions evaluate with current field values
-      (no per-cycle value history). Suspension re-enters compound
+      timeline. Proposition and repeat-bound values are retained per
+      state and evaluation context: rules sample before a global cycle
+      closes and at quit, and waits sample at each check, preserving
+      their local context. Later matching uses recorded values. Raw
+      `change`/`rise`/`fall` expressions and event-specific/per-instance
+      histories remain gaps. Suspension re-enters compound
       statements, including `if`/`case`/`for`/`for each`/`repeat until`;
       inline calls and `compute` still need call-stack continuations,
       and `on` blocks remain atomic

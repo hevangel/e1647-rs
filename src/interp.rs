@@ -727,6 +727,11 @@ struct Interp<'a> {
     /// temporal `wait`s and `expect` rules read it. One global
     /// timeline: all events share the per-cycle states.
     temporal_log: Vec<crate::temporal::State>,
+    temporal_rule_owner: Option<usize>,
+    retired_temporal_rules: BTreeSet<u64>,
+    sampling_temporal: bool,
+    temporal_wait_contexts: BTreeMap<(Option<u64>, usize, usize, Option<usize>), u64>,
+    next_temporal_context: u64,
     /// The scheduled coroutines (13.2.2): the main `run()` chain first,
     /// then every `start`ed TCM, run round-robin.
     coroutines: Vec<Coroutine<'a>>,
@@ -1160,6 +1165,11 @@ fn run_inner(
         sim_prev: BTreeMap::new(),
         port_edges: collect_port_edge_attributes(elaborated),
         temporal_log: Vec::new(),
+        temporal_rule_owner: None,
+        retired_temporal_rules: BTreeSet::new(),
+        sampling_temporal: false,
+        temporal_wait_contexts: BTreeMap::new(),
+        next_temporal_context: 1u64 << 32,
         coroutines: Vec::new(),
         tracing: false,
         atomic_depth: 0,
@@ -1349,6 +1359,7 @@ fn run_inner(
         .iter()
         .map(|rule| crate::temporal::RuleMonitor::new(&rule.te))
         .collect();
+    interp.temporal_rule_owner = Some(sys_index);
     while !interp.coroutines.is_empty() && !interp.stop_requested {
         // The clause 33 wake pass: a blocking call parked a coroutine on
         // a sync object; service the oldest waiter whose condition
@@ -1370,8 +1381,7 @@ fn run_inner(
                 break;
             }
             interp.wait_budget -= 1;
-            interp.cycle += 1;
-            interp.pad_log();
+            interp.advance_temporal_cycles(1);
             // The virtual cycle advanced: sample the simulator-side
             // triggers (11.1.4.2). A fire feeds the temporal log, runs
             // the event's `on` blocks and wakes TCMs parked on it.
@@ -1463,6 +1473,7 @@ fn run_inner(
     // the last boundary and report their end-of-run verdicts (12.3.3:
     // the obligation windows exhaust when the run ends — the earliest
     // sound closure point).
+    interp.sample_rule_values();
     check_expect_rules_at_quit(
         &mut interp,
         &expects,
@@ -1504,8 +1515,8 @@ fn origin() -> Position {
 }
 
 /// The clause 11.4 live monitoring pass: for every not-yet-fired
-/// expect/assume rule, re-evaluate its propositions with the current
-/// field values and check whether the rule has failed over the log so
+/// expect/assume rule, use its recorded propositions and bounds to
+/// check whether the rule has failed over the log so
 /// far ("all possibilities to satisfy it are exhausted", 12.3.3). The
 /// pass that first sees the failure fires the rule: the `else` body
 /// runs (or the failure itself is the check error, 11.4) and the rule
@@ -1524,9 +1535,7 @@ fn check_expect_rules(
             continue;
         }
         let kind = format!("{:?}", expect_rule.kind).to_lowercase();
-        let (booleans, numerics) =
-            interp.evaluate_temporal_exprs(&expect_rule.te, &mut Frame::default(), Some(sys_index));
-        let callbacks = temporal_callbacks(&booleans, &numerics);
+        let callbacks = historical_temporal_callbacks(rule_index as u64);
         // The monitor consumes only FINALIZED states: the current
         // cycle's state is still in progress (this cycle's emits record
         // into it during turns), so it is handed over at the next
@@ -1541,12 +1550,14 @@ fn check_expect_rules(
                 // computed, now incremental.
                 fire_expect_rule(interp, expect_rule, &kind, sys_index);
                 expect_fired[rule_index] = true;
+                interp.retired_temporal_rules.insert(rule_index as u64);
             }
             Ok(false) => {}
             Err(err) => {
                 // The rule cannot be evaluated over the log: report the
                 // gap honestly, once, and retire the rule.
                 expect_fired[rule_index] = true;
+                interp.retired_temporal_rules.insert(rule_index as u64);
                 interp.output.push_str(&format!(
                     "{kind} rule cannot be evaluated over the run: {err:?}\n"
                 ));
@@ -1602,9 +1613,7 @@ fn check_expect_rules_at_quit(
             continue;
         }
         let kind = format!("{:?}", expect_rule.kind).to_lowercase();
-        let (booleans, numerics) =
-            interp.evaluate_temporal_exprs(&expect_rule.te, &mut Frame::default(), Some(sys_index));
-        let callbacks = temporal_callbacks(&booleans, &numerics);
+        let callbacks = historical_temporal_callbacks(rule_index as u64);
         // The monitor catches any log growth since the last boundary,
         // then its end-of-run verdict decides (equivalent to the
         // previous whole-log `rule_failed` re-scan).
@@ -1612,6 +1621,7 @@ fn check_expect_rules_at_quit(
             Ok(_) => {}
             Err(err) => {
                 expect_fired[rule_index] = true;
+                interp.retired_temporal_rules.insert(rule_index as u64);
                 interp.output.push_str(&format!(
                     "{kind} rule cannot be evaluated over the run: {err:?}\n"
                 ));
@@ -1621,6 +1631,7 @@ fn check_expect_rules_at_quit(
         if rule_monitors[rule_index].failed_at_end() {
             fire_expect_rule(interp, expect_rule, &kind, sys_index);
             expect_fired[rule_index] = true;
+            interp.retired_temporal_rules.insert(rule_index as u64);
         }
     }
 }
@@ -1825,26 +1836,13 @@ fn resolve_method_blocks<'a>(
     Ok(blocks)
 }
 
-/// The engine callback set over pre-evaluated propositions and bounds:
-/// expressions are matched by identity (the engine passes back the
-/// references [`Interp::evaluate_temporal_exprs`] collected).
-fn temporal_callbacks<'a>(
-    booleans: &'a [(&'a crate::ast::Expr, Option<bool>)],
-    numerics: &'a [(&'a crate::ast::Expr, Option<i128>)],
-) -> crate::temporal::EvalCallbacks<'a> {
+/// Select the recorded expression values for one rule or wait. Missing
+/// historical samples do not fall back to present-day field values.
+fn historical_temporal_callbacks(context: u64) -> crate::temporal::EvalCallbacks<'static> {
     crate::temporal::EvalCallbacks {
-        boolean: Box::new(move |expr| {
-            booleans
-                .iter()
-                .find(|(key, _)| std::ptr::eq(*key, expr))
-                .and_then(|(_, value)| *value)
-        }),
-        numeric: Box::new(move |expr| {
-            numerics
-                .iter()
-                .find(|(key, _)| std::ptr::eq(*key, expr))
-                .and_then(|(_, value)| *value)
-        }),
+        context: Some(context),
+        boolean: Box::new(|_| None),
+        numeric: Box::new(|_| None),
     }
 }
 
@@ -2940,8 +2938,7 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 self.wait_budget -= 1;
-                self.cycle = self.cycle.saturating_add(n as u64);
-                self.pad_log();
+                self.advance_temporal_cycles(n as u64);
                 Ok(Flow::Normal)
             }
             Stmt::WaitTemporal { te, span } => self.temporal_wait(te, *span, frame, me),
@@ -2962,8 +2959,7 @@ impl<'a> Interp<'a> {
                         ));
                     }
                     self.wait_budget -= 1;
-                    self.cycle = self.cycle.saturating_add(1);
-                    self.pad_log();
+                    self.advance_temporal_cycles(1);
                     Ok(Flow::Normal)
                 }
             },
@@ -8962,6 +8958,57 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Freeze rule expressions before closing each global sampling
+    /// period, including cycles advanced inside inline waits.
+    fn advance_temporal_cycles(&mut self, cycles: u64) {
+        for _ in 0..cycles {
+            self.sample_rule_values();
+            self.cycle = self.cycle.saturating_add(1);
+            self.pad_log();
+        }
+    }
+
+    fn sample_rule_values(&mut self) {
+        let Some(owner) = self.temporal_rule_owner else {
+            return;
+        };
+        if self.sampling_temporal {
+            return;
+        }
+        self.sampling_temporal = true;
+        let types = self.types;
+        for (context, rule) in types.iter().flat_map(|ty| ty.expects.iter()).enumerate() {
+            if self.retired_temporal_rules.contains(&(context as u64)) {
+                continue;
+            }
+            self.sample_temporal_values(
+                &rule.te,
+                &mut Frame::default(),
+                Some(owner),
+                context as u64,
+            );
+        }
+        self.sampling_temporal = false;
+    }
+
+    fn sample_temporal_values(
+        &mut self,
+        te: &crate::ast::TemporalExpr,
+        frame: &mut Frame,
+        me: Option<usize>,
+        context: u64,
+    ) {
+        let (booleans, numerics) = self.evaluate_temporal_exprs(te, frame, me);
+        self.pad_log();
+        let state = &mut self.temporal_log[self.cycle as usize];
+        for (expr, value) in booleans {
+            state.record_boolean(context, expr, value);
+        }
+        for (expr, value) in numerics {
+            state.record_numeric(context, expr, value);
+        }
+    }
+
     /// Fire one event occurrence — the shared path of `emit` (11.2) and
     /// the simulator-side triggers: record it in the current cycle's
     /// state of the temporal log (clause 12), wake TCMs parked for the
@@ -9284,8 +9331,8 @@ impl<'a> Interp<'a> {
     /// evaluate the TE once; on success resume immediately, otherwise
     /// suspend until the next sampling occurrence, when the statement
     /// re-executes against the grown log. Propositions and repeat
-    /// bounds evaluate once per check, with current field values (the
-    /// log keeps event occurrences, not value history). In atomic
+    /// bounds are sampled at each check and stored in that wait's
+    /// context; earlier states retain their earlier values. In atomic
     /// regions and non-scheduled contexts the wait spins inline,
     /// advancing one cycle at a time under the budget; a wait
     /// unsatisfied for TEMPORAL_WAIT_CYCLES cycles there reports
@@ -9298,10 +9345,32 @@ impl<'a> Interp<'a> {
         me: Option<usize>,
     ) -> Result<Flow, Diagnostic> {
         let start = self.resume_wait_start.take().unwrap_or(self.cycle as usize);
+        let key = (self.current_coroutine_id, span.0.byte, start, me);
+        let context = *self.temporal_wait_contexts.entry(key).or_insert_with(|| {
+            let context = self.next_temporal_context;
+            self.next_temporal_context += 1;
+            context
+        });
+        let result = self.temporal_wait_in_context(te, span, frame, me, (start, context));
+        if !matches!(result, Ok(Flow::Suspend)) {
+            self.temporal_wait_contexts.remove(&key);
+        }
+        result
+    }
+
+    fn temporal_wait_in_context(
+        &mut self,
+        te: &crate::ast::TemporalExpr,
+        span: crate::ast::Span,
+        frame: &mut Frame,
+        me: Option<usize>,
+        sampling: (usize, u64),
+    ) -> Result<Flow, Diagnostic> {
+        let (start, context) = sampling;
         self.pad_log();
-        let (booleans, numerics) = self.evaluate_temporal_exprs(te, frame, me);
         if self.suspend_eligible() {
-            let callbacks = temporal_callbacks(&booleans, &numerics);
+            self.sample_temporal_values(te, frame, me, context);
+            let callbacks = historical_temporal_callbacks(context);
             let slice = &self.temporal_log[start..];
             match crate::temporal::succeeds(te, slice, &callbacks) {
                 Ok(true) => return Ok(Flow::Normal),
@@ -9326,7 +9395,8 @@ impl<'a> Interp<'a> {
         }
         let mut waited = 0u64;
         loop {
-            let callbacks = temporal_callbacks(&booleans, &numerics);
+            self.sample_temporal_values(te, frame, me, context);
+            let callbacks = historical_temporal_callbacks(context);
             let slice = &self.temporal_log[start..];
             match crate::temporal::succeeds(te, slice, &callbacks) {
                 Ok(true) => return Ok(Flow::Normal),
@@ -9351,8 +9421,7 @@ impl<'a> Interp<'a> {
             }
             self.wait_budget -= 1;
             waited += 1;
-            self.cycle = self.cycle.saturating_add(1);
-            self.pad_log();
+            self.advance_temporal_cycles(1);
         }
     }
 
@@ -9885,11 +9954,8 @@ impl<'a> Interp<'a> {
 
     /// Evaluate a temporal expression's propositions (`true(exp)` —
     /// `TRUE` or non-zero numeric, 12.1.1.1) and numeric repeat bounds
-    /// once, with current field values. The results key the callback
-    /// set the engine sees (by expression identity — the engine passes
-    /// back the very references collected here); the interpreter keeps
-    /// no per-cycle value history, so this is the honest approximation
-    /// for propositions spanning several states.
+    /// once at this sampling point. The results are stored in the
+    /// current state before the temporal engine matches the path.
     fn evaluate_temporal_exprs<'te>(
         &mut self,
         te: &'te crate::ast::TemporalExpr,

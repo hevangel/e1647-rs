@@ -169,7 +169,7 @@ browser sandbox API is not started.
   items (12.2.12), `fail`/`not`/`eventually` (12.2.13/17/15).
   Propositions and repeat bounds are evaluated through caller-supplied
   callbacks; `change/rise/fall(exp)` edge samples report
-  `EvalError::EdgeSample` (no sampled value history in the pure core)
+  `EvalError::EdgeSample` (raw edge-value history is not modeled)
   and unresolvable constructs report `EvalError::Unsupported`. The
   same module hosts the run-loop monitoring helpers:
   `succeeded_somewhere` (12.3.2 at any point), `rule_failed` (the
@@ -293,8 +293,15 @@ browser sandbox API is not started.
   `if`/`case`/`for` bodies (the documented v1 limitation of the
   cursor). Temporal waits (`@event`, sequences, propositions, event
   repeats, with 13.2.4's readability-only `until`) re-evaluate at
-  every turn (12.3.2); propositions and repeat bounds evaluate with
-  current field values (no per-cycle value history); a temporal wait
+  every turn (12.3.2); propositions and repeat bounds retain sampled
+  results in each state, scoped to the individual wait. Rules retain
+  their own samples before global cycles close (including inline time
+  advances) and at quit. The pure core reads these historical values,
+  and numeric repeats read their bound at the path's starting state;
+  callbacks remain available for external caller-supplied paths. Missing
+  history does not fall back to present-day values. This is expression
+  result history, not arbitrary variable snapshots or event-specific
+  sampling timelines. A temporal wait
   unsatisfied after 1,000 cycles reports `E0409`, and unevaluable TEs
   (`change/rise/fall`, unresolvable bounds) report `E0402` honestly.
   `sync` (13.2.3) parses in bare and TE forms — the bare form
