@@ -3592,6 +3592,43 @@ merge of #49):
   pass of the same change.
 
 
+## 2026-11-11 — Local declaration inference and parameter scopes
+
+The conservative type pass now retains known initializer kinds for
+type-inferring local declarations (clause 18), binds declared method
+parameter kinds within their method, and propagates homogeneous list
+elements and equal-kind ternary branches. Scalar/list aliases resolve
+with a recursion bound. Ambiguous alternatives, unknown operands,
+untyped parameters and custom numeric dispatch stay conservative;
+NULL-only initializers do not infer a concrete reference type.
+
+Seven independently authored fixture pairs under
+`tests/fixtures/typing-inference/` pin local aliases, assignments,
+argument/return checks, parameter/field scope, list/index propagation,
+conditional branches, named aliases, recursive aliases and fail-open
+boundaries. Exact E0220–E0223 diagnostics are checked. A CLI test checks
+that `elab` and `run` reject mismatched inferred locals and that a valid
+inference program executes with the independently expected output.
+
+Verification on this branch, independently based on merged main:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed after fixing a
+  documentation paragraph flagged by the initial Clippy run.
+- `cargo test --all-targets` — 441 passed, 0 failed.
+- `cargo test --test typing` — 5 passed, 0 failed.
+- `git diff --check` — passed.
+
+A checkpoint checkout with Windows `autocrlf` exposed CRLF conversion
+of the runtime `.out` golden file. `.gitattributes` now pins `.out`
+fixtures to LF alongside `.expected`; the full suite passed again
+after the checkout issue was corrected.
+
+No Specman reference runs were performed. This is implementation
+regression evidence, not differential qualification or a full type
+system. Flow-sensitive inference, interprocedural inference, full name
+resolution and width/range proof remain gaps. No conformance is claimed.
+
 ## 2026-11-11 — Keyed list extrema (IEEE 1647-2019 clause 27)
 
 Implemented optional item-key expressions for `max`, `max_index`,

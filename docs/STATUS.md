@@ -31,6 +31,11 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   receiver does not have (E0221), indexing a non-list (E0222), an
   operator on incompatible operand kinds (E0223) — anything uncertain
   stays silent.
+  Declared method parameters bind within their method, and type-inferring
+  local declarations retain known initializer kinds (clause 18),
+  including homogeneous list literals and equal-kind ternary branches.
+  Scalar/list aliases resolve with a recursion bound; custom numeric
+  dispatch stays outside the conservative lattice.
 - **Execution.** `e1647 run` executes the built-in `sys` unit through
   the Table 1 phases — `setup`, generation (with `pre_generate`/
   `post_generate` and the `connect_pointers`/`connect_ports`/
@@ -110,8 +115,9 @@ reading, nothing else.
 - A full type system (the [`typing`] conservative pass reports definite
   mismatches across method bodies, field init values, `keep`
   constraints, `on` bodies, coverage items and the synthesized `when`
-  views; there is no general type inference across untyped variables, no
-  name-resolution pass beyond it, and coverage options recorded as raw
+  views; local declarations propagate known initializer kinds, but
+  ambiguous kinds stay unknown and there is no interprocedural type
+  inference or full name-resolution pass. Coverage options recorded as raw
   tokens are not checked).
 - Temporal value history (each rule streams through a per-event
   monitor that holds its obligation state incrementally, but a rule's

@@ -192,7 +192,15 @@ browser sandbox API is not started.
   and expression traversal checks missing members, indexing and operand
   kinds (E0221–E0223). Unknown kinds stay silent. Cross/transition names
   refer to items rather than owner fields; raw coverage options remain
-  unchecked. General type inference and full name resolution remain gaps.
+  unchecked. Typed method parameters bind within their method scope.
+  Local `var x := e` declarations retain known initializer kinds,
+  including homogeneous list literals and equal-kind ternary branches
+  (clause 18). Scalar/list aliases resolve with a depth bound; recursive
+  aliases, custom numeric dispatch, mixed/empty list elements and
+  ambiguous alternatives stay unknown. Arithmetic on unknown operands
+  also remains unknown. This is declaration inference, with no
+  flow-sensitive narrowing or interprocedural inference; full name
+  resolution remains a gap.
 - `src/elab.rs` — member composition: `like` chains and `extend` blocks fold
   into one composed member list per `struct`/`unit` (inheritance-cycle,
   cross-declaration duplicate-field and unmodified-method-redefinition
