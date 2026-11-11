@@ -151,8 +151,7 @@
 //! semantics take a per-item expression argument cannot pass through the
 //! v1 dispatch (it evaluates arguments to values only), so they report
 //! `E0405` "list method ... is not supported": `apply` (27.4.2),
-//! `sort`/`sort_by_field` (27.4.23/27.4.24), `all`/`all_indices`
-//! (27.4.29/27.4.30), `has` (27.4.10), `count` (27.4.4), `first`/`last`
+//! `sort`/`sort_by_field` (27.4.23/27.4.24), `first`/`last`
 //! (27.4.6/27.4.13), `first_index`/`last_index` (27.4.7/27.4.14),
 //! `all_different` (27.4.1), `unique` (27.4.28), `split` (27.4.25), the
 //! `exp`-parameter forms of `min`/`max`/`min_index`/`max_index`
@@ -162,7 +161,13 @@
 //! per-item expression — they intercept before the argument evaluation
 //! ([`Interp::call_list_aggregate`]); their empty-list `average` and
 //! `max_value`/`min_value` results are the honest `E0402` (UNDEF and
-//! Table 54 are not in the value model). Also not
+//! Table 54 are not in the value model).
+//! `has`, `count`, `all` and `all_indices` evaluate one boolean
+//! expression per item with a scoped `it` binding (27.4.10/4/29/30).
+//! `has` stops at the first match; the other queries preserve list order.
+//! Their receiver is snapshotted before evaluation, so mutation during a
+//! predicate does not change the traversal. Implicit index bindings are
+//! not modeled. Also not
 //! modeled: `resize` (27.3.16 — the
 //! `filler`/`keep_old` parameters are expressions and new items need the
 //! element type's default value), `get_indices` (27.4.9 — the prose does
@@ -8512,6 +8517,78 @@ impl<'a> Interp<'a> {
         Ok(text)
     }
 
+    /// Predicate list queries (27.4.4/10/29/30). The snapshot keeps
+    /// borrows out of predicate evaluation and defines this subset's
+    /// traversal when a predicate mutates an alias of the receiver.
+    fn call_list_query(
+        &mut self,
+        list: &ListValue,
+        name: &str,
+        args: &[Expr],
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let [predicate] = args else {
+            return Err(self.error(
+                "E0402",
+                format!("'{name}' expects one boolean item expression"),
+                span,
+            ));
+        };
+        let items = list.items.borrow().clone();
+        let mut matches = Vec::new();
+        let mut count = 0;
+        for (index, item) in items.into_iter().enumerate() {
+            let previous = frame.locals.insert("it".to_owned(), item.clone());
+            let previous_type = frame.local_types.remove("it");
+            let result = self.eval(predicate, frame, me);
+            match previous {
+                Some(value) => {
+                    frame.locals.insert("it".to_owned(), value);
+                }
+                None => {
+                    frame.locals.remove("it");
+                }
+            }
+            if let Some(ty) = previous_type {
+                frame.local_types.insert("it".to_owned(), ty);
+            } else {
+                frame.local_types.remove("it");
+            }
+            let Value::Bool(selected) = result? else {
+                return Err(self.error(
+                    "E0402",
+                    format!("{name}() expects a boolean item expression"),
+                    predicate.span(),
+                ));
+            };
+            if selected {
+                if name == "has" {
+                    return Ok(Value::Bool(true));
+                }
+                count += 1;
+                match name {
+                    "all" => matches.push(item),
+                    "all_indices" => matches.push(Value::Int(index as i128)),
+                    _ => {}
+                }
+            }
+        }
+        Ok(match name {
+            "has" => Value::Bool(false),
+            "count" => Value::Int(count),
+            _ => Value::List(ListValue {
+                items: Rc::new(RefCell::new(matches)),
+                element: if name == "all_indices" {
+                    Some("uint".to_owned())
+                } else {
+                    list.element.clone()
+                },
+            }),
+        })
+    }
+
     /// The 27.4.17/27.4.20/27.5.4-27.5.6 aggregate pseudo-methods with
     /// a per-item expression: `l.sum(it)`, `l.product(it * it)`,
     /// `l.average(it)`, `l.max_value(it)`, `l.min_value(it)` — and
@@ -9487,8 +9564,9 @@ impl<'a> Interp<'a> {
     /// arithmetic. `None` when the name is not one of this subset (the
     /// caller reports `E0405`).
     ///
-    /// The methods taking a per-item expression (`apply`, `sort`, `all`,
-    /// `has`, ...) cannot pass through this value-only dispatch — see the
+    /// The methods taking a per-item expression cannot pass through
+    /// this value-only dispatch. Queries and numeric aggregates intercept
+    /// before it; `apply` and `sort` remain gaps — see the
     /// documented gaps in the module docs.
     fn call_list_pseudo_method(
         &mut self,
@@ -10482,13 +10560,23 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(result);
                 }
-                // The 27.4.17/27.4.20/27.5.4-27.5.6 aggregates read their
-                // receiver before the arguments: the per-item expression
-                // (`l.sum(it)`) names `it`, which is not a value outside
-                // the per-item evaluation, so the arguments cannot be
-                // pre-evaluated for this dispatch. A non-list receiver
-                // (a struct with a same-named method) falls through to
-                // the ordinary dispatch below, which re-evaluates it.
+                // Predicate queries bind `it` during traversal, before
+                // the ordinary value-only argument evaluation below.
+                let mut query_receiver = None;
+                if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
+                    && matches!(name.as_str(), "has" | "count" | "all" | "all_indices")
+                {
+                    let receiver = self.eval(object, frame, me)?;
+                    if let Value::List(list) = receiver {
+                        return self.call_list_query(&list, name, args, frame, me, *span);
+                    }
+                    // A struct's same-named ordinary method keeps its
+                    // evaluated receiver; do not repeat its side effects.
+                    query_receiver = Some(receiver);
+                }
+                // Numeric aggregates likewise evaluate per-item
+                // expressions. Their existing non-list fallback goes
+                // through ordinary method dispatch.
                 if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
                     && matches!(
                         name.as_str(),
@@ -10572,7 +10660,10 @@ impl<'a> Interp<'a> {
                         // dispatched before the argument evaluation
                         // above; every other member call evaluates its
                         // arguments to values first.
-                        let object_value = self.eval(object, frame, me)?;
+                        let object_value = match query_receiver {
+                            Some(value) => value,
+                            None => self.eval(object, frame, me)?,
+                        };
                         match object_value {
                             Value::Object(index) => {
                                 // Clause 6.13 dynamic dispatch: a call

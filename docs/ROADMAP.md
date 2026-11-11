@@ -308,7 +308,9 @@ not imply full language support or IEEE conformance.
       no-argument `min`/`max`/`min_index`/`max_index` extremes, the
       no-argument `sum`/`product`/`and_all`/`or_all` aggregates with
       their stated empty-list results, and `is_a_permutation`; the
-      expression-taking forms are documented gaps reporting `E0405`),
+      numeric expression aggregates and the predicate queries `has`,
+      `count`, `all` and `all_indices`; other expression-taking forms
+      remain documented gaps reporting `E0405`),
       struct instances, sequence `do` (generates the item in place; the
       `keeping` block is not enforced), and `gen`. The optional `do`
       sugar on `if`/`while` — including the one-statement
@@ -385,7 +387,11 @@ not imply full language support or IEEE conformance.
       sets, and `as_a` to an enumeral type maps the integer index to
       the enumerand (5.10.2). The clause 27 list pseudo-methods run the
       no-expression subset on list values (the 27.3 modifiers, the
-      no-argument general forms, extremes and aggregates — the
+      no-argument general forms, extremes and aggregates, numeric
+      expression aggregates, and `has`/`count`/`all`/`all_indices`
+      with one boolean expression bound to `it`. These queries preserve
+      order, snapshot the traversal and return fresh filtered/index
+      lists; implicit index bindings are not modeled. Other
       expression-taking forms, `resize`, the 27.6 CRC family and 27.7
       keyed lists are documented gaps in `src/interp.rs`). Set literals
       in expressions, range

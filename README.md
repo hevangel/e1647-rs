@@ -26,6 +26,10 @@
 > execution do **not** exist yet, and no
 > IEEE conformance is claimed.
 
+List queries `has`, `count`, `all` and `all_indices` accept one boolean
+expression with `it` bound to each item. Filtering preserves order and
+returns a fresh list; implicit index bindings remain unsupported.
+
 ## From Slopman to Rustman
 
 In keeping with this repository's policy of honest staged claims, the

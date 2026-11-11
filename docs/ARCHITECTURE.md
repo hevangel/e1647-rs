@@ -330,9 +330,17 @@ browser sandbox API is not started.
   no-argument extremes (`min`/`max`/`min_index`/`max_index` — ties go
   to the latest item, empty is an error) and aggregates (`sum`,
   `product`, `and_all`, `or_all` — with their stated empty-list
-  results), and `is_a_permutation`; the expression-taking pseudo-methods
-  (27.1 makes them macros) report `E0405` and are listed as documented
-  gaps in the module docs.
+  results), and `is_a_permutation`. Numeric expression aggregates run,
+  as do `has`/`count`/`all`/`all_indices` with one boolean expression
+  (27.4.10/4/29/30). These queries bind `it` in a temporary scope,
+  snapshot the receiver before traversal and preserve order; `has`
+  stops at the first match. `all` returns a fresh list with shared object
+  elements, and `all_indices` returns matching zero-based indices.
+  Empty lists return FALSE, zero or a fresh empty list. Arity and
+  non-boolean predicate errors report E0402. The type pass scopes `it`
+  to the element kind and infers the query result kind. Implicit index
+  bindings and the other expression-taking pseudo-methods remain gaps
+  (27.1 makes them macros); see the interpreter's module docs.
 - `src/solve.rs` — constraint IR and the pluggable solver seam: the
   top-level `keep` constraints of one type translate (conservatively) into
   bounded-integer variables plus a boolean tree of comparisons;

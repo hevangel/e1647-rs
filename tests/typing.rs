@@ -18,6 +18,11 @@ fn coverage_type_fixture_diagnostics_match_expected() {
     check_fixture_directory("fixtures/typing-coverage");
 }
 
+#[test]
+fn list_query_type_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures/typing-list-queries");
+}
+
 fn check_fixture_directory(directory: &str) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
