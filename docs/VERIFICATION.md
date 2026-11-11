@@ -3592,6 +3592,25 @@ merge of #49):
   pass of the same change.
 
 
+## 2026-11-11 — Recorded temporal propositions and repeat bounds
+
+Temporal path rescans now use scoped expression-result samples
+(12.2.4, 12.2.9–12.2.12, 12.3.3). Rules record propositions and
+numeric bounds before each global cycle closes and at quit, including
+time advanced inside inline calls. Each suspended wait records its own
+samples when checked. Repeat bounds use the starting state's recorded
+value. Rule and wait contexts are isolated; cloned monitor expressions
+match stored expressions structurally, and missing history does not
+fall back to current values. Retired rules stop sampling.
+
+Five independently authored fixture sets under
+`tests/fixtures/temporal-history/` cover changing booleans, mutation
+through a list reference, changing bounds, suspended sequences,
+concurrent calls sharing one TCM body, inline `compute` time advances,
+live invariant failure and an unsatisfied historical sequence. Two
+pure-core regressions check context isolation, monitor clones, missing
+history and starting-state bounds. Golden output uses LF on Windows.
+
 ## 2026-11-11 — Local declaration inference and parameter scopes
 
 The conservative type pass now retains known initializer kinds for
@@ -3651,11 +3670,20 @@ Verification:
 - `cargo fmt --all -- --check` — passed.
 - `cargo clippy --all-targets -- -D warnings` — passed without warnings.
 - `cargo test --all-targets` — 442 passed, 0 failed.
+- `cargo test --test temporal --test temporal_history --test interp` —
+  273 passed, 0 failed; the temporal-history fixtures were also rerun
+  after adding the negative verdict case, and the final all-target run
+  includes all five fixture sets.
 - `cargo test --test list_extrema --test typing` — 6 passed, 0 failed.
 - `git diff --check` — passed.
 
 No Specman reference runs were performed. This is implementation
 regression evidence, not differential qualification or conformance.
+Samples hold expression results, not arbitrary variable snapshots.
+Sampling remains on the global virtual timeline: rules sample cycle
+closure, waits sample their checks. Raw temporal `change/rise/fall`
+expressions and event-specific/per-instance timelines remain gaps.
+
 Keys use the runtime's integer/real/string ordering; enumeral/custom
 numeric keys and implicit index bindings are not modeled. The receiver
 is snapshotted before key evaluation, so mutation does not change which

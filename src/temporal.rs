@@ -4,7 +4,7 @@
 //!
 //! This module is a pure core the interpreter drives: a path is an
 //! explicit sequence of states (each state = the events that occurred in
-//! that sampling period), expressions are evaluated through caller
+//! that sampling period), expressions use recorded samples or caller
 //! supplied callbacks, and nothing here touches simulation time or the
 //! run loop — the `wait`/scheduler integration and the clause 11.4
 //! rule monitoring ([`RuleMonitor`]) live in `interp.rs` and feed this
@@ -25,17 +25,21 @@ use crate::ast::{EdgeRoutine, RepeatKind, TemporalExpr};
 use std::collections::BTreeSet;
 
 /// One state of a path (12.1.1.9): which events occurred in this
-/// sampling period. Event paths are dotted strings (`"sys.any"`,
-/// `"clk"`), matching [`TemporalExpr::EventRef`] paths.
+/// sampling period, plus scoped proposition and numeric-bound samples.
+/// Event paths are dotted strings (`"sys.any"`, `"clk"`), matching
+/// [`TemporalExpr::EventRef`] paths.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct State {
     occurred: BTreeSet<String>,
+    booleans: Vec<(u64, crate::ast::Expr, Option<bool>)>,
+    numerics: Vec<(u64, crate::ast::Expr, Option<i128>)>,
 }
 
 impl State {
     pub fn new(occurred: &[&str]) -> Self {
         Self {
             occurred: occurred.iter().map(|event| (*event).to_owned()).collect(),
+            ..Self::default()
         }
     }
 
@@ -49,6 +53,32 @@ impl State {
     pub fn record(&mut self, path: &str) {
         self.occurred.insert(path.to_owned());
     }
+
+    /// Record a proposition at this sampling point, scoped to its rule
+    /// or wait. Structural expression identity survives monitor cloning.
+    pub fn record_boolean(&mut self, context: u64, expr: &crate::ast::Expr, value: Option<bool>) {
+        if let Some(sample) = self
+            .booleans
+            .iter_mut()
+            .find(|(id, key, _)| *id == context && key == expr)
+        {
+            sample.2 = value;
+        } else {
+            self.booleans.push((context, expr.clone(), value));
+        }
+    }
+
+    pub fn record_numeric(&mut self, context: u64, expr: &crate::ast::Expr, value: Option<i128>) {
+        if let Some(sample) = self
+            .numerics
+            .iter_mut()
+            .find(|(id, key, _)| *id == context && key == expr)
+        {
+            sample.2 = value;
+        } else {
+            self.numerics.push((context, expr.clone(), value));
+        }
+    }
 }
 
 /// `true(exp)` propositions: `Some(TRUE/FALSE)` when evaluated.
@@ -57,9 +87,13 @@ pub type BooleanEval<'a> = Box<dyn Fn(&crate::ast::Expr) -> Option<bool> + 'a>;
 pub type NumericEval<'a> = Box<dyn Fn(&crate::ast::Expr) -> Option<i128> + 'a>;
 
 /// The expression-evaluation callbacks of one evaluation: `true(exp)`
-/// propositions and numeric repeat bounds both need the interpreter,
-/// which is not wired into this pure core yet.
+/// propositions and numeric repeat bounds use either the context's
+/// recorded samples or caller-supplied expression callbacks.
 pub struct EvalCallbacks<'a> {
+    /// A recorded rule/wait context. When set, missing history stays
+    /// unevaluated instead of falling back to current expression values.
+    /// None retains the callback-only API for caller-supplied paths.
+    pub context: Option<u64>,
     /// `true(exp)` propositions: `Some(TRUE/FALSE)` when evaluated.
     pub boolean: BooleanEval<'a>,
     /// Numeric expressions (repeat bounds): `Some(value)` when
@@ -240,7 +274,18 @@ fn holds_tight(
         // A proposition holds at the state where it is evaluated
         // (12.2.4).
         crate::ast::TemporalExpr::True { expr } => {
-            Ok(states.len() == 1 && (callbacks.boolean)(expr) == Some(true))
+            if states.len() != 1 {
+                return Ok(false);
+            }
+            let value = match callbacks.context {
+                Some(context) => states[0]
+                    .booleans
+                    .iter()
+                    .find(|(id, key, _)| *id == context && key == expr)
+                    .and_then(|(_, _, value)| *value),
+                None => (callbacks.boolean)(expr),
+            };
+            Ok(value == Some(true))
         }
         // Edge samples need the value history across states.
         crate::ast::TemporalExpr::EdgeSample { routine, .. } => {
@@ -304,7 +349,7 @@ fn holds_tight(
             // `[n]*te` — exactly n consecutive occurrences (12.2.10):
             // the unrolled sequence holds.
             RepeatKind::Fixed => {
-                let n = repeat_bound(low.as_ref(), callbacks)?;
+                let n = repeat_bound(low.as_ref(), states.first(), callbacks)?;
                 let unrolled = unroll(inner, n);
                 holds_tight(&unrolled, states, callbacks)
             }
@@ -314,11 +359,11 @@ fn holds_tight(
             // form, so the range starts at zero.
             RepeatKind::TrueMatch => {
                 let low = match low.as_ref() {
-                    Some(expr) => repeat_bound(Some(expr), callbacks)?,
+                    Some(expr) => repeat_bound(Some(expr), states.first(), callbacks)?,
                     None => 0,
                 };
                 let high = match high {
-                    Some(expr) => repeat_bound(Some(expr), callbacks)?,
+                    Some(expr) => repeat_bound(Some(expr), states.first(), callbacks)?,
                     None => states.len(),
                 };
                 for k in low..=high.min(states.len()) {
@@ -367,11 +412,11 @@ fn seq_holds(
     } = first
     {
         let low = match low.as_ref() {
-            Some(expr) => repeat_bound(Some(expr), callbacks)?,
+            Some(expr) => repeat_bound(Some(expr), states.first(), callbacks)?,
             None => 0,
         };
         let high = match high {
-            Some(expr) => repeat_bound(Some(expr), callbacks)?,
+            Some(expr) => repeat_bound(Some(expr), states.first(), callbacks)?,
             None => states.len(),
         };
         for k in low..=high.min(states.len()) {
@@ -411,10 +456,20 @@ fn unroll(te: &TemporalExpr, n: usize) -> TemporalExpr {
 /// Evaluate a repeat bound; bounds are ordinary numeric expressions.
 fn repeat_bound(
     expr: Option<&crate::ast::Expr>,
+    state: Option<&State>,
     callbacks: &EvalCallbacks,
 ) -> Result<usize, EvalError> {
     match expr {
-        Some(expr) => match (callbacks.numeric)(expr) {
+        Some(expr) => match match callbacks.context {
+            Some(context) => state.and_then(|state| {
+                state
+                    .numerics
+                    .iter()
+                    .find(|(id, key, _)| *id == context && key == expr)
+                    .and_then(|(_, _, value)| *value)
+            }),
+            None => (callbacks.numeric)(expr),
+        } {
             Some(value) if value >= 0 => Ok(value as usize),
             Some(_) => Err(EvalError::Unsupported("repeat bounds must not be negative")),
             None => Err(EvalError::Unsupported(
@@ -474,9 +529,9 @@ pub fn succeeded_somewhere(
 ///
 /// Approximations (documented, per the run loop's model): one global
 /// timeline of per-cycle states (the sampling event's occurrences are
-/// every cycle boundary), and propositions/bounds evaluated with the
-/// values the callbacks supply — the interpreter has no per-cycle
-/// value history. Edge samples propagate [`EvalError::EdgeSample`].
+/// every cycle boundary). Propositions/bounds use recorded values when
+/// a context is selected, or caller-supplied callbacks otherwise.
+/// Raw edge samples still propagate [`EvalError::EdgeSample`].
 pub fn rule_failed(
     te: &TemporalExpr,
     log: &[State],
@@ -595,8 +650,8 @@ impl RuleMonitor {
     /// whose forbidden behavior occurred, or a yield violation detected
     /// mid-run — which cannot happen for unbounded windows, but the
     /// verdict is computed the same way). Propositions and bounds
-    /// evaluate through the callbacks **at this call**, so a rule's
-    /// propositions see the values current when its states arrive.
+    /// use the context's recorded samples when available; callback-only
+    /// callers supply their own evaluation policy.
     pub fn observe(&mut self, log: &[State], callbacks: &EvalCallbacks) -> Result<bool, EvalError> {
         let from = self.consumed_index();
         for index in from..log.len() {

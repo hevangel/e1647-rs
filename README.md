@@ -23,9 +23,13 @@
 > and the reflection catalogue with `instance_iterator`. A full type
 > system (a conservative definite-mismatch check includes coverage items,
 > typed parameters and inferred locals),
-> temporal value history, general constraint solving and general testbench
-> execution do **not** exist yet, and no
+> full temporal value history, general constraint solving and general
+> testbench execution do **not** exist yet, and no
 > IEEE conformance is claimed.
+
+Temporal rules and waits retain sampled proposition and repeat-bound
+values, so later state matching uses the recorded values. Raw temporal
+`change`/`rise`/`fall` expressions remain unsupported.
 
 List extrema `min`, `max`, `min_index` and `max_index` accept an optional
 per-item key expression such as `it.score`. They return the selected
