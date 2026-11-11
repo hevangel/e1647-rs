@@ -119,13 +119,19 @@ reading, nothing else.
   ambiguous kinds stay unknown and there is no interprocedural type
   inference or full name-resolution pass. Coverage options recorded as raw
   tokens are not checked).
-- Temporal edge expressions (`change/rise/fall`) still lack raw sampled
-  value history. Propositions and repeat bounds now retain their sampled
-  values: rules sample before each global cycle closes and at quit;
+- General temporal sampling remains incomplete. Temporal
+  `change/rise/fall` now retain Boolean/integer/enumeral samples (numeric
+  rise/fall compare magnitude; the first value establishes a baseline).
+  Explicit event clocks gate edge sampling; active waits retain edges
+  arriving after their turn. Propositions and repeat bounds retain their
+  sampled values: rules sample before each global cycle closes and at quit;
   waits sample when checked, with a separate context for each suspended
   wait. Rescans use those recorded values, including through mutable
   list references. This is expression-result history, not an arbitrary
-  snapshot of every variable or an event-specific/per-instance timeline.
+  snapshot of every variable or a general event-specific/per-instance
+  timeline. Real/MVL/custom-numeric edges and static edge-width checks
+  remain unsupported. Multiple occurrences in one virtual cycle collapse
+  to the cycle's sample.
   Unbounded obligation windows exhaust when the run ends — that is the
   12.3.3 semantics, not a limitation.
 - Constraint solving beyond bounded shapes (`gen` handles the linear

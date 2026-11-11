@@ -516,6 +516,22 @@ struct Frame {
     local_types: std::collections::HashMap<String, TypeExpr>,
 }
 
+struct TemporalEdgeHistory {
+    context: u64,
+    routine: crate::ast::EdgeRoutine,
+    expr: Expr,
+    cycle: u64,
+    previous: Option<i128>,
+    current: i128,
+}
+
+struct TemporalWaitSampling {
+    te: crate::ast::TemporalExpr,
+    frame: Frame,
+    me: Option<usize>,
+    observed: usize,
+}
+
 #[derive(Debug, Clone)]
 struct StatementCall {
     receiver: usize,
@@ -753,6 +769,8 @@ struct Interp<'a> {
     sampling_temporal: bool,
     temporal_wait_contexts: BTreeMap<(Option<u64>, usize, usize, Option<usize>), u64>,
     next_temporal_context: u64,
+    temporal_edges: Vec<TemporalEdgeHistory>,
+    temporal_wait_sampling: BTreeMap<u64, TemporalWaitSampling>,
     /// The scheduled coroutines (13.2.2): the main `run()` chain first,
     /// then every `start`ed TCM, run round-robin.
     coroutines: Vec<Coroutine<'a>>,
@@ -1191,6 +1209,8 @@ fn run_inner(
         sampling_temporal: false,
         temporal_wait_contexts: BTreeMap::new(),
         next_temporal_context: 1u64 << 32,
+        temporal_edges: Vec::new(),
+        temporal_wait_sampling: BTreeMap::new(),
         coroutines: Vec::new(),
         tracing: false,
         atomic_depth: 0,
@@ -1429,6 +1449,7 @@ fn run_inner(
             }
             for position in expired.into_iter().rev() {
                 let co = interp.coroutines.remove(position);
+                interp.retire_temporal_waits(co.id);
                 diagnostics.push(interp.error(
                     "E0409",
                     format!(
@@ -1457,12 +1478,13 @@ fn run_inner(
         interp.current_coroutine_id = None;
         interp.resume_wait_start = None;
         match outcome {
-            TurnOutcome::Complete => {}
+            TurnOutcome::Complete => interp.retire_temporal_waits(co.id),
             TurnOutcome::Suspended => {
                 co.temporal_waited = 0;
                 interp.coroutines.push(co);
             }
             TurnOutcome::Error(diagnostic) => {
+                interp.retire_temporal_waits(co.id);
                 if matches!(co.kind, CoroutineKind::Main { .. }) {
                     diagnostics.push(diagnostic);
                     break;
@@ -9376,6 +9398,7 @@ impl<'a> Interp<'a> {
     fn advance_temporal_cycles(&mut self, cycles: u64) {
         for _ in 0..cycles {
             self.sample_rule_values();
+            self.sample_wait_edge_values();
             self.cycle = self.cycle.saturating_add(1);
             self.pad_log();
         }
@@ -9420,6 +9443,112 @@ impl<'a> Interp<'a> {
         for (expr, value) in numerics {
             state.record_numeric(context, expr, value);
         }
+        self.sample_temporal_edges(te, frame, me, context, false);
+    }
+
+    fn sample_wait_edge_values(&mut self) {
+        if self.sampling_temporal {
+            return;
+        }
+        self.sampling_temporal = true;
+        let waits: Vec<_> = self
+            .temporal_wait_sampling
+            .iter()
+            .map(|(context, sampling)| {
+                (
+                    *context,
+                    sampling.te.clone(),
+                    sampling.frame.clone(),
+                    sampling.me,
+                )
+            })
+            .collect();
+        for (context, te, mut frame, me) in waits {
+            self.sample_temporal_edges(&te, &mut frame, me, context, true);
+        }
+        self.sampling_temporal = false;
+    }
+
+    fn sample_temporal_edges(
+        &mut self,
+        te: &crate::ast::TemporalExpr,
+        frame: &mut Frame,
+        me: Option<usize>,
+        context: u64,
+        event_clocks_only: bool,
+    ) {
+        let mut edges = Vec::new();
+        crate::temporal::collect_edges(te, None, &mut edges);
+        for (routine, expr, sampling) in edges {
+            if event_clocks_only && temporal_sampling_is_global(sampling) {
+                continue;
+            }
+            let active = self.temporal_sampling_occurs(sampling);
+            let value = match active {
+                Some(false) => Some(false),
+                Some(true) => self.sample_temporal_edge(context, routine, expr, frame, me),
+                None => None,
+            };
+            self.temporal_log[self.cycle as usize].record_edge(context, routine, expr, value);
+        }
+    }
+
+    fn temporal_sampling_occurs(
+        &self,
+        sampling: Option<&crate::ast::TemporalExpr>,
+    ) -> Option<bool> {
+        match sampling {
+            None | Some(crate::ast::TemporalExpr::Cycle) => Some(true),
+            Some(crate::ast::TemporalExpr::Group(te)) => self.temporal_sampling_occurs(Some(te)),
+            Some(crate::ast::TemporalExpr::EventRef { path }) => Some(
+                is_every_cycle_event(&path.join("."))
+                    || self.temporal_log[self.cycle as usize].occurs(path),
+            ),
+            _ => None,
+        }
+    }
+
+    fn sample_temporal_edge(
+        &mut self,
+        context: u64,
+        routine: crate::ast::EdgeRoutine,
+        expr: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Option<bool> {
+        // The executed subset samples Boolean/integer/enumeral values.
+        // It uses the existing i128 value model; static edge-width
+        // legality and MVL/custom-numeric transitions are not checked.
+        let value = self.eval(expr, frame, me).ok()?;
+        let current = match value {
+            Value::Int(value) => value,
+            Value::Bool(value) => i128::from(value),
+            Value::Enum { type_name, name } => self.enumeral_index(&type_name, &name)?,
+            _ => return None,
+        };
+        let previous = if let Some(history) = self.temporal_edges.iter_mut().find(|history| {
+            history.context == context && history.routine == routine && history.expr == *expr
+        }) {
+            // Rechecking in the same virtual cycle updates the current
+            // sample, without changing which prior sample it compares to.
+            if history.cycle != self.cycle {
+                history.previous = Some(history.current);
+                history.cycle = self.cycle;
+            }
+            history.current = current;
+            history.previous
+        } else {
+            self.temporal_edges.push(TemporalEdgeHistory {
+                context,
+                routine,
+                expr: expr.clone(),
+                cycle: self.cycle,
+                previous: None,
+                current,
+            });
+            None
+        };
+        Some(crate::temporal::sampled_edge(routine, previous, current))
     }
 
     /// Fire one event occurrence — the shared path of `emit` (11.2) and
@@ -9764,11 +9893,68 @@ impl<'a> Interp<'a> {
             self.next_temporal_context += 1;
             context
         });
+        self.temporal_wait_sampling
+            .entry(context)
+            .and_modify(|sampling| {
+                sampling.frame = frame.clone();
+            })
+            .or_insert_with(|| TemporalWaitSampling {
+                te: te.clone(),
+                frame: frame.clone(),
+                me,
+                observed: 0,
+            });
         let result = self.temporal_wait_in_context(te, span, frame, me, (start, context));
         if !matches!(result, Ok(Flow::Suspend)) {
             self.temporal_wait_contexts.remove(&key);
+            self.temporal_wait_sampling.remove(&context);
+            self.temporal_edges
+                .retain(|history| history.context != context);
         }
         result
+    }
+
+    /// Only the previous in-progress state and newly appended states
+    /// can have gained a match since the last check. Preserve a match
+    /// that occurred after the waiter's turn, without rescanning every
+    /// old prefix on every scheduler turn.
+    fn temporal_wait_succeeded(
+        &mut self,
+        te: &crate::ast::TemporalExpr,
+        start: usize,
+        context: u64,
+    ) -> Result<bool, crate::temporal::EvalError> {
+        let observed = self
+            .temporal_wait_sampling
+            .get(&context)
+            .map_or(0, |sampling| sampling.observed);
+        let states = &self.temporal_log[start..];
+        let callbacks = historical_temporal_callbacks(context);
+        for end in observed.saturating_sub(1)..states.len() {
+            if crate::temporal::succeeds(te, &states[..=end], &callbacks)? {
+                return Ok(true);
+            }
+        }
+        if let Some(sampling) = self.temporal_wait_sampling.get_mut(&context) {
+            sampling.observed = states.len();
+        }
+        Ok(false)
+    }
+
+    fn retire_temporal_waits(&mut self, coroutine: u64) {
+        let contexts: Vec<_> = self
+            .temporal_wait_contexts
+            .iter()
+            .filter(|(key, _)| key.0 == Some(coroutine))
+            .map(|(_, context)| *context)
+            .collect();
+        self.temporal_wait_contexts
+            .retain(|key, _| key.0 != Some(coroutine));
+        for context in contexts {
+            self.temporal_wait_sampling.remove(&context);
+            self.temporal_edges
+                .retain(|history| history.context != context);
+        }
     }
 
     fn temporal_wait_in_context(
@@ -9783,9 +9969,7 @@ impl<'a> Interp<'a> {
         self.pad_log();
         if self.suspend_eligible() {
             self.sample_temporal_values(te, frame, me, context);
-            let callbacks = historical_temporal_callbacks(context);
-            let slice = &self.temporal_log[start..];
-            match crate::temporal::succeeds(te, slice, &callbacks) {
+            match self.temporal_wait_succeeded(te, start, context) {
                 Ok(true) => return Ok(Flow::Normal),
                 Ok(false) => {
                     return self.suspend_here(
@@ -9809,9 +9993,7 @@ impl<'a> Interp<'a> {
         let mut waited = 0u64;
         loop {
             self.sample_temporal_values(te, frame, me, context);
-            let callbacks = historical_temporal_callbacks(context);
-            let slice = &self.temporal_log[start..];
-            match crate::temporal::succeeds(te, slice, &callbacks) {
+            match self.temporal_wait_succeeded(te, start, context) {
                 Ok(true) => return Ok(Flow::Normal),
                 Ok(false) => {}
                 Err(err) => {
@@ -14614,6 +14796,15 @@ fn is_every_cycle_event(path: &str) -> bool {
         path,
         "sys.any" | "any" | "sys.new_time" | "new_time" | "sim"
     )
+}
+
+fn temporal_sampling_is_global(sampling: Option<&crate::ast::TemporalExpr>) -> bool {
+    match sampling {
+        None | Some(crate::ast::TemporalExpr::Cycle) => true,
+        Some(crate::ast::TemporalExpr::Group(te)) => temporal_sampling_is_global(Some(te)),
+        Some(crate::ast::TemporalExpr::EventRef { path }) => is_every_cycle_event(&path.join(".")),
+        _ => false,
+    }
 }
 
 /// The `keep <port>.edge() == <value>` attribute values (9.7.3) per
