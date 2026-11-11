@@ -1,0 +1,3 @@
+17:30: error[E0220]: coverage item: a value of kind 'int' cannot be stored into 'string'
+17:30: error[E0220]: coverage item: a value of kind 'int' cannot be stored into 'string'
+11:30: error[E0220]: coverage item: a value of kind 'string' cannot be stored into 'int'

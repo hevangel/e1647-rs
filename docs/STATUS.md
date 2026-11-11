@@ -25,8 +25,8 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   and `template extend` blocks apply to the instances whose actuals
   match; static members register per type. After composition, the
   conservative type check ([`typing`]) walks every method body, field
-  init value, `keep` constraint, `on` body and synthesized `when`
-  view, and reports definite mismatches only: a value that cannot be
+  init value, `keep` constraint, `on` body, coverage item and synthesized
+  `when` view, and reports definite mismatches only: a value that cannot be
   the target it is stored into (E0220), a member a known when-less
   receiver does not have (E0221), indexing a non-list (E0222), an
   operator on incompatible operand kinds (E0223) — anything uncertain
@@ -109,10 +109,10 @@ reading, nothing else.
 
 - A full type system (the [`typing`] conservative pass reports definite
   mismatches across method bodies, field init values, `keep`
-  constraints, `on` bodies and the synthesized `when` views; there is
-  no general type inference across untyped variables, no
-  name-resolution pass beyond it, and `cover` group expressions are
-  not walked).
+  constraints, `on` bodies, coverage items and the synthesized `when`
+  views; there is no general type inference across untyped variables, no
+  name-resolution pass beyond it, and coverage options recorded as raw
+  tokens are not checked).
 - Temporal value history (each rule streams through a per-event
   monitor that holds its obligation state incrementally, but a rule's
   propositions evaluate with the values current when a state arrives —

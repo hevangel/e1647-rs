@@ -184,6 +184,15 @@ browser sandbox API is not started.
   `keep` identifier roots, zero widths). The CLI runs this once on the
   import-merged declaration list. **Not** a symbol/type checker: no type
   system and no subtype-aware scope.
+- `src/typing.rs` — conservative post-composition type checking over
+  methods, field initial values, constraints, `on` bodies and coverage
+  items (14.3), including synthesized when views. Coverage expressions
+  resolve against the owner; items without expressions use the owner's
+  same-named field. An explicit item type checks compatibility (E0220),
+  and expression traversal checks missing members, indexing and operand
+  kinds (E0221–E0223). Unknown kinds stay silent. Cross/transition names
+  refer to items rather than owner fields; raw coverage options remain
+  unchecked. General type inference and full name resolution remain gaps.
 - `src/elab.rs` — member composition: `like` chains and `extend` blocks fold
   into one composed member list per `struct`/`unit` (inheritance-cycle,
   cross-declaration duplicate-field and unmodified-method-redefinition
@@ -206,7 +215,7 @@ browser sandbox API is not started.
   qualifiers) instantiate the view, so those members apply for the
   instance and `is a` walks the view's base chain. **Not** full
   elaboration: base-typed instances do not dynamically match
-  subtypes; no type checking.
+  subtypes; the separate conservative type pass checks composed views.
 - `src/builtins.rs` — predeclared names the executed subset relies on:
   the `sys` unit, sequence bases (`any_sequence_item` and siblings), and
   routines such as `out`, `outf`, `message`, `pack`, `append`,
@@ -290,8 +299,10 @@ browser sandbox API is not started.
   (`change/rise/fall`, unresolvable bounds) report `E0402` honestly.
   `sync` (13.2.3) parses in bare and TE forms — the bare form
   suspends one cycle, the TE form behaves like the temporal wait.
-  `expect`/`assume` rules (elaborated per type, 11.4) are monitored at
-  quit with `rule_failed` (12.3.3): a failed rule runs its `else` body
+  `expect`/`assume` rules (elaborated per type, 11.4) stream through
+  per-rule monitors at finalized cycle boundaries (12.3.3): invariant
+  violations fire then, and obligation verdicts finalize when their
+  windows close. A failed rule runs its `else` body
   on the sys instance as a check error, or prints the failure when
   there is no else body. One global timeline — no per-instance
   sampling. `emit` also samples the cover groups (clause 14) of the
@@ -324,12 +335,14 @@ browser sandbox API is not started.
   gaps in the module docs.
 - `src/solve.rs` — constraint IR and the pluggable solver seam: the
   top-level `keep` constraints of one type translate (conservatively) into
-  bounded-integer variables plus a conjunction of linear comparisons;
+  bounded-integer variables plus a boolean tree of comparisons;
   range membership (`x in [lo..hi]`) translates to the two comparisons,
-  item-list membership does not (no disjunction in the IR). Backend:
-  Pumpkin (pure-Rust CP solver) behind the `solver-pumpkin`
-  cargo feature — seeded, deterministic; without the feature `solve`
-  reports unsupported and `gen` falls back to rejection sampling.
+  item-list membership becomes a disjunction of equalities. Disjunction
+  and negation trees translate. Linear problems use Pumpkin behind the
+  `solver-pumpkin` feature; polynomial problems of degree up to four use
+  feature-independent enumeration with capped domain products. Both
+  paths are deterministic per seed; unsupported problems fall back to
+  rejection sampling.
 - `src/hdl.rs` — the simulator seam: the `Simulator` trait
   (`load`/`name`/`set`/`get`/`run`/`finish`), a small explicit registry
   (`registered_backends`, `default_backend`, `load_backend`, `load`),
@@ -354,10 +367,10 @@ Deliberately not implemented yet: dynamic subtype matching for
 base-typed instances (when views resolve through when-qualified field
 types; chained modifiers and nested when-in-when blocks compose,
 though a view's own when-of pairs are not re-verified against its
-base's fields), non-linear,
-disjunctive or temporal constraint solving (the solver backend covers
-conjunctive linear constraints and constant ranges over bounded
-integers), per-instance temporal timelines (the run log stays one
+base's fields), general constraint solving (bounded linear and
+polynomial shapes, including disjunctions, are supported; wide domains,
+division/modulo and temporal constraints remain gaps), per-instance
+temporal timelines (the run log stays one
 global timeline; the simulator-side `@sim`/event-port triggers fire
 per instance at the scheduler's cycle boundaries), and suspension
 re-entry into inline method calls and `compute` (waits inside
