@@ -13,10 +13,11 @@
 //! Coverage of the grammar:
 //! - evaluated: event atoms, `cycle`, `true(exp)` (via the callbacks),
 //!   sequences, `=>` yield, `and`/`or`/`not`/`fail`/`eventually`,
-//!   fixed and true-match repeats, sampling and grouping;
-//! - not evaluated: `change/rise/fall(exp)` edge samples (they need a
-//!   sampled value history — [`EvalError::EdgeSample`]) and
-//!   first-match repeats outside sequences ([`EvalError::Unsupported`]);
+//!   fixed and true-match repeats, sampling and grouping, and recorded
+//!   `change/rise/fall(exp)` scalar edge results;
+//! - not evaluated: edges without a supported recorded sample
+//!   ([`EvalError::EdgeSample`]) and first-match repeats outside
+//!   sequences ([`EvalError::Unsupported`]);
 //!   `detach`/`delay`/`exec` never parse (see the parser's `E0120`).
 //!
 //! Semantics are documented per function against their subclauses.
@@ -33,6 +34,7 @@ pub struct State {
     occurred: BTreeSet<String>,
     booleans: Vec<(u64, crate::ast::Expr, Option<bool>)>,
     numerics: Vec<(u64, crate::ast::Expr, Option<i128>)>,
+    edges: Vec<(u64, EdgeRoutine, crate::ast::Expr, Option<bool>)>,
 }
 
 impl State {
@@ -79,6 +81,39 @@ impl State {
             self.numerics.push((context, expr.clone(), value));
         }
     }
+
+    /// Record an edge result computed from consecutive sampled values.
+    pub fn record_edge(
+        &mut self,
+        context: u64,
+        routine: EdgeRoutine,
+        expr: &crate::ast::Expr,
+        value: Option<bool>,
+    ) {
+        if let Some(sample) = self
+            .edges
+            .iter_mut()
+            .find(|(id, kind, key, _)| *id == context && *kind == routine && key == expr)
+        {
+            sample.3 = value;
+        } else {
+            self.edges.push((context, routine, expr.clone(), value));
+        }
+    }
+}
+
+/// Defined scalar edge comparison (12.2.18). Boolean samples use 0/1;
+/// integer rises/falls compare magnitude, rather than testing for 1/0.
+/// With no previous sample, the current value establishes a baseline.
+pub fn sampled_edge(routine: EdgeRoutine, previous: Option<i128>, current: i128) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    match routine {
+        EdgeRoutine::Change => current != previous,
+        EdgeRoutine::Rise => current > previous,
+        EdgeRoutine::Fall => current < previous,
+    }
 }
 
 /// `true(exp)` propositions: `Some(TRUE/FALSE)` when evaluated.
@@ -104,8 +139,8 @@ pub struct EvalCallbacks<'a> {
 /// Why a temporal expression could not be evaluated on a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvalError {
-    /// `change/rise/fall(exp)` needs the sampled value history of its
-    /// expression across the path's states.
+    /// `change/rise/fall(exp)` has no recorded result, or its sampled
+    /// value/clock is outside the supported subset.
     EdgeSample(&'static str),
     /// A construct the evaluator does not handle (`detach`/`delay`/
     /// `exec` never parse; first-match repeats are handled inside
@@ -287,9 +322,20 @@ fn holds_tight(
             };
             Ok(value == Some(true))
         }
-        // Edge samples need the value history across states.
-        crate::ast::TemporalExpr::EdgeSample { routine, .. } => {
-            Err(EvalError::EdgeSample(edge_routine_name(*routine)))
+        // The interpreter records the comparison at the sampling point,
+        // so matching a suffix still sees its preceding sample's edge.
+        crate::ast::TemporalExpr::EdgeSample { routine, expr } => {
+            if states.len() != 1 {
+                return Ok(false);
+            }
+            let sampled = callbacks.context.and_then(|context| {
+                states[0]
+                    .edges
+                    .iter()
+                    .find(|(id, kind, key, _)| *id == context && *kind == *routine && key == expr)
+                    .and_then(|(_, _, _, value)| *value)
+            });
+            sampled.ok_or_else(|| EvalError::EdgeSample(edge_routine_name(*routine)))
         }
         // A sequence holds when its items hold over consecutive,
         // non-overlapping segments, each item starting in the sampling
@@ -531,7 +577,7 @@ pub fn succeeded_somewhere(
 /// timeline of per-cycle states (the sampling event's occurrences are
 /// every cycle boundary). Propositions/bounds use recorded values when
 /// a context is selected, or caller-supplied callbacks otherwise.
-/// Raw edge samples still propagate [`EvalError::EdgeSample`].
+/// Unsupported or missing edge samples propagate [`EvalError::EdgeSample`].
 pub fn rule_failed(
     te: &TemporalExpr,
     log: &[State],
@@ -793,11 +839,44 @@ pub fn collect_exprs<'te>(
         | crate::ast::TemporalExpr::Group(inner) => {
             collect_exprs(inner, propositions, bounds);
         }
-        // Edge samples need the value history the callbacks cannot
-        // supply; evaluation reports EvalError::EdgeSample before any
-        // expression is consulted.
+        // Edge expressions have their own sampling clocks and are
+        // collected separately by collect_edges.
         crate::ast::TemporalExpr::EventRef { .. }
         | crate::ast::TemporalExpr::Cycle
         | crate::ast::TemporalExpr::EdgeSample { .. } => {}
+    }
+}
+
+/// Visit edge expressions with their inherited sampling event. An
+/// explicit inner event overrides the enclosing event (12.1.4/12.2.6).
+pub fn collect_edges<'te>(
+    te: &'te TemporalExpr,
+    sampling: Option<&'te TemporalExpr>,
+    out: &mut Vec<(
+        EdgeRoutine,
+        &'te crate::ast::Expr,
+        Option<&'te TemporalExpr>,
+    )>,
+) {
+    match te {
+        TemporalExpr::EdgeSample { routine, expr } => out.push((*routine, expr, sampling)),
+        TemporalExpr::Sampled { te, event } => collect_edges(te, Some(event), out),
+        TemporalExpr::Repeat { te, .. }
+        | TemporalExpr::Group(te)
+        | TemporalExpr::Not(te)
+        | TemporalExpr::Fail(te)
+        | TemporalExpr::Eventually(te) => collect_edges(te, sampling, out),
+        TemporalExpr::Sequence { items } => {
+            for item in items {
+                collect_edges(item, sampling, out);
+            }
+        }
+        TemporalExpr::Yield { lhs, rhs }
+        | TemporalExpr::And(lhs, rhs)
+        | TemporalExpr::Or(lhs, rhs) => {
+            collect_edges(lhs, sampling, out);
+            collect_edges(rhs, sampling, out);
+        }
+        _ => {}
     }
 }

@@ -4,7 +4,7 @@ The IEEE 1647-2019 migration phases below are complete; the broader
 milestones remain partial. Recent work adds conservative type checking
 (now including coverage items), bounded polynomial constraint solving
 and streaming temporal rule monitors. Remaining work includes full name
-resolution/type inference, temporal edge expressions, call-stack
+resolution/type inference, general temporal sampling timelines, call-stack
 continuations for suspended TCM calls, the remaining coverage options,
 general constraint solving, differential qualification, HDL event
 ordering and a browser sandbox API. Completed migration checkboxes do
@@ -348,8 +348,14 @@ not imply full language support or IEEE conformance.
       state and evaluation context: rules sample before a global cycle
       closes and at quit, and waits sample at each check, preserving
       their local context. Later matching uses recorded values. Raw
-      `change`/`rise`/`fall` expressions and event-specific/per-instance
-      histories remain gaps. Suspension re-enters compound
+      `change`/`rise`/`fall` expressions now sample Boolean, integer and
+      enumeral values (12.2.18), including explicit event-clock gating
+      and late-arriving clock samples for suspended waits. Numeric
+      rise/fall compare magnitude; the first observation is a baseline.
+      Real/MVL/custom-numeric edges, static edge-width checks and general
+      event-specific/per-instance histories remain gaps; multiple
+      occurrences in one virtual cycle collapse to its sample.
+      Suspension re-enters compound
       statements, including `if`/`case`/`for`/`for each`/`repeat until`;
       inline calls and `compute` still need call-stack continuations,
       and `on` blocks remain atomic

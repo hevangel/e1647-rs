@@ -3629,3 +3629,49 @@ Sampling remains on the global virtual timeline: rules sample cycle
 closure, waits sample their checks. Raw temporal `change/rise/fall`
 expressions and event-specific/per-instance timelines remain gaps.
 
+## 2026-11-11 — Scalar temporal edge samples
+
+Implemented recorded `change`/`rise`/`fall` results for Boolean,
+integer and enumeral expressions (12.2.18). Numeric rises/falls compare
+magnitude; a first sample establishes the baseline. Edges retain
+separate histories per rule/wait, routine and expression. Explicit
+event clocks gate sampling and nested clocks override their enclosing
+clock. Active waits retain clocked samples arriving after their turn,
+and consume matches since their last observation. Completed, failed
+and expired wait contexts retire their sampling state.
+
+Reference basis: read-only inspection of the available lawful local
+2016 redline's shared scalar-edge behavior. The 2019 citation applies
+the migration plan's temporal-operator Introduction shift (+1). No
+standard text, tables or proprietary example code were copied into
+implementation or tests. The 2019-specific edge-width legality remains
+unqualified and is not statically checked. Published Cadence event-port
+material was located during research; it did not supply qualification
+for the scalar temporal semantics implemented here.
+
+Seven independently authored fixture sets under
+`tests/fixtures/temporal-edges/` pin Boolean transitions, numeric
+magnitude changes, enumeral ordinals, the initial baseline, explicit
+clock gating, concurrent local contexts, successive waits, late clocks
+and exact E0402 output for an unsupported real sample. Three core tests
+check scalar comparisons, clone-safe recorded edges/context isolation
+and sampling-event overrides.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed without warnings.
+- `cargo test --all-targets` — 446 passed, 0 failed.
+- `cargo test --test temporal --test temporal_history` — 17 passed,
+  0 failed; final all-target testing includes all seven edge fixtures.
+- `git diff --check` — passed.
+
+No Specman reference runs were performed. This is implementation
+regression evidence, not differential qualification or conformance.
+The runtime retains its integer value model rather than validating
+static edge widths. Real/MVL/custom-numeric edges are unsupported.
+Sampling is still per virtual cycle; multiple occurrences in one cycle
+collapse to that cycle's sample. General event-specific compound
+timelines, per-instance temporal rules and precise HDL event ordering
+remain gaps.
+
