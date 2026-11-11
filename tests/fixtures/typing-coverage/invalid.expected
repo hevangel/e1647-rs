@@ -1,0 +1,5 @@
+10:28: error[E0220]: coverage item: a value of kind 'string' cannot be stored into 'int'
+11:30: error[E0221]: 'plain_s' has no field or method 'absent'
+12:30: error[E0222]: indexing a value of kind 'int' — only a list is indexable
+13:33: error[E0223]: the left operand of the arithmetic operator is 'string' — a number is required
+14:14: error[E0220]: coverage item: a value of kind 'string' cannot be stored into 'int'

@@ -18,10 +18,11 @@
 //! - an operator applied to definitely incompatible operand kinds
 //!   (string against a number, an object in arithmetic — E0223).
 //!
-//! Coverage boundaries (documented honest limits): expressions in
-//! `keep` constraints, field init values, `when`-block members and
-//! `on`-block bodies are not walked; `table`/`table_row` receivers and
-//! any construct the checker cannot pin down stay unchecked. The pass
+//! The pass walks methods, field init values, `keep` constraints,
+//! `on` bodies and coverage item expressions, including synthesized
+//! `when` views. Coverage options remain raw tokens and are unchecked;
+//! `table`/`table_row` receivers and constructs the checker cannot pin
+//! down also stay unchecked. The pass
 //! runs over composed types (post `like`/`extend` fold), so extended
 //! members are visible.
 //!
@@ -879,7 +880,8 @@ fn check_field_inits(checker: &mut TypeChecker, fields: &[crate::ast::Field]) {
 }
 
 /// The type-check pass over every composed type's members — method
-/// bodies, field init values, `keep` constraints and `on` bodies. The
+/// bodies, field init values, `keep` constraints, `on` bodies and
+/// coverage items (14.3). The
 /// `when` blocks' members are checked through their synthesized
 /// when-view types (which carry the block's fields as ordinary fields,
 /// so sibling access resolves). The diagnostics join the elaboration
@@ -891,6 +893,27 @@ pub fn check_types(elaborated: &Elaborated) -> Vec<Diagnostic> {
         check_field_inits(&mut checker, &t.fields);
         for constraint in &t.constraints {
             checker.infer(&constraint.expr);
+        }
+        for group in &t.covers {
+            for item in &group.items {
+                if item.kind != crate::ast::CoverItemKind::Item {
+                    continue;
+                }
+                // Like the sampler, resolve an item without an explicit
+                // expression to its owner's field. Item names do not
+                // introduce locals for other sampled expressions.
+                let (value, span) = if let Some(expr) = &item.expr {
+                    (checker.infer(expr), expr.span())
+                } else if let Some((name, span)) = item.names.first() {
+                    (checker.me_field(name).unwrap_or(Ty::Unknown), *span)
+                } else {
+                    continue;
+                };
+                if let Some(ty) = &item.ty {
+                    let target = checker.type_of(ty);
+                    checker.check_assignable(&value, &target, span, "coverage item");
+                }
+            }
         }
         for on in &t.ons {
             checker.check_body(&on.body);

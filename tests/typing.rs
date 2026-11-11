@@ -10,9 +10,18 @@ use std::path::Path;
 /// `tests/fixtures/` harness above covers the parser's own contract.
 #[test]
 fn type_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures-type");
+}
+
+#[test]
+fn coverage_type_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures/typing-coverage");
+}
+
+fn check_fixture_directory(directory: &str) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
-        .join("fixtures-type");
+        .join(directory);
     let mut entries: Vec<_> = fs::read_dir(&dir)
         .expect("type fixtures directory exists")
         .collect::<Result<_, _>>()
@@ -46,7 +55,7 @@ fn type_fixture_diagnostics_match_expected() {
         checked += 1;
         if actual != expected {
             failures.push(format!(
-                "--- {} (relative: tests/fixtures-type/{})\nexpected:\n{}actual:\n{}",
+                "--- {} (relative: tests/{directory}/{})\nexpected:\n{}actual:\n{}",
                 path.display(),
                 path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
                 expected,

@@ -1,5 +1,15 @@
 # Roadmap
 
+The IEEE 1647-2019 migration phases below are complete; the broader
+milestones remain partial. Recent work adds conservative type checking
+(now including coverage items), bounded polynomial constraint solving
+and streaming temporal rule monitors. Remaining work includes full name
+resolution/type inference, temporal value history, call-stack
+continuations for suspended TCM calls, the remaining coverage options,
+general constraint solving, differential qualification, HDL event
+ordering and a browser sandbox API. Completed migration checkboxes do
+not imply full language support or IEEE conformance.
+
 ## M0 — Repository and infrastructure
 - [x] Rust package, README, license, tests, CI definition
 - [x] First tokenization smoke tests
@@ -205,13 +215,19 @@
       rules apply in one pass; the backtick Verilog-style names of
       4.1.5.4 and the cross-file include-order visibility of B.5 are
       not modeled)
-- [~] Add symbol resolution, types, diagnostics — minimal well-formedness
-      checks only (duplicate declaration/field names, duplicate
+- [~] Add symbol resolution, types, diagnostics — well-formedness
+      checks (duplicate declaration/field names, duplicate
       parameters/local variables/enumerals, unknown named/`like`/`extend`
       types including method signatures and `list of` elements, unknown
       `keep` identifiers checked against fields and enumerals, zero
       widths). The check runs on the import-merged declaration list.
-      No type system, and no subtype-aware scope yet
+      The post-composition conservative type pass (`src/typing.rs`)
+      checks methods, field initial values, constraints, `on` bodies and
+      coverage items, including synthesized when views. E0220–E0223
+      report definite incompatible values, missing members, non-list
+      indexing and invalid operands; unknown types stay silent.
+      Coverage options remain unchecked raw tokens; general type
+      inference and full name resolution are still missing
 - [ ] Differential corpus against an authorized reference simulator where
       available (started: Specman reference runs via EDA Playground are
       recorded in docs/VERIFICATION.md; no automated differential harness yet)
@@ -243,13 +259,16 @@
       a when block applies on top of the enclosing view (a further
       combined view, budget-capped); `is a` checks walk the view's
       base chain. Base-typed instances do not dynamically match
-      subtypes yet; there is no type checking
+      subtypes yet; the conservative type pass checks composed views
 - [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer
       fields into a solver problem; range membership (`x in [lo..hi]`)
       translates to the two comparisons; unsupported shapes fall back to
-      rejection sampling. No disjunctions (item-list membership, `||`),
-      negation trees or global constraints yet. `keep bind` and
+      rejection sampling. Disjunctions (item-list membership, `||`) and
+      negation trees translate; bounded polynomial problems of degree
+      up to four use feature-independent enumeration with capped domain
+      products. Wide domains, division/modulo and global constraints
+      remain unsupported by the solver. `keep bind` and
       `hdl_path()` / `delayed()` constraints do not gate `gen`.
       Connected field sets (10.3.6-10.3.7) scope generation, v1: `gen <obj>`
       inside a method gates the object with the enclosing instance's
@@ -320,14 +339,16 @@
       readability-only `until`) re-evaluate at every turn against the
       grown log, a temporal wait unsatisfied for 1,000 cycles (or the
       5,000-cycle shared budget) reports `E0409`, and
-      `expect`/`assume` rules (elaborated per type) are checked at quit
-      per 12.3.3 — a failed rule runs its `else` body (or prints the
+      `expect`/`assume` rules (elaborated per type) stream through
+      per-rule monitors at finalized cycle boundaries; invariants fail
+      when violated, and obligation verdicts finalize when their windows
+      close (12.3.3). A failed rule runs its `else` body (or prints the
       failure when there is none) as a check error. One global
       timeline, and propositions evaluate with current field values
-      (no per-cycle value history). Suspension re-enters `while` chains
-      only — waits inside `if`/`case`/`for` bodies, inline calls,
-      `compute` and `on` blocks keep the inline spin — and `wait` does
-      not advance the HDL simulator
+      (no per-cycle value history). Suspension re-enters compound
+      statements, including `if`/`case`/`for`/`for each`/`repeat until`;
+      inline calls and `compute` still need call-stack continuations,
+      and `on` blocks remain atomic
 - [~] Coverage data model and reports — started: `src/coverage.rs`
       builds buckets and grades from the recorded groups (14.3's
       ranges/defaults, 14.6 merging), the interpreter samples on the
