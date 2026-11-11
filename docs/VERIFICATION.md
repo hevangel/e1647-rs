@@ -3611,6 +3611,60 @@ live invariant failure and an unsatisfied historical sequence. Two
 pure-core regressions check context isolation, monitor clones, missing
 history and starting-state bounds. Golden output uses LF on Windows.
 
+## 2026-11-11 — Local declaration inference and parameter scopes
+
+The conservative type pass now retains known initializer kinds for
+type-inferring local declarations (clause 18), binds declared method
+parameter kinds within their method, and propagates homogeneous list
+elements and equal-kind ternary branches. Scalar/list aliases resolve
+with a recursion bound. Ambiguous alternatives, unknown operands,
+untyped parameters and custom numeric dispatch stay conservative;
+NULL-only initializers do not infer a concrete reference type.
+
+Seven independently authored fixture pairs under
+`tests/fixtures/typing-inference/` pin local aliases, assignments,
+argument/return checks, parameter/field scope, list/index propagation,
+conditional branches, named aliases, recursive aliases and fail-open
+boundaries. Exact E0220–E0223 diagnostics are checked. A CLI test checks
+that `elab` and `run` reject mismatched inferred locals and that a valid
+inference program executes with the independently expected output.
+
+Verification on this branch, independently based on merged main:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed after fixing a
+  documentation paragraph flagged by the initial Clippy run.
+- `cargo test --all-targets` — 441 passed, 0 failed.
+- `cargo test --test typing` — 5 passed, 0 failed.
+- `git diff --check` — passed.
+
+A checkpoint checkout with Windows `autocrlf` exposed CRLF conversion
+of the runtime `.out` golden file. `.gitattributes` now pins `.out`
+fixtures to LF alongside `.expected`; the full suite passed again
+after the checkout issue was corrected.
+
+No Specman reference runs were performed. This is implementation
+regression evidence, not differential qualification or a full type
+system. Flow-sensitive inference, interprocedural inference, full name
+resolution and width/range proof remain gaps. No conformance is claimed.
+
+## 2026-11-11 — Keyed list extrema (IEEE 1647-2019 clause 27)
+
+Implemented optional item-key expressions for `max`, `max_index`,
+`min` and `min_index` (27.4.15, 27.4.16, 27.4.18, 27.4.19). The key
+evaluates with a temporary `it` binding; the result selects an original
+item or its zero-based index, and the latest tied item wins. The
+conservative type checker scopes `it` to the list element kind and
+infers the item/index result kind.
+
+Independently authored fixtures under `tests/fixtures/list-extrema/`
+pin integer/real/string keys, ties, nested bindings, shared object
+identity, snapshot traversal under receiver mutation, ordinary
+same-named methods evaluated once, empty lists, unorderable singleton
+keys and propagation of key-expression errors. Type fixtures under
+`tests/fixtures/typing-list-extrema/` pin E0220/E0221/E0223 output.
+The arity/error matrix covers all four methods.
+
 Verification:
 
 - `cargo fmt --all -- --check` — passed.
@@ -3620,6 +3674,7 @@ Verification:
   273 passed, 0 failed; the temporal-history fixtures were also rerun
   after adding the negative verdict case, and the final all-target run
   includes all five fixture sets.
+- `cargo test --test list_extrema --test typing` — 6 passed, 0 failed.
 - `git diff --check` — passed.
 
 No Specman reference runs were performed. This is implementation
@@ -3629,3 +3684,34 @@ Sampling remains on the global virtual timeline: rules sample cycle
 closure, waits sample their checks. Raw temporal `change/rise/fall`
 expressions and event-specific/per-instance timelines remain gaps.
 
+Keys use the runtime's integer/real/string ordering; enumeral/custom
+numeric keys and implicit index bindings are not modeled. The receiver
+is snapshotted before key evaluation, so mutation does not change which
+items are visited. General expression-taking list routines remain gaps.
+
+## 2026-11-11 — Predicate list queries (IEEE 1647-2019 clause 27)
+
+Implemented `has`, `count`, `all` and `all_indices` with one boolean
+item expression and a scoped `it` binding (27.4.10, 27.4.4,
+27.4.29–27.4.30). Independently authored fixtures under
+`tests/fixtures/list-queries/` pin order, duplicate matches, empty
+results, nested bindings, shallow object identity, fresh result lists,
+short-circuit `has`, snapshot traversal during receiver mutation,
+ordinary same-named methods and E0402 diagnostics. Type fixtures under
+`tests/fixtures/typing-list-queries/` pin predicate/result kinds and
+E0220/E0221/E0223 diagnostics.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 442 passed, 0 failed.
+- `cargo test --test list_queries --test typing` — 6 passed, 0 failed.
+- `git diff --check` — passed.
+
+No Specman reference runs were performed. This is implementation
+regression evidence, not differential qualification or a conformance
+claim. The supported forms require exactly one boolean expression;
+implicit index bindings remain unsupported. Traversal snapshots the
+receiver before predicate evaluation, so mutation does not change the
+items visited. Other expression-taking list methods remain gaps.

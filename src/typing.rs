@@ -18,6 +18,13 @@
 //! - an operator applied to definitely incompatible operand kinds
 //!   (string against a number, an object in arithmetic — E0223).
 //!
+//! Declared parameter kinds are visible in their method bodies, and
+//! `var x := expression` keeps an inferable initializer kind (clause 18).
+//! Homogeneous list literals and equal-kind ternary branches propagate
+//! kinds; ambiguous expressions and untyped parameters stay unknown.
+//! Scalar/list aliases resolve with a recursion bound; custom numeric
+//! dispatch remains outside this lattice.
+//!
 //! The pass walks methods, field init values, `keep` constraints,
 //! `on` bodies and coverage item expressions, including synthesized
 //! `when` views. Coverage options remain raw tokens and are unchecked;
@@ -108,6 +115,12 @@ fn has_opinion(ty: &Ty) -> bool {
 /// to reals (the 5.6.3 precision contexts).
 fn numeric(ty: &Ty) -> bool {
     matches!(ty, Ty::Int | Ty::Real | Ty::Enum(_))
+}
+
+/// A kind shared by both alternatives. An unknown or differing kind
+/// stays unknown: this is declaration inference, not union typing.
+fn shared_kind(left: Ty, right: Ty) -> Ty {
+    if left == right { left } else { Ty::Unknown }
 }
 
 /// Whether `value` may be stored into `target`. `Unknown` on either
@@ -272,6 +285,15 @@ impl<'a> TypeChecker<'a> {
 
     /// The conservative conversion of a declared type expression.
     fn type_of(&self, ty: &TypeExpr) -> Ty {
+        self.type_of_at_depth(ty, 0)
+    }
+
+    fn type_of_at_depth(&self, ty: &TypeExpr, depth: usize) -> Ty {
+        // Recursive aliases and unusually deep type expressions must
+        // stay fail-open instead of overflowing the checker stack.
+        if depth >= 64 {
+            return Ty::Unknown;
+        }
         match ty {
             TypeExpr::Scalar { base, .. } => match base {
                 ScalarBase::Bool => Ty::Bool,
@@ -279,7 +301,9 @@ impl<'a> TypeChecker<'a> {
                 ScalarBase::String => Ty::Str,
                 _ => Ty::Int,
             },
-            TypeExpr::List { element, .. } => Ty::List(Box::new(self.type_of(element))),
+            TypeExpr::List { element, .. } => {
+                Ty::List(Box::new(self.type_of_at_depth(element, depth + 1)))
+            }
             TypeExpr::Named { name, .. } => {
                 if sync_type(name) {
                     return Ty::Sync;
@@ -291,9 +315,19 @@ impl<'a> TypeChecker<'a> {
                     // An enumeral type.
                     return Ty::Enum(name.clone());
                 }
+                if let Some(declared) = self.find_type(name) {
+                    if declared.kind == DeclarationKind::NumericType {
+                        // Custom numeric operator dispatch is outside
+                        // this lattice; do not treat it as an object.
+                        return Ty::Unknown;
+                    }
+                    if let Some(underlying) = &declared.underlying {
+                        return self.type_of_at_depth(underlying, depth + 1);
+                    }
+                }
                 Ty::Object(name.clone())
             }
-            TypeExpr::WhenQualified { base, .. } => self.type_of(base),
+            TypeExpr::WhenQualified { base, .. } => self.type_of_at_depth(base, depth + 1),
             TypeExpr::InlineEnum { .. } => Ty::Enum("<inline enumeral list>".to_owned()),
             // Template/formal/typeof spellings stay unchecked (v1).
             _ => Ty::Unknown,
@@ -332,7 +366,7 @@ impl<'a> TypeChecker<'a> {
         match statement {
             Stmt::VarDecl { name, ty, init, .. } => {
                 let declared = ty.as_ref().map(|ty| self.type_of(ty));
-                if let Some(init) = init {
+                let inferred = if let Some(init) = init {
                     let value = self.infer(init);
                     if let Some(target) = &declared {
                         self.check_assignable(
@@ -342,8 +376,17 @@ impl<'a> TypeChecker<'a> {
                             "variable initialization",
                         );
                     }
-                }
-                self.bind_local(name, declared.unwrap_or(Ty::Unknown));
+                    // NULL alone does not identify the declaration's
+                    // reference type; a later assignment cannot narrow it.
+                    if value == Ty::Void {
+                        Ty::Unknown
+                    } else {
+                        value
+                    }
+                } else {
+                    Ty::Unknown
+                };
+                self.bind_local(name, declared.unwrap_or(inferred));
             }
             Stmt::Assign { target, value, .. } => {
                 let value_ty = self.infer(value);
@@ -499,7 +542,28 @@ impl<'a> TypeChecker<'a> {
                 }
                 _ => Ty::Unknown,
             },
-            Expr::ListConcat { .. } => Ty::List(Box::new(Ty::Unknown)),
+            Expr::ListConcat { items, .. } => {
+                let mut element = None;
+                for item in items {
+                    let kind = self.infer(item);
+                    element = Some(match element {
+                        None => kind,
+                        Some(previous) => shared_kind(previous, kind),
+                    });
+                }
+                Ty::List(Box::new(element.unwrap_or(Ty::Unknown)))
+            }
+            Expr::Ternary {
+                cond,
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.infer(cond);
+                let left = self.infer(then_expr);
+                let right = self.infer(else_expr);
+                shared_kind(left, right)
+            }
             Expr::InSet { .. } => Ty::Bool,
             Expr::IsA { .. } => Ty::Bool,
             // `in_table`, casts, `chosen_from`, `evaluate`, static
@@ -623,6 +687,41 @@ impl<'a> TypeChecker<'a> {
                 ..
             } => {
                 let object_ty = self.infer(object);
+                if let Ty::List(element) = &object_ty
+                    && matches!(
+                        name.as_str(),
+                        "min"
+                            | "max"
+                            | "min_index"
+                            | "max_index"
+                            | "has"
+                            | "count"
+                            | "all"
+                            | "all_indices"
+                    )
+                {
+                    self.push_scope();
+                    self.bind_local("it", element.as_ref().clone());
+                    for arg in args {
+                        let argument_ty = self.infer(arg);
+                        if matches!(name.as_str(), "has" | "count" | "all" | "all_indices") {
+                            self.check_assignable(
+                                &argument_ty,
+                                &Ty::Bool,
+                                arg.span(),
+                                "list predicate",
+                            );
+                        }
+                    }
+                    self.pop_scope();
+                    return match name.as_str() {
+                        "min_index" | "max_index" | "count" => Ty::Int,
+                        "has" => Ty::Bool,
+                        "all_indices" => Ty::List(Box::new(Ty::Int)),
+                        "all" => object_ty,
+                        _ => element.as_ref().clone(),
+                    };
+                }
                 for arg in args {
                     self.infer(arg);
                 }
@@ -728,7 +827,9 @@ impl<'a> TypeChecker<'a> {
                         ));
                     }
                 }
-                if matches!(lhs_ty, Ty::Real) || matches!(rhs_ty, Ty::Real) {
+                if lhs_ty == Ty::Unknown || rhs_ty == Ty::Unknown {
+                    Ty::Unknown
+                } else if matches!(lhs_ty, Ty::Real) || matches!(rhs_ty, Ty::Real) {
                     Ty::Real
                 } else {
                     Ty::Int
@@ -777,7 +878,9 @@ impl<'a> TypeChecker<'a> {
                         ));
                     }
                 }
-                if matches!(lhs_ty, Ty::Real) || matches!(rhs_ty, Ty::Real) {
+                if lhs_ty == Ty::Unknown || rhs_ty == Ty::Unknown {
+                    Ty::Unknown
+                } else if matches!(lhs_ty, Ty::Real) || matches!(rhs_ty, Ty::Real) {
                     Ty::Real
                 } else {
                     Ty::Int
@@ -840,7 +943,9 @@ impl<'a> TypeChecker<'a> {
                         span,
                     ));
                 }
-                if matches!(inner, Ty::Real) {
+                if inner == Ty::Unknown {
+                    Ty::Unknown
+                } else if matches!(inner, Ty::Real) {
                     Ty::Real
                 } else {
                     Ty::Int
@@ -854,7 +959,11 @@ impl<'a> TypeChecker<'a> {
                         span,
                     ));
                 }
-                Ty::Int
+                if inner == Ty::Unknown {
+                    Ty::Unknown
+                } else {
+                    Ty::Int
+                }
             }
         }
     }
@@ -890,6 +999,7 @@ pub fn check_types(elaborated: &Elaborated) -> Vec<Diagnostic> {
     let mut checker = TypeChecker::new(&elaborated.types);
     for t in &elaborated.types {
         checker.me_type = Some(&t.name);
+        checker.return_ty = None;
         check_field_inits(&mut checker, &t.fields);
         for constraint in &t.constraints {
             checker.infer(&constraint.expr);
@@ -920,7 +1030,18 @@ pub fn check_types(elaborated: &Elaborated) -> Vec<Diagnostic> {
         }
         for method in &t.methods {
             checker.return_ty = method.return_type.as_ref();
+            checker.push_scope();
+            for parameter in &method.params {
+                let ty = parameter
+                    .ty
+                    .as_ref()
+                    .map(|ty| checker.type_of(ty))
+                    .unwrap_or(Ty::Unknown);
+                checker.bind_local(&parameter.name, ty);
+            }
             checker.check_body(&method.body);
+            checker.pop_scope();
+            checker.return_ty = None;
         }
     }
     checker.diagnostics

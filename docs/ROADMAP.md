@@ -226,8 +226,14 @@ not imply full language support or IEEE conformance.
       coverage items, including synthesized when views. E0220–E0223
       report definite incompatible values, missing members, non-list
       indexing and invalid operands; unknown types stay silent.
-      Coverage options remain unchecked raw tokens; general type
-      inference and full name resolution are still missing
+      Declared parameters bind within each method; local `var x := e`
+      declarations propagate known initializer kinds, homogeneous list
+      element kinds and equal-kind conditional branches (clause 18).
+      Scalar/list aliases resolve with bounded recursion. Unknown or
+      ambiguous kinds and custom numeric dispatch remain conservative;
+      there is no flow-sensitive or interprocedural inference. Coverage
+      options remain unchecked raw tokens and full name resolution is
+      still missing
 - [ ] Differential corpus against an authorized reference simulator where
       available (started: Specman reference runs via EDA Playground are
       recorded in docs/VERIFICATION.md; no automated differential harness yet)
@@ -305,10 +311,13 @@ not imply full language support or IEEE conformance.
       `push`/`push0`/`add`/`add0`/`pop`/`pop0`/`insert`/`delete`/
       `fast_delete`/`clear`, the no-argument general forms
       `size`/`is_empty`/`exists`/`copy`/`reverse`/`top`/`top0`, the
-      no-argument `min`/`max`/`min_index`/`max_index` extremes, the
+      `min`/`max`/`min_index`/`max_index` extremes with optional per-item
+      key expressions, the
       no-argument `sum`/`product`/`and_all`/`or_all` aggregates with
       their stated empty-list results, and `is_a_permutation`; the
-      expression-taking forms are documented gaps reporting `E0405`),
+      numeric expression aggregates and the predicate queries `has`,
+      `count`, `all` and `all_indices`; other expression-taking forms
+      remain documented gaps reporting `E0405`),
       struct instances, sequence `do` (generates the item in place; the
       `keeping` block is not enforced), and `gen`. The optional `do`
       sugar on `if`/`while` — including the one-statement
@@ -389,9 +398,15 @@ not imply full language support or IEEE conformance.
       sets, and `as_a` to an enumeral type maps the integer index to
       the enumerand (5.10.2). The clause 27 list pseudo-methods run the
       no-expression subset on list values (the 27.3 modifiers, the
-      no-argument general forms, extremes and aggregates — the
-      expression-taking forms, `resize`, the 27.6 CRC family and 27.7
-      keyed lists are documented gaps in `src/interp.rs`). Set literals
+      no-argument general forms and aggregates, numeric expression
+      aggregates, and extrema with optional key expressions bound to
+      `it`. Keyed extrema select the original item/index, prefer the
+      latest tied item and snapshot traversal; implicit index bindings
+      remain unsupported. `has`/`count`/`all`/`all_indices` accept one
+      boolean expression bound to `it`, preserve order and return fresh
+      filtered/index lists; implicit index bindings are not modeled.
+      Other expression-taking forms, `resize`, the 27.6 CRC family and
+      27.7 keyed lists are documented gaps in `src/interp.rs`). Set literals
       in expressions, range
       modifiers on declared types (so `full_set_of_values` can
       differ), and bare scalar keywords as type arguments

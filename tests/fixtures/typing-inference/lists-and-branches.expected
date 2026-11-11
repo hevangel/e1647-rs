@@ -1,0 +1,5 @@
+4:27: error[E0220]: variable initialization: a value of kind 'string' cannot be stored into 'int'
+6:17: error[E0220]: assignment: a value of kind 'int' cannot be stored into 'string'
+8:18: error[E0220]: assignment: a value of kind 'list of string' cannot be stored into 'list of int'
+9:29: error[E0223]: the right operand of the arithmetic operator is 'string' — a number is required
+10:35: error[E0223]: the right operand of the arithmetic operator is 'string' — a number is required

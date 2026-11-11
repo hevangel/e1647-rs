@@ -18,6 +18,52 @@ fn coverage_type_fixture_diagnostics_match_expected() {
     check_fixture_directory("fixtures/typing-coverage");
 }
 
+#[test]
+fn inferred_local_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures/typing-inference");
+}
+
+#[test]
+fn inferred_locals_are_checked_by_the_cli_and_valid_programs_execute() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typing-inference");
+    for command in ["elab", "run"] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+            .arg(command)
+            .arg(directory.join("locals.e"))
+            .output()
+            .expect("CLI starts");
+        assert!(
+            !result.status.success(),
+            "{command} accepted definite mismatches"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("error[E0220]: assignment"));
+    }
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+        .arg("run")
+        .arg(directory.join("runtime.e"))
+        .output()
+        .expect("CLI starts");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        fs::read_to_string(directory.join("runtime.out")).unwrap()
+    );
+}
+
+#[test]
+fn list_extrema_type_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures/typing-list-extrema");
+}
+
+#[test]
+fn list_query_type_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures/typing-list-queries");
+}
+
 fn check_fixture_directory(directory: &str) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
