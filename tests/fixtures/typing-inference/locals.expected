@@ -1,0 +1,5 @@
+8:13: error[E0220]: assignment: a value of kind 'string' cannot be stored into 'int'
+10:14: error[E0220]: argument: a value of kind 'string' cannot be stored into 'int'
+12:27: error[E0220]: variable initialization: a value of kind 'string' cannot be stored into 'int'
+14:9: error[E0221]: 'box_s' has no field or method 'absent'
+15:9: error[E0222]: indexing a value of kind 'int' — only a list is indexable

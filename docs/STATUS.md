@@ -31,6 +31,11 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   receiver does not have (E0221), indexing a non-list (E0222), an
   operator on incompatible operand kinds (E0223) — anything uncertain
   stays silent.
+  Declared method parameters bind within their method, and type-inferring
+  local declarations retain known initializer kinds (clause 18),
+  including homogeneous list literals and equal-kind ternary branches.
+  Scalar/list aliases resolve with a recursion bound; custom numeric
+  dispatch stays outside the conservative lattice.
 - **Execution.** `e1647 run` executes the built-in `sys` unit through
   the Table 1 phases — `setup`, generation (with `pre_generate`/
   `post_generate` and the `connect_pointers`/`connect_ports`/
@@ -79,7 +84,7 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
 | Annotations: `annotation @name`, attachments | 35 | recorded metadata, no semantic effect |
 | `semaphore` / `rdv_semaphore` / `locker`, the resource-sharing TCMs | 33 | blocking `up()`/`down()`/`lock()` park on a FIFO wake pass; `try_up()`/`try_down()` never switch; `set_value`/`set_max_value` rules enforced |
 | Reflection catalogue + `instance_iterator` | 32.1–32.2 | catalogue in [REFLECTION_2019.md](REFLECTION_2019.md); the base iterator walks the instance tree |
-| Set/list pseudo-method subsets, `set_of_values` | 28.5, 27 | the expression-taking forms are the documented gaps |
+| Set/list pseudo-method subsets, `set_of_values` | 28.5, 27 | numeric expression aggregates, keyed `min`/`max`/`min_index`/`max_index`, and `has`/`count`/`all`/`all_indices` predicates run; other expression-taking forms remain gaps |
 | Simulator side | 23 | `rise/fall/change(HDL expression) @sim` events and `hdl_path()`-bound event ports sample each virtual cycle (a live xezim session, or an injected history); TCMs declared `@event` commence on the event |
 
 Recognised-but-unimplemented 2019 library names (the full list sits in
@@ -110,8 +115,9 @@ reading, nothing else.
 - A full type system (the [`typing`] conservative pass reports definite
   mismatches across method bodies, field init values, `keep`
   constraints, `on` bodies, coverage items and the synthesized `when`
-  views; there is no general type inference across untyped variables, no
-  name-resolution pass beyond it, and coverage options recorded as raw
+  views; local declarations propagate known initializer kinds, but
+  ambiguous kinds stay unknown and there is no interprocedural type
+  inference or full name-resolution pass. Coverage options recorded as raw
   tokens are not checked).
 - General temporal sampling remains incomplete. Temporal
   `change/rise/fall` now retain Boolean/integer/enumeral samples (numeric

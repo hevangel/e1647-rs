@@ -21,15 +21,24 @@
 > `chosen_from`, custom numeric types, tables, annotations, the clause
 > 33 resource-sharing structs (`semaphore`/`rdv_semaphore`/`locker`),
 > and the reflection catalogue with `instance_iterator`. A full type
-> system (a conservative definite-mismatch check includes coverage items),
-> event-specific temporal timelines, general constraint solving and general testbench
-> execution do **not** exist yet, and no
+> system (a conservative definite-mismatch check includes coverage items,
+> typed parameters and inferred locals),
+> full temporal value history, general constraint solving and general
+> testbench execution do **not** exist yet, and no
 > IEEE conformance is claimed.
 
 Temporal rules and waits retain sampled proposition and repeat-bound
 values, so later state matching uses the recorded values. Temporal
 `change`/`rise`/`fall` also sample Boolean, integer and enumeral
 expressions; general event-specific timelines remain incomplete.
+
+List extrema `min`, `max`, `min_index` and `max_index` accept an optional
+per-item key expression such as `it.score`. They return the selected
+original item or its index; the latest item wins a tie.
+
+List queries `has`, `count`, `all` and `all_indices` accept one boolean
+expression with `it` bound to each item. Filtering preserves order and
+returns a fresh list; implicit index bindings remain unsupported.
 
 ## From Slopman to Rustman
 
