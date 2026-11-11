@@ -624,18 +624,38 @@ impl<'a> TypeChecker<'a> {
             } => {
                 let object_ty = self.infer(object);
                 if let Ty::List(element) = &object_ty
-                    && matches!(name.as_str(), "min" | "max" | "min_index" | "max_index")
+                    && matches!(
+                        name.as_str(),
+                        "min"
+                            | "max"
+                            | "min_index"
+                            | "max_index"
+                            | "has"
+                            | "count"
+                            | "all"
+                            | "all_indices"
+                    )
                 {
                     self.push_scope();
                     self.bind_local("it", element.as_ref().clone());
                     for arg in args {
-                        self.infer(arg);
+                        let argument_ty = self.infer(arg);
+                        if matches!(name.as_str(), "has" | "count" | "all" | "all_indices") {
+                            self.check_assignable(
+                                &argument_ty,
+                                &Ty::Bool,
+                                arg.span(),
+                                "list predicate",
+                            );
+                        }
                     }
                     self.pop_scope();
-                    return if name.ends_with("_index") {
-                        Ty::Int
-                    } else {
-                        element.as_ref().clone()
+                    return match name.as_str() {
+                        "min_index" | "max_index" | "count" => Ty::Int,
+                        "has" => Ty::Bool,
+                        "all_indices" => Ty::List(Box::new(Ty::Int)),
+                        "all" => object_ty,
+                        _ => element.as_ref().clone(),
                     };
                 }
                 for arg in args {

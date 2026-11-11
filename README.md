@@ -30,6 +30,10 @@ List extrema `min`, `max`, `min_index` and `max_index` accept an optional
 per-item key expression such as `it.score`. They return the selected
 original item or its index; the latest item wins a tie.
 
+List queries `has`, `count`, `all` and `all_indices` accept one boolean
+expression with `it` bound to each item. Filtering preserves order and
+returns a fresh list; implicit index bindings remain unsupported.
+
 ## From Slopman to Rustman
 
 In keeping with this repository's policy of honest staged claims, the

@@ -309,8 +309,9 @@ not imply full language support or IEEE conformance.
       key expressions, the
       no-argument `sum`/`product`/`and_all`/`or_all` aggregates with
       their stated empty-list results, and `is_a_permutation`; the
-      numeric expression aggregates; other expression-taking forms
-      remain documented gaps),
+      numeric expression aggregates and the predicate queries `has`,
+      `count`, `all` and `all_indices`; other expression-taking forms
+      remain documented gaps reporting `E0405`),
       struct instances, sequence `do` (generates the item in place; the
       `keeping` block is not enforced), and `gen`. The optional `do`
       sugar on `if`/`while` — including the one-statement
@@ -391,9 +392,11 @@ not imply full language support or IEEE conformance.
       aggregates, and extrema with optional key expressions bound to
       `it`. Keyed extrema select the original item/index, prefer the
       latest tied item and snapshot traversal; implicit index bindings
-      remain unsupported. Other expression-taking forms, `resize`, the
-      27.6 CRC family and 27.7
-      keyed lists are documented gaps in `src/interp.rs`). Set literals
+      remain unsupported. `has`/`count`/`all`/`all_indices` accept one
+      boolean expression bound to `it`, preserve order and return fresh
+      filtered/index lists; implicit index bindings are not modeled.
+      Other expression-taking forms, `resize`, the 27.6 CRC family and
+      27.7 keyed lists are documented gaps in `src/interp.rs`). Set literals
       in expressions, range
       modifiers on declared types (so `full_set_of_values` can
       differ), and bare scalar keywords as type arguments

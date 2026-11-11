@@ -79,7 +79,7 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
 | Annotations: `annotation @name`, attachments | 35 | recorded metadata, no semantic effect |
 | `semaphore` / `rdv_semaphore` / `locker`, the resource-sharing TCMs | 33 | blocking `up()`/`down()`/`lock()` park on a FIFO wake pass; `try_up()`/`try_down()` never switch; `set_value`/`set_max_value` rules enforced |
 | Reflection catalogue + `instance_iterator` | 32.1–32.2 | catalogue in [REFLECTION_2019.md](REFLECTION_2019.md); the base iterator walks the instance tree |
-| Set/list pseudo-method subsets, `set_of_values` | 28.5, 27 | numeric expression aggregates and keyed `min`/`max`/`min_index`/`max_index` run; other expression-taking forms remain gaps |
+| Set/list pseudo-method subsets, `set_of_values` | 28.5, 27 | numeric expression aggregates, keyed `min`/`max`/`min_index`/`max_index`, and `has`/`count`/`all`/`all_indices` predicates run; other expression-taking forms remain gaps |
 | Simulator side | 23 | `rise/fall/change(HDL expression) @sim` events and `hdl_path()`-bound event ports sample each virtual cycle (a live xezim session, or an injected history); TCMs declared `@event` commence on the event |
 
 Recognised-but-unimplemented 2019 library names (the full list sits in

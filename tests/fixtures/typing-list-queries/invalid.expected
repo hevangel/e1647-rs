@@ -1,0 +1,4 @@
+8:16: error[E0220]: list predicate: a value of kind 'int' cannot be stored into 'bool'
+9:18: error[E0223]: the right operand of the arithmetic operator is 'string' — a number is required
+10:21: error[E0221]: 'item_s' has no field or method 'absent'
+11:29: error[E0220]: variable initialization: a value of kind 'int' cannot be stored into 'string'

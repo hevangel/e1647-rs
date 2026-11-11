@@ -151,8 +151,7 @@
 //! semantics take a per-item expression argument cannot pass through the
 //! v1 dispatch (it evaluates arguments to values only), so they report
 //! `E0405` "list method ... is not supported": `apply` (27.4.2),
-//! `sort`/`sort_by_field` (27.4.23/27.4.24), `all`/`all_indices`
-//! (27.4.29/27.4.30), `has` (27.4.10), `count` (27.4.4), `first`/`last`
+//! `sort`/`sort_by_field` (27.4.23/27.4.24), `first`/`last`
 //! (27.4.6/27.4.13), `first_index`/`last_index` (27.4.7/27.4.14),
 //! `all_different` (27.4.1), `unique` (27.4.28), `split` (27.4.25), the
 //! expression forms of the boolean 27.5 aggregates
@@ -166,7 +165,12 @@
 //! evaluated with `it` bound to each item. They select the original
 //! item/index, with the latest tie winning; numeric and string keys
 //! follow the runtime's relational ordering. Traversal snapshots the
-//! receiver; implicit index bindings remain unsupported. Also not
+//! receiver; implicit index bindings remain unsupported. `has`, `count`,
+//! `all` and `all_indices` evaluate one boolean expression per item with
+//! a scoped `it` binding (27.4.10/4/29/30). `has` stops at the first
+//! match; the others preserve order. Their receiver is snapshotted before
+//! evaluation, so mutation during a predicate does not change traversal.
+//! Implicit index bindings are not modeled. Also not
 //! modeled: `resize` (27.3.16 — the
 //! `filler`/`keep_old` parameters are expressions and new items need the
 //! element type's default value), `get_indices` (27.4.9 — the prose does
@@ -506,10 +510,20 @@ impl ObjectInstance {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 struct Frame {
     locals: std::collections::HashMap<String, Value>,
     local_types: std::collections::HashMap<String, TypeExpr>,
+}
+
+#[derive(Debug, Clone)]
+struct StatementCall {
+    receiver: usize,
+    name: String,
+    args: Vec<Value>,
+    block: usize,
+    frame: Frame,
+    span: crate::ast::Span,
 }
 
 enum Flow {
@@ -545,6 +559,9 @@ enum Flow {
 /// the conservative run-to-completion model.
 #[derive(Debug, Clone)]
 enum Child {
+    /// A statement-position call, with its own locals and once-evaluated
+    /// receiver/arguments. Further path levels descend into its body.
+    Call(Box<StatementCall>),
     /// A `while` body mid-iteration — the condition is re-checked only
     /// when the iteration completes.
     WhileBody,
@@ -2319,6 +2336,9 @@ impl<'a> Interp<'a> {
             ));
         }
         match (statement, child) {
+            (Stmt::Compute { .. } | Stmt::ExprStmt { .. }, Child::Call(call)) => {
+                self.exec_statement_call(call.as_ref().clone(), frame, Some(rest))
+            }
             (Stmt::While { cond, body, .. }, Child::WhileBody) => {
                 let first_flow = self.exec_block_resumable(body, frame, me, rest)?;
                 self.while_loop(cond, body, frame, me, first_flow)
@@ -2722,6 +2742,9 @@ impl<'a> Interp<'a> {
                 if let Some(flow) = self.sync_statement_call(expr, frame, me)? {
                     return Ok(flow);
                 }
+                if let Some(flow) = self.declared_statement_call(expr, frame, me)? {
+                    return Ok(flow);
+                }
                 self.eval(expr, frame, me)?;
                 Ok(Flow::Normal)
             }
@@ -3119,6 +3142,9 @@ impl<'a> Interp<'a> {
                                 *span,
                             ));
                         };
+                        if self.suspend_eligible() {
+                            return self.begin_statement_call(index, name, values, *span, frame);
+                        }
                         self.call_method(index, name, values, *span)?;
                     }
                     Expr::MemberAccess { object, name, .. } => {
@@ -3126,6 +3152,9 @@ impl<'a> Interp<'a> {
                         let Value::Object(index) = object_value else {
                             return Err(self.error("E0402", "compute requires an object", *span));
                         };
+                        if self.suspend_eligible() {
+                            return self.begin_statement_call(index, name, values, *span, frame);
+                        }
                         self.call_method(index, name, values, *span)?;
                     }
                     // See `start`: a static method is not a TCM.
@@ -5210,6 +5239,270 @@ impl<'a> Interp<'a> {
     ) -> Result<Vec<&MethodDecl>, Diagnostic> {
         let type_name = self.instances[object_index].type_name.clone();
         resolve_method_blocks(self.types, &type_name, name, span)
+    }
+
+    fn peek_statement_receiver(
+        &self,
+        expr: &Expr,
+        frame: &Frame,
+        me: Option<usize>,
+    ) -> Option<usize> {
+        match expr {
+            Expr::Ident { name, .. } if name == "me" || name == "self" => me,
+            Expr::Ident { name, .. } => match frame
+                .locals
+                .get(name)
+                .or_else(|| me.and_then(|index| self.instances[index].get(name)))
+            {
+                Some(Value::Object(index)) => Some(*index),
+                _ => None,
+            },
+            Expr::MemberAccess { object, name, .. } => {
+                let index = self.peek_statement_receiver(object, frame, me)?;
+                match self.instances[index].get(name) {
+                    Some(Value::Object(index)) => Some(*index),
+                    _ => None,
+                }
+            }
+            Expr::Paren { expr, .. } => self.peek_statement_receiver(expr, frame, me),
+            _ => None,
+        }
+    }
+
+    fn statement_type_name(ty: &TypeExpr) -> Option<String> {
+        match ty {
+            TypeExpr::Named { name, .. } => Some(name.clone()),
+            TypeExpr::WhenQualified { value, base, .. } => when_view_name(value, base),
+            TypeExpr::TemplateRef { name, args, .. } => {
+                Some(crate::ast::template_instance_name(name, args))
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve receiver kinds without evaluating a receiver or argument.
+    /// The later call preparation evaluates each expression exactly once.
+    fn statement_receiver_type(
+        &self,
+        expr: &Expr,
+        frame: &Frame,
+        me: Option<usize>,
+    ) -> Option<String> {
+        if let Some(index) = self.peek_statement_receiver(expr, frame, me) {
+            return Some(self.instances[index].type_name.clone());
+        }
+        if let Some(ty) = self.static_type_of(expr, frame, me) {
+            return Self::statement_type_name(&ty);
+        }
+        match expr {
+            Expr::Paren { expr, .. } => self.statement_receiver_type(expr, frame, me),
+            Expr::New { ty: Some(ty), .. } | Expr::CastAs { ty, .. } => {
+                Self::statement_type_name(ty)
+            }
+            Expr::Index { base, .. } => match self.static_type_of(base, frame, me)? {
+                TypeExpr::List { element, .. } => Self::statement_type_name(&element),
+                _ => None,
+            },
+            Expr::Call { callee, .. } => {
+                let (owner, name) = match callee.as_ref() {
+                    Expr::Ident { name, .. } => (self.instances[me?].type_name.clone(), name),
+                    Expr::MemberAccess { object, name, .. } => {
+                        (self.statement_receiver_type(object, frame, me)?, name)
+                    }
+                    _ => return None,
+                };
+                let method = self
+                    .types
+                    .iter()
+                    .find(|ty| ty.name == owner)?
+                    .methods
+                    .iter()
+                    .find(|method| method.name == *name)?;
+                Self::statement_type_name(method.return_type.as_ref()?)
+            }
+            _ => None,
+        }
+    }
+
+    /// A whole call used as a statement can carry a suspension without
+    /// an expression-value continuation. Builtins and unresolved value
+    /// receivers keep their ordinary expression dispatch.
+    fn declared_statement_call(
+        &mut self,
+        expr: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Option<Flow>, Diagnostic> {
+        if !self.suspend_eligible() {
+            return Ok(None);
+        }
+        let Expr::Call { callee, args, span } = expr else {
+            return Ok(None);
+        };
+        let (type_name, name) = match callee.as_ref() {
+            Expr::Ident { name, .. } if !crate::builtins::is_builtin_routine(name) => {
+                let Some(index) = me else {
+                    return Ok(None);
+                };
+                (self.instances[index].type_name.clone(), name)
+            }
+            Expr::MemberAccess { object, name, .. } => {
+                let Some(type_name) = self.statement_receiver_type(object, frame, me) else {
+                    return Ok(None);
+                };
+                (type_name, name)
+            }
+            _ => return Ok(None),
+        };
+        if !self.types.iter().any(|ty| {
+            ty.name == type_name
+                && ty.methods.iter().any(|method| {
+                    method.name == *name && !method.is_static && method.tcm_event.is_some()
+                })
+        }) {
+            return Ok(None);
+        }
+        let hints = self.call_arg_hints(callee, args.len(), frame, me);
+        let mut values = Vec::with_capacity(args.len());
+        for (index, arg) in args.iter().enumerate() {
+            values.push(self.eval_with_hint(
+                hints.get(index).cloned().flatten(),
+                arg,
+                frame,
+                me,
+            )?);
+        }
+        let receiver = match callee.as_ref() {
+            Expr::Ident { .. } => me.expect("enclosing instance was checked"),
+            Expr::MemberAccess { object, .. } => match self.eval(object, frame, me)? {
+                Value::Object(index) => index,
+                _ => return Err(self.error("E0402", "method call requires an object", *span)),
+            },
+            _ => unreachable!("callee shape was checked"),
+        };
+        self.begin_statement_call(receiver, name, values, *span, frame)
+            .map(Some)
+    }
+
+    fn begin_statement_call(
+        &mut self,
+        receiver: usize,
+        name: &str,
+        args: Vec<Value>,
+        span: crate::ast::Span,
+        caller: &Frame,
+    ) -> Result<Flow, Diagnostic> {
+        let declared = self
+            .resolve_method(receiver, name, span)
+            .is_ok_and(|blocks| blocks.iter().any(|block| !block.is_static));
+        if !declared {
+            self.call_method(receiver, name, args, span)?;
+            return Ok(Flow::Normal);
+        }
+        self.exec_statement_call(
+            StatementCall {
+                receiver,
+                name: name.to_owned(),
+                args,
+                block: 0,
+                frame: Frame::default(),
+                span,
+            },
+            caller,
+            None,
+        )
+    }
+
+    /// Carry one method call through all its composed blocks. The path
+    /// stores each callee's locals at its call boundary; the scheduler's
+    /// outer frame always remains the caller's frame.
+    fn exec_statement_call(
+        &mut self,
+        mut call: StatementCall,
+        caller: &Frame,
+        mut resume: Option<&[PathLevel]>,
+    ) -> Result<Flow, Diagnostic> {
+        if self.depth > 200 {
+            return Err(self.error("E0406", "recursion too deep", call.span));
+        }
+        self.depth += 1;
+        let result = (|| {
+            let types = self.types;
+            let type_name = self.instances[call.receiver].type_name.clone();
+            let blocks = resolve_method_blocks(types, &type_name, &call.name, call.span)?;
+            let call_level = self.exec_context.len().checked_sub(1).ok_or_else(|| {
+                self.error(
+                    "E0402",
+                    "internal: method continuation without a caller",
+                    call.span,
+                )
+            })?;
+            while call.block < blocks.len() {
+                let block = blocks[call.block];
+                if call.args.len() != block.params.len() {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "method '{}' expects {} argument(s), got {}",
+                            call.name,
+                            block.params.len(),
+                            call.args.len()
+                        ),
+                        call.span,
+                    ));
+                }
+                let mut frame = if resume.is_some() {
+                    call.frame.clone()
+                } else {
+                    let mut frame = Frame::default();
+                    for (param, arg) in block.params.iter().zip(&call.args) {
+                        if let Some(ty) = &param.ty {
+                            frame.local_types.insert(param.name.clone(), ty.clone());
+                        }
+                        let value =
+                            self.bind_slot_value(arg.clone(), param.ty.as_ref(), call.span)?;
+                        frame.locals.insert(param.name.clone(), value);
+                    }
+                    frame
+                };
+                call.frame = frame.clone();
+                self.exec_context[call_level].child = Some(Child::Call(Box::new(call.clone())));
+                let flow = match resume.take() {
+                    Some(path) => self.exec_block_resumable(
+                        &block.body,
+                        &mut frame,
+                        Some(call.receiver),
+                        path,
+                    )?,
+                    None => self.exec_block(&block.body, &mut frame, Some(call.receiver))?,
+                };
+                match flow {
+                    Flow::Suspend => {
+                        let Some(pending) = self.pending_suspension.as_mut() else {
+                            return Err(self.error(
+                                "E0402",
+                                "internal: method suspension without state",
+                                call.span,
+                            ));
+                        };
+                        call.frame = pending.frame.clone();
+                        pending.path[call_level].child = Some(Child::Call(Box::new(call)));
+                        pending.frame = caller.clone();
+                        return Ok(Flow::Suspend);
+                    }
+                    Flow::Stop => {
+                        self.stop_requested = true;
+                        return Ok(Flow::Stop);
+                    }
+                    Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_) => {
+                        call.block += 1;
+                    }
+                }
+            }
+            Ok(Flow::Normal)
+        })();
+        self.depth -= 1;
+        result
     }
 
     fn call_method(
@@ -8591,6 +8884,60 @@ impl<'a> Interp<'a> {
         })
     }
 
+    /// Predicate list queries (27.4.4/10/29/30), with receiver snapshot.
+    fn call_list_query(
+        &mut self,
+        list: &ListValue,
+        name: &str,
+        args: &[Expr],
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<Value, Diagnostic> {
+        let [predicate] = args else {
+            return Err(self.error(
+                "E0402",
+                format!("'{name}' expects one boolean item expression"),
+                span,
+            ));
+        };
+        let items = list.items.borrow().clone();
+        let mut matches = Vec::new();
+        let mut count = 0;
+        for (index, item) in items.into_iter().enumerate() {
+            let Value::Bool(selected) = self.eval_list_item(predicate, &item, frame, me)? else {
+                return Err(self.error(
+                    "E0402",
+                    format!("{name}() expects a boolean item expression"),
+                    predicate.span(),
+                ));
+            };
+            if selected {
+                if name == "has" {
+                    return Ok(Value::Bool(true));
+                }
+                count += 1;
+                match name {
+                    "all" => matches.push(item),
+                    "all_indices" => matches.push(Value::Int(index as i128)),
+                    _ => {}
+                }
+            }
+        }
+        Ok(match name {
+            "has" => Value::Bool(false),
+            "count" => Value::Int(count),
+            _ => Value::List(ListValue {
+                items: Rc::new(RefCell::new(matches)),
+                element: if name == "all_indices" {
+                    Some("uint".to_owned())
+                } else {
+                    list.element.clone()
+                },
+            }),
+        })
+    }
+
     /// The 27.4.17/27.4.20/27.5.4-27.5.6 aggregate pseudo-methods with
     /// a per-item expression: `l.sum(it)`, `l.product(it * it)`,
     /// `l.average(it)`, `l.max_value(it)`, `l.min_value(it)` — and
@@ -10548,6 +10895,15 @@ impl<'a> Interp<'a> {
                 // ordinary value-only argument evaluation. Preserve a
                 // non-list receiver for same-named struct methods.
                 let mut extreme_receiver = None;
+                if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
+                    && matches!(name.as_str(), "has" | "count" | "all" | "all_indices")
+                {
+                    let receiver = self.eval(object, frame, me)?;
+                    if let Value::List(list) = receiver {
+                        return self.call_list_query(&list, name, args, frame, me, *span);
+                    }
+                    extreme_receiver = Some(receiver);
+                }
                 if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
                     && matches!(name.as_str(), "min" | "max" | "min_index" | "max_index")
                 {
