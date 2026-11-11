@@ -3619,6 +3619,11 @@ Verification on this branch, independently based on merged main:
 - `cargo test --test typing` — 5 passed, 0 failed.
 - `git diff --check` — passed.
 
+A checkpoint checkout with Windows `autocrlf` exposed CRLF conversion
+of the runtime `.out` golden file. `.gitattributes` now pins `.out`
+fixtures to LF alongside `.expected`; the full suite passed again
+after the checkout issue was corrected.
+
 No Specman reference runs were performed. This is implementation
 regression evidence, not differential qualification or a full type
 system. Flow-sensitive inference, interprocedural inference, full name
