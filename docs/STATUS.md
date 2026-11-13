@@ -79,6 +79,18 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   zero-goal buckets retain counts without contributing to bucket grades.
   `set_config(cover, at_least, N)` configures the default before sampling.
   Explicit range construction is capped at 65536 buckets per item.
+  Basic-item `ignore`/`illegal` expressions use their item and constants;
+  `instance_ignore`/`instance_illegal` additionally allow `inst` fields in
+  per-unit groups (14.3/14.3.4). Ignored/illegal values add neither hits nor
+  derived samples; wholly excluded buckets leave grade denominators and
+  hole lists. Illegal values produce DUT errors after check hooks, or at
+  observation when `check_illegal_immediately` is TRUE (29.9). Ignore wins
+  overlapping matches; that policy and exact reporting phase are unqualified.
+  Integral/Boolean bucket masks classify comparisons/membership/Boolean
+  compositions symbolically, or enumerate at most 65536 candidate visits
+  per item refresh for other pure expressions. Wider arithmetic reports
+  E0402. Real/string unbucketed items only filter observed values.
+  Derived-item filters and full option type checking remain gaps.
   Real/enumeral ranges, general constant-name resolution and item-domain
   width proofs remain unfinished.
 

@@ -66,6 +66,16 @@ Run the independently authored example with
 `cargo run -- run examples/coverage_config.e --seed 1 --coverage`.
 The range example is `examples/coverage_ranges.e`.
 
+Basic items accept `ignore` and `illegal` Boolean predicates over their own
+value and constants. Per-unit `instance_ignore` and `instance_illegal`
+also bind `inst` to the containing unit. Excluded observations do not add
+hits or derived combinations; wholly excluded buckets leave grades and
+holes. Illegal observations add DUT errors after check hooks by default;
+`set_config(cover, check_illegal_immediately, TRUE)` reports them at sampling.
+The example is `examples/coverage_effects.e`. Simultaneous ignore/illegal
+matches currently prefer ignore; this policy and deferred phase ordering
+have not been compared against Specman. Derived-item filters remain gaps.
+
 Coverage groups can use `per_unit_instance` (or
 `per_unit_instance = unit_type`) to keep separate counts for containing
 units. Group/basic-item `when` expressions filter sampling; per-unit

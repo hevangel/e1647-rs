@@ -274,7 +274,28 @@ browser sandbox API is not started.
   unit. Crosses require current-round source values, and transitions keep
   previous sampled values separately. The returned report view removes
   hidden items/groups and per-unit schema placeholders. Full option type
-  checking and the remaining ignore/illegal/radix semantics are unfinished.
+  checking, derived-item ignore/illegal filters and radix remain unfinished.
+  Basic-item ignore/illegal predicates run in fresh frames with only their
+  item, constants, and (for instance variants) the associated `inst`. Calls
+  and owner/local access are rejected with E0224. Non-Boolean results and
+  unsupported wide classification report E0402. Comparisons, membership
+  and logical compositions classify integral/Boolean intervals exactly;
+  other pure shapes enumerate with a shared 65536-candidate budget per item
+  refresh. Short circuit domains prevent evaluating guarded arithmetic on
+  excluded values. Masks commit atomically per group and refresh at sampling,
+  grade computation and final reporting. Partial buckets remain gradeable;
+  fully ignored/illegal buckets leave the denominator and report view.
+  Legal observations retain their original counts; ignored/illegal observations
+  are never recorded. Derived keys retain bucket indices separately from
+  display names, enabling current masks to filter historical combinations
+  and recompute possible-combination totals. Restoring masks reveals earlier
+  legal history. Unbucketed real/string items filter actual observations only.
+  Illegal observations queue DUT errors until after check hooks, with a final
+  flush after finalize/stop; check_illegal_immediately reports at observation.
+  Ignore takes precedence over illegal on overlap. This precedence, mutable
+  masks and exact reporting-phase placement are not reference-qualified.
+  Predicate arithmetic uses the interpreter's current scalar model; complete
+  typed-domain and precision proofs remain future work.
   Integral `range(...)` construction parses positional name/width/goal
   parameters, subdivides inclusive bounds and uses stable automatic bucket
   labels. Range-local goal metadata preserves precedence over item/group/
@@ -442,7 +463,7 @@ group grade; the group/item `no_collect`/`instance_no_collect`
 options, the cross/transition `name` option and the group-level
 `at_least`/`weight` apply; per-unit scoping, `instance_no_collect` with
 `inst` and group/basic-item `when` filters run. Full option type checking,
-instance ignore/illegal, real/enumeral ranges and general constant/type
+derived-item ignore/illegal, real/enumeral ranges and general constant/type
 resolution, radix/never and
 derived-item filter semantics remain unmodeled.
 The coverage subset of `set_config()` is wired; other categories,

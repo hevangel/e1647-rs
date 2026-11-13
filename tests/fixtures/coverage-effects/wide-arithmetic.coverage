@@ -1,0 +1,3 @@
+sys.cg samples=0 grade=0.000
+n buckets=1 grade=0.000 samples=0
+0..100000 [0..100000] goal=1 hits=0

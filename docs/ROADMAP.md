@@ -116,7 +116,7 @@ not imply full language support or IEEE conformance.
       through the builder API (`max_int_buckets`, the coverage mode);
       runtime configuration enables collection. Per-unit-instance
       groups and group/basic-item `when` filters run; full option type
-      checking and the remaining range/ignore/illegal/radix semantics
+      checking, real/enumeral ranges, derived-item ignore/illegal filters and radix
       remain unfinished.
       Predefined non-scalar types `file` and `event` are accepted in
       type positions; `for each <type> (v) in list` records the element
@@ -190,10 +190,11 @@ not imply full language support or IEEE conformance.
       category validation — computed macros evaluate their restricted
       body subset, see M1), the remaining clause 14
       coverage model —
-      `instance_ignore`/`instance_illegal`, real/enumeral ranges and general constant/type resolution,
+      real/enumeral ranges and general constant/type resolution,
       `radix`/`never` and derived-item filters; full option type checking;
       runtime configuration categories/options
-      beyond coverage mode, `max_int_buckets` and `at_least`, and `set_config_max()` —
+      beyond coverage mode, `max_int_buckets`, `at_least` and
+      `check_illegal_immediately`, and `set_config_max()` —
       the clause 12/13 temporal
       engine's remaining simulation integration — the scheduler runs
       started TCMs concurrently and waits/sync suspend, `@`-triggered
@@ -394,14 +395,18 @@ not imply full language support or IEEE conformance.
       `per_unit_instance [= unit_type]` and `instance_no_collect` with
       `inst` collect and present per-unit data (14.2.2/14.3.4); structural
       option/scope errors are E0224. Other runtime configuration
-      categories/options, `set_config_max`, instance ignore/illegal,
+      categories/options, `set_config_max`, derived-item ignore/illegal filters,
       real/enumeral ranges, general constant/type resolution, radix/filter semantics and full option type checking
       remain gaps. Integral range widths and per-range goals run with
       range/item/group/global precedence; zero-goal buckets are ungraded
       and do not show holes. Explicit construction is capped at 65536
       buckets per item; checked i128 arithmetic diagnoses unsupported or
       overflowing parameters (E0224). Global at_least changes are allowed
-      before sampling and report E0402 afterwards
+      before sampling and report E0402 afterwards. Basic-item ignore/illegal
+      and per-unit instance variants exclude observations and whole buckets;
+      illegal values produce immediate or deferred DUT errors. Interval masks
+      and bounded arithmetic classification preserve derived bucket identity.
+      Exact overlap/phase behavior still needs reference qualification
 - [~] Part 2 predefined routine library — started with the reflection
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`
       (5.10.5/5.10.6 — the argument parses as a type) build the
