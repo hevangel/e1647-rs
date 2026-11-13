@@ -1,1 +1,1 @@
-4:24: error[E0224]: per_unit_instance cannot change after instance_no_collect (14.2.2)
+4:24: error[E0224]: per_unit_instance cannot change after instance coverage options (14.2.2)

@@ -1,0 +1,3 @@
+dut_error: illegal derived coverage value (n=TRUE, m=FALSE) in 'filter_u.cg.cross_n__m@sys.b'
+dut_error: illegal derived coverage value (n=TRUE, m=TRUE) in 'filter_u.cg.cross_n__m@sys.b'
+Checking is complete - 2 DUT error(s).

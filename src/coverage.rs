@@ -21,11 +21,14 @@
 //! Basic-item ignore/illegal predicates exclude observations and wholly
 //! excluded buckets from goals. Instance variants bind the containing unit.
 //! Integral/Boolean masks use interval classification or bounded exact
-//! evaluation. Derived histories retain bucket identities across mask changes.
+//! evaluation. Derived scalar predicates bind participating basic values and
+//! transition prev_<source> snapshots; finite tuple masks use bounded exact
+//! classification. Composite operands remain unsupported. Derived histories
+//! retain bucket identities across mask changes.
 //!
 //! Structural option/scope errors report E0224 after composition. The
 //! interpreter evaluates Boolean filters and per-unit visibility. Full
-//! option type checking, derived-item ignore/illegal filters, radix
+//! option type checking, predicates over composite-valued sources, radix
 //! semantics, real/enumeral ranges and general
 //! constant/type resolution for range parameters,
 //! item `using also` overrides and the wider runtime configuration API
@@ -149,7 +152,44 @@ enum BucketIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum ScalarSample {
+    Int(i128),
+    Bool(bool),
+    Real(u64),
+    Str(String),
+    Enum(String, String),
+}
+
+impl ScalarSample {
+    fn capture(value: &crate::interp::Value) -> Option<Self> {
+        use crate::interp::Value;
+        match value {
+            Value::Int(value) => Some(Self::Int(*value)),
+            Value::Bool(value) => Some(Self::Bool(*value)),
+            Value::Real(value) => Some(Self::Real(value.to_bits())),
+            Value::Str(value) => Some(Self::Str(value.clone())),
+            Value::Enum { type_name, name } => Some(Self::Enum(type_name.clone(), name.clone())),
+            _ => None,
+        }
+    }
+    fn value(&self) -> crate::interp::Value {
+        use crate::interp::Value;
+        match self {
+            Self::Int(value) => Value::Int(*value),
+            Self::Bool(value) => Value::Bool(*value),
+            Self::Real(value) => Value::Real(f64::from_bits(*value)),
+            Self::Str(value) => Value::Str(value.clone()),
+            Self::Enum(type_name, name) => Value::Enum {
+                type_name: type_name.clone(),
+                name: name.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Observation {
+    scalar: Option<ScalarSample>,
     label: String,
     bucket: BucketIdentity,
 }
@@ -191,6 +231,9 @@ pub struct CoverDerivedData {
     pub(crate) kind: CoverItemKind,
     pub(crate) options: ItemOptions,
     pub(crate) collect: bool,
+    /// None preserves the source domain. Some retains these basic-bucket
+    /// tuples; an empty set excludes the entire node, including composites.
+    pub(crate) allowed: Option<BTreeSet<Vec<usize>>>,
     explicit_goal: bool,
     explicit_weight: bool,
     /// Required observations per derived combination; zero is ungraded.
@@ -391,7 +434,14 @@ impl CoverGroupData {
             index.map_or(BucketIdentity::Outside, BucketIdentity::Basic)
         };
         let label = item_label(item, as_int).unwrap_or_else(|| render_value(value));
-        self.remember(item_name, Observation { label, bucket });
+        self.remember(
+            item_name,
+            Observation {
+                scalar: ScalarSample::capture(value),
+                label,
+                bucket,
+            },
+        );
         let item = self
             .items
             .iter_mut()
@@ -437,6 +487,37 @@ impl CoverGroupData {
                 pending.extend(self.transitions_from(&name));
             }
         }
+    }
+
+    /// Scalar inputs to a ready derived observation. Composite inputs are
+    /// omitted; validation admits only constant predicates over those nodes.
+    pub(crate) fn derived_bindings(
+        &self,
+        index: usize,
+    ) -> Option<Vec<(String, crate::interp::Value)>> {
+        let item = self.derived.get(index)?;
+        if self.round_items.contains(&item.name)
+            || !item
+                .sources
+                .iter()
+                .all(|source| self.round_items.contains(source))
+        {
+            return None;
+        }
+        let mut bindings = Vec::new();
+        for source in &item.sources {
+            let current = self.last_values.get(source)?;
+            if let Some(value) = &current.scalar {
+                bindings.push((source.clone(), value.value()));
+            }
+            if item.kind == CoverItemKind::Transition {
+                let previous = self.prior_values.get(source)?;
+                if let Some(value) = &previous.scalar {
+                    bindings.push((format!("prev_{source}"), value.value()));
+                }
+            }
+        }
+        Some(bindings)
     }
 
     pub(crate) fn record_transition(&mut self, index: usize) -> Option<String> {
@@ -491,7 +572,14 @@ impl CoverGroupData {
         };
         let bucket = BucketIdentity::Derived(item.record(labels, buckets));
         let name = item.name.clone();
-        self.remember(&name, Observation { label, bucket });
+        self.remember(
+            &name,
+            Observation {
+                scalar: None,
+                label,
+                bucket,
+            },
+        );
         name
     }
 
@@ -533,20 +621,35 @@ impl CoverGroupData {
                         .try_fold(1u64, |total, source| total.checked_mul(source.total?))
                 }
             });
+            if let Some(allowed) = &item.allowed {
+                item.total_combos = Some(allowed.len() as u64);
+            }
             let mut valid = Vec::new();
             item.samples = 0;
             item.combos.clear();
             for key in &item.keys {
-                let allowed = sources.as_ref().is_some_and(|sources| {
-                    key.buckets.iter().enumerate().all(|(position, bucket)| {
-                        let source = if item.kind == CoverItemKind::Transition {
-                            sources.first()
-                        } else {
-                            sources.get(position)
-                        };
-                        source.is_some_and(|source| source.accepts(bucket))
-                    })
+                let retained = item.allowed.as_ref().is_none_or(|allowed| {
+                    let coordinates: Option<Vec<_>> = key
+                        .buckets
+                        .iter()
+                        .map(|bucket| match bucket {
+                            BucketIdentity::Basic(index) => Some(*index),
+                            _ => None,
+                        })
+                        .collect();
+                    coordinates.is_some_and(|coordinates| allowed.contains(&coordinates))
                 });
+                let allowed = retained
+                    && sources.as_ref().is_some_and(|sources| {
+                        key.buckets.iter().enumerate().all(|(position, bucket)| {
+                            let source = if item.kind == CoverItemKind::Transition {
+                                sources.first()
+                            } else {
+                                sources.get(position)
+                            };
+                            source.is_some_and(|source| source.accepts(bucket))
+                        })
+                    });
                 valid.push(allowed);
                 if allowed {
                     item.samples += key.hits;
@@ -863,6 +966,7 @@ fn build_derived(decl: &CoverGroupDecl, config: &CoverageConfig) -> Vec<CoverDer
             kind: entry.kind,
             options: item_options(entry).unwrap_or_default(),
             collect: true,
+            allowed: None,
             explicit_goal: coverage_goal(&entry.using).ok().flatten().is_some(),
             explicit_weight: coverage_weight(&entry.using).ok().flatten().is_some(),
             goal: coverage_goal(&entry.using)
@@ -1527,7 +1631,7 @@ fn group_options(
                 if scope_frozen && options.unit_scope.as_ref() != Some(&scope) {
                     return Err(option_error(
                         entry,
-                        "per_unit_instance cannot change after instance_no_collect (14.2.2)",
+                        "per_unit_instance cannot change after instance coverage options (14.2.2)",
                     ));
                 }
                 options.unit_scope = Some(scope);
@@ -1543,11 +1647,11 @@ fn group_options(
                 scope_frozen = true;
             }
         }
-        if decl
-            .items
-            .iter()
-            .any(|item| option_value(&item.using, "instance_no_collect").is_some())
-        {
+        if decl.items.iter().any(|item| {
+            ["instance_no_collect", "instance_ignore", "instance_illegal"]
+                .iter()
+                .any(|name| option_value(&item.using, name).is_some())
+        }) {
             scope_frozen = true;
         }
     }
@@ -1721,6 +1825,31 @@ pub(crate) fn validate_types(
                 if let Ok(effect_options) = item_options(item)
                     && let Some((name, _)) = item.names.first()
                 {
+                    let mut inputs = BTreeSet::new();
+                    if item.kind == CoverItemKind::Item {
+                        inputs.insert(name.clone());
+                    } else {
+                        for (source, _) in &item.names {
+                            let basic = ty
+                                .covers
+                                .iter()
+                                .filter(|group| group.name == decl.name)
+                                .flat_map(|group| &group.items)
+                                .any(|candidate| {
+                                    candidate.kind == CoverItemKind::Item
+                                        && candidate
+                                            .names
+                                            .first()
+                                            .is_some_and(|(name, _)| name == source)
+                                });
+                            if basic {
+                                inputs.insert(source.clone());
+                                if item.kind == CoverItemKind::Transition {
+                                    inputs.insert(format!("prev_{source}"));
+                                }
+                            }
+                        }
+                    }
                     for (effect, per_unit) in [
                         (&effect_options.ignore, false),
                         (&effect_options.illegal, false),
@@ -1728,13 +1857,15 @@ pub(crate) fn validate_types(
                         (&effect_options.instance_illegal, true),
                     ] {
                         if let Some(expr) = effect {
-                            if item.kind != CoverItemKind::Item {
-                                diagnostics.push(option_error(&item.using, "derived-item ignore/illegal filters are not implemented (14.3)"));
-                            } else if per_unit && options.unit_scope.is_none() {
+                            if per_unit && options.unit_scope.is_none() {
                                 diagnostics.push(option_error(&item.using, "instance_ignore/instance_illegal require per_unit_instance (14.3.4)"));
-                            } else if let Err(diagnostic) =
-                                validate_effect(expr, name, per_unit, &constants)
-                            {
+                            } else if let Err(diagnostic) = validate_effect(
+                                expr,
+                                &inputs,
+                                item.kind != CoverItemKind::Item,
+                                per_unit,
+                                &constants,
+                            ) {
                                 diagnostics.push(diagnostic);
                             }
                         }
@@ -1778,21 +1909,28 @@ pub(crate) fn for_report(coverage: &[TypeCoverage]) -> Vec<TypeCoverage> {
 
 fn validate_effect(
     expr: &Expr,
-    item: &str,
+    allowed: &BTreeSet<String>,
+    derived: bool,
     per_unit: bool,
     constants: &BTreeSet<String>,
 ) -> Result<(), crate::diagnostic::Diagnostic> {
     let invalid = || {
         crate::diagnostic::Diagnostic::new(
             "E0224",
-            "ignore/illegal predicates require their item, constants and permitted inst fields (14.3)",
+            if derived {
+                "derived coverage predicates require scalar sources, constants and permitted inst fields (14.4-14.5)"
+            } else {
+                "ignore/illegal predicates require their item, constants and permitted inst fields (14.3)"
+            },
             expr.span().0,
             expr.span().1,
         )
     };
     match expr {
         Expr::Ident { name, .. }
-            if name == item || constants.contains(name) || (per_unit && name == "inst") =>
+            if allowed.contains(name)
+                || constants.contains(name)
+                || (per_unit && name == "inst") =>
         {
             Ok(())
         }
@@ -1802,11 +1940,11 @@ fn validate_effect(
         | Expr::StringLiteral { .. }
         | Expr::BoolLiteral { .. } => Ok(()),
         Expr::Paren { expr, .. } | Expr::Unary { expr, .. } => {
-            validate_effect(expr, item, per_unit, constants)
+            validate_effect(expr, allowed, derived, per_unit, constants)
         }
         Expr::Binary { lhs, rhs, .. } => {
-            validate_effect(lhs, item, per_unit, constants)?;
-            validate_effect(rhs, item, per_unit, constants)
+            validate_effect(lhs, allowed, derived, per_unit, constants)?;
+            validate_effect(rhs, allowed, derived, per_unit, constants)
         }
         Expr::Ternary {
             cond,
@@ -1814,27 +1952,27 @@ fn validate_effect(
             else_expr,
             ..
         } => {
-            validate_effect(cond, item, per_unit, constants)?;
-            validate_effect(then_expr, item, per_unit, constants)?;
-            validate_effect(else_expr, item, per_unit, constants)
+            validate_effect(cond, allowed, derived, per_unit, constants)?;
+            validate_effect(then_expr, allowed, derived, per_unit, constants)?;
+            validate_effect(else_expr, allowed, derived, per_unit, constants)
         }
         Expr::MemberAccess { object, .. } if per_unit && inst_path(object) => {
-            validate_effect(object, item, per_unit, constants)
+            validate_effect(object, allowed, derived, per_unit, constants)
         }
         Expr::Index { base, index, .. } if per_unit && inst_path(base) => {
-            validate_effect(base, item, per_unit, constants)?;
-            validate_effect(index, item, per_unit, constants)
+            validate_effect(base, allowed, derived, per_unit, constants)?;
+            validate_effect(index, allowed, derived, per_unit, constants)
         }
         Expr::ListConcat { items, .. } => {
             for expr in items {
-                validate_effect(expr, item, per_unit, constants)?;
+                validate_effect(expr, allowed, derived, per_unit, constants)?;
             }
             Ok(())
         }
         Expr::InSet { element, set, .. } => {
-            validate_effect(element, item, per_unit, constants)?;
+            validate_effect(element, allowed, derived, per_unit, constants)?;
             for expr in inset_expressions(set) {
-                validate_effect(expr, item, per_unit, constants)?;
+                validate_effect(expr, allowed, derived, per_unit, constants)?;
             }
             Ok(())
         }
@@ -1860,7 +1998,7 @@ fn inset_expressions(set: &crate::ast::InSetExpr) -> Vec<&Expr> {
     }
 }
 
-fn uses_item(expr: &Expr, item: &str) -> bool {
+pub(crate) fn uses_item(expr: &Expr, item: &str) -> bool {
     match expr {
         Expr::Ident { name, .. } => name == item,
         Expr::Paren { expr, .. }

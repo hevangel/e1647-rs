@@ -395,7 +395,7 @@ not imply full language support or IEEE conformance.
       `per_unit_instance [= unit_type]` and `instance_no_collect` with
       `inst` collect and present per-unit data (14.2.2/14.3.4); structural
       option/scope errors are E0224. Other runtime configuration
-      categories/options, `set_config_max`, derived-item ignore/illegal filters,
+      categories/options, `set_config_max`, composite-valued predicates,
       real/enumeral ranges, general constant/type resolution, radix/filter semantics and full option type checking
       remain gaps. Integral range widths and per-range goals run with
       range/item/group/global precedence; zero-goal buckets are ungraded
@@ -413,7 +413,14 @@ not imply full language support or IEEE conformance.
       Derived source graphs preserve nested key identities, current-round
       freshness, masks and per-unit histories. Source order/name/arity errors
       are E0224; expanded tuples are capped at 65536 scalar components.
-      Derived ignore/illegal predicates remain gaps.
+      Scalar cross/transition ignore/illegal predicates and instance variants
+      filter observations and classify finite integral/Boolean combinations.
+      Transitions bind prev_<source> snapshots. Basic and derived masks commit
+      together; the per-item classification budget is 65536 scalar visits.
+      Unbucketed real/string/enumeral sources filter points without grades.
+      Composite-valued predicates and general wide-domain classification remain
+      gaps; constant predicates work over nested sources. Unit scope freezes
+      after all instance-dependent coverage options
       Exact overlap/phase/filter-side-effect behavior needs qualification
 - [~] Part 2 predefined routine library — started with the reflection
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`

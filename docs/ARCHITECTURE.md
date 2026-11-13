@@ -284,8 +284,25 @@ browser sandbox API is not started.
   recursive source-graph walks. The library round API requires begin_sample,
   sample for each basic source, then record_crosses to finalize derived stats;
   completing the same round twice does not add duplicate derived samples.
-  Derived ignore/illegal predicates and exact side-effectful filter ordering
-  still require further implementation/qualification. The 14.9 coverage
+  Scalar basic observations additionally retain owned value snapshots, separate
+  from labels/identities. Cross predicates bind their participating basic items;
+  transition predicates bind the source and prev_<source>. Instance variants
+  also bind the unit as inst. Pure-expression validation rejects owner/local
+  access, calls and direct composite-valued operands (E0224). Runtime Boolean
+  checks are E0402. Ignore short circuits illegal, using the existing overlap
+  policy and immediate/deferred DUT reporting. Suppressed derived observations
+  do not become child sources; basic source history still advances.
+  Finite integral/Boolean classification enumerates bucket tuples and candidate
+  values until finding a legal witness for each retained goal, checking basic
+  ignore/illegal predicates too. A shared 65536 scalar-candidate budget applies
+  per derived item refresh; exceeding it diagnoses E0402 rather than inventing
+  a mask. Constant prefixes can exclude entire nodes without enumeration.
+  All basic and derived masks commit together after successful classification.
+  Unbucketed real/string/enumeral sources filter points only and remain ungraded.
+  Constant predicates work over nested sources; source-dependent classification
+  over mixed composite inputs remains E0402. Composite-valued predicates,
+  general wide-domain classification, typed-domain/precision proofs and exact
+  side-effectful filter ordering still need implementation/qualification. The 14.9 coverage
   configuration (`CoverageConfig`: the coverage mode per 14.2's NOTE
   and `max_int_buckets` per 14.3's bracket) is honored through the
   `build_with_config` builder API and `set_config(cover, ...)` (29.9).

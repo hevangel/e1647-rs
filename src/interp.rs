@@ -714,6 +714,36 @@ struct SimTrigger {
     span: crate::ast::Span,
 }
 
+struct CoverageAxis {
+    binding: String,
+    source: String,
+    prototype: Value,
+    options: crate::coverage::ItemOptions,
+    buckets: Vec<(usize, i128, i128)>,
+}
+
+fn next_coverage_indices(indices: &mut [usize], limits: &[usize]) -> bool {
+    for (index, limit) in indices.iter_mut().zip(limits).rev() {
+        if *index + 1 < *limit {
+            *index += 1;
+            return true;
+        }
+        *index = 0;
+    }
+    false
+}
+
+fn next_coverage_point(values: &mut [i128], ranges: &[(i128, i128)]) -> bool {
+    for (value, (lo, hi)) in values.iter_mut().zip(ranges).rev() {
+        if *value < *hi {
+            *value += 1;
+            return true;
+        }
+        *value = *lo;
+    }
+    false
+}
+
 struct Interp<'a> {
     types: &'a [crate::elab::ElaboratedType],
     instances: Vec<ObjectInstance>,
@@ -9947,6 +9977,232 @@ impl<'a> Interp<'a> {
         }
     }
 
+    fn coverage_multi_matches(
+        &mut self,
+        expressions: &[Option<Expr>],
+        bindings: &[(String, Value)],
+        unit: Option<usize>,
+    ) -> Result<bool, Diagnostic> {
+        for expr in expressions.iter().flatten() {
+            let mut frame = Frame::default();
+            frame.locals.extend(bindings.iter().cloned());
+            if let Some(unit) = unit {
+                frame.locals.insert("inst".to_owned(), Value::Object(unit));
+            }
+            match self.eval(expr, &mut frame, None)? {
+                Value::Bool(true) => return Ok(true),
+                Value::Bool(false) => {}
+                _ => {
+                    return Err(self.error(
+                        "E0402",
+                        "derived coverage predicate expects a Boolean value (14.4-14.5)",
+                        expr.span(),
+                    ));
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn coverage_basic_prototype(&self, entry: usize, group: usize, name: &str) -> Option<Value> {
+        let ty = self
+            .types
+            .iter()
+            .find(|ty| ty.name == self.coverage[entry].type_name)?;
+        let item = ty
+            .covers
+            .iter()
+            .filter(|decl| decl.name == self.coverage[entry].groups[group].name)
+            .flat_map(|decl| &decl.items)
+            .find(|item| {
+                item.kind == crate::ast::CoverItemKind::Item
+                    && item.names.first().is_some_and(|(source, _)| source == name)
+            });
+        let ty = item.and_then(|item| item.ty.as_ref()).or_else(|| {
+            ty.fields
+                .iter()
+                .find(|field| field.name == name)
+                .map(|field| &field.ty)
+        })?;
+        self.coverage_prototype(ty, 0)
+    }
+
+    fn classify_derived_effects(
+        &mut self,
+        entry: usize,
+        group: usize,
+        index: usize,
+        masks: &BTreeMap<(usize, usize), bool>,
+    ) -> Result<Option<BTreeSet<Vec<usize>>>, Diagnostic> {
+        let item = &self.coverage[entry].groups[group].derived[index];
+        let options = item.options.clone();
+        let sources = item.sources.clone();
+        let transition = item.kind == crate::ast::CoverItemKind::Transition;
+        let expressions = [
+            options.ignore,
+            options.instance_ignore,
+            options.illegal,
+            options.instance_illegal,
+        ];
+        let unit = self.coverage[entry].groups[group].unit_owner;
+        let mut names = sources.clone();
+        if transition {
+            names.extend(sources.iter().map(|source| format!("prev_{source}")));
+        }
+        let mut dependent = false;
+        let mut span = origin_span();
+        // Only fold a constant prefix: later expressions may be guarded by
+        // a source-dependent ignore predicate and must retain short circuit.
+        for expr in expressions.iter().flatten() {
+            span = expr.span();
+            if names
+                .iter()
+                .any(|name| crate::coverage::uses_item(expr, name))
+            {
+                dependent = true;
+                break;
+            }
+            if self.coverage_multi_matches(&[Some(expr.clone())], &[], unit)? {
+                return Ok(Some(BTreeSet::new()));
+            }
+        }
+        if !dependent {
+            return Ok(None);
+        }
+        let basics: Vec<_> = self.coverage[entry].groups[group]
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (index, item.clone()))
+            .collect();
+        let mut axes = Vec::new();
+        let inputs: Vec<_> = if transition {
+            vec![
+                (format!("prev_{}", sources[0]), sources[0].clone()),
+                (sources[0].clone(), sources[0].clone()),
+            ]
+        } else {
+            sources
+                .iter()
+                .map(|source| (source.clone(), source.clone()))
+                .collect()
+        };
+        if inputs
+            .iter()
+            .any(|(_, source)| !basics.iter().any(|(_, item)| item.name == *source))
+        {
+            return Err(self.error(
+                "E0402",
+                "derived predicate classification over composite sources is not implemented (14.4-14.5)",
+                span,
+            ));
+        }
+        for (binding, source) in inputs {
+            let Some((item_index, item)) = basics.iter().find(|(_, item)| item.name == source)
+            else {
+                return Err(self.error("E0402", "derived predicate classification over composite sources is not implemented (14.4-14.5)", span));
+            };
+            if item.buckets.is_empty() {
+                return Ok(None);
+            } // ungradeable: point filtering only
+            let Some(prototype) = self.coverage_basic_prototype(entry, group, &source) else {
+                return Err(self.error(
+                    "E0402",
+                    "derived predicate buckets require integral or Boolean sources (14.4-14.5)",
+                    span,
+                ));
+            };
+            let buckets = item
+                .buckets
+                .iter()
+                .enumerate()
+                .filter(|(bucket, data)| {
+                    !masks
+                        .get(&(*item_index, *bucket))
+                        .copied()
+                        .unwrap_or(data.excluded)
+                })
+                .map(|(bucket, data)| (bucket, data.lo, data.hi))
+                .collect();
+            axes.push(CoverageAxis {
+                binding,
+                source,
+                prototype,
+                options: item.options.clone(),
+                buckets,
+            });
+        }
+        if axes.iter().any(|axis| axis.buckets.is_empty()) {
+            return Ok(Some(BTreeSet::new()));
+        }
+        let limits: Vec<_> = axes.iter().map(|axis| axis.buckets.len()).collect();
+        let mut coordinates = vec![0; axes.len()];
+        let mut allowed = BTreeSet::new();
+        let mut budget = 65_536usize;
+        loop {
+            let ranges: Vec<_> = axes
+                .iter()
+                .zip(&coordinates)
+                .map(|(axis, index)| {
+                    let (_, lo, hi) = axis.buckets[*index];
+                    (lo, hi)
+                })
+                .collect();
+            let mut point: Vec<_> = ranges.iter().map(|(lo, _)| *lo).collect();
+            loop {
+                if budget < axes.len() {
+                    return Err(self.error("E0402", "derived predicate classification exceeds the 65536 scalar-candidate limit (14.4-14.5)", span));
+                }
+                budget -= axes.len();
+                let bindings: Vec<_> = axes
+                    .iter()
+                    .zip(&point)
+                    .map(|(axis, value)| {
+                        let value = if matches!(axis.prototype, Value::Bool(_)) {
+                            Value::Bool(*value != 0)
+                        } else {
+                            Value::Int(*value)
+                        };
+                        (axis.binding.clone(), value)
+                    })
+                    .collect();
+                let mut legal = true;
+                for (axis, (_, value)) in axes.iter().zip(&bindings) {
+                    if self.coverage_effect_matches(
+                        &[
+                            axis.options.ignore.clone(),
+                            axis.options.instance_ignore.clone(),
+                            axis.options.illegal.clone(),
+                            axis.options.instance_illegal.clone(),
+                        ],
+                        &axis.source,
+                        value,
+                        unit,
+                    )? {
+                        legal = false;
+                        break;
+                    }
+                }
+                if legal && !self.coverage_multi_matches(&expressions, &bindings, unit)? {
+                    allowed.insert(
+                        axes.iter()
+                            .zip(&coordinates)
+                            .map(|(axis, index)| axis.buckets[*index].0)
+                            .collect(),
+                    );
+                    break;
+                }
+                if !next_coverage_point(&mut point, &ranges) {
+                    break;
+                }
+            }
+            if !next_coverage_indices(&mut coordinates, &limits) {
+                break;
+            }
+        }
+        Ok(Some(allowed))
+    }
+
     fn refresh_coverage_group_effects(
         &mut self,
         entry: usize,
@@ -10034,8 +10290,23 @@ impl<'a> Interp<'a> {
                 ));
             }
         }
+        let prospective: BTreeMap<_, _> = masks
+            .iter()
+            .map(|(item, bucket, excluded)| ((*item, *bucket), *excluded))
+            .collect();
+        let mut derived_masks = Vec::new();
+        for index in 0..self.coverage[entry].groups[group].derived.len() {
+            derived_masks.push(self.classify_derived_effects(entry, group, index, &prospective)?);
+        }
         for (item, bucket, excluded) in masks {
             self.coverage[entry].groups[group].items[item].buckets[bucket].excluded = excluded;
+        }
+        for (item, allowed) in self.coverage[entry].groups[group]
+            .derived
+            .iter_mut()
+            .zip(derived_masks)
+        {
+            item.allowed = allowed;
         }
         self.coverage[entry].groups[group].refresh_derived();
         Ok(())
@@ -10194,11 +10465,10 @@ impl<'a> Interp<'a> {
     }
 
     fn prepare_derived_item(&mut self, entry: usize, group: usize, owner: usize, index: usize) {
-        let when = self.coverage[entry].groups[group].derived[index]
+        let options = self.coverage[entry].groups[group].derived[index]
             .options
-            .when
             .clone();
-        let collect = match when {
+        let mut collect = match options.when {
             Some(expr) => match self.coverage_boolean(&expr, owner, None) {
                 Ok(value) => value,
                 Err(diagnostic) => {
@@ -10208,6 +10478,52 @@ impl<'a> Interp<'a> {
             },
             None => true,
         };
+        if collect
+            && let Some(bindings) = self.coverage[entry].groups[group].derived_bindings(index)
+        {
+            let unit = self.coverage[entry].groups[group].unit_owner;
+            match self.coverage_multi_matches(
+                &[options.ignore, options.instance_ignore],
+                &bindings,
+                unit,
+            ) {
+                Ok(true) => collect = false,
+                Err(diagnostic) => {
+                    self.pending_diagnostics.push(diagnostic);
+                    collect = false;
+                }
+                Ok(false) => match self.coverage_multi_matches(
+                    &[options.illegal, options.instance_illegal],
+                    &bindings,
+                    unit,
+                ) {
+                    Ok(true) => {
+                        let data = &self.coverage[entry];
+                        let group = &data.groups[group];
+                        let suffix = group
+                            .unit_instance
+                            .as_ref()
+                            .map_or(String::new(), |path| format!("@{path}"));
+                        let values = bindings
+                            .iter()
+                            .map(|(name, value)| format!("{name}={}", self.format_value(value)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let message = format!(
+                            "illegal derived coverage value ({values}) in '{}.{}.{}{suffix}'",
+                            data.type_name, group.name, group.derived[index].name
+                        );
+                        self.report_coverage_illegal(message);
+                        collect = false;
+                    }
+                    Ok(false) => {}
+                    Err(diagnostic) => {
+                        self.pending_diagnostics.push(diagnostic);
+                        collect = false;
+                    }
+                },
+            }
+        }
         self.coverage[entry].groups[group].derived[index].collect = collect;
     }
 
