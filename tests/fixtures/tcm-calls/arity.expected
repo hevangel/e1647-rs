@@ -1,0 +1,1 @@
+4:21: error[E0402]: method 'inner' expects 0 argument(s), got 1

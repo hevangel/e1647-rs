@@ -522,6 +522,7 @@ struct StatementCall {
     name: String,
     args: Vec<Value>,
     block: usize,
+    entry_complete: bool,
     frame: Frame,
     span: crate::ast::Span,
 }
@@ -554,9 +555,9 @@ enum Flow {
 /// loop body is re-entered mid-iteration (the condition is re-checked
 /// only when the iteration completes, exactly like the `while` model
 /// this generalizes). The descent reaches every compound; only the
-/// atomic regions (inline method calls, `compute`, `on` blocks, and a
-/// `check` else body, which continue their enclosing fragment) keep
-/// the conservative run-to-completion model.
+/// value-expression calls, `on` blocks and `check` else bodies keep
+/// the conservative run-to-completion model. Whole statement calls
+/// and `compute` carry callee frames in the same path.
 #[derive(Debug, Clone)]
 enum Child {
     /// A statement-position call, with its own locals and once-evaluated
@@ -605,6 +606,7 @@ struct PendingSuspension {
     path: Vec<PathLevel>,
     frame: Frame,
     eligible_at_cycle: u64,
+    wake_event: Option<String>,
     temporal: bool,
     span: crate::ast::Span,
     wait_start: Option<usize>,
@@ -759,7 +761,7 @@ struct Interp<'a> {
     /// Set while a coroutine turn executes: statement walks record
     /// their descent for the resume path.
     tracing: bool,
-    /// Atomic regions (inline method calls, `compute`, `on` blocks,
+    /// Atomic regions (value-expression calls, `on` blocks,
     /// `check` else bodies): waits inside keep the inline spin instead
     /// of suspending.
     atomic_depth: usize,
@@ -2737,14 +2739,18 @@ impl<'a> Interp<'a> {
                 // (31.2.5's non-preemptive model interrupts at TCM
                 // calls and release/lock requests). Any other spelling
                 // evaluates through the expression evaluator.
-                if let Some(flow) = self.sync_statement_call(expr, frame, me)? {
-                    return Ok(flow);
-                }
                 if let Some(flow) = self.declared_statement_call(expr, frame, me)? {
                     return Ok(flow);
                 }
+                if let Some(flow) = self.sync_statement_call(expr, frame, me)? {
+                    return Ok(flow);
+                }
                 self.eval(expr, frame, me)?;
-                Ok(Flow::Normal)
+                Ok(if self.stop_requested {
+                    Flow::Stop
+                } else {
+                    Flow::Normal
+                })
             }
             Stmt::Return { value, .. } => {
                 let value = match value {
@@ -3118,9 +3124,8 @@ impl<'a> Interp<'a> {
                 self.next_coroutine_id += 1;
                 Ok(Flow::Normal)
             }
-            // `compute <call>;` — without TCM suspension, the call runs
-            // inline exactly like `start` (clause 13's run-to-completion
-            // semantics needs the scheduler).
+            // `compute <call>;` keeps the caller parked while the
+            // callee suspends and resumes on the same coroutine.
             Stmt::Compute { call, span } => {
                 let Expr::Call { callee, args, .. } = call else {
                     return Err(self.error("E0402", "compute expects a method call", *span));
@@ -5332,6 +5337,9 @@ impl<'a> Interp<'a> {
         if !self.suspend_eligible() {
             return Ok(None);
         }
+        if let Expr::Paren { expr, .. } = expr {
+            return self.declared_statement_call(expr, frame, me);
+        }
         let Expr::Call { callee, args, span } = expr else {
             return Ok(None);
         };
@@ -5342,7 +5350,9 @@ impl<'a> Interp<'a> {
                 };
                 (self.instances[index].type_name.clone(), name)
             }
-            Expr::MemberAccess { object, name, .. } => {
+            Expr::MemberAccess { object, name, .. }
+                if !crate::builtins::is_builtin_routine(name) =>
+            {
                 let Some(type_name) = self.statement_receiver_type(object, frame, me) else {
                     return Ok(None);
                 };
@@ -5352,9 +5362,10 @@ impl<'a> Interp<'a> {
         };
         if !self.types.iter().any(|ty| {
             ty.name == type_name
-                && ty.methods.iter().any(|method| {
-                    method.name == *name && !method.is_static && method.tcm_event.is_some()
-                })
+                && ty
+                    .methods
+                    .iter()
+                    .any(|method| method.name == *name && !method.is_static)
         }) {
             return Ok(None);
         }
@@ -5401,6 +5412,7 @@ impl<'a> Interp<'a> {
                 name: name.to_owned(),
                 args,
                 block: 0,
+                entry_complete: false,
                 frame: Frame::default(),
                 span,
             },
@@ -5433,6 +5445,46 @@ impl<'a> Interp<'a> {
                     call.span,
                 )
             })?;
+            if !call.entry_complete {
+                if let Some(block) = blocks.first()
+                    && call.args.len() != block.params.len()
+                {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "method '{}' expects {} argument(s), got {}",
+                            call.name,
+                            block.params.len(),
+                            call.args.len()
+                        ),
+                        call.span,
+                    ));
+                }
+                // Clause 17.1.2: an inline TCM also synchronizes on
+                // its declared event before its first body action.
+                if let Some(event) = blocks.first().and_then(|block| block.tcm_event.as_ref()) {
+                    let event = self.event_path(event)?;
+                    if !is_every_cycle_event(&event) && !self.event_occurred_this_cycle(&event) {
+                        self.exec_context[call_level].child =
+                            Some(Child::Call(Box::new(call.clone())));
+                        // A synthetic leaf keeps entry distinct from
+                        // the body's first statement on resumption.
+                        self.exec_context.push(PathLevel {
+                            index: 0,
+                            child: None,
+                        });
+                        let flow =
+                            self.suspend_here(caller, call.span, false, self.cycle + 1, true, None);
+                        self.exec_context.pop();
+                        if let Some(pending) = &mut self.pending_suspension {
+                            pending.wake_event = Some(event);
+                        }
+                        return flow;
+                    }
+                }
+                call.entry_complete = true;
+                resume = None;
+            }
             while call.block < blocks.len() {
                 let block = blocks[call.block];
                 if call.args.len() != block.params.len() {
@@ -5554,9 +5606,8 @@ impl<'a> Interp<'a> {
             return Err(self.error("E0406", "recursion too deep", span));
         }
         self.depth += 1;
-        // Inline calls are atomic regions (13.2.2: a called TCM runs to
-        // its return before the callee resumes): waits inside keep the
-        // inline spin.
+        // Calls reached through value expressions remain atomic.
+        // Statement calls use exec_statement_call's saved frames.
         self.atomic_depth += 1;
         let mut result = Value::Void;
         for block in blocks {
@@ -9697,8 +9748,8 @@ impl<'a> Interp<'a> {
     }
 
     /// Whether the running statement may suspend to the scheduler: a
-    /// coroutine turn, not inside an atomic region (inline method
-    /// calls, `compute`, `on` blocks, `check` else bodies — 13.2.2
+    /// coroutine turn, not inside an atomic region (value-expression
+    /// calls, `on` blocks, `check` else bodies — 13.2.2
     /// delimits atomic fragments at the synchronization actions, and
     /// these regions keep the conservative run-to-completion model of
     /// v1; `on` bodies may not contain time-consuming actions at all,
@@ -9732,6 +9783,7 @@ impl<'a> Interp<'a> {
             path,
             frame: frame.clone(),
             eligible_at_cycle,
+            wake_event: None,
             temporal,
             span,
             wait_start,
@@ -15197,6 +15249,7 @@ impl<'a> Interp<'a> {
                 co.path = suspension.path;
                 co.frame = suspension.frame;
                 co.eligible_at_cycle = suspension.eligible_at_cycle;
+                co.wake_event = suspension.wake_event;
                 co.suspended_temporal = suspension.temporal;
                 co.span = suspension.span;
                 co.wait_start = suspension.wait_start;

@@ -293,13 +293,15 @@ browser sandbox API is not started.
   turns that run atomically from one synchronization action to the
   next, and when nothing is eligible one cycle passes (the 5,000-cycle
   shared budget guards runaway programs, `E0409`). Suspending
-  captures the locals frame and builds a skip-cursor over `while`
-  chains — resumption re-enters the mid-iteration loop without
-  re-checking its condition and re-executes the wait statement
-  against the grown log (13.2.2(b)); `compute` and inline calls are
-  atomic regions whose waits spin inline, as do waits inside
-  `if`/`case`/`for` bodies (the documented v1 limitation of the
-  cursor). Temporal waits (`@event`, sequences, propositions, event
+  captures locals and the full statement path through compounds and
+  statement-position calls. Each call boundary retains the receiver,
+  evaluated arguments, callee locals and composed-body index. Nested
+  helpers and `compute` suspend on the same coroutine; returning
+  restores the caller without replaying its prefix. Entry-event waits
+  park through the scheduler's event wake pass. Value-expression calls,
+  receivers whose types cannot be resolved before evaluation, `on`
+  blocks and check failure bodies remain atomic. Temporal waits
+  (`@event`, sequences, propositions, event
   repeats, with 13.2.4's readability-only `until`) re-evaluate at
   every turn (12.3.2); propositions and repeat bounds retain sampled
   results in each state, scoped to the individual wait. Rules retain
