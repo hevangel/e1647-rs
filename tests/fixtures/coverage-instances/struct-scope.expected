@@ -1,0 +1,1 @@
+3:20: error[E0224]: per_unit_instance requires a unit type in a struct (14.2)

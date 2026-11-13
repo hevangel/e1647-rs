@@ -1,45 +1,42 @@
-//! The coverage data model (clause 14): buckets, hits and grades for
-//! the cover groups the parser records.
+//! Coverage schemas, sampling data and grades (clause 14).
 //!
-//! Groups are built from the recorded [`CoverGroupDecl`]s at run start:
-//! `is also` / `empty` extensions merge into their base group by name
-//! (14.6), and each item's `using ranges` clause — recorded as raw
-//! tokens in the shape `ranges = { range([lo..hi], "label"); ... }` —
-//! is parsed into explicit buckets. Items without a `ranges` clause
-//! get the clause 14.3 defaults: 16 buckets for integers ("buckets are
-//! created by default for only the first 16 possible values (0 through
-//! 15)" — the count is the `max_int_buckets` coverage configuration
-//! option, 14.9) and the two values for booleans. Values falling
-//! outside every bucket are ungradeable ("those values are given goals
-//! of 0 and do not affect the grade for the item").
+//! Builders compose base and extended groups, default/explicit buckets,
+//! derived items and supported option expressions while retaining source
+//! spans. Runtime configuration (29.9) controls collection independently
+//! of schema construction; the interpreter starts with coverage disabled.
 //!
-//! The 14.9 coverage configuration ([`CoverageConfig`]) carries the
-//! coverage mode (14.2's NOTE: "Unless coverage mode is turned on
-//! first (see 14.9), no coverage results are collected") and
-//! `max_int_buckets`. The interpreter's `set_config(cover, ...)`
-//! (29.9) controls runtime collection, initially disabled, and default
-//! integer bucket counts. Builders construct schemas independently of
-//! runtime enablement. The option entries whose semantics the
-//! extractable prose defines apply from the recorded tokens:
-//! `no_collect`/`instance_no_collect` on the group (14.3.2) or the
-//! item (14.4.4) — when TRUE the group/item "shall not be presented" —
-//! the cross and transition `name` option (14.4/14.5), and the
-//! group-level `at_least`/`weight` spellings (14.9.3/14.9.4: both "can
-//! be set in the coverage group or item definitions").
+//! `per_instance` partitions grades by item bucket. `per_unit_instance`
+//! instead collects separate groups for containing unit objects. Hidden
+//! groups/items retain their sampling storage for derived items, then are
+//! removed from the reported view. Group/basic-item `when` expressions
+//! gate sampling in the owning struct context. Crosses require every
+//! source in the current round; transitions retain the last sampled value.
 //!
-//! Not modeled yet: other runtime configuration categories/options, the bool-exp
-//! option forms (including the implicit `inst` variable and the
-//! `per_unit_instance` scoping of 14.3.2/14.4.4),
-//! `instance_ignore`/`instance_illegal`, the `radix`/`when`/`never`
-//! option semantics (Tables 40/41 are images in the local redline
-//! copy), item `using also` extension overrides (14.7), and the
-//! numeric parameters of `range(...)` beyond the bounds and label
-//! (their semantics live in Table 41, an image in the local redline
-//! copy — they are recorded and counted but not applied).
+//! Structural option/scope errors report E0224 after composition. The
+//! interpreter evaluates Boolean filters and per-unit visibility. Full
+//! option type checking, instance_ignore/instance_illegal, general
+//! ignore/illegal/radix semantics, range parameters beyond bounds/labels,
+//! item `using also` overrides and the wider runtime configuration API
+//! remain unfinished. No conformance is claimed.
 
 use crate::ast::{CoverGroupDecl, CoverItemDecl, CoverItemKind, Expr, ScalarBase, TypeExpr};
 use crate::lexer::{Token, TokenKind};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ItemOptions {
+    pub hidden: bool,
+    pub when: Option<Expr>,
+    pub instance_no_collect: Option<Expr>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GroupOptions {
+    pub hidden: bool,
+    pub when: Option<Expr>,
+    pub unit_scope: Option<String>,
+    pub instance_no_collect: Option<Expr>,
+}
 
 /// One bucket of an item: an inclusive integer range with a hit goal
 /// (1 unless a `range(...)` clause says otherwise) and the hits so far.
@@ -56,6 +53,7 @@ pub struct CoverBucket {
 /// ungradeable (its values are counted but contribute no grade).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverItemData {
+    pub(crate) options: ItemOptions,
     pub name: String,
     pub buckets: Vec<CoverBucket>,
     /// Samples whose value fell outside every bucket (or had no bucket
@@ -163,6 +161,11 @@ impl CoverDerivedData {
 /// its `is also` extensions).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverGroupData {
+    pub(crate) options: GroupOptions,
+    /// The containing unit's path for per-unit-instance collection.
+    /// None identifies the type-level schema/collection.
+    pub unit_instance: Option<String>,
+    pub(crate) unit_owner: Option<usize>,
     pub name: String,
     /// The sampling event as a dotted path, when it resolves to one.
     pub event_path: Option<String>,
@@ -173,9 +176,20 @@ pub struct CoverGroupData {
     /// Each item's containing-bucket label (or raw value) at the last
     /// sampling event — the transition source (14.5's previous-value).
     last_values: BTreeMap<String, String>,
+    round_items: BTreeSet<String>,
 }
 
 impl CoverGroupData {
+    /// Start a sampling round before recording item values and crosses.
+    /// Sources omitted in this round cannot contribute stale cross values.
+    pub fn begin_sample(&mut self) {
+        self.samples += 1;
+        self.round_items.clear();
+    }
+
+    pub(crate) fn is_reported(&self) -> bool {
+        !self.options.hidden && (self.options.unit_scope.is_none() || self.unit_owner.is_some())
+    }
     /// The group's grade (14.3/14.4.2). With no `per_instance` items:
     /// the plain average of the gradeable items' (basic and derived)
     /// grades. With `per_instance` items: "the grade of the cover
@@ -189,14 +203,18 @@ impl CoverGroupData {
         let per_instance: Vec<&CoverItemData> = self
             .items
             .iter()
-            .filter(|item| item.per_instance && !item.buckets.is_empty())
+            .filter(|item| !item.options.hidden && item.per_instance && !item.buckets.is_empty())
             .collect();
         if per_instance.is_empty() {
             // The weighted average of the gradeable items' (basic and
             // derived) grades; weight 1 when the option is absent.
             let mut weighted_sum = 0.0f64;
             let mut weight_total = 0u64;
-            for item in self.items.iter().filter(|item| !item.per_instance) {
+            for item in self
+                .items
+                .iter()
+                .filter(|item| !item.options.hidden && !item.per_instance)
+            {
                 if let Some(grade) = item.grade() {
                     weighted_sum += grade * item.weight as f64;
                     weight_total += item.weight;
@@ -232,7 +250,7 @@ impl CoverGroupData {
         let per_type_grades: Vec<f64> = self
             .items
             .iter()
-            .filter(|item| !item.per_instance)
+            .filter(|item| !item.options.hidden && !item.per_instance)
             .filter_map(|item| item.grade())
             .collect();
         if !per_type_grades.is_empty() {
@@ -251,7 +269,7 @@ impl CoverGroupData {
     pub fn instances(&self) -> Vec<CoverInstanceData> {
         let mut instances = Vec::new();
         for item in &self.items {
-            if !item.per_instance {
+            if item.options.hidden || !item.per_instance {
                 continue;
             }
             for bucket in &item.buckets {
@@ -273,6 +291,7 @@ impl CoverGroupData {
     /// crossed items' values). The group's sample count is kept by the
     /// caller — once per sampling event, not once per item.
     pub fn sample(&mut self, item_name: &str, value: &crate::interp::Value) {
+        self.round_items.insert(item_name.to_owned());
         let item = self.items.iter().find(|item| item.name == item_name);
         let as_int = value_to_int(value);
         // The bucket label this value lands in (14.3's bucket model),
@@ -281,13 +300,14 @@ impl CoverGroupData {
         let label = label.unwrap_or_else(|| render_value(value));
         // The transition over this item: previous → current (14.5).
         let previous = self.last_values.get(item_name).cloned();
-        if let (Some(derived), Some(previous)) = (
-            self.derived
+        if let Some(previous) = previous {
+            for derived in self
+                .derived
                 .iter_mut()
-                .find(|derived| derived.sources == vec![item_name]),
-            previous,
-        ) {
-            derived.record(&format!("{previous}→{label}"));
+                .filter(|derived| derived.sources == vec![item_name])
+            {
+                derived.record(&format!("{previous}→{label}"));
+            }
         }
         self.last_values.insert(item_name.to_owned(), label.clone());
         // The crosses over combinations including this item record
@@ -329,6 +349,12 @@ impl CoverGroupData {
             .map(|derived| (derived.name.clone(), derived.sources.clone()))
             .collect();
         for (name, sources) in crosses {
+            if !sources
+                .iter()
+                .all(|source| self.round_items.contains(source))
+            {
+                continue;
+            }
             let labels: Option<Vec<String>> = sources
                 .iter()
                 .map(|source| self.last_values.get(source).cloned())
@@ -460,12 +486,16 @@ pub(crate) fn build_types(
                 .collect();
             let derived = build_derived(decl, &items);
             groups.push(CoverGroupData {
+                options: group_options(ty, &decl.name).unwrap_or_default(),
+                unit_instance: None,
+                unit_owner: None,
                 name: decl.name.clone(),
                 event_path: group_event_path(decl),
                 items,
                 derived,
                 samples: 0,
                 last_values: BTreeMap::new(),
+                round_items: BTreeSet::new(),
             });
         }
         // Pass 2: merge every extension's items into its base by name
@@ -506,24 +536,6 @@ pub(crate) fn build_types(
                 }
             }
         }
-        // 14.3.2: "if one or both of no_collect and instance_no_collect
-        // options of the group are evaluated to TRUE, the group shall
-        // not be presented under that instance." The OR relation of the
-        // prose, over every declaration of the group; the constant TRUE
-        // spelling drops the group from the collected model (not
-        // sampled, not graded, not presented in the report). The
-        // bool-exp form and the per-unit-instance scoping are not
-        // modeled.
-        groups.retain(|group| {
-            !ty.covers.iter().any(|decl| {
-                decl.name == group.name
-                    && group.event_path == group_event_path(decl)
-                    && decl.options.iter().any(|entry| {
-                        scan_bool_option(entry, "no_collect") == Some(true)
-                            || scan_bool_option(entry, "instance_no_collect") == Some(true)
-                    })
-            })
-        });
         // Group-level `at_least`/`weight` (14.9.3/14.9.4: both "can be
         // set in the coverage group or item definitions"): the group
         // option applies to every item of the group that does not set
@@ -687,17 +699,6 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
         // cross/transition items are recorded, not collected yet.
         return None;
     }
-    // 14.4.4: "if one or both of no_collect and instance_no_collect
-    // options of the item are evaluated to TRUE, the item shall not be
-    // presented under that instance." The constant TRUE spelling (the
-    // OR relation of the prose) drops the item from the collected
-    // model; the bool-exp form and the per-unit-instance scoping are
-    // not modeled.
-    if scan_bool_option(&item.using, "no_collect") == Some(true)
-        || scan_bool_option(&item.using, "instance_no_collect") == Some(true)
-    {
-        return None;
-    }
     let name = item
         .names
         .first()
@@ -717,6 +718,7 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
     let mut ranges = Vec::new();
     if let Some(note) = parse_ranges(&item.using, &mut ranges) {
         return Some(CoverItemData {
+            options: item_options(item).unwrap_or_default(),
             name,
             buckets: Vec::new(),
             ungradeable_hits: 0,
@@ -763,6 +765,7 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
         bucket.goal = at_least;
     }
     Some(CoverItemData {
+        options: item_options(item).unwrap_or_default(),
         name,
         buckets,
         ungradeable_hits: 0,
@@ -1056,4 +1059,225 @@ fn token_word(token: &Token) -> Option<&str> {
 
 fn token_kind_is(token: &Token, symbol: &str) -> bool {
     matches!(&token.kind, TokenKind::Punctuation(p) if p == symbol)
+}
+
+/// Split only top-level option separators; calls and range bodies keep
+/// their internal commas/semicolons and their original source spans.
+fn option_value<'a>(tokens: &'a [Token], name: &str) -> Option<&'a [Token]> {
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut found = None;
+    for end in 0..=tokens.len() {
+        let separator = end == tokens.len()
+            || (depth == 0
+                && (token_kind_is(&tokens[end], ",") || token_kind_is(&tokens[end], ";")));
+        if separator {
+            let part = &tokens[start..end];
+            if part.first().and_then(token_word) == Some(name) {
+                found = Some(
+                    if part.get(1).is_some_and(|token| token_kind_is(token, "=")) {
+                        &part[2..]
+                    } else {
+                        &part[1..]
+                    },
+                );
+            }
+            start = end + 1;
+        } else if let TokenKind::Punctuation(symbol) = &tokens[end].kind {
+            match symbol.as_str() {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+fn option_error(tokens: &[Token], message: &str) -> crate::diagnostic::Diagnostic {
+    let position = tokens
+        .first()
+        .map(|token| token.start)
+        .unwrap_or(crate::lexer::Position {
+            byte: 0,
+            line: 1,
+            column: 1,
+        });
+    crate::diagnostic::Diagnostic::new("E0224", message, position, position)
+}
+
+fn option_expr(
+    tokens: &[Token],
+    name: &str,
+) -> Result<Option<Expr>, crate::diagnostic::Diagnostic> {
+    let Some(value) = option_value(tokens, name) else {
+        return Ok(None);
+    };
+    if value.is_empty() && name == "no_collect" {
+        let token = tokens.first().expect("present option has a token");
+        return Ok(Some(Expr::BoolLiteral {
+            value: true,
+            span: (token.start, token.end),
+        }));
+    }
+    crate::parser::parse_expression_tokens(value)
+        .map(Some)
+        .map_err(|diagnostic| {
+            let mut diagnostic = diagnostic;
+            diagnostic.code = "E0224";
+            diagnostic
+        })
+}
+
+fn hidden_option(tokens: &[Token]) -> Result<bool, crate::diagnostic::Diagnostic> {
+    match option_expr(tokens, "no_collect")? {
+        None => Ok(false),
+        Some(Expr::BoolLiteral { value, .. }) => Ok(value),
+        Some(_) => Err(option_error(
+            tokens,
+            "no_collect expects a flag or Boolean literal (14.2)",
+        )),
+    }
+}
+
+fn item_options(item: &CoverItemDecl) -> Result<ItemOptions, crate::diagnostic::Diagnostic> {
+    Ok(ItemOptions {
+        hidden: hidden_option(&item.using)?,
+        when: option_expr(&item.using, "when")?,
+        instance_no_collect: option_expr(&item.using, "instance_no_collect")?,
+    })
+}
+
+fn group_options(
+    ty: &crate::elab::ElaboratedType,
+    name: &str,
+) -> Result<GroupOptions, crate::diagnostic::Diagnostic> {
+    let mut options = GroupOptions::default();
+    let mut scope_frozen = false;
+    for decl in ty.covers.iter().filter(|decl| decl.name == name) {
+        for entry in &decl.options {
+            if let Some(value) = option_value(entry, "per_unit_instance") {
+                let scope = if value.is_empty() {
+                    if ty.kind != crate::ast::DeclarationKind::Unit {
+                        return Err(option_error(
+                            entry,
+                            "per_unit_instance requires a unit type in a struct (14.2)",
+                        ));
+                    }
+                    ty.name.clone()
+                } else if value.len() == 1 {
+                    token_word(&value[0])
+                        .ok_or_else(|| {
+                            option_error(entry, "per_unit_instance expects a unit type name (14.2)")
+                        })?
+                        .to_owned()
+                } else {
+                    return Err(option_error(
+                        entry,
+                        "per_unit_instance expects a unit type name (14.2)",
+                    ));
+                };
+                if scope_frozen && options.unit_scope.as_ref() != Some(&scope) {
+                    return Err(option_error(
+                        entry,
+                        "per_unit_instance cannot change after instance_no_collect (14.2.2)",
+                    ));
+                }
+                options.unit_scope = Some(scope);
+            }
+            options.hidden |= hidden_option(entry)?;
+            if let Some(expr) = option_expr(entry, "when")? {
+                options.when = Some(expr);
+            }
+            if let Some(expr) = option_expr(entry, "instance_no_collect")? {
+                options.instance_no_collect = Some(expr);
+                scope_frozen = true;
+            }
+        }
+        if decl
+            .items
+            .iter()
+            .any(|item| option_value(&item.using, "instance_no_collect").is_some())
+        {
+            scope_frozen = true;
+        }
+    }
+    Ok(options)
+}
+
+/// Structural coverage option checks run on the composed type view,
+/// so inherited and extended groups use the same scope as execution.
+pub(crate) fn validate_types(
+    types: &[crate::elab::ElaboratedType],
+) -> Vec<crate::diagnostic::Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for ty in types {
+        let mut seen = BTreeSet::new();
+        for decl in &ty.covers {
+            if !seen.insert(&decl.name) {
+                continue;
+            }
+            let options = match group_options(ty, &decl.name) {
+                Ok(options) => options,
+                Err(diagnostic) => {
+                    diagnostics.push(diagnostic);
+                    continue;
+                }
+            };
+            if let Some(scope) = &options.unit_scope {
+                if !types
+                    .iter()
+                    .any(|ty| &ty.name == scope && ty.kind == crate::ast::DeclarationKind::Unit)
+                {
+                    diagnostics.push(crate::diagnostic::Diagnostic::new(
+                        "E0224",
+                        format!("coverage unit type '{scope}' is not a declared unit (14.2)"),
+                        decl.name_span.0,
+                        decl.name_span.1,
+                    ));
+                }
+            } else if options.instance_no_collect.is_some() {
+                diagnostics.push(crate::diagnostic::Diagnostic::new(
+                    "E0224",
+                    "instance_no_collect requires per_unit_instance (14.2.2)",
+                    decl.name_span.0,
+                    decl.name_span.1,
+                ));
+            }
+            for item in ty
+                .covers
+                .iter()
+                .filter(|group| group.name == decl.name)
+                .flat_map(|group| &group.items)
+            {
+                match item_options(item) {
+                    Err(diagnostic) => diagnostics.push(diagnostic),
+                    Ok(item_options)
+                        if item_options.instance_no_collect.is_some()
+                            && options.unit_scope.is_none() =>
+                    {
+                        diagnostics.push(option_error(
+                            &item.using,
+                            "item instance_no_collect requires per_unit_instance (14.3.4)",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    diagnostics
+}
+
+/// Hide presentation-only data after collection, preserving hidden
+/// source items internally for derived sampling and grading.
+pub(crate) fn for_report(coverage: &[TypeCoverage]) -> Vec<TypeCoverage> {
+    let mut result = coverage.to_vec();
+    for entry in &mut result {
+        entry.groups.retain(CoverGroupData::is_reported);
+        for group in &mut entry.groups {
+            group.items.retain(|item| !item.options.hidden);
+        }
+    }
+    result
 }

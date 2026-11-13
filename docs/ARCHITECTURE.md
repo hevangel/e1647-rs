@@ -191,8 +191,9 @@ browser sandbox API is not started.
   same-named field. An explicit item type checks compatibility (E0220),
   and expression traversal checks missing members, indexing and operand
   kinds (E0221–E0223). Unknown kinds stay silent. Cross/transition names
-  refer to items rather than owner fields; raw coverage options remain
-  unchecked. Typed method parameters bind within their method scope.
+  refer to items rather than owner fields; coverage option types remain
+  unchecked by this pass. Supported option syntax and unit scopes are
+  checked during elaboration. Typed method parameters bind within their method scope.
   Local `var x := e` declarations retain known initializer kinds,
   including homogeneous list literals and equal-kind ternary branches
   (clause 18). Scalar/list aliases resolve with a depth bound; recursive
@@ -237,7 +238,7 @@ browser sandbox API is not started.
   take the 14.3 defaults (16 buckets for integers — "0 through 15" —
   two for booleans; anything else is ungradeable with a note). The
   interpreter samples a group when its event fires: each item's
-  recorded expression evaluates in the emitting frame (or the named
+  recorded expression evaluates in its owning struct (or the named
   field is read) and the value lands in the containing bucket;
   out-of-range values are ungradeable (14.3: "goals of 0"). Grades
   are covered-buckets-per-item, averaged over gradeable items; cross/
@@ -250,8 +251,8 @@ browser sandbox API is not started.
   per_type bucket), `weight = N` scales the grade contribution, the
   group-level `at_least`/`weight` spellings apply to items without
   their own (14.9.3/14.9.4), `no_collect`/`instance_no_collect`
-  (group, 14.2.2; item, 14.3.4) drop the group/item from the
-  collected model when TRUE, and the cross/transition `name` option
+  (group, 14.2.2; item, 14.3.4) suppress presentation while retaining
+  sampling storage, and the cross/transition `name` option
   renames the derived item (14.4/14.5). The 14.9 coverage
   configuration (`CoverageConfig`: the coverage mode per 14.2's NOTE
   and `max_int_buckets` per 14.3's bracket) is honored through the
@@ -263,6 +264,17 @@ browser sandbox API is not started.
   Before sampling, `max_int_buckets` changes rebuild the schema from the
   composed type declarations; after sampling they report E0402. The
   runtime resource bound is 65536 buckets per default integer item.
+  Per-unit groups keep a schema plus one collection per containing unit,
+  labelled by `CoverGroupData::unit_instance`. The bounded, visited-set
+  instance walk resolves the nearest requested unit through inheritance,
+  flattened lists and cycles; aliases use the first visited path.
+  Unsampled units keep zero-hit groups. Structural option/scope errors
+  report E0224 after composition. `when` expressions use a fresh owner
+  frame; per-unit presentation expressions bind `inst` to the associated
+  unit. Crosses require current-round source values, and transitions keep
+  previous sampled values separately. The returned report view removes
+  hidden items/groups and per-unit schema placeholders. Full option type
+  checking and the remaining ignore/illegal/radix semantics are unfinished.
   `range(...)`'s numeric parameters beyond
   bounds/label are recorded, not applied.
 - `src/interp.rs` — interpreter for the statement subset (codes
@@ -422,10 +434,10 @@ clause 14 coverage model (basic and derived items collect and grade;
 per_instance items grade per bucket with holes and the weighted
 group grade; the group/item `no_collect`/`instance_no_collect`
 options, the cross/transition `name` option and the group-level
-`at_least`/`weight` apply; the bool-exp option forms with the
-implicit `inst` variable, the per-unit-instance scoping
-(14.2.2/14.3.4), the `radix`/`when`/`never` option semantics (the
-option tables were not previously inspected) remain unmodeled.
+`at_least`/`weight` apply; per-unit scoping, `instance_no_collect` with
+`inst` and group/basic-item `when` filters run. Full option type checking,
+instance ignore/illegal, remaining range parameters, radix/never and
+derived-item filter semantics remain unmodeled.
 The coverage subset of `set_config()` is wired; other categories,
 options and `set_config_max()` remain gaps), integer width
 truncation, evaluation of MVL literals, `detach`/`delay`/`exec` TEs, select

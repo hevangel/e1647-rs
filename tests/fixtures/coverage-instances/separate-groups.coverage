@@ -1,0 +1,4 @@
+sys.first_cg@type samples=1 grade=0.250
+value samples=1 hits=[0,0,1,0]
+sys.second_cg@type samples=1 grade=0.250
+value samples=1 hits=[0,0,0,1]

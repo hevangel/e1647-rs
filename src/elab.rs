@@ -13,6 +13,8 @@
 //!
 //! ## Diagnostics (on top of the parser's)
 //!
+//! - `E0224` invalid coverage option syntax or per-unit-instance scope
+//!   (clauses 14.2–14.3), checked after member composition
 //! - `E0301` `like` inheritance cycle (reported once per type)
 //! - `E0302` the same field name is contributed by two different
 //!   declarations or extend blocks (duplicates inside one declaration are
@@ -1524,7 +1526,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
     // monomorphization worklist; a file-declared name of the same kind
     // shadows the builtin (the synthesized entry is skipped).
     compose_builtin_numeric_interfaces(&mut types);
-    Elaborated {
+    let mut result = Elaborated {
         types,
         defines,
         sequences,
@@ -1535,7 +1537,11 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         static_methods: static_registry(declarations),
         static_events: static_registry(declarations),
         static_ons: static_registry(declarations),
-    }
+    };
+    result
+        .diagnostics
+        .extend(crate::coverage::validate_types(&result.types));
+    result
 }
 
 /// The clause 31 predefined numeric names (T7.2), synthesized as

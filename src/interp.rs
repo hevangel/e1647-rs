@@ -1276,7 +1276,7 @@ fn run_inner(
             output: interp.output,
             diagnostics: interp.pending_diagnostics,
             coverage: if interp.coverage_was_enabled {
-                interp.coverage
+                crate::coverage::for_report(&interp.coverage)
             } else {
                 Vec::new()
             },
@@ -1528,6 +1528,7 @@ fn run_inner(
             interp.dut_errors
         ));
     }
+    interp.prepare_coverage_instances(true);
     // Field init-value failures collected during instance creation
     // (clause 6.9.1/6.9.4) join the run's diagnostics.
     diagnostics.append(&mut interp.pending_diagnostics);
@@ -1535,7 +1536,7 @@ fn run_inner(
         output: interp.output,
         diagnostics,
         coverage: if interp.coverage_was_enabled {
-            interp.coverage
+            crate::coverage::for_report(&interp.coverage)
         } else {
             Vec::new()
         },
@@ -6543,6 +6544,7 @@ impl<'a> Interp<'a> {
     /// prose normalises is Specman-internal). Stores the value for
     /// `get_overall_grade()`.
     fn compute_overall_grade_value(&mut self) -> f64 {
+        self.prepare_coverage_instances(true);
         if !self.coverage_was_enabled {
             self.overall_grade = Some(0.0);
             return 0.0;
@@ -6550,7 +6552,7 @@ impl<'a> Interp<'a> {
         let mut sum = 0.0f64;
         let mut count = 0usize;
         for entry in &self.coverage {
-            for group in &entry.groups {
+            for group in entry.groups.iter().filter(|group| group.is_reported()) {
                 if let Some(grade) = group.grade() {
                     sum += grade;
                     count += 1;
@@ -6590,7 +6592,7 @@ impl<'a> Interp<'a> {
             .groups
             .iter()
             .enumerate()
-            .filter(|(_, group)| group.name == group_name)
+            .filter(|(_, group)| group.name == group_name && group.unit_owner.is_none())
             .map(|(index, _)| index)
             .collect();
         if group_indices.is_empty() {
@@ -6610,7 +6612,7 @@ impl<'a> Interp<'a> {
         let mut frame = Frame::default();
         for owner in instance_indices {
             for group_index in &group_indices {
-                self.sample_group_on_instance(entry_index, *group_index, owner, &mut frame);
+                self.sample_group_on_instance(entry_index, *group_index, owner, &mut frame, span);
             }
         }
         Ok(())
@@ -9567,7 +9569,7 @@ impl<'a> Interp<'a> {
         self.temporal_log[self.cycle as usize].record(path);
         self.wake_tcm_listeners(path);
         self.run_on_blocks(path, owner, span)?;
-        self.sample_cover_groups(path, owner, frame);
+        self.sample_cover_groups(path, owner, frame, span);
         Ok(())
     }
 
@@ -9740,7 +9742,13 @@ impl<'a> Interp<'a> {
     /// fired: each item's recorded expression evaluates in the emitting
     /// frame, or the item's field is read from the owner, and the value
     /// lands in the item's buckets.
-    fn sample_cover_groups(&mut self, path: &str, owner: Option<usize>, frame: &mut Frame) {
+    fn sample_cover_groups(
+        &mut self,
+        path: &str,
+        owner: Option<usize>,
+        frame: &mut Frame,
+        span: crate::ast::Span,
+    ) {
         let Some(owner) = owner else {
             return;
         };
@@ -9756,11 +9764,13 @@ impl<'a> Interp<'a> {
             .groups
             .iter()
             .enumerate()
-            .filter(|(_, group)| group.event_path.as_deref() == Some(path))
+            .filter(|(_, group)| {
+                group.event_path.as_deref() == Some(path) && group.unit_owner.is_none()
+            })
             .map(|(index, _)| index)
             .collect();
         for group_index in group_indices {
-            self.sample_group_on_instance(entry_index, group_index, owner, frame);
+            self.sample_group_on_instance(entry_index, group_index, owner, frame, span);
         }
     }
 
@@ -9770,58 +9780,237 @@ impl<'a> Interp<'a> {
     /// the cross items read the round's labels afterwards (14.4). The
     /// shared path of the emit-driven sampling (14.2) and the
     /// procedural `covers.sample_cg()` sampling (14.8.2.10).
+    fn coverage_unit_for(&self, owner: usize, scope: &str) -> Option<(usize, String)> {
+        let root = self
+            .instances
+            .iter()
+            .position(|instance| instance.type_name == "sys")?;
+        let paths = self.walk_instance_tree(root);
+        let path = paths
+            .iter()
+            .find(|path| path.last().is_some_and(|item| item.instance == owner))?;
+        self.coverage_unit_on_path(path, scope)
+    }
+
+    fn coverage_unit_on_path(
+        &self,
+        path: &[InstancePathItem],
+        scope: &str,
+    ) -> Option<(usize, String)> {
+        for position in (0..path.len()).rev() {
+            let unit = path[position].instance;
+            let name = &self.instances[unit].type_name;
+            if self
+                .types
+                .iter()
+                .any(|ty| ty.name == *name && ty.kind == DeclarationKind::Unit)
+                && self.type_is_a(name, scope)
+            {
+                return Some((unit, render_iterator_path(&path[..=position], "sys")));
+            }
+        }
+        None
+    }
+
+    fn coverage_boolean(
+        &mut self,
+        expr: &Expr,
+        owner: usize,
+        unit: Option<usize>,
+    ) -> Result<bool, Diagnostic> {
+        // Coverage options use their declaring struct context, never
+        // the locals of the method that happened to emit the event.
+        let mut frame = Frame::default();
+        if let Some(unit) = unit {
+            frame.locals.insert("inst".to_owned(), Value::Object(unit));
+        }
+        match self.eval(expr, &mut frame, Some(owner))? {
+            Value::Bool(value) => Ok(value),
+            _ => Err(self.error(
+                "E0402",
+                "coverage option expects a Boolean value (14.2-14.3)",
+                expr.span(),
+            )),
+        }
+    }
+
+    fn prepare_coverage_instances(&mut self, refresh_visibility: bool) {
+        if !self.coverage_was_enabled {
+            return;
+        }
+        let Some(root) = self
+            .instances
+            .iter()
+            .position(|instance| instance.type_name == "sys")
+        else {
+            return;
+        };
+        let paths = self.walk_instance_tree(root);
+        let mut plans = Vec::new();
+        for (entry_index, entry) in self.coverage.iter().enumerate() {
+            for (group_index, group) in entry.groups.iter().enumerate() {
+                if group.unit_owner.is_some() {
+                    continue;
+                }
+                let Some(scope) = &group.options.unit_scope else {
+                    continue;
+                };
+                for path in &paths {
+                    let owner = path
+                        .last()
+                        .expect("instance walk path is nonempty")
+                        .instance;
+                    if self.instances[owner].type_name == entry.type_name
+                        && let Some((unit, label)) = self.coverage_unit_on_path(path, scope)
+                    {
+                        plans.push((entry_index, group_index, owner, unit, label));
+                    }
+                }
+            }
+        }
+        let mut refreshed = BTreeSet::new();
+        for (entry, base, owner, unit, path) in plans {
+            if !refreshed.insert((entry, base, unit)) {
+                continue;
+            }
+            let name = self.coverage[entry].groups[base].name.clone();
+            let index = if let Some(index) = self.coverage[entry]
+                .groups
+                .iter()
+                .position(|group| group.name == name && group.unit_owner == Some(unit))
+            {
+                index
+            } else {
+                let mut group = self.coverage[entry].groups[base].clone();
+                group.unit_owner = Some(unit);
+                group.unit_instance = Some(path);
+                self.coverage[entry].groups.push(group);
+                self.coverage[entry].groups.len() - 1
+            };
+            if !refresh_visibility {
+                continue;
+            }
+            let options = self.coverage[entry].groups[base].options.clone();
+            let items: Vec<_> = self.coverage[entry].groups[base]
+                .items
+                .iter()
+                .map(|item| item.options.clone())
+                .collect();
+            let hidden = match &options.instance_no_collect {
+                Some(expr) => match self.coverage_boolean(expr, owner, Some(unit)) {
+                    Ok(value) => value,
+                    Err(diagnostic) => {
+                        self.pending_diagnostics.push(diagnostic);
+                        true
+                    }
+                },
+                None => false,
+            };
+            self.coverage[entry].groups[index].options.hidden = options.hidden || hidden;
+            for (item_index, item) in items.iter().enumerate() {
+                let hidden = match &item.instance_no_collect {
+                    Some(expr) => match self.coverage_boolean(expr, owner, Some(unit)) {
+                        Ok(value) => value,
+                        Err(diagnostic) => {
+                            self.pending_diagnostics.push(diagnostic);
+                            true
+                        }
+                    },
+                    None => false,
+                };
+                self.coverage[entry].groups[index].items[item_index]
+                    .options
+                    .hidden = item.hidden || hidden;
+            }
+        }
+    }
+
     fn sample_group_on_instance(
         &mut self,
         entry_index: usize,
-        group_index: usize,
+        mut group_index: usize,
         owner: usize,
-        frame: &mut Frame,
+        _emitting_frame: &mut Frame,
+        span: crate::ast::Span,
     ) {
         if !self.coverage_config.mode {
             return;
         }
+        let settings = self.coverage[entry_index].groups[group_index]
+            .options
+            .clone();
+        if let Some(scope) = &settings.unit_scope {
+            let Some((unit, _)) = self.coverage_unit_for(owner, scope) else {
+                self.pending_diagnostics.push(self.error(
+                    "E0402",
+                    format!("coverage owner has no containing unit of type '{scope}' (14.2)"),
+                    span,
+                ));
+                return;
+            };
+            self.prepare_coverage_instances(false);
+            let name = self.coverage[entry_index].groups[group_index].name.clone();
+            group_index = self.coverage[entry_index]
+                .groups
+                .iter()
+                .position(|group| group.name == name && group.unit_owner == Some(unit))
+                .expect("prepared coverage instance");
+        }
+        if let Some(expr) = &settings.when {
+            match self.coverage_boolean(expr, owner, None) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(diagnostic) => {
+                    self.pending_diagnostics.push(diagnostic);
+                    return;
+                }
+            }
+        }
         let type_name = self.instances[owner].type_name.clone();
-        // The items' recorded declarations (expression or field name),
-        // looked up in the elaborated type's cover groups by name.
-        let types: &[crate::elab::ElaboratedType] = self.types;
-        let item_sources: Vec<(String, Option<Expr>)> = types
+        let group_name = self.coverage[entry_index].groups[group_index].name.clone();
+        let sources: Vec<_> = self
+            .types
             .iter()
-            .find(|t| t.name == type_name)
-            .map(|ty| {
-                ty.covers
-                    .iter()
-                    .flat_map(|decl| decl.items.iter())
-                    .filter(|item| item.kind == crate::ast::CoverItemKind::Item)
-                    .filter_map(|item| {
-                        let name = item.names.first().map(|(name, _)| name.clone())?;
-                        Some((name, item.expr.clone()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.coverage[entry_index].groups[group_index].samples += 1;
-        let item_names: Vec<String> = self.coverage[entry_index].groups[group_index]
+            .find(|ty| ty.name == type_name)
+            .into_iter()
+            .flat_map(|ty| &ty.covers)
+            .filter(|group| group.name == group_name)
+            .flat_map(|group| &group.items)
+            .filter(|item| item.kind == crate::ast::CoverItemKind::Item)
+            .map(|item| (item.names[0].0.clone(), item.expr.clone()))
+            .collect();
+        let items: Vec<_> = self.coverage[entry_index].groups[group_index]
             .items
             .iter()
-            .map(|item| item.name.clone())
+            .map(|item| (item.name.clone(), item.options.when.clone()))
             .collect();
-        for name in item_names {
-            let Some((_, expr)) = item_sources
-                .iter()
-                .find(|(source_name, _)| *source_name == name)
-            else {
+        self.coverage[entry_index].groups[group_index].begin_sample();
+        let mut frame = Frame::default();
+        for (name, filter) in items {
+            if let Some(expr) = &filter {
+                match self.coverage_boolean(expr, owner, None) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(diagnostic) => {
+                        self.pending_diagnostics.push(diagnostic);
+                        continue;
+                    }
+                }
+            }
+            let Some((_, expr)) = sources.iter().find(|(source, _)| *source == name) else {
                 continue;
             };
             let value = match expr {
-                Some(expr) => self.eval(expr, frame, Some(owner)).ok(),
-                None => self.instances[owner].get(&name).cloned(),
+                Some(expr) => self.eval(expr, &mut frame, Some(owner)),
+                None => self.instances[owner].get(&name).cloned().ok_or_else(|| {
+                    self.error("E0401", format!("unknown coverage field '{name}'"), span)
+                }),
             };
-            if let Some(value) = value {
-                self.coverage[entry_index].groups[group_index].sample(&name, &value);
+            match value {
+                Ok(value) => self.coverage[entry_index].groups[group_index].sample(&name, &value),
+                Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
             }
         }
-        // The cross items record after all of their sources have
-        // this round's labels (14.4).
         self.coverage[entry_index].groups[group_index].record_crosses();
     }
 
@@ -10689,7 +10878,7 @@ impl<'a> Interp<'a> {
             self.atomic_depth -= 1;
             self.depth -= 1;
         }
-        self.sample_cover_groups(&path, None, frame);
+        self.sample_cover_groups(&path, None, frame, span);
         Ok(())
     }
 

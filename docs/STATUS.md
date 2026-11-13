@@ -68,6 +68,12 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   ranges and Boolean buckets retain their declared/default shapes.
   `run --coverage` reports collected groups; `print`/`out` and the
   message hooks produce the run log.
+  `per_unit_instance [= unit_type]` collects separate groups for the
+  nearest containing unit of that type, including unsampled units.
+  Group/basic-item `when` expressions gate sampling in their owning
+  struct context. `instance_no_collect` uses `inst` to suppress a unit's
+  group or item in reports. Hidden items remain available to crosses and
+  transitions; filtered-out sources do not reuse stale cross values.
 
 ## What runs, by 2019 feature
 
@@ -123,8 +129,9 @@ reading, nothing else.
   constraints, `on` bodies, coverage items and the synthesized `when`
   views; local declarations propagate known initializer kinds, but
   ambiguous kinds stay unknown and there is no interprocedural type
-  inference or full name-resolution pass. Coverage options recorded as raw
-  tokens are not checked).
+  inference or full name-resolution pass. Supported coverage option
+  syntax and unit scopes are checked, but full option type checking
+  remains unfinished).
 - Temporal edge expressions (`change/rise/fall`) still lack raw sampled
   value history. Propositions and repeat bounds now retain their sampled
   values: rules sample before each global cycle closes and at quit;
