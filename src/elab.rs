@@ -13,7 +13,7 @@
 //!
 //! ## Diagnostics (on top of the parser's)
 //!
-//! - `E0224` invalid coverage option syntax or per-unit-instance scope
+//! - `E0224` invalid coverage option/range parameters or per-unit-instance scope
 //!   (clauses 14.2–14.3), checked after member composition
 //! - `E0301` `like` inheritance cycle (reported once per type)
 //! - `E0302` the same field name is contributed by two different

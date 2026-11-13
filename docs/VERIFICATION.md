@@ -3842,3 +3842,62 @@ bounded primary field-tree walk. General ignore/illegal/radix semantics,
 instance_ignore/instance_illegal, remaining range parameters, derived-item
 filters, item using-also overrides, full option type checking and the
 broader runtime configuration API remain gaps.
+
+## 2026-11-12 — Integral coverage range parameters and goal precedence
+
+Integral `range(...)` entries now parse their positional name, bucket width
+and hit-goal parameters (14.3). A positive width subdivides inclusive
+bounds, preserving a short final bucket. Named ranges require an undefined
+width; constant string concatenation is supported for names. Integer
+bounds/widths/goals use checked i128 literal/predefined-limit arithmetic,
+including negative values and parenthesized expressions. Unsupported
+constants, overflow, division by zero, invalid widths/goals, reversed/open
+bounds and malformed parameters report E0224 with source spans.
+Construction is capped at 65536 buckets per item, including aggregate
+entries and extreme signed domains, before attempting unbounded allocation.
+
+Range-local goal metadata preserves range > item > group > global
+precedence. `set_config(cover, at_least, N)` supplies the default before
+sampling; changing it after sampling reports E0402 without resetting hits.
+Zero-goal buckets retain counts but leave bucket-grade denominators and do
+not show holes, including per-instance report entries. Bare per_instance
+flags are recognized. Unnamed ranges receive stable bucket labels so
+crosses/transitions use bucket identity rather than the raw sampled value.
+
+Twenty-nine independently authored fixture sets in
+`tests/fixtures/coverage-ranges/` pin subdivision/tails, negative bounds,
+constant expressions and names, goal precedence, zero-goal grading and
+holes, unnamed bucket identity, per-unit copies, overlapping-first-match
+behavior, full signed-domain bounds, exact construction limits, malformed
+parameters, overflow/zero-division, invalid goals, late changes and explicit
+real/string range diagnostics. A CLI test verifies zero-goal reporting.
+README, status, roadmap, architecture, CLI help and the E0224 allocation
+are updated. `examples/coverage_ranges.e` demonstrates four graded buckets
+plus an ungraded optional bucket.
+
+Verification on `agent/coverage-range-options` (based on PR #68):
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 456 passed, 0 failed.
+- `cargo test --test coverage_ranges` — 2 passed, 0 failed; all
+  twenty-nine fixture sets and the CLI check are also in the final suite.
+- `cargo run -- run examples/coverage_ranges.e --seed 1 --coverage` —
+  passed; ten samples, three of four graded buckets covered, grade 75%,
+  with the zero-goal optional bucket excluded from that denominator.
+- `git diff --check` — passed.
+
+The implementation replaces the earlier numeric-argument heuristic and
+prevents item/group defaults from overwriting explicit range goals. Initial
+compilation caught incorrect operator variant spellings; these were fixed
+before the final checks. No local all-feature, WASM or Specman comparison
+was performed.
+
+Reference basis: read-only visual inspection of the lawful local 2016
+redline coverage range/goal tables and grading prose, using the migration
+plan's 2019 clause mapping. No standard text/images or vendor output were
+committed. The zero-goal exclusion is this implementation's reading of the
+shared behavior and has not been differentially qualified. Real/enumeral
+bounds, user-defined constant-name resolution, typed item-domain/precision
+proofs, broader coverage options and procedural goal overrides remain gaps.
+This is regression evidence, not IEEE conformance.

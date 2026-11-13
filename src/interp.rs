@@ -6443,6 +6443,22 @@ impl<'a> Interp<'a> {
                     }
                     config.max_int_buckets = count as u64;
                 }
+                "at_least" => {
+                    let Value::Int(goal) = self.eval(&pair[1], frame, me)? else {
+                        return Err(self.error(
+                            "E0402",
+                            "at_least expects an integer",
+                            pair[1].span(),
+                        ));
+                    };
+                    config.at_least = u64::try_from(goal).map_err(|_| {
+                        self.error(
+                            "E0402",
+                            "at_least must be a nonnegative u64 value",
+                            pair[1].span(),
+                        )
+                    })?;
+                }
                 _ => {
                     return Err(self.error(
                         "E0419",
@@ -6452,7 +6468,9 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        if config.max_int_buckets != self.coverage_config.max_int_buckets {
+        if config.max_int_buckets != self.coverage_config.max_int_buckets
+            || config.at_least != self.coverage_config.at_least
+        {
             if self
                 .coverage
                 .iter()
@@ -6461,7 +6479,11 @@ impl<'a> Interp<'a> {
             {
                 return Err(self.error(
                     "E0402",
-                    "max_int_buckets cannot change after coverage sampling starts",
+                    if config.max_int_buckets != self.coverage_config.max_int_buckets {
+                        "max_int_buckets cannot change after coverage sampling starts"
+                    } else {
+                        "at_least cannot change after coverage sampling starts"
+                    },
                     span,
                 ));
             }

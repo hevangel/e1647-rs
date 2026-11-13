@@ -15,7 +15,8 @@
 //! Structural option/scope errors report E0224 after composition. The
 //! interpreter evaluates Boolean filters and per-unit visibility. Full
 //! option type checking, instance_ignore/instance_illegal, general
-//! ignore/illegal/radix semantics, range parameters beyond bounds/labels,
+//! ignore/illegal/radix semantics, real/enumeral ranges and general
+//! constant/type resolution for range parameters,
 //! item `using also` overrides and the wider runtime configuration API
 //! remain unfinished. No conformance is claimed.
 
@@ -42,6 +43,8 @@ pub(crate) struct GroupOptions {
 /// (1 unless a `range(...)` clause says otherwise) and the hits so far.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverBucket {
+    /// Preserve range-local precedence over item/group/global defaults.
+    pub(crate) explicit_goal: bool,
     pub label: String,
     pub lo: i128,
     pub hi: i128,
@@ -74,15 +77,20 @@ impl CoverItemData {
     /// The item's grade (14.3): the fraction of buckets that reached
     /// their goal; `None` when the item is ungradeable.
     pub fn grade(&self) -> Option<f64> {
-        if self.buckets.is_empty() {
+        let total = self.graded_bucket_count();
+        if total == 0 {
             return None;
         }
         let covered = self
             .buckets
             .iter()
-            .filter(|bucket| bucket.hits >= bucket.goal)
+            .filter(|bucket| bucket.goal > 0 && bucket.hits >= bucket.goal)
             .count();
-        Some(covered as f64 / self.buckets.len() as f64)
+        Some(covered as f64 / total as f64)
+    }
+
+    pub fn graded_bucket_count(&self) -> usize {
+        self.buckets.iter().filter(|bucket| bucket.goal > 0).count()
     }
 }
 
@@ -108,7 +116,7 @@ impl CoverInstanceData {
     }
 
     pub fn is_hole(&self) -> bool {
-        self.hits == 0
+        self.goal > 0 && self.hits == 0
     }
 }
 
@@ -203,7 +211,9 @@ impl CoverGroupData {
         let per_instance: Vec<&CoverItemData> = self
             .items
             .iter()
-            .filter(|item| !item.options.hidden && item.per_instance && !item.buckets.is_empty())
+            .filter(|item| {
+                !item.options.hidden && item.per_instance && item.graded_bucket_count() > 0
+            })
             .collect();
         if per_instance.is_empty() {
             // The weighted average of the gradeable items' (basic and
@@ -234,7 +244,7 @@ impl CoverGroupData {
         let mut weighted_sum = 0.0f64;
         let mut weight_total = 0u64;
         for item in &per_instance {
-            for bucket in &item.buckets {
+            for bucket in item.buckets.iter().filter(|bucket| bucket.goal > 0) {
                 let instance = CoverInstanceData {
                     name: format!("{}=={}", item.name, bucket.label),
                     hits: bucket.hits,
@@ -433,6 +443,8 @@ pub struct CoverageConfig {
     /// (14.3); 0 leaves the item without default buckets
     /// (ungradeable).
     pub max_int_buckets: u64,
+    /// Default hit goal, overridden by group, item and range settings.
+    pub at_least: u64,
 }
 
 impl Default for CoverageConfig {
@@ -440,6 +452,7 @@ impl Default for CoverageConfig {
         Self {
             mode: true,
             max_int_buckets: 16,
+            at_least: 1,
         }
     }
 }
@@ -536,12 +549,9 @@ pub(crate) fn build_types(
                 }
             }
         }
-        // Group-level `at_least`/`weight` (14.9.3/14.9.4: both "can be
-        // set in the coverage group or item definitions"): the group
-        // option applies to every item of the group that does not set
-        // its own; a later declaration's reading overrides an earlier
-        // one (14.6's override reading). The item-level spellings win
-        // where present.
+        // Group defaults (14.9.3/14.9.4) apply where an item has no
+        // override; explicit range goals retain the highest precedence.
+        // Later group declarations replace earlier group defaults.
         for group in groups.iter_mut() {
             let matching: Vec<&CoverGroupDecl> = ty
                 .covers
@@ -554,7 +564,7 @@ pub(crate) fn build_types(
             let mut group_weight: Option<u64> = None;
             for decl in &matching {
                 for entry in &decl.options {
-                    if let Some(Some(value)) = scan_uint_option(entry, "at_least") {
+                    if let Ok(Some(value)) = coverage_goal(entry) {
                         group_at_least = Some(value);
                     }
                     if let Some(Some(value)) = scan_uint_option(entry, "weight") {
@@ -577,9 +587,13 @@ pub(crate) fn build_types(
                         continue;
                     };
                     if let Some(goal) = group_at_least
-                        && scan_uint_option(&entry.using, "at_least").is_none()
+                        && coverage_goal(&entry.using).ok().flatten().is_none()
                     {
-                        for bucket in &mut item.buckets {
+                        for bucket in item
+                            .buckets
+                            .iter_mut()
+                            .filter(|bucket| !bucket.explicit_goal)
+                        {
                             bucket.goal = goal;
                         }
                     }
@@ -704,30 +718,31 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
         .first()
         .map(|(name, _)| name.clone())
         .unwrap_or_default();
-    // The item options (Table 41 is an image in the local copy; the
-    // common readings apply): `at_least = N` is the per-bucket goal,
-    // `per_instance = TRUE` makes each bucket its own graded instance
-    // (14.4.2), `weight = N` weights the grade.
-    let at_least = scan_uint_option(&item.using, "at_least")
-        .unwrap_or_default()
-        .unwrap_or(1);
+    // Item defaults apply after range construction (14.3). Per-instance
+    // grading and weights use the existing collection model (14.3.2).
+    let at_least = coverage_goal(&item.using)
+        .ok()
+        .flatten()
+        .unwrap_or(config.at_least);
     let per_instance = scan_bool_option(&item.using, "per_instance").unwrap_or(false);
     let weight = scan_uint_option(&item.using, "weight")
         .unwrap_or_default()
         .unwrap_or(1);
-    let mut ranges = Vec::new();
-    if let Some(note) = parse_ranges(&item.using, &mut ranges) {
-        return Some(CoverItemData {
-            options: item_options(item).unwrap_or_default(),
-            name,
-            buckets: Vec::new(),
-            ungradeable_hits: 0,
-            samples: 0,
-            note: Some(note),
-            per_instance,
-            weight,
-        });
-    }
+    let ranges = match parse_ranges(&item.using) {
+        Ok(ranges) => ranges,
+        Err(_) => {
+            return Some(CoverItemData {
+                options: item_options(item).unwrap_or_default(),
+                name,
+                buckets: Vec::new(),
+                ungradeable_hits: 0,
+                samples: 0,
+                note: Some("invalid or unsupported coverage ranges"),
+                per_instance,
+                weight,
+            });
+        }
+    };
     let (mut buckets, note) = if ranges.is_empty() {
         // 14.3 defaults: integers grade over the first `max_int_buckets`
         // values (16 unless the 14.9 configuration option says
@@ -761,7 +776,7 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
     } else {
         (ranges, None)
     };
-    for bucket in &mut buckets {
+    for bucket in buckets.iter_mut().filter(|bucket| !bucket.explicit_goal) {
         bucket.goal = at_least;
     }
     Some(CoverItemData {
@@ -796,18 +811,18 @@ fn scan_uint_option(tokens: &[Token], name: &str) -> Option<Option<u64>> {
 
 /// Scan `name = TRUE|FALSE` in recorded option tokens.
 fn scan_bool_option(tokens: &[Token], name: &str) -> Option<bool> {
-    for index in 0..tokens.len() {
-        if token_word(&tokens[index]) == Some(name) && token_kind_is(tokens.get(index + 1)?, "=") {
-            let value = tokens.get(index + 2)?;
-            return match &value.kind {
-                TokenKind::Identifier(word) | TokenKind::Keyword(word) => {
-                    Some(word == "TRUE" || word == "true")
-                }
-                _ => Some(false),
-            };
-        }
+    let value = option_value(tokens, name)?;
+    if value.is_empty() {
+        return Some(true);
     }
-    None
+    match value {
+        [token] => match token_word(token)? {
+            "TRUE" | "true" => Some(true),
+            "FALSE" | "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Scan `name = "text"` in recorded option tokens; `None` when the
@@ -827,6 +842,7 @@ fn scan_string_option(tokens: &[Token], name: &str) -> Option<String> {
 fn bool_buckets() -> Vec<CoverBucket> {
     vec![
         CoverBucket {
+            explicit_goal: false,
             label: "FALSE".to_owned(),
             lo: 0,
             hi: 0,
@@ -834,6 +850,7 @@ fn bool_buckets() -> Vec<CoverBucket> {
             hits: 0,
         },
         CoverBucket {
+            explicit_goal: false,
             label: "TRUE".to_owned(),
             lo: 1,
             hi: 1,
@@ -849,6 +866,7 @@ fn bool_buckets() -> Vec<CoverBucket> {
 fn default_int_buckets(max: u64) -> Vec<CoverBucket> {
     (0..max)
         .map(|value| CoverBucket {
+            explicit_goal: false,
             label: format!("{value}"),
             lo: value as i128,
             hi: value as i128,
@@ -904,150 +922,266 @@ fn type_is_int(ty: &TypeExpr) -> bool {
     )
 }
 
-/// Parse `using ranges = { range([lo..hi], "label" [, num]*); ... }`
-/// from the recorded `using` tokens. Returns `Some(reason)` when the
-/// tokens carry a ranges clause this parser cannot read.
-fn parse_ranges(using: &[Token], buckets: &mut Vec<CoverBucket>) -> Option<&'static str> {
-    // Locate the `ranges` word followed by `= {`.
-    let mut index = 0;
-    while index < using.len() {
-        if token_word(&using[index]) == Some("ranges")
-            && using
-                .get(index + 1)
-                .is_some_and(|token| token_kind_is(token, "="))
-        {
-            break;
-        }
-        index += 1;
-    }
-    if index >= using.len() {
-        return None; // no ranges clause at all
-    }
-    let mut cursor = index + 2;
-    if !using
-        .get(cursor)
-        .is_some_and(|token| token_kind_is(token, "{"))
-    {
-        return Some("ranges clause is not a braced list");
-    }
-    cursor += 1;
-    while cursor < using.len() {
-        if token_kind_is(&using[cursor], "}") {
-            return None;
-        }
-        if token_word(&using[cursor]) != Some("range") {
-            return Some("unsupported entry in the ranges clause");
-        }
-        cursor += 1;
-        let Some(parsed) = parse_range_entry(using, &mut cursor) else {
-            return Some("unsupported range(...) shape");
-        };
-        buckets.push(parsed);
-        // Consume the trailing ';'.
-        if token_kind_is(using.get(cursor)?, ";") {
-            cursor += 1;
-        }
-    }
-    Some("ranges clause is not closed")
-}
-
-/// `([lo..hi], "label" [, num]*)` starting at `cursor['(']`; advances
-/// the cursor past the entry.
-fn parse_range_entry(tokens: &[Token], cursor: &mut usize) -> Option<CoverBucket> {
-    if !token_kind_is(tokens.get(*cursor)?, "(") {
-        return None;
-    }
-    *cursor += 1;
-    if !token_kind_is(tokens.get(*cursor)?, "[") {
-        return None;
-    }
-    *cursor += 1;
-    // The bounds are constant integer expressions over the recorded
-    // tokens (`0`, `0x21`, `MAX_UINT-9` — the corpus usage), evaluated
-    // with the sampler's choice-expression evaluator.
-    let mut lo_tokens = Vec::new();
-    let ranged = loop {
-        let token = tokens.get(*cursor)?;
-        if token_kind_is(token, "..") {
-            *cursor += 1;
-            break true;
-        }
-        if token_kind_is(token, "]") {
-            break false;
-        }
-        lo_tokens.push(token.clone());
-        *cursor += 1;
+/// Integral range construction (14.3). Width, name and hit goal are
+/// positional parameters; unsupported forms are diagnosed, never guessed.
+fn parse_ranges(using: &[Token]) -> Result<Vec<CoverBucket>, crate::diagnostic::Diagnostic> {
+    let Some(tokens) = option_value(using, "ranges") else {
+        return Ok(Vec::new());
     };
-    let lo = crate::interp::eval_choice_int(&lo_tokens)?;
-    let hi = if ranged {
-        let mut hi_tokens = Vec::new();
-        loop {
-            let token = tokens.get(*cursor)?;
-            if token_kind_is(token, "]") {
+    if tokens.len() < 2
+        || !token_kind_is(&tokens[0], "{")
+        || !token_kind_is(tokens.last().unwrap(), "}")
+    {
+        return Err(option_error(
+            tokens,
+            "coverage ranges must be a braced list (14.3)",
+        ));
+    }
+    let mut buckets = Vec::new();
+    for entry in split_parameters(&tokens[1..tokens.len() - 1], ";") {
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.len() < 4
+            || token_word(&entry[0]) != Some("range")
+            || !token_kind_is(&entry[1], "(")
+            || !token_kind_is(entry.last().unwrap(), ")")
+        {
+            return Err(option_error(
+                entry,
+                "expected range(...) in coverage ranges (14.3)",
+            ));
+        }
+        let parameters = split_parameters(&entry[2..entry.len() - 1], ",");
+        if parameters.is_empty()
+            || parameters.len() > 4
+            || parameters.iter().any(|parameter| parameter.is_empty())
+        {
+            return Err(option_error(
+                entry,
+                "range expects one to four nonempty parameters (14.3)",
+            ));
+        }
+        let bounds = parameters[0];
+        if bounds.len() < 3
+            || !token_kind_is(&bounds[0], "[")
+            || !token_kind_is(bounds.last().unwrap(), "]")
+        {
+            return Err(option_error(
+                bounds,
+                "coverage range bounds must use brackets (14.3)",
+            ));
+        }
+        let bounds = split_parameters(&bounds[1..bounds.len() - 1], "..");
+        if bounds.len() > 2 || bounds.iter().any(|bound| bound.is_empty()) {
+            return Err(option_error(
+                parameters[0],
+                "coverage ranges require one value or two finite bounds (14.3)",
+            ));
+        }
+        let lo = constant_integer(bounds[0])?;
+        let hi = if bounds.len() == 2 {
+            constant_integer(bounds[1])?
+        } else {
+            lo
+        };
+        if lo > hi {
+            return Err(option_error(
+                parameters[0],
+                "coverage range lower bound exceeds upper bound (14.3)",
+            ));
+        }
+        let name = parameters
+            .get(1)
+            .map(|tokens| constant_string(tokens))
+            .transpose()?
+            .unwrap_or_default();
+        let width = match parameters.get(2) {
+            None => None,
+            Some(tokens) if is_undef(tokens) => None,
+            Some(tokens) => {
+                let width = constant_integer(tokens)?;
+                if width <= 0 {
+                    return Err(option_error(
+                        tokens,
+                        "coverage range bucket width must be positive (14.3)",
+                    ));
+                }
+                if !name.is_empty() {
+                    return Err(option_error(
+                        tokens,
+                        "subdivided coverage ranges require an empty name (14.3)",
+                    ));
+                }
+                Some(width)
+            }
+        };
+        let goal = parameters
+            .get(3)
+            .filter(|tokens| !is_undef(tokens))
+            .map(|tokens| unsigned_goal(tokens))
+            .transpose()?;
+        let count = match width {
+            None => Some(1),
+            Some(width) => hi
+                .abs_diff(lo)
+                .checked_div(width as u128)
+                .and_then(|count| count.checked_add(1)),
+        };
+        let Some(count) =
+            count.filter(|count| *count <= 65_536 && *count + buckets.len() as u128 <= 65_536)
+        else {
+            return Err(option_error(
+                entry,
+                "coverage ranges exceed the 65536 bucket construction limit (14.3)",
+            ));
+        };
+        let mut start = lo;
+        for _ in 0..count {
+            let end = width.map_or(hi, |width| {
+                start.checked_add(width - 1).unwrap_or(i128::MAX).min(hi)
+            });
+            let label = if !name.is_empty() {
+                name.clone()
+            } else if start == end {
+                start.to_string()
+            } else {
+                format!("{start}..{end}")
+            };
+            buckets.push(CoverBucket {
+                explicit_goal: goal.is_some(),
+                label,
+                lo: start,
+                hi: end,
+                goal: goal.unwrap_or(1),
+                hits: 0,
+            });
+            if end == hi {
                 break;
             }
-            hi_tokens.push(token.clone());
-            *cursor += 1;
+            start = end + 1;
         }
-        crate::interp::eval_choice_int(&hi_tokens)?
-    } else {
-        // `range([v], ..)` — a single-value bucket has lo == hi.
-        lo
-    };
-    // The bounds loops stop at the closing bracket without consuming it.
-    if !token_kind_is(tokens.get(*cursor)?, "]") {
-        return None;
     }
-    *cursor += 1;
-    let mut label = String::new();
-    let mut goal = 1u64;
-    // Optional `, "label"` and further parameters — the first positive
-    // numeric value is the bucket's goal; `UNDEF` marks a parameter the
-    // writer left unset (both per the corpus usage; the full option
-    // semantics live in Table 41, an image in the local copy).
-    while token_kind_is(tokens.get(*cursor)?, ",") {
-        *cursor += 1;
-        let token = tokens.get(*cursor)?;
-        match &token.kind {
-            TokenKind::StringLiteral(text) => {
-                label = text.clone();
-                *cursor += 1;
-            }
-            _ => {
-                // A constant expression parameter (`10`, `MAX_UINT/20`,
-                // `UNDEF`): evaluated with the choice-expression
-                // evaluator, the first positive value taken as the
-                // bucket's goal; `UNDEF` evaluates to nothing and is
-                // skipped, as are unknown expressions (Table 41 is an
-                // image in the local copy).
-                let mut expr_tokens = Vec::new();
-                while let Some(token) = tokens.get(*cursor) {
-                    if token_kind_is(token, ",") || token_kind_is(token, ")") {
-                        break;
-                    }
-                    expr_tokens.push(token.clone());
-                    *cursor += 1;
-                }
-                if let Some(value) = crate::interp::eval_choice_int(&expr_tokens)
-                    && goal == 1
-                    && value > 0
-                {
-                    goal = value as u64;
-                }
+    if buckets.is_empty() {
+        return Err(option_error(
+            tokens,
+            "coverage ranges require at least one range (14.3)",
+        ));
+    }
+    Ok(buckets)
+}
+
+fn split_parameters<'a>(tokens: &'a [Token], separator: &str) -> Vec<&'a [Token]> {
+    let mut result = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (index, token) in tokens.iter().enumerate() {
+        if depth == 0 && token_kind_is(token, separator) {
+            result.push(&tokens[start..index]);
+            start = index + 1;
+        } else if let TokenKind::Punctuation(symbol) = &token.kind {
+            match symbol.as_str() {
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => depth = depth.saturating_sub(1),
+                _ => {}
             }
         }
     }
-    if !token_kind_is(tokens.get(*cursor)?, ")") {
-        return None;
+    if start < tokens.len() || separator != ";" {
+        result.push(&tokens[start..]);
     }
-    *cursor += 1;
-    Some(CoverBucket {
-        label,
-        lo,
-        hi,
-        goal,
-        hits: 0,
+    result
+}
+
+fn is_undef(tokens: &[Token]) -> bool {
+    matches!(tokens, [token] if token_word(token) == Some("UNDEF"))
+}
+
+fn constant_integer(tokens: &[Token]) -> Result<i128, crate::diagnostic::Diagnostic> {
+    fn evaluate(expr: &Expr) -> Option<i128> {
+        use crate::ast::{BinaryOp, UnaryOp};
+        match expr {
+            Expr::IntLiteral { text, .. } | Expr::BitLiteral { text, .. } => {
+                crate::interp::parse_int_literal(text)
+            }
+            Expr::Ident { name, .. } => match name.as_str() {
+                "MAX_UINT" => Some(u32::MAX as i128),
+                "MAX_INT" => Some(i32::MAX as i128),
+                "MAX_LONGUINT" => Some(u64::MAX as i128),
+                "MAX_LONGINT" => Some(i64::MAX as i128),
+                "MIN_INT" => Some(i32::MIN as i128),
+                "MIN_LONGINT" => Some(i64::MIN as i128),
+                _ => None,
+            },
+            Expr::Paren { expr, .. } => evaluate(expr),
+            Expr::Unary { op, expr, .. } => {
+                let value = evaluate(expr)?;
+                match op {
+                    UnaryOp::Plus => Some(value),
+                    UnaryOp::Negate => value.checked_neg(),
+                    _ => None,
+                }
+            }
+            Expr::Binary { op, lhs, rhs, .. } => {
+                let (lhs, rhs) = (evaluate(lhs)?, evaluate(rhs)?);
+                match op {
+                    BinaryOp::Add => lhs.checked_add(rhs),
+                    BinaryOp::Sub => lhs.checked_sub(rhs),
+                    BinaryOp::Mul => lhs.checked_mul(rhs),
+                    BinaryOp::Div => lhs.checked_div(rhs),
+                    BinaryOp::Mod => lhs.checked_rem(rhs),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    crate::parser::parse_expression_tokens(tokens).ok().and_then(|expr| evaluate(&expr))
+        .ok_or_else(|| option_error(tokens, "coverage range parameters require supported constant integers without overflow (14.3)"))
+}
+
+fn constant_string(tokens: &[Token]) -> Result<String, crate::diagnostic::Diagnostic> {
+    fn evaluate(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::StringLiteral { value, .. } => Some(value.clone()),
+            Expr::Paren { expr, .. } => evaluate(expr),
+            Expr::Binary {
+                op: crate::ast::BinaryOp::Add,
+                lhs,
+                rhs,
+                ..
+            } => {
+                let mut value = evaluate(lhs)?;
+                value.push_str(&evaluate(rhs)?);
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+    crate::parser::parse_expression_tokens(tokens)
+        .ok()
+        .and_then(|expr| evaluate(&expr))
+        .ok_or_else(|| {
+            option_error(
+                tokens,
+                "coverage range name requires a supported constant string (14.3)",
+            )
+        })
+}
+
+fn unsigned_goal(tokens: &[Token]) -> Result<u64, crate::diagnostic::Diagnostic> {
+    u64::try_from(constant_integer(tokens)?).map_err(|_| {
+        option_error(
+            tokens,
+            "coverage hit goals must be nonnegative u64 values (14.3)",
+        )
     })
+}
+
+fn coverage_goal(tokens: &[Token]) -> Result<Option<u64>, crate::diagnostic::Diagnostic> {
+    option_value(tokens, "at_least")
+        .map(unsigned_goal)
+        .transpose()
 }
 
 fn token_word(token: &Token) -> Option<&str> {
@@ -1185,6 +1319,7 @@ fn group_options(
                 }
                 options.unit_scope = Some(scope);
             }
+            coverage_goal(entry)?;
             options.hidden |= hidden_option(entry)?;
             if let Some(expr) = option_expr(entry, "when")? {
                 options.when = Some(expr);
@@ -1250,6 +1385,29 @@ pub(crate) fn validate_types(
                 .filter(|group| group.name == decl.name)
                 .flat_map(|group| &group.items)
             {
+                if item.kind == CoverItemKind::Item {
+                    if let Err(diagnostic) = coverage_goal(&item.using) {
+                        diagnostics.push(diagnostic);
+                    }
+                    if let Some(tokens) = option_value(&item.using, "ranges") {
+                        let unsupported = match &item.ty {
+                            Some(TypeExpr::Scalar {
+                                base: ScalarBase::String,
+                                ..
+                            }) => Some("coverage ranges are not permitted for string items (14.3)"),
+                            Some(TypeExpr::Scalar {
+                                base: ScalarBase::Real,
+                                ..
+                            }) => Some("real coverage ranges are not implemented (14.3)"),
+                            _ => None,
+                        };
+                        if let Some(message) = unsupported {
+                            diagnostics.push(option_error(tokens, message));
+                        } else if let Err(diagnostic) = parse_ranges(&item.using) {
+                            diagnostics.push(diagnostic);
+                        }
+                    }
+                }
                 match item_options(item) {
                     Err(diagnostic) => diagnostics.push(diagnostic),
                     Ok(item_options)
