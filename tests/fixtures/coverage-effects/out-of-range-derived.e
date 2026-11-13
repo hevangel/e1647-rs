@@ -10,4 +10,3 @@ extend sys {
     setup() is also { set_config(cover, mode, normal); };
     run() is also { for i from 0 to 4 { n = i; emit cg; }; };
 };
-

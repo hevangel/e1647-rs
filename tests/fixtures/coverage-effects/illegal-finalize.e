@@ -9,4 +9,3 @@ extend sys {
     check() is also { out("check\n"); };
     finalize() is also { emit cg; out("final\n"); };
 };
-

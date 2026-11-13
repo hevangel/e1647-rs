@@ -15,4 +15,3 @@ extend sys {
     setup() is also { set_config(cover, mode, normal); b.skip = 2; b.bad = 0; };
     run() is also { a.send(0); a.send(1); a.send(2); b.send(0); b.send(1); b.send(2); };
 };
-

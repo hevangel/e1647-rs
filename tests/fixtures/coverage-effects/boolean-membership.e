@@ -5,4 +5,3 @@ extend sys {
     setup() is also { set_config(cover, mode, normal); };
     run() is also { emit cg; n = TRUE; emit cg; };
 };
-
