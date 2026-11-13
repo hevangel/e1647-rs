@@ -3,3 +3,4 @@
 # CRLF and fail the comparison.
 *.expected text eol=lf
 *.out text eol=lf
+*.coverage text eol=lf

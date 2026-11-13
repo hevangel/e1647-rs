@@ -17,6 +17,9 @@ pub const BUILTIN_UNITS: &[&str] = &["sys"];
 /// design, `hdl_set`/`hdl_get` assign and read signals by hierarchical
 /// path, `hdl_run` advances time, `hdl_finish` ends the simulation.
 pub const BUILTIN_ROUTINES: &[&str] = &[
+    // Clause 29.9: keyword category/options are handled before value
+    // dispatch. The implemented category is coverage.
+    "set_config",
     "out",
     "outf",
     "hdl_load",

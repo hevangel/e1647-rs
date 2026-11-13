@@ -60,8 +60,14 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   per seed. `select` distributions
   (weights/min/max/edges/others/normal) bias the sampler.
 - **Observability.** Coverage groups (clause 14) collect basic-item
-  buckets and grades on their sampling event (`run --coverage` reports
-  them); `print`/`out` and the message hooks produce the run log.
+  buckets and grades on their sampling event after
+  `set_config(cover, mode, normal)` enables collection. Collection
+  starts disabled; `off` pauses it without clearing counts, and
+  `count_only` collects counts with no interactive post-processing API.
+  `max_int_buckets` accepts 0–65536 before sampling starts; explicit
+  ranges and Boolean buckets retain their declared/default shapes.
+  `run --coverage` reports collected groups; `print`/`out` and the
+  message hooks produce the run log.
 
 ## What runs, by 2019 feature
 

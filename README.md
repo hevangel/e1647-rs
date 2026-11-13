@@ -39,6 +39,24 @@ List queries `has`, `count`, `all` and `all_indices` accept one boolean
 expression with `it` bound to each item. Filtering preserves order and
 returns a fresh list; implicit index bindings remain unsupported.
 
+Coverage starts disabled. Enable it in a `sys.setup()` extension:
+
+```e
+extend sys {
+    setup() is also {
+        set_config(cover, mode, normal, max_int_buckets, 16);
+    };
+};
+```
+
+`run --coverage` reports collected data. Mode `off` pauses collection
+without clearing counts; `count_only` also collects counts. Boolean
+values can enable or disable collection. The bucket limit accepts
+0–65536 and can change before the first sampling event. Other
+configuration categories/options and `set_config_max` remain unsupported.
+Run the independently authored example with
+`cargo run -- run examples/coverage_config.e --seed 1 --coverage`.
+
 ## From Slopman to Rustman
 
 In keeping with this repository's policy of honest staged claims, the

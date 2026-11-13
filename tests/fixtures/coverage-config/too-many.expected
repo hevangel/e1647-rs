@@ -1,0 +1,1 @@
+3:44: error[E0402]: max_int_buckets must be between 0 and 65536

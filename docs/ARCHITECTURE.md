@@ -255,8 +255,15 @@ browser sandbox API is not started.
   renames the derived item (14.4/14.5). The 14.9 coverage
   configuration (`CoverageConfig`: the coverage mode per 14.2's NOTE
   and `max_int_buckets` per 14.3's bracket) is honored through the
-  `build_with_config` builder API — the `set_config()` routine the
-  prose names is not wired; `range(...)`'s numeric parameters beyond
+  `build_with_config` builder API and `set_config(cover, ...)` (29.9).
+  The interpreter builds the schema independently of collection mode,
+  which starts disabled. It validates category/option keyword positions
+  before evaluating values and commits option changes together. Mode
+  changes gate emit-driven and procedural sampling without clearing data.
+  Before sampling, `max_int_buckets` changes rebuild the schema from the
+  composed type declarations; after sampling they report E0402. The
+  runtime resource bound is 65536 buckets per default integer item.
+  `range(...)`'s numeric parameters beyond
   bounds/label are recorded, not applied.
 - `src/interp.rs` — interpreter for the statement subset (codes
   `E0401`–`E0413`). List values (clause 4.11.4's `list_ptr==`) carry
@@ -418,9 +425,9 @@ options, the cross/transition `name` option and the group-level
 `at_least`/`weight` apply; the bool-exp option forms with the
 implicit `inst` variable, the per-unit-instance scoping
 (14.2.2/14.3.4), the `radix`/`when`/`never` option semantics (the
-option tables are images) and the `set_config()` routine the 14.9
-configuration names are not modeled — the configuration is the
-`build_with_config` builder API), integer width
+option tables were not previously inspected) remain unmodeled.
+The coverage subset of `set_config()` is wired; other categories,
+options and `set_config_max()` remain gaps), integer width
 truncation, evaluation of MVL literals, `detach`/`delay`/`exec` TEs, select
 choice policies beyond the constant-expression subset (the full
 choice-expression grammar, soft-order interactions between multiple
