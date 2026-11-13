@@ -1,0 +1,1 @@
+25:9: error[E0224]: coverage source graph exceeds the 65536 scalar-component limit (14.4-14.5)

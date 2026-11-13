@@ -1,0 +1,5 @@
+sys.cg samples=4 grade=0.375
+cross_transition__n__m samples=3 combinations=3 total=Some(8) goal=1 weight=1 grade=Some(0.375)
+((FALSE→TRUE), FALSE) hits=1
+((TRUE→FALSE), TRUE) hits=1
+((FALSE→TRUE), TRUE) hits=1

@@ -91,14 +91,20 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   per item refresh for other pure expressions. Wider arithmetic reports
   E0402. Real/string unbucketed items only filter observed values.
   Cross/transition `when`, `no_collect`, `instance_no_collect`, `at_least`
-  and `weight` options run over basic-item sources (14.4/14.5). Transition
+  and `weight` options run over basic or derived sources (14.4/14.5). Transition
   history advances through legal source samples even when the derived item
   is filtered. Goals inherit item → group → runtime precedence. Zero goals
   are ungraded; zero weights contribute nothing. Hidden derived items keep
   collection data but leave report/grade views. Derived grades participate
   in the weighted per-type aggregate of mixed per-instance groups.
-  Derived ignore/illegal predicates, derived sources and full option type
-  checking remain gaps.
+  Named crosses/transitions may source earlier basic or derived items in
+  the same group. Stable observation references preserve nested histories,
+  duplicate bucket labels, masks and per-unit collections. Parent filters
+  cannot leak stale values into child crosses. Source order, names and
+  cardinality are validated with E0224, including across group extensions.
+  Expanded tuples are capped at 65536 scalar components. Unbucketed source
+  histories retain real/string labels but remain ungraded. Derived
+  ignore/illegal predicates and full option type checking remain gaps.
   Real/enumeral ranges, general constant-name resolution and item-domain
   width proofs remain unfinished.
 

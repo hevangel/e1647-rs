@@ -11,9 +11,12 @@
 //! removed from the reported view. Group/basic/derived `when` expressions
 //! gate sampling in the owning struct context. Crosses require every
 //! source in the current round; transitions retain the last sampled value.
+//! Crosses and transitions can consume previously declared derived items.
+//! Source graphs use stable observation references, with a 65536 expanded
+//! scalar-component bound. E0224 rejects invalid source order/names/shape.
 //! Derived hit goals follow item > group > runtime defaults; weights use
 //! item > group > 1.
-//! presentation-only hiding leaves underlying sampling data intact.
+//! Presentation-only hiding leaves underlying sampling data intact.
 //!
 //! Basic-item ignore/illegal predicates exclude observations and wholly
 //! excluded buckets from goals. Instance variants bind the containing unit.
@@ -138,9 +141,44 @@ impl CoverInstanceData {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum BucketIdentity {
+    Basic(usize),
+    Unbucketed,
+    Outside,
+    Derived(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Observation {
+    label: String,
+    bucket: BucketIdentity,
+}
+
+struct SourceSummary {
+    total: Option<u64>,
+    basic: bool,
+    valid: Vec<bool>,
+}
+
+impl SourceSummary {
+    fn accepts(&self, bucket: &BucketIdentity) -> bool {
+        match bucket {
+            BucketIdentity::Basic(index) if self.basic => {
+                self.valid.get(*index).copied().unwrap_or(false)
+            }
+            BucketIdentity::Unbucketed => self.basic && self.valid.is_empty(),
+            BucketIdentity::Derived(index) if !self.basic => {
+                self.valid.get(*index).copied().unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DerivedKey {
     labels: Vec<String>,
-    buckets: Vec<Option<usize>>,
+    buckets: Vec<BucketIdentity>,
     hits: u64,
 }
 
@@ -150,6 +188,7 @@ struct DerivedKey {
 /// or the base item's previous→current labels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverDerivedData {
+    pub(crate) kind: CoverItemKind,
     pub(crate) options: ItemOptions,
     pub(crate) collect: bool,
     explicit_goal: bool,
@@ -193,25 +232,21 @@ impl CoverDerivedData {
         Some(covered as f64 / total as f64)
     }
 
-    fn record(&mut self, combo: &str, labels: Vec<String>, buckets: Vec<Option<usize>>) {
-        if let Some(key) = self
+    fn record(&mut self, labels: Vec<String>, buckets: Vec<BucketIdentity>) -> usize {
+        let index = self
             .keys
-            .iter_mut()
-            .find(|key| key.labels == labels && key.buckets == buckets)
-        {
-            key.hits += 1;
+            .iter()
+            .position(|key| key.labels == labels && key.buckets == buckets);
+        if let Some(index) = index {
+            self.keys[index].hits += 1;
+            index
         } else {
             self.keys.push(DerivedKey {
                 labels,
                 buckets,
                 hits: 1,
             });
-        }
-        self.samples += 1;
-        if let Some(entry) = self.combos.iter_mut().find(|(seen, _)| seen == combo) {
-            entry.1 += 1;
-        } else {
-            self.combos.push((combo.to_owned(), 1));
+            self.keys.len() - 1
         }
     }
 }
@@ -234,8 +269,8 @@ pub struct CoverGroupData {
     pub samples: u64,
     /// Each item's containing-bucket label (or raw value) at the last
     /// sampling event — the transition source (14.5's previous-value).
-    last_values: BTreeMap<String, String>,
-    last_buckets: BTreeMap<String, Option<usize>>,
+    last_values: BTreeMap<String, Observation>,
+    prior_values: BTreeMap<String, Observation>,
     round_items: BTreeSet<String>,
 }
 
@@ -330,165 +365,212 @@ impl CoverGroupData {
         instances
     }
 
-    /// Record one sampled value for the named item, then update the
-    /// transition/cross derived items (14.5: the transition derives
-    /// `previous-value, value` pairs from the base item's consecutive
-    /// samples; 14.4: the cross records every combination of the
-    /// crossed items' values). The group's sample count is kept by the
-    /// caller — once per sampling event, not once per item.
+    /// Record a basic item and its dependent transitions. Call
+    /// `begin_sample` before the round and `record_crosses` afterwards.
+    /// Library callers manage expression filters; the interpreter evaluates
+    /// them in owner frames at each produced source observation.
     pub fn sample(&mut self, item_name: &str, value: &crate::interp::Value) {
-        self.round_items.insert(item_name.to_owned());
-        let item = self.items.iter().find(|item| item.name == item_name);
+        self.sample_basic(item_name, value);
+        self.record_transitions_from(item_name);
+        self.refresh_derived();
+    }
+
+    pub(crate) fn sample_basic(&mut self, item_name: &str, value: &crate::interp::Value) {
+        let Some(item) = self.items.iter().find(|item| item.name == item_name) else {
+            return;
+        };
         let as_int = value_to_int(value);
-        let bucket = item.and_then(|item| {
-            as_int.and_then(|value| {
-                item.buckets
-                    .iter()
-                    .position(|bucket| value >= bucket.lo && value <= bucket.hi)
-            })
+        let index = as_int.and_then(|value| {
+            item.buckets
+                .iter()
+                .position(|bucket| value >= bucket.lo && value <= bucket.hi)
         });
-        let previous_bucket = self.last_buckets.get(item_name).copied().flatten();
-        // The bucket label this value lands in (14.3's bucket model),
-        // or the raw value when the item is unbucketed.
-        let label = item.and_then(|item| item_label(item, as_int));
-        let label = label.unwrap_or_else(|| render_value(value));
-        // The transition over this item: previous → current (14.5).
-        let previous = self.last_values.get(item_name).cloned();
-        if let Some(previous) = previous {
-            for derived in self
-                .derived
-                .iter_mut()
-                .filter(|derived| derived.collect && derived.sources == vec![item_name])
-            {
-                derived.record(
-                    &format!("{previous}→{label}"),
-                    vec![previous.clone(), label.clone()],
-                    vec![previous_bucket, bucket],
-                );
-            }
-        }
-        self.last_values.insert(item_name.to_owned(), label.clone());
-        self.last_buckets.insert(item_name.to_owned(), bucket);
-        // The crosses over combinations including this item record
-        // after all items have their fresh labels, from record_round's
-        // final pass — nothing to do here.
-        let Some(item) = self.items.iter_mut().find(|item| item.name == item_name) else {
-            return;
-        };
-        item.samples += 1;
-        let Some(as_int) = as_int else {
-            // Enumerands, strings, reals and lists are recorded but not
-            // graded in this milestone.
-            item.ungradeable_hits += 1;
-            return;
-        };
-        if item.buckets.is_empty() {
-            item.ungradeable_hits += 1;
-            return;
-        }
-        if let Some(bucket) = item
-            .buckets
-            .iter_mut()
-            .find(|bucket| as_int >= bucket.lo && as_int <= bucket.hi)
-        {
-            bucket.hits += 1;
+        let bucket = if item.buckets.is_empty() {
+            BucketIdentity::Unbucketed
         } else {
-            // Outside every bucket: ungradeable (14.3).
+            index.map_or(BucketIdentity::Outside, BucketIdentity::Basic)
+        };
+        let label = item_label(item, as_int).unwrap_or_else(|| render_value(value));
+        self.remember(item_name, Observation { label, bucket });
+        let item = self
+            .items
+            .iter_mut()
+            .find(|item| item.name == item_name)
+            .expect("sampled item exists");
+        item.samples += 1;
+        if let Some(index) = index {
+            item.buckets[index].hits += 1;
+        } else {
             item.ungradeable_hits += 1;
         }
     }
 
-    /// Rebuild derived presentation/grade data from stable source bucket
-    /// identities. Original observations remain available if unit masks change.
-    pub(crate) fn refresh_derived(&mut self) {
-        for derived in &mut self.derived {
-            let source_items: Vec<_> = derived
-                .sources
-                .iter()
-                .filter_map(|name| self.items.iter().find(|item| item.name == *name))
-                .collect();
-            derived.total_combos = if source_items.len() != derived.sources.len()
-                || source_items.iter().any(|item| item.buckets.is_empty())
-            {
-                None
-            } else if source_items.len() == 1 {
-                let count = source_items[0]
-                    .buckets
-                    .iter()
-                    .filter(|bucket| !bucket.excluded)
-                    .count() as u64;
-                count.checked_mul(count)
-            } else {
-                source_items.iter().try_fold(1u64, |total, item| {
-                    total.checked_mul(
-                        item.buckets
-                            .iter()
-                            .filter(|bucket| !bucket.excluded)
-                            .count() as u64,
-                    )
-                })
-            };
-            derived.combos.clear();
-            derived.samples = 0;
-            for key in &derived.keys {
-                let valid = key.buckets.iter().enumerate().all(|(position, bucket)| {
-                    let source = if derived.sources.len() == 1 {
-                        source_items.first()
-                    } else {
-                        source_items.get(position)
-                    };
-                    source.is_some_and(|item| {
-                        item.buckets.is_empty()
-                            || bucket.is_some_and(|index| {
-                                item.buckets
-                                    .get(index)
-                                    .is_some_and(|bucket| !bucket.excluded)
-                            })
-                    })
-                });
-                if valid {
-                    let rendered = if derived.sources.len() == 1 {
-                        format!("{}→{}", key.labels[0], key.labels[1])
-                    } else {
-                        format!("({})", key.labels.join(", "))
-                    };
-                    derived.samples += key.hits;
-                    // Equal display names do not merge distinct bucket
-                    // identities or reduce the number of covered goals.
-                    derived.combos.push((rendered, key.hits));
-                }
-            }
+    fn remember(&mut self, name: &str, observation: Observation) {
+        if let Some(previous) = self.last_values.insert(name.to_owned(), observation) {
+            self.prior_values.insert(name.to_owned(), previous);
+        } else {
+            self.prior_values.remove(name);
         }
+        self.round_items.insert(name.to_owned());
     }
 
-    /// The cross pass of one sampling event (14.4): record each cross
-    /// item's combination from its sources' current labels.
-    pub fn record_crosses(&mut self) {
-        let crosses: Vec<(String, Vec<String>)> = self
-            .derived
+    pub(crate) fn transitions_from(&self, source: &str) -> Vec<usize> {
+        self.derived
             .iter()
-            .filter(|derived| derived.collect && derived.sources.len() > 1)
-            .map(|derived| (derived.name.clone(), derived.sources.clone()))
-            .collect();
-        for (name, sources) in crosses {
-            if !sources
-                .iter()
-                .all(|source| self.round_items.contains(source))
-            {
+            .enumerate()
+            .filter(|(_, item)| {
+                item.kind == CoverItemKind::Transition
+                    && item.sources.first().is_some_and(|name| name == source)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn record_transitions_from(&mut self, source: &str) {
+        let mut pending: BTreeSet<_> = self.transitions_from(source).into_iter().collect();
+        let mut seen = BTreeSet::new();
+        while let Some(index) = pending.pop_first() {
+            if !seen.insert(index) {
                 continue;
             }
-            let labels: Option<Vec<String>> = sources
+            if let Some(name) = self.record_transition(index) {
+                pending.extend(self.transitions_from(&name));
+            }
+        }
+    }
+
+    pub(crate) fn record_transition(&mut self, index: usize) -> Option<String> {
+        let item = self.derived.get(index)?;
+        if item.kind != CoverItemKind::Transition
+            || !item.collect
+            || self.round_items.contains(&item.name)
+        {
+            return None;
+        }
+        let source = item.sources.first()?;
+        if !self.round_items.contains(source) {
+            return None;
+        }
+        let previous = self.prior_values.get(source)?.clone();
+        let current = self.last_values.get(source)?.clone();
+        Some(self.record_derived(index, vec![previous, current]))
+    }
+
+    pub(crate) fn record_cross(&mut self, index: usize) -> Option<String> {
+        let item = self.derived.get(index)?;
+        if item.kind != CoverItemKind::Cross
+            || !item.collect
+            || self.round_items.contains(&item.name)
+            || !item
+                .sources
                 .iter()
-                .map(|source| self.last_values.get(source).cloned())
+                .all(|source| self.round_items.contains(source))
+        {
+            return None;
+        }
+        let observations: Option<Vec<_>> = item
+            .sources
+            .iter()
+            .map(|source| self.last_values.get(source).cloned())
+            .collect();
+        Some(self.record_derived(index, observations?))
+    }
+
+    fn record_derived(&mut self, index: usize, observations: Vec<Observation>) -> String {
+        let labels: Vec<_> = observations
+            .iter()
+            .map(|value| value.label.clone())
+            .collect();
+        let buckets = observations.into_iter().map(|value| value.bucket).collect();
+        let item = &mut self.derived[index];
+        let rendered = render_combination(item.kind, &labels);
+        let label = if item.kind == CoverItemKind::Transition {
+            format!("({rendered})")
+        } else {
+            rendered
+        };
+        let bucket = BucketIdentity::Derived(item.record(labels, buckets));
+        let name = item.name.clone();
+        self.remember(&name, Observation { label, bucket });
+        name
+    }
+
+    /// Recompute nested validity and possible-combination counts in declaration
+    /// order. Stable key indices retain history across changing unit masks.
+    pub(crate) fn refresh_derived(&mut self) {
+        let mut summaries: BTreeMap<String, SourceSummary> = self
+            .items
+            .iter()
+            .map(|item| {
+                let valid: Vec<_> = item.buckets.iter().map(|bucket| !bucket.excluded).collect();
+                let total = (!valid.is_empty())
+                    .then(|| valid.iter().filter(|valid| **valid).count() as u64);
+                (
+                    item.name.clone(),
+                    SourceSummary {
+                        total,
+                        basic: true,
+                        valid,
+                    },
+                )
+            })
+            .collect();
+        for item in &mut self.derived {
+            let sources: Option<Vec<_>> = item
+                .sources
+                .iter()
+                .map(|name| summaries.get(name))
                 .collect();
-            let Some(labels) = labels else { continue };
-            let combo = format!("({})", labels.join(", "));
-            if let Some(derived) = self.derived.iter_mut().find(|derived| derived.name == name) {
-                let buckets = sources
-                    .iter()
-                    .map(|source| self.last_buckets.get(source).copied().flatten())
-                    .collect();
-                derived.record(&combo, labels, buckets);
+            item.total_combos = sources.as_ref().and_then(|sources| {
+                if item.kind == CoverItemKind::Transition {
+                    let count = sources.first()?.total?;
+                    count.checked_mul(count)
+                } else if sources.iter().any(|source| source.total == Some(0)) {
+                    Some(0)
+                } else {
+                    sources
+                        .iter()
+                        .try_fold(1u64, |total, source| total.checked_mul(source.total?))
+                }
+            });
+            let mut valid = Vec::new();
+            item.samples = 0;
+            item.combos.clear();
+            for key in &item.keys {
+                let allowed = sources.as_ref().is_some_and(|sources| {
+                    key.buckets.iter().enumerate().all(|(position, bucket)| {
+                        let source = if item.kind == CoverItemKind::Transition {
+                            sources.first()
+                        } else {
+                            sources.get(position)
+                        };
+                        source.is_some_and(|source| source.accepts(bucket))
+                    })
+                });
+                valid.push(allowed);
+                if allowed {
+                    item.samples += key.hits;
+                    item.combos
+                        .push((render_combination(item.kind, &key.labels), key.hits));
+                }
+            }
+            summaries.insert(
+                item.name.clone(),
+                SourceSummary {
+                    total: item.total_combos,
+                    basic: false,
+                    valid,
+                },
+            );
+        }
+    }
+
+    /// Complete the round's crosses in declaration order, including descendants
+    /// of newly produced crosses and transitions. Sources must be fresh.
+    pub fn record_crosses(&mut self) {
+        for index in 0..self.derived.len() {
+            if let Some(name) = self.record_cross(index) {
+                self.record_transitions_from(&name);
             }
         }
         self.refresh_derived();
@@ -524,6 +606,8 @@ fn render_value(value: &crate::interp::Value) -> String {
         crate::interp::Value::Int(value) => format!("{value}"),
         crate::interp::Value::Bool(value) => format!("{value}"),
         crate::interp::Value::Enum { name, .. } => name.clone(),
+        crate::interp::Value::Str(value) => format!("{value:?}"),
+        crate::interp::Value::Real(value) => value.to_string(),
         _ => "?".to_owned(),
     }
 }
@@ -617,7 +701,7 @@ pub(crate) fn build_types(
                 .iter()
                 .filter_map(|item| build_item(item, config))
                 .collect();
-            let derived = build_derived(decl, &items, config);
+            let derived = build_derived(decl, config);
             groups.push(CoverGroupData {
                 options: group_options(ty, &decl.name).unwrap_or_default(),
                 unit_instance: None,
@@ -628,7 +712,7 @@ pub(crate) fn build_types(
                 derived,
                 samples: 0,
                 last_values: BTreeMap::new(),
-                last_buckets: BTreeMap::new(),
+                prior_values: BTreeMap::new(),
                 round_items: BTreeSet::new(),
             });
         }
@@ -647,8 +731,7 @@ pub(crate) fn build_types(
                         .iter()
                         .filter_map(|item| build_item(item, config)),
                 );
-                base.derived
-                    .extend(build_derived(decl, &base.items, config));
+                base.derived.extend(build_derived(decl, config));
             }
         }
         // Group-level options: `per_instance = TRUE` marks every item
@@ -753,96 +836,56 @@ pub(crate) fn build_types(
 }
 
 /// Synthesize a group's derived items (14.4/14.5) from its recorded
-/// cross/transition entries, with totals over the basic items' buckets.
-fn build_derived(
-    decl: &CoverGroupDecl,
-    items: &[CoverItemData],
-    config: &CoverageConfig,
-) -> Vec<CoverDerivedData> {
-    let mut derived = Vec::new();
-    for entry in &decl.items {
-        match entry.kind {
-            CoverItemKind::Transition => {
-                let Some((base, _)) = entry.names.first() else {
-                    continue;
-                };
-                let total = items
-                    .iter()
-                    .find(|item| &item.name == base)
-                    .filter(|item| !item.buckets.is_empty())
-                    .and_then(|item| {
-                        let count = item.buckets.len() as u64;
-                        count.checked_mul(count)
-                    });
-                // 14.5: "If no name is specified for the transition item
-                // with the name option, it gets a default name of
-                // transition item-name" (two underscores).
-                let name = scan_string_option(&entry.using, "name")
-                    .unwrap_or_else(|| format!("transition__{base}"));
-                derived.push(CoverDerivedData {
-                    options: item_options(entry).unwrap_or_default(),
-                    collect: true,
-                    explicit_goal: coverage_goal(&entry.using).ok().flatten().is_some(),
-                    explicit_weight: coverage_weight(&entry.using).ok().flatten().is_some(),
-                    goal: coverage_goal(&entry.using)
-                        .ok()
-                        .flatten()
-                        .unwrap_or(config.at_least),
-                    weight: coverage_weight(&entry.using).ok().flatten().unwrap_or(1),
-                    keys: Vec::new(),
-                    name,
-                    sources: vec![base.clone()],
-                    samples: 0,
-                    combos: Vec::new(),
-                    total_combos: total,
-                });
-            }
-            CoverItemKind::Cross => {
-                let sources: Vec<String> =
-                    entry.names.iter().map(|(name, _)| name.clone()).collect();
-                if sources.is_empty() {
-                    continue;
-                }
-                let bucket_counts: Option<Vec<&CoverItemData>> = sources
-                    .iter()
-                    .map(|source| items.iter().find(|item| item.name == *source))
-                    .collect();
-                let total = bucket_counts.and_then(|items| {
-                    items.iter().try_fold(1u64, |product, item| {
-                        if item.buckets.is_empty() {
-                            None
-                        } else {
-                            product.checked_mul(item.buckets.len() as u64)
-                        }
-                    })
-                });
-                // 14.4: "It creates a new item with a name specified
-                // using a name option or by using the default name of
-                // cross item-name-1 item-name-2" (two underscores).
-                let name = scan_string_option(&entry.using, "name")
-                    .unwrap_or_else(|| format!("cross_{}", sources.join("__")));
-                derived.push(CoverDerivedData {
-                    options: item_options(entry).unwrap_or_default(),
-                    collect: true,
-                    explicit_goal: coverage_goal(&entry.using).ok().flatten().is_some(),
-                    explicit_weight: coverage_weight(&entry.using).ok().flatten().is_some(),
-                    goal: coverage_goal(&entry.using)
-                        .ok()
-                        .flatten()
-                        .unwrap_or(config.at_least),
-                    weight: coverage_weight(&entry.using).ok().flatten().unwrap_or(1),
-                    keys: Vec::new(),
-                    name,
-                    sources,
-                    samples: 0,
-                    combos: Vec::new(),
-                    total_combos: total,
-                });
-            }
-            CoverItemKind::Item => {}
-        }
+/// cross/transition entries; final graph totals are computed after merging.
+fn derived_name(entry: &CoverItemDecl) -> String {
+    scan_string_option(&entry.using, "name").unwrap_or_else(|| match entry.kind {
+        CoverItemKind::Transition => format!(
+            "transition__{}",
+            entry.names.first().map_or("", |(name, _)| name)
+        ),
+        _ => format!(
+            "cross_{}",
+            entry
+                .names
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join("__")
+        ),
+    })
+}
+
+fn build_derived(decl: &CoverGroupDecl, config: &CoverageConfig) -> Vec<CoverDerivedData> {
+    decl.items
+        .iter()
+        .filter(|entry| entry.kind != CoverItemKind::Item)
+        .map(|entry| CoverDerivedData {
+            kind: entry.kind,
+            options: item_options(entry).unwrap_or_default(),
+            collect: true,
+            explicit_goal: coverage_goal(&entry.using).ok().flatten().is_some(),
+            explicit_weight: coverage_weight(&entry.using).ok().flatten().is_some(),
+            goal: coverage_goal(&entry.using)
+                .ok()
+                .flatten()
+                .unwrap_or(config.at_least),
+            weight: coverage_weight(&entry.using).ok().flatten().unwrap_or(1),
+            keys: Vec::new(),
+            name: derived_name(entry),
+            sources: entry.names.iter().map(|(name, _)| name.clone()).collect(),
+            samples: 0,
+            combos: Vec::new(),
+            total_combos: None,
+        })
+        .collect()
+}
+
+fn render_combination(kind: CoverItemKind, labels: &[String]) -> String {
+    if kind == CoverItemKind::Transition {
+        format!("{}→{}", labels[0], labels[1])
+    } else {
+        format!("({})", labels.join(", "))
     }
-    derived
 }
 
 /// The group's sampling event as a dotted path (`cover_trans`,
@@ -1511,6 +1554,82 @@ fn group_options(
     Ok(options)
 }
 
+/// Source order makes the derived graph acyclic (14.4/14.5). The
+/// expanded scalar-component cap bounds nested rendered tuples, separately
+/// from the possible bucket count (which can be much larger or unbounded).
+fn validate_source_graph(
+    ty: &crate::elab::ElaboratedType,
+    group: &str,
+) -> Vec<crate::diagnostic::Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut widths = BTreeMap::<String, usize>::new();
+    let declarations = ty
+        .covers
+        .iter()
+        .filter(|decl| decl.name == group && !decl.is_also)
+        .chain(
+            ty.covers
+                .iter()
+                .filter(|decl| decl.name == group && decl.is_also),
+        );
+    for item in declarations.flat_map(|decl| &decl.items) {
+        let error = |message: String, span: crate::ast::Span| {
+            crate::diagnostic::Diagnostic::new("E0224", message, span.0, span.1)
+        };
+        let (name, width) = if item.kind == CoverItemKind::Item {
+            if item.names.len() != 1 {
+                diagnostics.push(error(
+                    "basic coverage item requires exactly one name (14.3)".to_owned(),
+                    item.span,
+                ));
+            }
+            (
+                item.names
+                    .first()
+                    .map_or(String::new(), |(name, _)| name.clone()),
+                1,
+            )
+        } else {
+            if (item.kind == CoverItemKind::Cross && item.names.len() < 2)
+                || (item.kind == CoverItemKind::Transition && item.names.len() != 1)
+            {
+                diagnostics.push(error(
+                    "cross requires at least two sources and transition requires one (14.4-14.5)"
+                        .to_owned(),
+                    item.span,
+                ));
+            }
+            let mut width = Some(0usize);
+            for (source, span) in &item.names {
+                if let Some(source_width) = widths.get(source) {
+                    width = width.and_then(|width| width.checked_add(*source_width));
+                } else {
+                    diagnostics.push(error(format!("coverage source '{source}' must be defined earlier in this group (14.4-14.5)"), *span));
+                }
+            }
+            if item.kind == CoverItemKind::Transition {
+                width = width.and_then(|width| width.checked_mul(2));
+            }
+            let width = width.filter(|width| *width <= 65_536);
+            if width.is_none() {
+                diagnostics.push(error(
+                    "coverage source graph exceeds the 65536 scalar-component limit (14.4-14.5)"
+                        .to_owned(),
+                    item.span,
+                ));
+            }
+            (derived_name(item), width.unwrap_or(65_536))
+        };
+        if widths.insert(name.clone(), width).is_some() {
+            diagnostics.push(error(
+                format!("duplicate coverage item name '{name}' (14.3-14.5)"),
+                item.span,
+            ));
+        }
+    }
+    diagnostics
+}
+
 /// Structural coverage option checks run on the composed type view,
 /// so inherited and extended groups use the same scope as execution.
 pub(crate) fn validate_types(
@@ -1539,6 +1658,7 @@ pub(crate) fn validate_types(
             if !seen.insert(&decl.name) {
                 continue;
             }
+            diagnostics.extend(validate_source_graph(ty, &decl.name));
             let options = match group_options(ty, &decl.name) {
                 Ok(options) => options,
                 Err(diagnostic) => {

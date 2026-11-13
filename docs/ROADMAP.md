@@ -407,9 +407,13 @@ not imply full language support or IEEE conformance.
       illegal values produce immediate or deferred DUT errors. Interval masks
       and bounded arithmetic classification preserve derived bucket identity.
       Cross/transition when, visibility, hit-goal and weight options run over
-      basic sources. Derived grades enter the weighted per-type aggregate in
+      basic and previously declared derived sources. Derived grades enter the
+      weighted per-type aggregate in
       mixed per-instance groups; filtered transitions retain source history.
-      Derived sources and derived ignore/illegal predicates remain gaps.
+      Derived source graphs preserve nested key identities, current-round
+      freshness, masks and per-unit histories. Source order/name/arity errors
+      are E0224; expanded tuples are capped at 65536 scalar components.
+      Derived ignore/illegal predicates remain gaps.
       Exact overlap/phase/filter-side-effect behavior needs qualification
 - [~] Part 2 predefined routine library — started with the reflection
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`

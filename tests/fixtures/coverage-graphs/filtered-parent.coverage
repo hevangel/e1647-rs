@@ -1,0 +1,4 @@
+sys.cg samples=4 grade=0.125
+transition__p samples=2 combinations=2 total=Some(16) goal=1 weight=1 grade=Some(0.125)
+(FALSE, FALSE)→(FALSE, TRUE) hits=1
+(FALSE, TRUE)→(TRUE, TRUE) hits=1
