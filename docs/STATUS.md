@@ -90,7 +90,15 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   compositions symbolically, or enumerate at most 65536 candidate visits
   per item refresh for other pure expressions. Wider arithmetic reports
   E0402. Real/string unbucketed items only filter observed values.
-  Derived-item filters and full option type checking remain gaps.
+  Cross/transition `when`, `no_collect`, `instance_no_collect`, `at_least`
+  and `weight` options run over basic-item sources (14.4/14.5). Transition
+  history advances through legal source samples even when the derived item
+  is filtered. Goals inherit item → group → runtime precedence. Zero goals
+  are ungraded; zero weights contribute nothing. Hidden derived items keep
+  collection data but leave report/grade views. Derived grades participate
+  in the weighted per-type aggregate of mixed per-instance groups.
+  Derived ignore/illegal predicates, derived sources and full option type
+  checking remain gaps.
   Real/enumeral ranges, general constant-name resolution and item-domain
   width proofs remain unfinished.
 

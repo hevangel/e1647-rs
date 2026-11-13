@@ -1,0 +1,5 @@
+sys.cg samples=2 grade=0.250
+cross_n__flag samples=2 combinations=1 total=Some(4) goal=1 weight=18446744073709551615 grade=Some(0.25)
+transition__n samples=1 combinations=1 total=Some(4) goal=1 weight=18446744073709551615 grade=Some(0.25)
+(FALSE, FALSE) hits=2
+FALSE→FALSE hits=1

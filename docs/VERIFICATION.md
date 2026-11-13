@@ -3967,3 +3967,72 @@ Real/enumeral ranges, derived-item filters, general option type checking,
 complete typed-domain/precision proofs and wider configuration remain gaps.
 Unbucketed real/string items filter observed values without bucket-domain
 classification. This is regression evidence, not IEEE conformance.
+
+
+## 2026-11-13 — Derived coverage collection and grading options
+
+On `agent/derived-coverage-options`, based on PR #70, cross and transition
+items now apply `when`, `no_collect`, `instance_no_collect`, `at_least` and
+`weight` (IEEE 1647-2019, 14.4/14.5). Transition filters run with a fresh
+owner frame at the legal source observation; cross filters run after the
+round's basic sources. Suppression of a derived sample does not suppress
+basic collection or rewind the previous legal source value. Per-unit
+presentation expressions bind `inst` to the associated unit; hiding leaves
+sampling storage intact and excludes presentation/grade contributions.
+
+Derived grades count combinations reaching their hit goal. Item-local
+goals override group defaults, which override runtime at_least; weights
+use item > group > 1. Zero goals are ungraded and zero weights contribute
+nothing. Derived items now participate in the weighted per-type aggregate
+of mixed per-instance groups, fixing their earlier omission. Three existing
+coverage-effect fixture grades changed: ignore-cross-transition and
+ignore-precedence are 0.806, duplicate-labels is 0.852 (three-decimal
+rendering). Their sample/hit histories are unchanged. Weight parsing now
+uses checked constant u64 validation (basic/group spellings included),
+with E0224 for malformed, negative, fractional or overflowing values.
+
+Weight sums use floating-point totals rather than overflowing u64 sums.
+Derived combination products use checked u64 multiplication, including a
+transition with 65536 source buckets (4294967296 possible pairs) without
+host-pointer-width multiplication. Totals refresh against the final merged
+schema, so later group extensions can supply sources. Unsupported product
+sizes remain ungradeable rather than panicking. CLI output includes derived
+goals and weights. The generic Boolean-option diagnostic now cites clause
+14, covering both basic and derived options.
+
+Twenty-five independently authored fixture sets in
+`tests/fixtures/coverage-derived/` cover filter/history behavior, fresh owner
+frames and method predicates, multiple transitions over one source, stale
+cross prevention, visibility restoration, per-unit filters, local/group/
+runtime goal precedence, extension defaults, weights and mixed instance
+grades, zero goals/weights, maximal weights, product overflow, the largest
+transition domain and spanned scope/type/value diagnostics. A library test
+checks hidden data retention and a CLI test checks goal/weight reporting.
+`examples/coverage_derived.e` demonstrates two filtered derived items.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 461 passed, 0 failed (18 test binaries).
+- `cargo test --test coverage_derived` — 3 passed, 0 failed; the fixture,
+  library and CLI tests are included in the final full-suite result.
+- `cargo run -- run examples/coverage_derived.e --seed 1 --coverage` —
+  passed: six events, each derived item has three samples and two observed
+  combinations; one combination reaches goal 2, giving both grades and
+  the group grade 25%.
+- `git diff --check` — passed.
+
+The first new-fixture run exposed an expected-output formatting mismatch
+(0 versus the interpreter's real-valued 0.0), corrected before the final
+run. Clippy found one nested-if style issue, also corrected. No local
+all-feature, WASM runtime or Specman comparison was performed.
+
+Reference basis: visual inspection of current cross/transition option
+rows in the lawful local 2016 redline, excluding deleted rows, with the
+migration plan's 2019 clause mapping. No standard text/images or vendor
+output committed. Derived ignore/illegal predicates, crossing/transiting
+other derived items, full option typing, text metadata, real/enumeral
+ranges and procedural overrides remain unfinished. Exact side-effectful
+filter ordering and the inherited grading model still need differential
+qualification. This is regression evidence, not IEEE conformance.

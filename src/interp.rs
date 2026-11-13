@@ -9866,7 +9866,7 @@ impl<'a> Interp<'a> {
             Value::Bool(value) => Ok(value),
             _ => Err(self.error(
                 "E0402",
-                "coverage option expects a Boolean value (14.2-14.3)",
+                "coverage option expects a Boolean value (clause 14)",
                 expr.span(),
             )),
         }
@@ -10155,6 +10155,26 @@ impl<'a> Interp<'a> {
                 None => false,
             };
             self.coverage[entry].groups[index].options.hidden = options.hidden || hidden;
+            let derived: Vec<_> = self.coverage[entry].groups[base]
+                .derived
+                .iter()
+                .map(|item| item.options.clone())
+                .collect();
+            for (item_index, item) in derived.iter().enumerate() {
+                let hidden = match &item.instance_no_collect {
+                    Some(expr) => match self.coverage_boolean(expr, owner, Some(unit)) {
+                        Ok(value) => value,
+                        Err(diagnostic) => {
+                            self.pending_diagnostics.push(diagnostic);
+                            true
+                        }
+                    },
+                    None => false,
+                };
+                self.coverage[entry].groups[index].derived[item_index]
+                    .options
+                    .hidden = item.hidden || hidden;
+            }
             for (item_index, item) in items.iter().enumerate() {
                 let hidden = match &item.instance_no_collect {
                     Some(expr) => match self.coverage_boolean(expr, owner, Some(unit)) {
@@ -10170,6 +10190,40 @@ impl<'a> Interp<'a> {
                     .options
                     .hidden = item.hidden || hidden;
             }
+        }
+    }
+
+    // Transition filters run at their source observation; cross filters
+    // run after all basic source expressions for the current round.
+    fn prepare_derived_sampling(
+        &mut self,
+        entry: usize,
+        group: usize,
+        owner: usize,
+        source: Option<&str>,
+    ) {
+        let items: Vec<_> = self.coverage[entry].groups[group]
+            .derived
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| match source {
+                Some(source) => item.sources.len() == 1 && item.sources[0] == source,
+                None => item.sources.len() > 1,
+            })
+            .map(|(index, item)| (index, item.options.when.clone()))
+            .collect();
+        for (index, when) in items {
+            let collect = match when {
+                Some(expr) => match self.coverage_boolean(&expr, owner, None) {
+                    Ok(value) => value,
+                    Err(diagnostic) => {
+                        self.pending_diagnostics.push(diagnostic);
+                        false
+                    }
+                },
+                None => true,
+            };
+            self.coverage[entry].groups[group].derived[index].collect = collect;
         }
     }
 
@@ -10291,6 +10345,12 @@ impl<'a> Interp<'a> {
                             continue;
                         }
                         Ok(false) => {
+                            self.prepare_derived_sampling(
+                                entry_index,
+                                group_index,
+                                owner,
+                                Some(&name),
+                            );
                             self.coverage[entry_index].groups[group_index].sample(&name, &value)
                         }
                         Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
@@ -10299,6 +10359,7 @@ impl<'a> Interp<'a> {
                 Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
             }
         }
+        self.prepare_derived_sampling(entry_index, group_index, owner, None);
         self.coverage[entry_index].groups[group_index].record_crosses();
     }
 
