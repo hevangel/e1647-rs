@@ -4387,7 +4387,10 @@ fn table_from_csv_to_table_with_filter() {
     // T9.2's test: the rows come from tests/data/regs.csv's `regs`
     // table; the filter drops the `dummy` row, so `ctrl:8` and
     // `stat:4` print.
-    let path = format!("{}/tests/data/regs", env!("CARGO_MANIFEST_DIR"));
+    let path = format!(
+        "{}/tests/data/regs",
+        env!("CARGO_MANIFEST_DIR").replace('\\', "/")
+    );
     let source = format!(
         "extend sys {{\n    \
          run() is also {{\n        \
@@ -4404,7 +4407,10 @@ fn table_from_csv_to_table_with_unique() {
     // The unique option keeps the first row per distinct value,
     // applied after the filter — over the `dups` table whose widths
     // repeat (8, 4, 8, 4, 8), only the first 8 and the first 4 stay.
-    let path = format!("{}/tests/data/regs", env!("CARGO_MANIFEST_DIR"));
+    let path = format!(
+        "{}/tests/data/regs",
+        env!("CARGO_MANIFEST_DIR").replace('\\', "/")
+    );
     let source = format!(
         "extend sys {{\n    \
          run() is also {{\n        \
@@ -4467,7 +4473,7 @@ fn table_read_from_csv_is_cached_and_read_only() {
          run() is also {{\n        \
          var t := table_manager.read_table_from_csv(\"{}/tests/data/regs\", \"regs\");\n        \
          t.get_row(0).set_data(1, \"9\");\n    }};\n}};\n",
-        env!("CARGO_MANIFEST_DIR")
+        env!("CARGO_MANIFEST_DIR").replace('\\', "/")
     ));
     assert!(parsed.diagnostics.is_empty(), "parse failed");
     let elaborated = elaborate(&parsed.declarations);
@@ -4561,7 +4567,10 @@ fn gen_chosen_from_no_satisfying_element_reports_e0417() {
 fn table_copy_is_writable_and_read_helpers_work() {
     // copy() lifts the read-only flag; the csv readers report their
     // source, and the manager's line helpers answer per 32.3.3.
-    let path = format!("{}/tests/data/regs", env!("CARGO_MANIFEST_DIR"));
+    let path = format!(
+        "{}/tests/data/regs",
+        env!("CARGO_MANIFEST_DIR").replace('\\', "/")
+    );
     let output = clean_output(
         &format!(
             "extend sys {{\n    \

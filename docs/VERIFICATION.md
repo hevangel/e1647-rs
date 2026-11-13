@@ -3684,34 +3684,6 @@ Sampling remains on the global virtual timeline: rules sample cycle
 closure, waits sample their checks. Raw temporal `change/rise/fall`
 expressions and event-specific/per-instance timelines remain gaps.
 
-## 2026-11-11 — Scalar temporal edge samples
-
-Implemented recorded `change`/`rise`/`fall` results for Boolean,
-integer and enumeral expressions (12.2.18). Numeric rises/falls compare
-magnitude; a first sample establishes the baseline. Edges retain
-separate histories per rule/wait, routine and expression. Explicit
-event clocks gate sampling and nested clocks override their enclosing
-clock. Active waits retain clocked samples arriving after their turn,
-and consume matches since their last observation. Completed, failed
-and expired wait contexts retire their sampling state.
-
-Reference basis: read-only inspection of the available lawful local
-2016 redline's shared scalar-edge behavior. The 2019 citation applies
-the migration plan's temporal-operator Introduction shift (+1). No
-standard text, tables or proprietary example code were copied into
-implementation or tests. The 2019-specific edge-width legality remains
-unqualified and is not statically checked. Published Cadence event-port
-material was located during research; it did not supply qualification
-for the scalar temporal semantics implemented here.
-
-Seven independently authored fixture sets under
-`tests/fixtures/temporal-edges/` pin Boolean transitions, numeric
-magnitude changes, enumeral ordinals, the initial baseline, explicit
-clock gating, concurrent local contexts, successive waits, late clocks
-and exact E0402 output for an unsupported real sample. Three core tests
-check scalar comparisons, clone-safe recorded edges/context isolation
-and sampling-event overrides.
-
 Keys use the runtime's integer/real/string ordering; enumeral/custom
 numeric keys and implicit index bindings are not modeled. The receiver
 is snapshotted before key evaluation, so mutation does not change which
@@ -3732,21 +3704,6 @@ E0220/E0221/E0223 diagnostics.
 Verification:
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo clippy --all-targets -- -D warnings` — passed without warnings.
-- `cargo test --all-targets` — 446 passed, 0 failed.
-- `cargo test --test temporal --test temporal_history` — 17 passed,
-  0 failed; final all-target testing includes all seven edge fixtures.
-- `git diff --check` — passed.
-
-No Specman reference runs were performed. This is implementation
-regression evidence, not differential qualification or conformance.
-The runtime retains its integer value model rather than validating
-static edge widths. Real/MVL/custom-numeric edges are unsupported.
-Sampling is still per virtual cycle; multiple occurrences in one cycle
-collapse to that cycle's sample. General event-specific compound
-timelines, per-instance temporal rules and precise HDL event ordering
-remain gaps.
-
 - `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
 - `cargo test --all-targets` — 442 passed, 0 failed.
 - `cargo test --test list_queries --test typing` — 6 passed, 0 failed.
@@ -3758,3 +3715,51 @@ claim. The supported forms require exactly one boolean expression;
 implicit index bindings remain unsupported. Traversal snapshots the
 receiver before predicate evaluation, so mutation does not change the
 items visited. Other expression-taking list methods remain gaps.
+
+## 2026-11-12 — Integrate reviewed scalar temporal edges into main
+
+PR #64 was merged into `agent/temporal-sampled-history` after that
+branch's original main merge. This integration brings its scalar temporal
+edge work to a feature branch based on current main, retaining the current
+license and the later frontend/type-checking changes.
+
+Recorded `change`/`rise`/`fall` results cover Boolean, integer and
+enumeral expressions (12.2.18). Numeric rise/fall compare magnitude;
+the first sample establishes a baseline. Rule/wait contexts retain
+separate histories. Explicit event clocks gate sampling and inner clocks
+override enclosing clocks. Active waits retain late-arriving clocked
+samples and consume matches since the previous observation. Completed,
+failed and expired waits retire their sampling state.
+
+Seven independently authored runtime fixture sets cover transitions,
+initial baselines, numeric magnitude, enumerals, explicit clocks,
+concurrent locals, successive waits, late clocks and exact E0402 output
+for unsupported real samples. Three core regressions cover comparisons,
+cloned monitors/context isolation and nested clock selection.
+
+The inherited verification-log merge had placed the edge entry inside
+the keyed-extrema entry and its verification inside the predicate-query
+entry. Those entries are separated here. Four CSV tests now normalize
+Windows path separators before embedding paths in e string literals;
+a checkout path containing a backslash followed by t otherwise became
+a tab and caused unrelated file-read failures.
+
+Verification on `agent/integrate-temporal-edges`:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 454 passed, 0 failed.
+- `git diff --check` — passed.
+
+The initial all-target run failed four CSV path tests; the final result
+above includes their path fixes. No local all-feature, WASM or Specman
+run was performed. PR #64 records the original reference basis as the
+lawful local 2016 redline's shared behavior with the 2019 clause-number
+mapping; this integration adds no new standard-reading qualification.
+
+This is regression evidence, not differential qualification or conformance.
+Static edge-width legality, real/MVL/custom-numeric edge samples,
+multiple distinct samples within one virtual cycle, general event-specific
+compound timelines, per-instance rule timelines and precise HDL event
+ordering remain gaps. The TCM call-continuation increment is separate
+(PR #65) and is not included in this branch.
