@@ -28,8 +28,9 @@
 > IEEE conformance is claimed.
 
 Temporal rules and waits retain sampled proposition and repeat-bound
-values, so later state matching uses the recorded values. Raw temporal
-`change`/`rise`/`fall` expressions remain unsupported.
+values, so later state matching uses the recorded values. Temporal
+`change`/`rise`/`fall` also sample Boolean, integer and enumeral
+expressions; general event-specific timelines remain incomplete.
 
 List extrema `min`, `max`, `min_index` and `max_index` accept an optional
 per-item key expression such as `it.score`. They return the selected

@@ -3715,3 +3715,51 @@ claim. The supported forms require exactly one boolean expression;
 implicit index bindings remain unsupported. Traversal snapshots the
 receiver before predicate evaluation, so mutation does not change the
 items visited. Other expression-taking list methods remain gaps.
+
+## 2026-11-12 — Integrate reviewed scalar temporal edges into main
+
+PR #64 was merged into `agent/temporal-sampled-history` after that
+branch's original main merge. This integration brings its scalar temporal
+edge work to a feature branch based on current main, retaining the current
+license and the later frontend/type-checking changes.
+
+Recorded `change`/`rise`/`fall` results cover Boolean, integer and
+enumeral expressions (12.2.18). Numeric rise/fall compare magnitude;
+the first sample establishes a baseline. Rule/wait contexts retain
+separate histories. Explicit event clocks gate sampling and inner clocks
+override enclosing clocks. Active waits retain late-arriving clocked
+samples and consume matches since the previous observation. Completed,
+failed and expired waits retire their sampling state.
+
+Seven independently authored runtime fixture sets cover transitions,
+initial baselines, numeric magnitude, enumerals, explicit clocks,
+concurrent locals, successive waits, late clocks and exact E0402 output
+for unsupported real samples. Three core regressions cover comparisons,
+cloned monitors/context isolation and nested clock selection.
+
+The inherited verification-log merge had placed the edge entry inside
+the keyed-extrema entry and its verification inside the predicate-query
+entry. Those entries are separated here. Four CSV tests now normalize
+Windows path separators before embedding paths in e string literals;
+a checkout path containing a backslash followed by t otherwise became
+a tab and caused unrelated file-read failures.
+
+Verification on `agent/integrate-temporal-edges`:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 454 passed, 0 failed.
+- `git diff --check` — passed.
+
+The initial all-target run failed four CSV path tests; the final result
+above includes their path fixes. No local all-feature, WASM or Specman
+run was performed. PR #64 records the original reference basis as the
+lawful local 2016 redline's shared behavior with the 2019 clause-number
+mapping; this integration adds no new standard-reading qualification.
+
+This is regression evidence, not differential qualification or conformance.
+Static edge-width legality, real/MVL/custom-numeric edge samples,
+multiple distinct samples within one virtual cycle, general event-specific
+compound timelines, per-instance rule timelines and precise HDL event
+ordering remain gaps. The TCM call-continuation increment is separate
+(PR #65) and is not included in this branch.
