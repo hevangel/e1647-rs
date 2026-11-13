@@ -287,6 +287,60 @@ fn recorded_repeat_bound_uses_the_starting_state() {
 }
 
 #[test]
+fn scalar_edges_compare_numeric_magnitude_and_require_a_baseline() {
+    use e1647::ast::EdgeRoutine::{Change, Fall, Rise};
+    use e1647::temporal::sampled_edge;
+    for routine in [Change, Rise, Fall] {
+        assert!(!sampled_edge(routine, None, 7));
+        assert!(!sampled_edge(routine, Some(7), 7));
+    }
+    assert!(sampled_edge(Rise, Some(7), 8));
+    assert!(!sampled_edge(Fall, Some(7), 8));
+    assert!(sampled_edge(Fall, Some(-3), -9));
+    assert!(sampled_edge(Change, Some(1), 0));
+    assert!(sampled_edge(Rise, Some(0), 1));
+    assert!(sampled_edge(Fall, Some(1), 0));
+}
+
+#[test]
+fn recorded_edges_survive_monitor_cloning_and_context_isolation() {
+    use e1647::ast::EdgeRoutine::Rise;
+    let te = parse_temporal_expression("rise(flag)").unwrap();
+    let TemporalExpr::EdgeSample { expr, .. } = &te else {
+        panic!("edge expected");
+    };
+    let mut state = State::default();
+    state.record_edge(1, Rise, expr, Some(true));
+    state.record_edge(2, Rise, expr, Some(false));
+    let mut cb = EvalCallbacks {
+        context: Some(1),
+        boolean: Box::new(|_| None),
+        numeric: Box::new(|_| None),
+    };
+    assert!(succeeds(&te, &[state.clone()], &cb).unwrap());
+    let mut monitor = e1647::temporal::RuleMonitor::new(&te);
+    monitor.observe(&[state.clone()], &cb).unwrap();
+    assert!(!monitor.failed_at_end());
+    cb.context = Some(2);
+    assert!(!succeeds(&te, &[state.clone()], &cb).unwrap());
+    cb.context = Some(3);
+    assert_eq!(
+        succeeds(&te, &[state], &cb),
+        Err(EvalError::EdgeSample("rise"))
+    );
+}
+
+#[test]
+fn edge_sampling_events_override_the_enclosing_event() {
+    let te = parse_temporal_expression("{rise(a) @qa; fall(b) @qb} @outer").unwrap();
+    let mut edges = Vec::new();
+    e1647::temporal::collect_edges(&te, None, &mut edges);
+    assert_eq!(edges.len(), 2);
+    assert_eq!(edges[0].2, Some(&event("qa")));
+    assert_eq!(edges[1].2, Some(&event("qb")));
+}
+
+#[test]
 fn monitor_fires_an_invariant_when_the_forbidden_event_occurs() {
     let te = parse_temporal_expression("not @bad").expect("parses");
     let empty_b: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
