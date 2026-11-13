@@ -903,12 +903,12 @@ fn set_max_below_the_current_value_is_e0422() {
 #[test]
 fn a_blocking_call_outside_a_tcm_context_is_e0421() {
     // down() on an empty semaphore inside run()'s main coroutine IS a
-    // coroutine — the block is legal there. Inside an inline (atomic)
-    // method it cannot suspend: E0421.
+    // coroutine — the block is legal there. A call inside a value
+    // expression is atomic and cannot suspend: E0421.
     let result = run_source(
-        "struct helper_s {\n    s: semaphore;\n    take() is {\n        s.down();\n    };\n};\n\
+        "struct helper_s {\n    s: semaphore;\n    take(): uint is {\n        s.down();\n        return 1;\n    };\n};\n\
          extend sys {\n    run() is also {\n        var h: helper_s = new helper_s;\n        \
-         h.s = new semaphore;\n        h.take();\n    };\n};\n",
+         h.s = new semaphore;\n        var ignored: uint = h.take();\n    };\n};\n",
         1,
     );
     assert!(

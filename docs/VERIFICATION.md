@@ -3715,3 +3715,41 @@ claim. The supported forms require exactly one boolean expression;
 implicit index bindings remain unsupported. Traversal snapshots the
 receiver before predicate evaluation, so mutation does not change the
 items visited. Other expression-taking list methods remain gaps.
+
+## 2026-11-12 — Nested statement-call continuations
+
+Statement-position instance methods, including ordinary helper methods,
+now preserve their caller/callee frames across suspension (13.2.2).
+The existing call-path machinery retains evaluated arguments, receivers,
+local variables and composed-body positions for nested and recursive
+calls and `compute`. Dispatch checks declared methods before resource
+method interception, avoiding repeated receiver evaluation for user
+methods named `down` or `up`. Entry-event synchronization (17.1.2)
+parks on the scheduler event wake pass. Argument-count errors are checked
+before parking. A `stop_run()` expression statement propagates Stop
+through the saved caller chain.
+
+Seven independently authored fixture sets in `tests/fixtures/tcm-calls/`
+pin nested blocking calls, concurrent callers with distinct locals,
+recursive calls and composed bodies, receiver/argument side effects,
+TCM entry synchronization, arity diagnostics and stopping nested callers.
+The resource-context regression now tests a value-expression call, which
+remains atomic, rather than an ordinary statement call.
+
+Verification on `agent/complete-tcm-continuations`:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 451 passed, 0 failed.
+- `git diff --check` — passed.
+
+The initial fixture runs exposed a missed entry-event wake and failure
+to propagate `stop_run()` through expression statements; both are fixed
+and included in the final all-target result. No all-feature, WASM or
+Specman reference run was performed for this increment. This is regression
+evidence, not differential qualification or a conformance claim.
+
+Value-expression calls, receivers whose types cannot be resolved before
+evaluation, `on` blocks and check failure bodies still use atomic
+execution. General expression continuations, per-instance event identity,
+temporal edge expressions and precise HDL event ordering remain gaps.
