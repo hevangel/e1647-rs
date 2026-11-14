@@ -1,0 +1,2 @@
+5:51: error[E0220]: variable initialization: a value of kind 'string' cannot be stored into 'int'
+7:42: error[E0220]: assignment: a value of kind 'bool' cannot be stored into 'int'

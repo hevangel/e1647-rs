@@ -1,0 +1,1 @@
+1:19: error[E0402]: type alias defaulting exceeds the 64-alias limit

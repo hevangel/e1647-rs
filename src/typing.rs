@@ -38,8 +38,11 @@
 //! members are visible. Nested value operands, scoped evaluate/new bodies,
 //! statement value children and temporal rule/wait values are traversed.
 //! Explicit evaluate, slice and table-test results retain known kinds;
-//! cast results, implicit contexts, static references and type-embedded
-//! expressions remain conservative. Index-kind/membership compatibility
+//! qualified static field/call signatures retain declared kinds. Static
+//! bodies have a declaring namespace without a me receiver and are checked
+//! once from their registries. Omitted extension annotations inherit from
+//! their declaration. Cast results, implicit contexts, unregistered statics
+//! and type-embedded expressions remain conservative. Index-kind/membership compatibility
 //! and conditional is-a bindings still need separate typing rules.
 //!
 //! ## Diagnostic codes
@@ -224,6 +227,9 @@ const PREDEFINED_MEMBERS: &[&str] = &[
 
 /// The statement/expression checker for one method body.
 struct TypeChecker<'a> {
+    elaborated: &'a Elaborated,
+    /// A static method/on block has an owner namespace but no me receiver.
+    static_context: Option<&'a str>,
     types: &'a [ElaboratedType],
     /// Enumerand → its enumeral type name (composed `type` kinds).
     enumeral_table: BTreeMap<String, String>,
@@ -240,7 +246,9 @@ struct TypeChecker<'a> {
 }
 
 impl<'a> TypeChecker<'a> {
-    fn new(types: &'a [ElaboratedType], defines: &'a BTreeMap<String, Expr>) -> Self {
+    fn new(elaborated: &'a Elaborated) -> Self {
+        let types = &elaborated.types;
+        let defines = &elaborated.defines;
         let mut enumeral_table = BTreeMap::new();
         for t in types {
             if t.kind == DeclarationKind::Type {
@@ -250,6 +258,8 @@ impl<'a> TypeChecker<'a> {
             }
         }
         Self {
+            elaborated,
+            static_context: None,
             types,
             enumeral_table,
             locals: vec![BTreeMap::new()],
@@ -592,6 +602,7 @@ impl<'a> TypeChecker<'a> {
                 // The runtime's with block has a fresh frame and the new
                 // object as me. Caller locals and return types do not apply.
                 let old_me = self.me_type;
+                let old_static = self.static_context.take();
                 let old_return = self.return_ty.take();
                 let old_locals = std::mem::take(&mut self.locals);
                 self.me_type = match &result {
@@ -602,6 +613,7 @@ impl<'a> TypeChecker<'a> {
                 self.locals = old_locals;
                 self.return_ty = old_return;
                 self.me_type = old_me;
+                self.static_context = old_static;
                 result
             }
             Expr::ListConcat { items, .. } => {
@@ -695,11 +707,13 @@ impl<'a> TypeChecker<'a> {
                 self.pop_scope();
                 result
             }
-            // Leaves without ordinary expression children. Static member
-            // resolution and type-embedded expressions need separate scopes.
+            Expr::StaticAccess {
+                type_name, member, ..
+            } => self.static_field(type_name, member).unwrap_or(Ty::Unknown),
+            // Leaves without ordinary expression children. Type-embedded
+            // expressions still need their own scopes.
             Expr::Formal { .. }
             | Expr::HdlPath { .. }
-            | Expr::StaticAccess { .. }
             | Expr::AnnotationTypeRef { .. }
             | Expr::SetOfValues { .. } => Ty::Unknown,
         }
@@ -799,10 +813,44 @@ impl<'a> TypeChecker<'a> {
         if let Some(ty) = self.me_field(name) {
             return ty;
         }
+        if let Some(owner) = self.me_type.or(self.static_context)
+            && let Some(kind) = self.bare_static_field(owner, name)
+        {
+            return kind;
+        }
         if let Some(type_name) = self.enumeral_table.get(name) {
             return Ty::Enum(type_name.clone());
         }
         Ty::Unknown
+    }
+
+    fn static_field(&self, owner: &str, name: &str) -> Option<Ty> {
+        self.elaborated
+            .static_fields
+            .get(owner)?
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| self.type_of(&field.ty))
+    }
+
+    fn bare_static_field(&self, owner: &str, name: &str) -> Option<Ty> {
+        let mut owner = owner;
+        for _ in 0..64 {
+            if let Some(kind) = self.static_field(owner, name) {
+                return Some(kind);
+            }
+            owner = self.find_type(owner)?.base.as_deref()?;
+        }
+        None
+    }
+
+    /// Prefer the declaration over an extension that precedes it in the file.
+    fn static_method(&self, owner: &str, name: &str) -> Option<&'a MethodDecl> {
+        let methods = self.elaborated.static_methods.get(owner)?;
+        methods
+            .iter()
+            .find(|method| method.name == name && method.modifier.is_none())
+            .or_else(|| methods.iter().find(|method| method.name == name))
     }
 
     /// A field or method name on a known receiver kind: the field's
@@ -984,6 +1032,20 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 Ty::Unknown
+            }
+            Expr::StaticAccess {
+                type_name, member, ..
+            } => {
+                let argument_types: Vec<_> = args.iter().map(|arg| self.infer(arg)).collect();
+                let Some(method) = self.static_method(type_name, member) else {
+                    return Ty::Unknown; // E0307 ownership checks belong to elaboration.
+                };
+                self.check_args(method, args, &argument_types);
+                method
+                    .return_type
+                    .as_ref()
+                    .map(|ty| self.type_of(ty))
+                    .unwrap_or(Ty::Void)
             }
             // Unknown callee kinds still have expression children.
             _ => {
@@ -1184,16 +1246,74 @@ fn type_name_of(ty: &Ty) -> &str {
     }
 }
 
-/// One field's init value against its declared type (6.9.1/6.9.4).
-fn check_field_inits(checker: &mut TypeChecker, fields: &[crate::ast::Field]) {
-    for field in fields {
-        let Some(init) = &field.init else {
-            continue;
+/// Registered statics are owned by source declaration, not by each
+/// inherited/when-view copy. Match provenance even if elaboration rewrote a
+/// type expression in the copied member.
+fn registered_static_member<'a, T>(
+    elaborated: &'a Elaborated,
+    registry: &BTreeMap<String, Vec<T>>,
+    mut owner: &'a str,
+    matches: impl Fn(&T) -> bool,
+) -> bool {
+    for _ in 0..64 {
+        if registry
+            .get(owner)
+            .is_some_and(|entries| entries.iter().any(&matches))
+        {
+            return true;
+        }
+        let Some(base) = elaborated
+            .types
+            .iter()
+            .find(|ty| ty.name == owner)
+            .and_then(|ty| ty.base.as_deref())
+        else {
+            return false;
         };
-        let value = checker.infer(init);
-        let target = checker.type_of(&field.ty);
-        checker.check_assignable(&value, &target, init.span(), "field init value");
+        owner = base;
     }
+    false
+}
+
+/// One field's init value against its declared type (6.9.1/6.9.4).
+fn check_field_init(checker: &mut TypeChecker, field: &crate::ast::Field) {
+    let Some(init) = &field.init else {
+        return;
+    };
+    let value = checker.infer(init);
+    let target = checker.type_of(&field.ty);
+    checker.check_assignable(&value, &target, init.span(), "field init value");
+}
+
+/// An extension can omit result/parameter annotations supplied by its
+/// declaration. Explicit annotations retain their own conservative kinds.
+fn check_method<'a>(
+    checker: &mut TypeChecker<'a>,
+    method: &'a MethodDecl,
+    prototype: &'a MethodDecl,
+) {
+    checker.return_ty = method
+        .return_type
+        .as_ref()
+        .or(prototype.return_type.as_ref());
+    checker.push_scope();
+    for (index, parameter) in method.params.iter().enumerate() {
+        let ty = parameter
+            .ty
+            .as_ref()
+            .or_else(|| {
+                prototype
+                    .params
+                    .get(index)
+                    .and_then(|parameter| parameter.ty.as_ref())
+            })
+            .map(|ty| checker.type_of(ty))
+            .unwrap_or(Ty::Unknown);
+        checker.bind_local(&parameter.name, ty);
+    }
+    checker.check_body(&method.body);
+    checker.pop_scope();
+    checker.return_ty = None;
 }
 
 /// Check effective Boolean options with the same binding frames as the
@@ -1287,11 +1407,28 @@ fn check_coverage_options<'a>(
 /// so sibling access resolves). The diagnostics join the elaboration
 /// diagnostics (the CLI prints both).
 pub fn check_types(elaborated: &Elaborated) -> Vec<Diagnostic> {
-    let mut checker = TypeChecker::new(&elaborated.types, &elaborated.defines);
+    let mut checker = TypeChecker::new(elaborated);
     for t in &elaborated.types {
         checker.me_type = Some(&t.name);
         checker.return_ty = None;
-        check_field_inits(&mut checker, &t.fields);
+        for field in &t.fields {
+            if field.is_static {
+                // The registry owns these entries, including inherited copies.
+                if registered_static_member(
+                    elaborated,
+                    &elaborated.static_fields,
+                    &t.name,
+                    |entry| entry.name == field.name && entry.name_span == field.name_span,
+                ) {
+                    continue;
+                }
+                checker.me_type = None; // Unregistered/template static context stays conservative.
+                check_field_init(&mut checker, field);
+                checker.me_type = Some(&t.name);
+            } else {
+                check_field_init(&mut checker, field);
+            }
+        }
         for constraint in &t.constraints {
             checker.infer(&constraint.expr);
         }
@@ -1330,27 +1467,64 @@ pub fn check_types(elaborated: &Elaborated) -> Vec<Diagnostic> {
         }
         check_coverage_options(&mut checker, t, &coverage_kinds);
         for on in &t.ons {
-            checker.check_body(&on.body);
+            if on.is_static || on.type_qualified.is_some() {
+                if registered_static_member(elaborated, &elaborated.static_ons, &t.name, |entry| {
+                    entry.path == on.path
+                        && entry.span == on.span
+                        && entry.type_qualified == on.type_qualified
+                }) {
+                    continue;
+                }
+                checker.me_type = None;
+                checker.check_body(&on.body);
+                checker.me_type = Some(&t.name);
+            } else {
+                checker.check_body(&on.body);
+            }
         }
         for rule in &t.expects {
             checker.check_temporal(&rule.te);
             checker.check_body(&rule.else_body);
         }
         for method in &t.methods {
-            checker.return_ty = method.return_type.as_ref();
-            checker.push_scope();
-            for parameter in &method.params {
-                let ty = parameter
-                    .ty
-                    .as_ref()
-                    .map(|ty| checker.type_of(ty))
-                    .unwrap_or(Ty::Unknown);
-                checker.bind_local(&parameter.name, ty);
+            if method.is_static {
+                if registered_static_member(
+                    elaborated,
+                    &elaborated.static_methods,
+                    &t.name,
+                    |entry| entry.name == method.name && entry.span == method.span,
+                ) {
+                    continue;
+                }
+                checker.me_type = None;
+                check_method(&mut checker, method, method);
+                checker.me_type = Some(&t.name);
+            } else {
+                check_method(&mut checker, method, method);
             }
-            checker.check_body(&method.body);
-            checker.pop_scope();
-            checker.return_ty = None;
         }
     }
+    checker.me_type = None;
+    // The runtime initializes the static store with no receiver or bare-name
+    // static context. Qualified references are still available.
+    for fields in elaborated.static_fields.values() {
+        for field in fields {
+            check_field_init(&mut checker, field);
+        }
+    }
+    for (owner, methods) in &elaborated.static_methods {
+        checker.static_context = Some(owner);
+        for method in methods {
+            let prototype = checker.static_method(owner, &method.name).unwrap_or(method);
+            check_method(&mut checker, method, prototype);
+        }
+    }
+    for (owner, ons) in &elaborated.static_ons {
+        checker.static_context = Some(owner);
+        for on in ons {
+            checker.check_body(&on.body);
+        }
+    }
+    checker.static_context = None;
     checker.diagnostics
 }

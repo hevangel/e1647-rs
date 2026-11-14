@@ -244,7 +244,12 @@ not imply full language support or IEEE conformance.
       kinds propagate for explicit evaluate, slices and in_table. Call
       arguments are inferred once, preventing duplicate nested diagnostics.
       Index-kind/membership checks, contextual inference, conditional
-      bindings and type-embedded expressions remain incomplete
+      bindings and type-embedded expressions remain incomplete. Registered
+      static fields and qualified call signatures now retain kinds. Static
+      initializers/methods/handlers are checked once in their declaring
+      scope, with omitted extension annotations inherited from the prototype.
+      Bare static-field writes and alias defaulting are corrected; bare
+      static method calls and full signature-equivalence checks remain gaps
 - [ ] Differential corpus against an authorized reference simulator where
       available (started: Specman reference runs via EDA Playground are
       recorded in docs/VERIFICATION.md; no automated differential harness yet)

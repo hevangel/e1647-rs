@@ -232,10 +232,24 @@ browser sandbox API is not started.
   Events/ports have unknown value kinds rather than false missing-member
   errors. Known method arguments are inferred once, then validated against
   their signatures without re-traversing them. Index-kind checks, membership
-  compatibility, static member typing and conditional `is a` bindings still
-  require further work. Define and predefined constant precedence now
+  compatibility and conditional `is a` bindings still require further work. Define and predefined constant precedence now
   applies across every checked context, preventing same-named fields or
   locals from supplying the wrong kind; define values remain unknown.
+  Registered `Type::field` accesses read kinds from the exact declaring
+  registry; qualified calls check arguments once against that owner's
+  prototype and retain the declared result kind. E0307 still owns invalid
+  static-member shape/ownership checks. Static entries are checked once
+  from their registries, skipping inherited/synthesized copies. A static
+  method/handler has its declaring namespace but no `me`; bare static fields
+  follow the bounded base-chain lookup after locals. Static initializers
+  have neither receiver nor a bare static namespace, matching current runtime
+  initialization. A declaration is preferred over physically earlier
+  extension blocks; omitted extension annotations inherit by parameter
+  position/result. Explicit annotations keep their own kinds; full extension
+  signature equivalence is not checked. Unregistered/template entries stay
+  conservative. New initializers clear the caller's static context and restore
+  it afterward. Bare static method calls remain unsupported in the runtime
+  and unknown to this checker; qualified calls are the supported form.
 - `src/elab.rs` — member composition: `like` chains and `extend` blocks fold
   into one composed member list per `struct`/`unit` (inheritance-cycle,
   cross-declaration duplicate-field and unmodified-method-redefinition
@@ -603,8 +617,12 @@ limits live in the PR bodies and the module headers.
   `BTreeMap<TypeName, BTreeMap<FieldName, Value>>` created at program
   start; keys come from elaboration's static-member registries (the
   declaring base or `extend` target). `Type::member` validates the
-  declared-in-exactly-T rule (E0307); `when` subtypes never own store
-  keys; static `on` blocks compose per type and run with no `me`.
+  declared-in-exactly-T rule (E0307). Bare field writes use the same owner
+  walk as reads even without an instance receiver; locals and actual
+  instance fields take precedence. Alias defaults recursively use their
+  declared representation; more than 64 aliases produce E0402 rather than
+  a fictitious alias object or unbounded recursion. `when` subtypes never
+  own store keys; static `on` blocks compose per type and run with no `me`.
 - **Interface attachment (6.13)** — an `interface` composes to its own
   ElaboratedType whose methods are the transitive signatures; a
   struct's `implementing` set composes through the same walk as like
