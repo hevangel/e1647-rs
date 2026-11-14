@@ -4190,3 +4190,81 @@ retroactively reclassify individual historical points; finite masks remove
 whole tuples. Overlap precedence, mutable-mask semantics, Cartesian-product
 grading and exact reporting/filter ordering still need differential evidence.
 This is regression evidence, not IEEE conformance.
+
+
+## 2026-11-13 — Conservative coverage domain proofs
+
+On `agent/coverage-domain-proofs`, based on PR #73, derived integral/Boolean
+classification uses conservative interval proofs, iterative splitting and
+ordinary concrete checks (IEEE 1647-2019 coverage, 14.4/14.5). The proof
+module is `src/coverage/proof.rs`. A known result guarantees the same Boolean
+value without evaluation errors across a region; unknown results retain
+ordinary evaluation. Supported proofs include relational comparisons,
+Boolean logic/conditionals, membership and checked arithmetic bounds.
+
+Short-circuit and list-membership order are preserved. Potentially shielded
+errors remain unknown until a selected branch or concrete check reaches
+them. Arithmetic intervals require checked endpoints; wrapping/overflow
+regions do not become unlimited-mathematics proofs. Singleton inputs use the
+actual evaluator. Name domains honor define/predefined precedence and the
+implicit inst binding. This preserves the current predicate-frame numeric
+model; it adds no field-width precision support or general type proof.
+
+A uniform proof over the source envelope can retain its full domain or
+exclude a node without enumerating Cartesian tuples. Uncertain bucket
+regions use an iterative work list, uniform proofs and concrete lower-end
+witnesses. The first referenced varying axis splits, using an overflow-safe
+sign-biased u128 midpoint over the full i128 storage domain. Basic source
+filters participate in the proof/check sequence. The 65536 scalar-domain
+work budget charges region proofs and concrete checks by their axis count;
+excess work remains E0402 and all masks still commit atomically.
+
+The previous n == n resource fixtures now have an exact exclusion proof.
+Their three resource/transaction cases use a non-symbolic remainder tautology
+instead and retain their negative boundary checks; diagnostic wording now
+identifies scalar-domain work rather than only scalar candidates. Other
+existing expected results are unchanged.
+
+A regression first reproduced false E0402 when a physically earlier group
+extension's transition shadowed an aliased basic source declaration. Basic
+and derived classifiers now share declaration/prototype lookup that selects
+Item kind, preserving alias type and declaration spans. A second fixture
+checks named scalar aliases. Separately, negating the internal integer
+minimum now returns E0402 integer negation overflow instead of panicking.
+
+Thirty-one independently authored fixture sets in
+`tests/fixtures/domain-proofs/` cover billion-value and full-storage signed
+ranges, inequality witnesses, comparisons, safe arithmetic bounds, guarded
+division, membership order, conditional/logical proofs, partial basic masks,
+per-unit thresholds, predefined-name precedence, integer wrapping/error
+boundaries and both alias regressions. An additional independent oracle
+compares masks and hit counts against all 25 concrete input pairs in fourteen
+small-domain programs (350 samples), including division guards and membership
+short circuits. No new dependencies or external reference modifications.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 469 passed, 0 failed (21 test binaries),
+  including both domain-proof tests and all thirty-one fixture sets.
+- `cargo test --test domain_proofs` — 2 passed, 0 failed.
+- `cargo run -- run examples/coverage_domain_proofs.e --seed 1 --coverage` —
+  passed: four events over two billion-wide ranges, two legal samples in one
+  retained combination, grade 100%.
+- `git diff --check` — passed.
+
+The alias fixture failed with the old lookup before the fix and passed
+with the shared lookup. All newly authored domain fixtures passed; the
+independent oracle agrees with concrete sampling for every program. No
+local all-feature, WASM runtime or Specman comparison was performed.
+
+Reference scope: independently authored arithmetic/proof logic against the
+repository's evaluator and existing coverage model, retaining the lawful
+reference basis and 2019 clause mapping recorded in preceding entries.
+No standard text/images or vendor output committed. Unproved nonlinear or
+wide shapes can still exhaust the work budget. Composite predicates, full
+option typing and typed-domain/precision proofs remain unfinished. Exact
+IEEE grading, mutable masks and side-effectful filter/report ordering still
+require differential qualification. This is regression evidence, not IEEE
+conformance.

@@ -292,11 +292,26 @@ browser sandbox API is not started.
   checks are E0402. Ignore short circuits illegal, using the existing overlap
   policy and immediate/deferred DUT reporting. Suppressed derived observations
   do not become child sources; basic source history still advances.
-  Finite integral/Boolean classification enumerates bucket tuples and candidate
-  values until finding a legal witness for each retained goal, checking basic
-  ignore/illegal predicates too. A shared 65536 scalar-candidate budget applies
-  per derived item refresh; exceeding it diagnoses E0402 rather than inventing
-  a mask. Constant prefixes can exclude entire nodes without enumeration.
+  Derived integral/Boolean classification first proves uniform outcomes over
+  the remaining source envelope. `coverage/proof.rs` propagates conservative
+  integer intervals and total Boolean domains, respecting short-circuit logic,
+  conditionals and membership evaluation order. Arithmetic bounds require
+  checked endpoints; possible storage overflow stays unknown. Singleton inputs
+  use the real evaluator. Constant/name lookup respects define/predefined
+  precedence and the implicit inst binding. The current predicate-frame numeric
+  semantics are preserved; this adds no field-width precision support.
+  Uniform results retain the full source domain or exclude the node without
+  Cartesian enumeration. Otherwise bucket tuples use an iterative box work
+  list, exact proofs and concrete lower-end witnesses. Unknown boxes split the
+  first referenced varying axis; a sign-biased u128 midpoint handles the full
+  i128 domain without overflow. Basic ignore/illegal predicates participate in
+  every proof/check. A shared 65536 scalar-domain work budget charges each
+  interval proof and concrete check by its axis count. Excess work diagnoses
+  E0402 instead of inventing a mask. No recursive box search is used.
+  Basic source declaration/prototype lookup is shared with the basic classifier
+  and filters by Item kind, preventing earlier extension transitions from
+  shadowing aliased source types. Integer-minimum negation reports E0402 rather
+  than panicking. Constant prefixes can still exclude nodes before domain work.
   All basic and derived masks commit together after successful classification.
   Unbucketed real/string/enumeral sources filter points only and remain ungraded.
   Constant predicates work over nested sources; source-dependent classification

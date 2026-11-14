@@ -416,11 +416,16 @@ not imply full language support or IEEE conformance.
       Scalar cross/transition ignore/illegal predicates and instance variants
       filter observations and classify finite integral/Boolean combinations.
       Transitions bind prev_<source> snapshots. Basic and derived masks commit
-      together; the per-item classification budget is 65536 scalar visits.
+      together. Conservative interval proofs handle supported relations, logic,
+      membership and safe arithmetic; unknown regions split iteratively and
+      retain concrete evaluation. The per-item budget is 65536 scalar-domain
+      work units. Full signed-domain splitting avoids midpoint overflow;
+      checked negation diagnoses the storage limit rather than panicking.
       Unbucketed real/string/enumeral sources filter points without grades.
       Composite-valued predicates and general wide-domain classification remain
       gaps; constant predicates work over nested sources. Unit scope freezes
-      after all instance-dependent coverage options
+      after all instance-dependent coverage options. Source-kind-aware metadata
+      lookup resolves aliased items despite physically earlier extensions.
       Exact overlap/phase/filter-side-effect behavior needs qualification
 - [~] Part 2 predefined routine library — started with the reflection
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`

@@ -106,10 +106,15 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   histories retain real/string labels but remain ungraded. Cross/transition
   ignore/illegal predicates bind participating basic scalar values; transition
   predicates also bind prev_<source> snapshots. Instance variants bind inst.
-  Finite integral/Boolean masks search for legal tuple witnesses, considering
-  basic filters and removing wholly excluded combinations. The budget is
-  65536 scalar-candidate visits per derived item refresh; excess work reports
-  E0402. Unbucketed real/string/enumeral values only filter actual observations.
+  Integral/Boolean masks use conservative interval proofs and iterative range
+  splitting to find legal tuple witnesses, considering basic filters and
+  removing wholly excluded combinations. Supported proofs include comparisons,
+  Boolean logic, membership and checked arithmetic bounds. Unknown shapes
+  retain ordinary evaluation. The budget is 65536 scalar-domain work units
+  per derived item refresh, charging proofs and concrete checks; excess work
+  reports E0402. Storage-boundary wrapping and short-circuit errors are
+  preserved. Basic metadata lookup selects item declarations even when an
+  extension's transition physically precedes its aliased source. Unbucketed real/string/enumeral values only filter actual observations.
   Masks commit atomically across basic and derived items and propagate to
   descendants. Composite predicate operands remain unsupported (E0224), and
   source-dependent classification over mixed composite inputs reports E0402.
