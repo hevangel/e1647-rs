@@ -74,6 +74,13 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   struct context. `instance_no_collect` uses `inst` to suppress a unit's
   group or item in reports. Hidden items remain available to crosses and
   transitions; filtered-out sources do not reuse stale cross values.
+  Integral range widths subdivide inclusive bounds and preserve short
+  final buckets. Hit goals resolve range → item → group → global;
+  zero-goal buckets retain counts without contributing to bucket grades.
+  `set_config(cover, at_least, N)` configures the default before sampling.
+  Explicit range construction is capped at 65536 buckets per item.
+  Real/enumeral ranges, general constant-name resolution and item-domain
+  width proofs remain unfinished.
 
 ## What runs, by 2019 feature
 

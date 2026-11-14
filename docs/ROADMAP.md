@@ -190,10 +190,10 @@ not imply full language support or IEEE conformance.
       category validation — computed macros evaluate their restricted
       body subset, see M1), the remaining clause 14
       coverage model —
-      `instance_ignore`/`instance_illegal`, remaining range parameters,
+      `instance_ignore`/`instance_illegal`, real/enumeral ranges and general constant/type resolution,
       `radix`/`never` and derived-item filters; full option type checking;
       runtime configuration categories/options
-      beyond coverage mode and `max_int_buckets`, and `set_config_max()` —
+      beyond coverage mode, `max_int_buckets` and `at_least`, and `set_config_max()` —
       the clause 12/13 temporal
       engine's remaining simulation integration — the scheduler runs
       started TCMs concurrently and waits/sync suspend, `@`-triggered
@@ -395,8 +395,13 @@ not imply full language support or IEEE conformance.
       `inst` collect and present per-unit data (14.2.2/14.3.4); structural
       option/scope errors are E0224. Other runtime configuration
       categories/options, `set_config_max`, instance ignore/illegal,
-      remaining range/radix/filter semantics and full option type checking
-      remain gaps
+      real/enumeral ranges, general constant/type resolution, radix/filter semantics and full option type checking
+      remain gaps. Integral range widths and per-range goals run with
+      range/item/group/global precedence; zero-goal buckets are ungraded
+      and do not show holes. Explicit construction is capped at 65536
+      buckets per item; checked i128 arithmetic diagnoses unsupported or
+      overflowing parameters (E0224). Global at_least changes are allowed
+      before sampling and report E0402 afterwards
 - [~] Part 2 predefined routine library — started with the reflection
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`
       (5.10.5/5.10.6 — the argument parses as a type) build the

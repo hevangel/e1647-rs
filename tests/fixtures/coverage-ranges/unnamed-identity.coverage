@@ -1,0 +1,8 @@
+sys.cg samples=3 grade=0.750
+n buckets=1 grade=1.000
+0..3 [0..3] goal=1 hits=3
+flag buckets=2 grade=0.500
+FALSE [0..0] goal=1 hits=3
+TRUE [1..1] goal=1 hits=0
+cross_n__flag samples=3 combinations=1
+transition__n samples=2 combinations=1

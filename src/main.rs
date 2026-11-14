@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-const USAGE: &str = "Usage: e1647 <command> <source.e> [--seed N] [--coverage]\nCommands:\n  tokens  tokenize the source (does not parse)\n  parse   parse the source and print the AST or diagnostics\n  elab    parse and fold like/extend into elaborated types\n  run     parse, elaborate and run the phases: sys.setup, generate,\n          run/extract/check/finalize over the field tree (Table 1,\n          28.3) and the 9.13 generation sub-phases (--seed N for\n          reproducible gen)\n\n`elab` and `run` check definite type mismatches in methods, field\ninitial values, constraints, on bodies and coverage items. Typed method\nparameters and known local initializer kinds propagate; uncertain types\nstay unchecked.\n\nList min/max/min_index/max_index accept an optional key expression\nwith it bound to each item; has/count/all/all_indices accept one\nboolean item expression with it bound to each item (clause 27).\n\nTemporal rules and waits retain sampled proposition and repeat-bound\nvalues; raw temporal change/rise/fall expressions remain unsupported.\n\n`run --coverage` prints the coverage groups' buckets and grades after\nthe run (clause 14). Collection starts disabled: enable it with\nset_config(cover, mode, normal). Mode off pauses collection; count_only\nalso collects counts. max_int_buckets accepts 0..65536 before sampling.\nOther configuration categories/options remain unsupported.\nCover groups support per_unit_instance, group/basic-item when filters,\nand instance_no_collect with inst bound to the containing unit.\n\n`import x.y;` members resolve to `x/y.e` (or `x.y.e`) next to the source\nfile; imported declarations are spliced before the importing file's own.";
+const USAGE: &str = "Usage: e1647 <command> <source.e> [--seed N] [--coverage]\nCommands:\n  tokens  tokenize the source (does not parse)\n  parse   parse the source and print the AST or diagnostics\n  elab    parse and fold like/extend into elaborated types\n  run     parse, elaborate and run the phases: sys.setup, generate,\n          run/extract/check/finalize over the field tree (Table 1,\n          28.3) and the 9.13 generation sub-phases (--seed N for\n          reproducible gen)\n\n`elab` and `run` check definite type mismatches in methods, field\ninitial values, constraints, on bodies and coverage items. Typed method\nparameters and known local initializer kinds propagate; uncertain types\nstay unchecked.\n\nList min/max/min_index/max_index accept an optional key expression\nwith it bound to each item; has/count/all/all_indices accept one\nboolean item expression with it bound to each item (clause 27).\n\nTemporal rules and waits retain sampled proposition and repeat-bound\nvalues; raw temporal change/rise/fall expressions remain unsupported.\n\n`run --coverage` prints the coverage groups' buckets and grades after\nthe run (clause 14). Collection starts disabled: enable it with\nset_config(cover, mode, normal). Mode off pauses collection; count_only\nalso collects counts. max_int_buckets accepts 0..65536 before sampling.\nOther configuration categories/options remain unsupported.\nCover groups support per_unit_instance, group/basic-item when filters,\nand instance_no_collect with inst bound to the containing unit.\nIntegral ranges accept bucket widths and hit goals; at_least defaults\ncan be configured before sampling. Range goals override item/group/global\ndefaults. Zero-goal buckets are ungraded; real/enumeral ranges remain gaps.\n\n`import x.y;` members resolve to `x/y.e` (or `x.y.e`) next to the source\nfile; imported declarations are spliced before the importing file's own.";
 
 /// Parse `source` and splice in the files it imports (`import a.b;` →
 /// `a/b.e` or `a.b.e` beside the source), depth-first, one level wide.
@@ -494,7 +494,7 @@ fn print_coverage(coverage: &[e1647::coverage::TypeCoverage]) {
                 let covered = item
                     .buckets
                     .iter()
-                    .filter(|bucket| bucket.hits >= bucket.goal)
+                    .filter(|bucket| bucket.goal > 0 && bucket.hits >= bucket.goal)
                     .count();
                 let note = item
                     .note
@@ -503,7 +503,7 @@ fn print_coverage(coverage: &[e1647::coverage::TypeCoverage]) {
                 println!(
                     "    item {}: {covered}/{} buckets, {} samples, {} ungradeable{note}",
                     item.name,
-                    item.buckets.len(),
+                    item.graded_bucket_count(),
                     item.samples,
                     item.ungradeable_hits
                 );
@@ -515,12 +515,14 @@ fn print_coverage(coverage: &[e1647::coverage::TypeCoverage]) {
                     .filter(|instance| instance.name.starts_with(&format!("{}==", item.name)))
                 {
                     let hole = if instance.is_hole() { " [hole]" } else { "" };
+                    let grade = if instance.goal == 0 {
+                        "no goal".to_owned()
+                    } else {
+                        format!("grade {:.0}%", instance.grade() * 100.0)
+                    };
                     println!(
-                        "      instance {}: {}/{} hits, grade {:.0}%{hole}",
-                        instance.name,
-                        instance.hits,
-                        instance.goal,
-                        instance.grade() * 100.0
+                        "      instance {}: {}/{} hits, {grade}{hole}",
+                        instance.name, instance.hits, instance.goal,
                     );
                 }
                 for bucket in &item.buckets {

@@ -54,8 +54,17 @@ without clearing counts; `count_only` also collects counts. Boolean
 values can enable or disable collection. The bucket limit accepts
 0–65536 and can change before the first sampling event. Other
 configuration categories/options and `set_config_max` remain unsupported.
+`set_config(cover, at_least, N)` sets the default hit goal before sampling.
+Range goals override item goals, which override group/global defaults.
+Integral ranges support a bucket width and per-range goal, for example
+`range([0..9], "", 3, 2)` creates buckets 0–2, 3–5, 6–8 and 9, each
+with goal 2. A named range uses `UNDEF` for its width. Zero-goal buckets
+retain counts but do not contribute to bucket grades or show holes.
+Explicit range construction is limited to 65536 buckets per item;
+real/enumeral bounds and general constant/type resolution remain gaps.
 Run the independently authored example with
 `cargo run -- run examples/coverage_config.e --seed 1 --coverage`.
+The range example is `examples/coverage_ranges.e`.
 
 Coverage groups can use `per_unit_instance` (or
 `per_unit_instance = unit_type`) to keep separate counts for containing

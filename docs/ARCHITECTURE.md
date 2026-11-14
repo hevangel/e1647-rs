@@ -261,7 +261,7 @@ browser sandbox API is not started.
   which starts disabled. It validates category/option keyword positions
   before evaluating values and commits option changes together. Mode
   changes gate emit-driven and procedural sampling without clearing data.
-  Before sampling, `max_int_buckets` changes rebuild the schema from the
+  Before sampling, `max_int_buckets`/`at_least` changes rebuild the schema from the
   composed type declarations; after sampling they report E0402. The
   runtime resource bound is 65536 buckets per default integer item.
   Per-unit groups keep a schema plus one collection per containing unit,
@@ -275,8 +275,14 @@ browser sandbox API is not started.
   previous sampled values separately. The returned report view removes
   hidden items/groups and per-unit schema placeholders. Full option type
   checking and the remaining ignore/illegal/radix semantics are unfinished.
-  `range(...)`'s numeric parameters beyond
-  bounds/label are recorded, not applied.
+  Integral `range(...)` construction parses positional name/width/goal
+  parameters, subdivides inclusive bounds and uses stable automatic bucket
+  labels. Range-local goal metadata preserves precedence over item/group/
+  global defaults. Zero-goal buckets retain counts but leave the bucket-grade
+  denominator; they do not report holes. Checked i128 constant arithmetic
+  rejects overflow/division errors, and construction is capped at 65536
+  buckets per item. General constant-name/type resolution, real/enumeral
+  bounds and item-domain width proofs remain unfinished.
 - `src/interp.rs` — interpreter for the statement subset (codes
   `E0401`–`E0413`). List values (clause 4.11.4's `list_ptr==`) carry
   reference identity: a `Value::List` holds its items behind a shared
@@ -436,7 +442,8 @@ group grade; the group/item `no_collect`/`instance_no_collect`
 options, the cross/transition `name` option and the group-level
 `at_least`/`weight` apply; per-unit scoping, `instance_no_collect` with
 `inst` and group/basic-item `when` filters run. Full option type checking,
-instance ignore/illegal, remaining range parameters, radix/never and
+instance ignore/illegal, real/enumeral ranges and general constant/type
+resolution, radix/never and
 derived-item filter semantics remain unmodeled.
 The coverage subset of `set_config()` is wired; other categories,
 options and `set_config_max()` remain gaps), integer width
