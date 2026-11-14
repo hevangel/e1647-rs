@@ -783,6 +783,8 @@ struct Interp<'a> {
     /// Coverage data (clause 14), keyed by type; `emit` of a group's
     /// sampling event records item values into the buckets.
     coverage: Vec<crate::coverage::TypeCoverage>,
+    coverage_config: crate::coverage::CoverageConfig,
+    coverage_was_enabled: bool,
     /// Set by `stop_run()`; unwinds the whole run.
     stop_requested: bool,
     /// Failed `check that` conditions (`dut_error`), reported like
@@ -1201,6 +1203,11 @@ fn run_inner(
         next_coroutine_id: 0,
         resume_wait_start: None,
         coverage: crate::coverage::build(elaborated),
+        coverage_config: crate::coverage::CoverageConfig {
+            mode: false,
+            ..Default::default()
+        },
+        coverage_was_enabled: false,
         stop_requested: false,
         dut_errors: 0,
         defines,
@@ -1268,7 +1275,11 @@ fn run_inner(
         return RunResult {
             output: interp.output,
             diagnostics: interp.pending_diagnostics,
-            coverage: interp.coverage,
+            coverage: if interp.coverage_was_enabled {
+                interp.coverage
+            } else {
+                Vec::new()
+            },
         };
     };
     let run_blocks: Vec<&MethodDecl> = sys
@@ -1523,7 +1534,11 @@ fn run_inner(
     RunResult {
         output: interp.output,
         diagnostics,
-        coverage: interp.coverage,
+        coverage: if interp.coverage_was_enabled {
+            interp.coverage
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -6354,6 +6369,113 @@ impl<'a> Interp<'a> {
         self.instances[owner].port_path(port).is_some()
     }
 
+    /// Coverage configuration (29.9). Category and option arguments
+    /// are names; only option values evaluate in the caller's frame.
+    /// Configuration changes commit together after validation.
+    fn set_runtime_config(
+        &mut self,
+        args: &[Expr],
+        span: crate::ast::Span,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Value, Diagnostic> {
+        if args.len() < 3 || args.len().is_multiple_of(2) {
+            return Err(self.error(
+                "E0402",
+                "set_config expects a category and one or more option/value pairs (29.9)",
+                span,
+            ));
+        }
+        let Expr::Ident { name: category, .. } = &args[0] else {
+            return Err(self.error("E0402", "set_config category must be a keyword", span));
+        };
+        if category != "cover" {
+            return Err(self.error(
+                "E0419",
+                format!("set_config category '{category}' is not implemented (29.9)"),
+                span,
+            ));
+        }
+        let mut config = self.coverage_config.clone();
+        for pair in args[1..].as_chunks::<2>().0 {
+            let Expr::Ident { name: option, .. } = &pair[0] else {
+                return Err(self.error("E0402", "set_config option must be a keyword", span));
+            };
+            match option.as_str() {
+                "mode" => {
+                    // Values are implementation-defined (29.9). Off
+                    // pauses collection; both collecting modes retain
+                    // counts. No interactive post-processing API exists.
+                    config.mode = match &pair[1] {
+                        Expr::Ident { name, .. } if name == "normal" || name == "count_only" => {
+                            true
+                        }
+                        Expr::Ident { name, .. } if name == "off" => false,
+                        expr => {
+                            match self.eval(expr, frame, me)? {
+                                Value::Bool(enabled) => enabled,
+                                _ => return Err(self.error(
+                                    "E0402",
+                                    "cover mode expects normal, count_only, off or a Boolean value",
+                                    pair[1].span(),
+                                )),
+                            }
+                        }
+                    };
+                }
+                "max_int_buckets" => {
+                    let Value::Int(count) = self.eval(&pair[1], frame, me)? else {
+                        return Err(self.error(
+                            "E0402",
+                            "max_int_buckets expects an integer",
+                            pair[1].span(),
+                        ));
+                    };
+                    // A documented resource bound, not a language
+                    // bound. Builder clients can choose their own cap.
+                    if !(0..=65_536).contains(&count) {
+                        return Err(self.error(
+                            "E0402",
+                            "max_int_buckets must be between 0 and 65536",
+                            pair[1].span(),
+                        ));
+                    }
+                    config.max_int_buckets = count as u64;
+                }
+                _ => {
+                    return Err(self.error(
+                        "E0419",
+                        format!("cover configuration option '{option}' is not implemented (29.9)"),
+                        pair[0].span(),
+                    ));
+                }
+            }
+        }
+        if config.max_int_buckets != self.coverage_config.max_int_buckets {
+            if self
+                .coverage
+                .iter()
+                .flat_map(|entry| &entry.groups)
+                .any(|group| group.samples != 0)
+            {
+                return Err(self.error(
+                    "E0402",
+                    "max_int_buckets cannot change after coverage sampling starts",
+                    span,
+                ));
+            }
+            let schema_config = crate::coverage::CoverageConfig {
+                mode: true,
+                ..config.clone()
+            };
+            self.coverage = crate::coverage::build_types(self.types, &schema_config);
+            self.overall_grade = None;
+        }
+        self.coverage_was_enabled |= config.mode;
+        self.coverage_config = config;
+        Ok(Value::Void)
+    }
+
     /// The `covers` singleton methods (14.9): the procedural cover
     /// group sampling (14.8.2.10), the overall grade compute/read pair
     /// (14.9.6), the coverage-database path query, and the
@@ -6421,6 +6543,10 @@ impl<'a> Interp<'a> {
     /// prose normalises is Specman-internal). Stores the value for
     /// `get_overall_grade()`.
     fn compute_overall_grade_value(&mut self) -> f64 {
+        if !self.coverage_was_enabled {
+            self.overall_grade = Some(0.0);
+            return 0.0;
+        }
         let mut sum = 0.0f64;
         let mut count = 0usize;
         for entry in &self.coverage {
@@ -9651,6 +9777,9 @@ impl<'a> Interp<'a> {
         owner: usize,
         frame: &mut Frame,
     ) {
+        if !self.coverage_config.mode {
+            return;
+        }
         let type_name = self.instances[owner].type_name.clone();
         // The items' recorded declarations (expression or field name),
         // looked up in the elaborated type's cover groups by name.
@@ -10948,6 +11077,9 @@ impl<'a> Interp<'a> {
                 self.read_qualified_field(index, qualifiers, field, *field_span, *span)
             }
             Expr::Call { callee, args, span } => {
+                if matches!(callee.as_ref(), Expr::Ident { name, .. } if name == "set_config") {
+                    return self.set_runtime_config(args, *span, frame, me);
+                }
                 // The clause 29.13 rgf routines read their field argument
                 // as a path (its instance and field name), not as a
                 // value: the interception runs before the generic

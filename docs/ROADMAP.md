@@ -192,8 +192,8 @@ not imply full language support or IEEE conformance.
       with the implicit `inst` variable, `instance_ignore`/
       `instance_illegal`), the per-unit-instance scoping (14.2.2), the
       `radix`/`when`/`never` option semantics (the option tables are
-      images) and the `set_config()` routine the 14.9 configuration
-      names (the configuration itself is a builder API) —
+      not previously inspected); runtime configuration categories/options
+      beyond coverage mode and `max_int_buckets`, and `set_config_max()` —
       the clause 12/13 temporal
       engine's remaining simulation integration — the scheduler runs
       started TCMs concurrently and waits/sync suspend, `@`-triggered
@@ -376,17 +376,20 @@ not imply full language support or IEEE conformance.
       cross/transition `name` option renames the derived item
       (14.4/14.5), and `run --coverage` reports instances; the 14.9
       configuration is honored through the builder API
-      (`max_int_buckets`, the coverage mode), while `set_config()` is
-      not wired and the bool-exp forms, per-unit-instance scoping
-      (14.2.2) and option-table-image semantics are not collected
+      (`max_int_buckets`, the coverage mode) and runtime `set_config(cover, ...)`.
+      Runtime collection starts disabled until enabled explicitly.
+      Bool-exp forms, per-unit-instance scoping (14.2.2) and the remaining
+      option semantics are not collected
 - [~] Coverage configuration options (14.9) and per-unit-instance options (14.2.2) —
       started: the configuration record (`CoverageConfig`: the
       coverage mode per 14.2's NOTE, `max_int_buckets` per 14.3's
       bracket) is honored through the `build_with_config` builder API,
-      and the constant-TRUE `no_collect`/`instance_no_collect`
-      spellings suppress presentation; the `set_config()` routine, the
-      bool-exp option forms and the `per_unit_instance` scoping are
-      not modeled
+      and through `set_config(cover, ...)` (29.9). Modes `normal` and
+      `count_only` collect; `off` pauses without clearing counts;
+      Boolean values also control enablement. `max_int_buckets` accepts
+      0–65536 before sampling; after sampling, changes report E0402.
+      Other runtime configuration categories/options, `set_config_max`,
+      bool-exp option forms and `per_unit_instance` scoping remain gaps
 - [~] Part 2 predefined routine library — started with the reflection
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`
       (5.10.5/5.10.6 — the argument parses as a type) build the

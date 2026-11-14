@@ -3715,3 +3715,62 @@ claim. The supported forms require exactly one boolean expression;
 implicit index bindings remain unsupported. Traversal snapshots the
 receiver before predicate evaluation, so mutation does not change the
 items visited. Other expression-taking list methods remain gaps.
+
+## 2026-11-12 — Runtime coverage configuration
+
+`set_config(cover, ...)` now controls runtime coverage enablement and
+`max_int_buckets` (29.9, 14.2–14.3). Category/option arguments parse as
+keyword names; values evaluate in the caller's scope. Each call validates
+all options before committing configuration. Unknown categories/options
+report E0419; invalid arity, types, bucket limits and late bucket changes
+report E0402 with source spans.
+
+Execution now starts with coverage disabled. `normal` and `count_only`
+enable collection; `off` pauses without clearing counts. Boolean values
+also control enablement. These accepted values are implementation choices
+under 29.9's implementation-defined configuration values. `count_only`
+retains counts; no interactive post-processing API exists. Event-driven
+and procedural sampling share the mode gate. Reports omit coverage that
+was never enabled. The schema builder remains independently usable and
+continues to build enabled schemas by default.
+
+Before sampling starts, changing `max_int_buckets` rebuilds the schema
+from composed declarations. Explicit ranges and Boolean buckets retain
+their shapes. Runtime values are bounded to 0–65536 for resource control;
+bucket changes after sampling report E0402 instead of discarding hits.
+Other categories/options and `set_config_max` remain unsupported.
+
+Twelve independently authored fixture sets under
+`tests/fixtures/coverage-config/` pin default-off behavior, explicit
+startup enablement, one-time value evaluation, count-only collection,
+pause/resume, explicit ranges, zero buckets, atomic validation, invalid
+arity/category/type/mode/limits and late changes. A CLI test verifies
+that `--coverage` reports only explicitly enabled collection. Existing
+coverage regressions now enable collection explicitly in setup.
+CSV regression paths normalize Windows separators before insertion into
+e strings, as also fixed independently in PR #66. `.coverage` golden
+files are pinned to LF. README, CLI help, status, architecture and roadmap
+state the new behavior and the remaining per-unit-instance/option gaps.
+
+Verification on `agent/coverage-runtime-config`:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 452 passed, 0 failed.
+- `cargo run -- run examples/coverage_config.e --seed 1 --coverage` —
+  passed; four samples, four covered buckets, grade 100%.
+- `git diff --check` — passed.
+
+The initial Clippy run flagged two iterator/arithmetic idioms; those
+were corrected before the final checks. Initial fixture checks also
+caught a diagnostic-column expectation and Windows newline conversion;
+the final result includes their corrections. No local all-feature, WASM
+or Specman run was performed.
+
+Reference basis: read-only visual inspection of the lawful local 2016
+redline's coverage tables and configuration routine, with 2019 clause
+numbers mapped through the migration plan. No standard text, tables,
+images or proprietary output were committed. This is implementation
+regression evidence, not differential qualification or conformance.
+Per-unit-instance storage, dynamic coverage filters, the remaining range
+parameters and the broader configuration API are still unfinished.
