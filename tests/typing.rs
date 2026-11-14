@@ -56,6 +56,44 @@ fn coverage_options_are_checked_by_the_cli_and_valid_scopes_execute() {
 }
 
 #[test]
+fn traversal_type_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures/typing-traversal");
+}
+
+#[test]
+fn traversal_errors_are_rejected_by_cli_and_valid_scopes_execute() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typing-traversal");
+    for command in ["elab", "run"] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+            .arg(command)
+            .arg(directory.join("expression-children.e"))
+            .output()
+            .expect("CLI starts");
+        assert!(
+            !result.status.success(),
+            "{command} accepted hidden operand errors"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("error[E0223]"));
+    }
+    for (file, expected) in [
+        ("runtime.e", "traversal scopes passed"),
+        ("define-precedence.e", "define scopes passed"),
+    ] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+            .arg("run")
+            .arg(directory.join(file))
+            .output()
+            .expect("CLI starts");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(String::from_utf8(result.stdout).unwrap(), expected);
+    }
+}
+
+#[test]
 fn inferred_local_fixture_diagnostics_match_expected() {
     check_fixture_directory("fixtures/typing-inference");
 }

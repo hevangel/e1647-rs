@@ -4320,3 +4320,70 @@ local all-feature run or WASM runtime run was performed. This extends the
 conservative checker; define-value inference, composite source operands,
 complete expression/name resolution and other option types remain incomplete.
 It provides no IEEE conformance claim.
+
+
+## 2026-11-14 — Nested value and temporal type-check traversal
+
+The conservative checker previously skipped children of membership, casts,
+slices, table tests, set literals, selects, chosen-from directives and scoped
+expression bodies. For example, an absent member used only as a list index
+could pass the CLI's type gate. The pass now traverses ordinary expression
+children with an exhaustive Expr match, and statement value children with an
+exhaustive Stmt match. Raw distribution choices, type-embedded expressions,
+recorded foreach index-name paths and temporal event-reference paths retain
+their separate unresolved grammar/scope rather than being interpreted as
+ordinary values. This is traversal, not complete name resolution.
+
+An `evaluate` body (2019 4.17.7) gets a scoped result local, preserving the
+owner and other caller locals; an explicit result type propagates its kind.
+Implicit result types remain unknown here. A `new ... with` body (6.3) gets
+a fresh locals frame, the explicit new object as receiver, and no enclosing
+return type, matching the interpreter. All contexts restore after checking.
+New instance_iterator expressions now retain the iterator kind rather than
+being mistaken for ordinary struct objects. Slices and table tests retain
+Int and Bool results respectively; cast results remain unknown because the
+runtime fallback preserves the input value.
+
+Nested statement values in print/gen/emit/wait/start/compute, rgf assignments
+and counted-loop bounds now traverse. Temporal rule/wait propositions, edge
+operands and repeat bounds traverse recursively (clauses 11-13), as do rule
+else actions. The duplicated bound representation of a single written
+exact-count true-match repeat is checked once. Event/port members remain
+unknown rather than producing false missing-field errors. No new temporal
+operand rule or execution support was added. Known method arguments now infer
+once before signature validation, avoiding duplicate nested diagnostics on
+bare, member and subtype-qualified calls.
+
+Seventeen independently authored fixture sets under
+`tests/fixtures/typing-traversal/` cover every newly traversed value family,
+statement contexts, temporal composition, scope restoration/isolation,
+explicit and implicit contexts, known result propagation, legitimate
+unknowns/events/ports, composed when-view coverage and single diagnostics
+through nested calls. A define/predefined name collision fixture first
+reproduced three false E0220 diagnostics: the checker was using same-named
+fields rather than runtime constants. Lookup now respects that precedence
+in every checked context, with define values left unknown. The fixture and
+its runtime checks pass after the fix. Two new test functions provide the
+byte-exact fixture contract plus CLI rejection and valid execution checks.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 473 passed, 0 failed (21 test binaries),
+  including all seventeen new fixture sets and all eleven typing tests.
+- `cargo test --test typing` — 11 passed, 0 failed on the final seventeen
+  fixture sets; CLI elab/run rejected hidden operand errors and valid runtime
+  scope checks produced their independently specified output.
+- Additional CLI elab audit: all 176 pre-existing successful fixture
+  declarations inspected produced no E022x type diagnostics. Existing
+  expected diagnostics were unchanged.
+- `git diff --check` — passed.
+
+Reference scope: independently authored traversal/scoping checks against the
+repository's evaluator and existing 2019 clause mapping. No standard text,
+vendor output or external code was copied. No local all-feature run, WASM
+runtime test or Specman comparison was performed. Index-kind and membership
+compatibility checks, static member typing, conditional is-a bindings,
+contextual inference, define-value typing and type-embedded expressions remain
+unfinished. No full type-system or IEEE conformance claim is made.

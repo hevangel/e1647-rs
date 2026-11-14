@@ -30,7 +30,12 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   the target it is stored into (E0220), a member a known when-less
   receiver does not have (E0221), indexing a non-list (E0222), an
   operator on incompatible operand kinds (E0223) — anything uncertain
-  stays silent.
+  stays silent. Traversal includes nested membership/casts/slices/tables,
+  scoped `evaluate` and `new ... with` bodies, all statement value children,
+  and temporal rule/wait proposition and repeat-bound expressions. Explicit
+  `evaluate`, bit-slice and `in_table` results retain known kinds. Index
+  kinds, membership compatibility, context-inferred expression types,
+  conditional bindings and type-embedded expressions remain incomplete.
   Declared method parameters bind within their method, and type-inferring
   local declarations retain known initializer kinds (clause 18),
   including homogeneous list literals and equal-kind ternary branches.

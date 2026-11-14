@@ -1,0 +1,4 @@
+7:20: error[E0223]: the left operand of the arithmetic operator is 'string' — a number is required
+7:33: error[E0221]: 'child_s' has no field or method 'absent'
+8:31: error[E0221]: 'child_s' has no field or method 'absent'
+8:51: error[E0223]: the left operand of the arithmetic operator is 'string' — a number is required
