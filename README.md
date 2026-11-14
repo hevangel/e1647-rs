@@ -74,7 +74,17 @@ holes. Illegal observations add DUT errors after check hooks by default;
 `set_config(cover, check_illegal_immediately, TRUE)` reports them at sampling.
 The example is `examples/coverage_effects.e`. Simultaneous ignore/illegal
 matches currently prefer ignore; this policy and deferred phase ordering
-have not been compared against Specman. Derived ignore/illegal predicates remain gaps.
+have not been compared against Specman.
+
+Cross/transition `ignore` and `illegal` predicates can use participating
+basic scalar items. Transitions also bind `prev_<source>` to the previous
+sampled value, even inside one bucket. Instance variants additionally bind
+`inst`. Excluded observations do not reach child items; wholly excluded
+combinations leave grades. Finite integral/Boolean classification has a
+65536 scalar-candidate budget per item refresh; wider work reports E0402.
+Real/string/enumeral sources filter observations without finite grades.
+Composite-valued predicate operands remain unsupported; whole-node constant
+filters work over nested sources. See `examples/derived_effects.e`.
 
 Crosses and transitions accept their own `when`, `no_collect`,
 `instance_no_collect`, `at_least` and `weight` options. A filtered transition

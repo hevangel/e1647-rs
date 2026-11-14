@@ -103,8 +103,18 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   cannot leak stale values into child crosses. Source order, names and
   cardinality are validated with E0224, including across group extensions.
   Expanded tuples are capped at 65536 scalar components. Unbucketed source
-  histories retain real/string labels but remain ungraded. Derived
-  ignore/illegal predicates and full option type checking remain gaps.
+  histories retain real/string labels but remain ungraded. Cross/transition
+  ignore/illegal predicates bind participating basic scalar values; transition
+  predicates also bind prev_<source> snapshots. Instance variants bind inst.
+  Finite integral/Boolean masks search for legal tuple witnesses, considering
+  basic filters and removing wholly excluded combinations. The budget is
+  65536 scalar-candidate visits per derived item refresh; excess work reports
+  E0402. Unbucketed real/string/enumeral values only filter actual observations.
+  Masks commit atomically across basic and derived items and propagate to
+  descendants. Composite predicate operands remain unsupported (E0224), and
+  source-dependent classification over mixed composite inputs reports E0402.
+  Whole-node constant predicates support nested sources. Full option type
+  checking remains unfinished.
   Real/enumeral ranges, general constant-name resolution and item-domain
   width proofs remain unfinished.
 

@@ -4112,3 +4112,81 @@ radix/implicit buckets and real/enumeral ranges remain unfinished. Nested
 Cartesian-product grading and exact side-effectful filter ordering still
 need differential qualification. This is regression evidence, not IEEE
 conformance.
+
+
+## 2026-11-13 — Derived scalar ignore/illegal predicates
+
+On `agent/derived-coverage-effects`, based on PR #72, cross/transition
+`ignore`, `illegal`, `instance_ignore` and `instance_illegal` predicates
+operate over participating basic scalar items (IEEE 1647-2019, 14.4/14.5).
+Transitions additionally bind `prev_<source>`. Owned snapshots retain
+integer, Boolean, real, string and enumeral values independently of bucket
+labels and later field updates. Alias/source-expression values are captured
+once at observation; classification never evaluates the source expression.
+Predicate frames contain their inputs/constants and, for instance variants,
+the associated unit as `inst`. Owner/local access, calls and composite-valued
+operands remain E0224; non-Boolean results are E0402.
+
+Ignored/illegal derived observations do not enter histories or become child
+sources. Basic source history still advances. Illegal values use the existing
+immediate/deferred DUT reporting, including the final stop/finalize flush.
+Classification inspects domains without producing DUT errors. Ignore retains
+precedence over illegal, using the existing explicitly unqualified overlap
+policy.
+
+For bucketed integral/Boolean inputs, classification retains a bucket tuple
+only after finding a legal scalar witness. It considers the basic sources'
+ignore/illegal filters, including partially excluded bins, and the derived
+predicates in short-circuit order. The per-derived-item refresh budget is
+65536 scalar-candidate visits; exceeding it reports E0402 before committing
+masks. Constant prefixes can exclude whole nodes without enumeration,
+including nested or unbucketed sources. All basic and derived masks commit
+together after every classifier succeeds. Finite masks propagate through
+parent-key identities and restore original legal history when unit masks
+are restored. Unbucketed real/string/enumeral inputs filter actual points
+without acquiring finite grades.
+
+Unit scope now freezes after instance_ignore/instance_illegal as well as
+instance_no_collect (14.3.4). E0224's scope-freeze diagnostic says instance
+coverage options, and its existing fixture was updated. The old negative
+derived-rejected fixture became a positive derived-ignore fixture with the
+new expected result; its group grade is 0.792 under the existing mixed
+per-instance model. Other existing fixtures are unchanged.
+
+Thirty-five independently authored fixture sets in
+`tests/fixtures/derived-effects/` cover scalar crosses, prev-source transitions,
+partial bins, source-filter legality, fresh frames and expression snapshots,
+Boolean/string/real/enumeral observations, immediate/deferred/stop errors,
+unsampled illegal domains, guarded arithmetic, nested parent filtering and
+constant masks, per-unit variants and mask restoration, scope freezing,
+resource bounds, atomic basic/derived mask failure and unsupported/type
+boundaries. A CLI test checks DUT ordering and retained-combination grades.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 467 passed, 0 failed (20 test binaries),
+  including both derived-effect tests and all thirty-five fixture sets.
+- `cargo test --test derived_effects` — 2 passed, 0 failed.
+- `cargo run -- run examples/derived_effects.e --seed 1 --coverage` —
+  passed: four events, two retained non-stuttering transitions, both goals
+  reached, grade 100%.
+- `git diff --check` — passed.
+
+Initial compilation caught a shadowed validator parameter in list expressions;
+it was corrected before the checks. An early fixture-generation script had
+a syntax typo, corrected before any new fixture files were generated. No
+local all-feature, WASM runtime or Specman comparison was performed.
+
+Reference basis: the previously inspected current cross/transition option
+rows in the lawful local 2016 redline, with the migration plan's 2019 clause
+mapping. No standard text/images or vendor output committed. Composite-valued
+predicate operands and source-dependent classification over mixed composite
+inputs remain diagnosed (E0224/E0402); whole-node constant predicates work.
+General wide-domain classification, complete option typing and typed-domain/
+precision proofs remain unfinished. Point-only unbucketed filtering does not
+retroactively reclassify individual historical points; finite masks remove
+whole tuples. Overlap precedence, mutable-mask semantics, Cartesian-product
+grading and exact reporting/filter ordering still need differential evidence.
+This is regression evidence, not IEEE conformance.

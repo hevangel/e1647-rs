@@ -1,0 +1,8 @@
+filter_u.cg@sys.a samples=4 grade=1.000
+cross_n__m samples=2 combinations=2 total=Some(2) goal=1 weight=1 grade=Some(1.0)
+(TRUE, FALSE) hits=1
+(FALSE, TRUE) hits=1
+filter_u.cg@sys.b samples=4 grade=1.000
+cross_n__m samples=2 combinations=2 total=Some(2) goal=1 weight=1 grade=Some(1.0)
+(FALSE, FALSE) hits=1
+(FALSE, TRUE) hits=1
