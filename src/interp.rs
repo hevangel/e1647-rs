@@ -733,15 +733,25 @@ fn next_coverage_indices(indices: &mut [usize], limits: &[usize]) -> bool {
     false
 }
 
-fn next_coverage_point(values: &mut [i128], ranges: &[(i128, i128)]) -> bool {
-    for (value, (lo, hi)) in values.iter_mut().zip(ranges).rev() {
-        if *value < *hi {
-            *value += 1;
-            return true;
-        }
-        *value = *lo;
-    }
-    false
+fn coverage_point_bindings(axes: &[CoverageAxis], ranges: &[(i128, i128)]) -> Vec<(String, Value)> {
+    axes.iter()
+        .zip(ranges)
+        .map(|(axis, (lo, _))| {
+            let value = if matches!(axis.prototype, Value::Bool(_)) {
+                Value::Bool(*lo != 0)
+            } else {
+                Value::Int(*lo)
+            };
+            (axis.binding.clone(), value)
+        })
+        .collect()
+}
+
+fn coverage_midpoint(lo: i128, hi: i128) -> i128 {
+    let sign = 1u128 << 127;
+    let lo = (lo as u128) ^ sign;
+    let hi = (hi as u128) ^ sign;
+    ((lo + (hi - lo) / 2) ^ sign) as i128
 }
 
 struct Interp<'a> {
@@ -10004,12 +10014,15 @@ impl<'a> Interp<'a> {
         Ok(false)
     }
 
-    fn coverage_basic_prototype(&self, entry: usize, group: usize, name: &str) -> Option<Value> {
-        let ty = self
-            .types
+    fn coverage_basic_declaration(
+        &self,
+        entry: usize,
+        group: usize,
+        name: &str,
+    ) -> Option<&crate::ast::CoverItemDecl> {
+        self.types
             .iter()
-            .find(|ty| ty.name == self.coverage[entry].type_name)?;
-        let item = ty
+            .find(|ty| ty.name == self.coverage[entry].type_name)?
             .covers
             .iter()
             .filter(|decl| decl.name == self.coverage[entry].groups[group].name)
@@ -10017,7 +10030,15 @@ impl<'a> Interp<'a> {
             .find(|item| {
                 item.kind == crate::ast::CoverItemKind::Item
                     && item.names.first().is_some_and(|(source, _)| source == name)
-            });
+            })
+    }
+
+    fn coverage_basic_prototype(&self, entry: usize, group: usize, name: &str) -> Option<Value> {
+        let ty = self
+            .types
+            .iter()
+            .find(|ty| ty.name == self.coverage[entry].type_name)?;
+        let item = self.coverage_basic_declaration(entry, group, name);
         let ty = item.and_then(|item| item.ty.as_ref()).or_else(|| {
             ty.fields
                 .iter()
@@ -10025,6 +10046,171 @@ impl<'a> Interp<'a> {
                 .map(|field| &field.ty)
         })?;
         self.coverage_prototype(ty, 0)
+    }
+
+    fn coverage_domain_variable(&self, name: &str, unit: Option<usize>) -> bool {
+        !matches!(name, "me" | "self" | "NULL" | "TEST_DONE")
+            && !name.ends_with('$')
+            && !self.defines.contains_key(name)
+            && predefined_constant(name).is_none()
+            && !(name == "inst" && unit.is_some())
+    }
+
+    fn coverage_region_proof(
+        &mut self,
+        axes: &[CoverageAxis],
+        ranges: &[(i128, i128)],
+        expressions: &[Option<Expr>],
+        unit: Option<usize>,
+    ) -> Result<Option<bool>, Diagnostic> {
+        for (axis, bounds) in axes.iter().zip(ranges) {
+            let domains = if self.coverage_domain_variable(&axis.source, unit) {
+                BTreeMap::from([(
+                    axis.source.clone(),
+                    crate::coverage::ScalarDomain::new(&axis.prototype, *bounds),
+                )])
+            } else {
+                BTreeMap::new()
+            };
+            let value = if matches!(axis.prototype, Value::Bool(_)) {
+                Value::Bool(bounds.0 != 0)
+            } else {
+                Value::Int(bounds.0)
+            };
+            for expr in [
+                &axis.options.ignore,
+                &axis.options.instance_ignore,
+                &axis.options.illegal,
+                &axis.options.instance_illegal,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let mut evaluate = |expr: &Expr| {
+                    self.coverage_effect_value(expr, &axis.source, &value, None, unit)
+                };
+                match crate::coverage::prove_predicate(expr, &domains, &mut evaluate)? {
+                    Some(true) => return Ok(Some(false)),
+                    Some(false) => {}
+                    None => return Ok(None),
+                }
+            }
+        }
+        let domains = axes
+            .iter()
+            .zip(ranges)
+            .filter(|(axis, _)| self.coverage_domain_variable(&axis.binding, unit))
+            .map(|(axis, bounds)| {
+                (
+                    axis.binding.clone(),
+                    crate::coverage::ScalarDomain::new(&axis.prototype, *bounds),
+                )
+            })
+            .collect();
+        let bindings = coverage_point_bindings(axes, ranges);
+        for expr in expressions.iter().flatten() {
+            let mut evaluate = |expr: &Expr| {
+                let mut frame = Frame::default();
+                frame.locals.extend(bindings.iter().cloned());
+                if let Some(unit) = unit {
+                    frame.locals.insert("inst".to_owned(), Value::Object(unit));
+                }
+                self.eval(expr, &mut frame, None)
+            };
+            match crate::coverage::prove_predicate(expr, &domains, &mut evaluate)? {
+                Some(true) => return Ok(Some(false)),
+                Some(false) => {}
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(true))
+    }
+
+    fn spend_coverage_domain_work(
+        &self,
+        budget: &mut usize,
+        amount: usize,
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        if *budget < amount {
+            return Err(self.error("E0402", "derived predicate classification exceeds the 65536 scalar-domain work limit (14.4-14.5)", span));
+        }
+        *budget -= amount;
+        Ok(())
+    }
+
+    fn coverage_region_witness(
+        &mut self,
+        axes: &[CoverageAxis],
+        ranges: Vec<(i128, i128)>,
+        expressions: &[Option<Expr>],
+        unit: Option<usize>,
+        budget: &mut usize,
+        span: crate::ast::Span,
+    ) -> Result<bool, Diagnostic> {
+        let varying: Vec<_> = axes
+            .iter()
+            .map(|axis| {
+                expressions
+                    .iter()
+                    .flatten()
+                    .any(|expr| crate::coverage::uses_item(expr, &axis.binding))
+                    || [
+                        &axis.options.ignore,
+                        &axis.options.instance_ignore,
+                        &axis.options.illegal,
+                        &axis.options.instance_illegal,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|expr| crate::coverage::uses_item(expr, &axis.source))
+            })
+            .collect();
+        let mut pending = vec![ranges];
+        while let Some(ranges) = pending.pop() {
+            self.spend_coverage_domain_work(budget, axes.len(), span)?;
+            match self.coverage_region_proof(axes, &ranges, expressions, unit)? {
+                Some(true) => return Ok(true),
+                Some(false) => continue,
+                None => {}
+            }
+            self.spend_coverage_domain_work(budget, axes.len(), span)?;
+            let bindings = coverage_point_bindings(axes, &ranges);
+            let mut legal = true;
+            for (axis, (_, value)) in axes.iter().zip(&bindings) {
+                if self.coverage_effect_matches(
+                    &[
+                        axis.options.ignore.clone(),
+                        axis.options.instance_ignore.clone(),
+                        axis.options.illegal.clone(),
+                        axis.options.instance_illegal.clone(),
+                    ],
+                    &axis.source,
+                    value,
+                    unit,
+                )? {
+                    legal = false;
+                    break;
+                }
+            }
+            if legal && !self.coverage_multi_matches(expressions, &bindings, unit)? {
+                return Ok(true);
+            }
+            if let Some(axis) = ranges
+                .iter()
+                .zip(&varying)
+                .position(|((lo, hi), used)| *used && lo < hi)
+            {
+                let mid = coverage_midpoint(ranges[axis].0, ranges[axis].1);
+                let mut higher = ranges.clone();
+                higher[axis].0 = mid + 1; // mid is strictly below hi
+                let mut lower = ranges;
+                lower[axis].1 = mid;
+                pending.push(higher);
+                pending.push(lower);
+            }
+        }
+        Ok(false)
     }
 
     fn classify_derived_effects(
@@ -10135,12 +10321,35 @@ impl<'a> Interp<'a> {
         if axes.iter().any(|axis| axis.buckets.is_empty()) {
             return Ok(Some(BTreeSet::new()));
         }
+        let mut budget = 65_536usize;
+        let envelope: Vec<_> = axes
+            .iter()
+            .map(|axis| {
+                (
+                    axis.buckets
+                        .iter()
+                        .map(|(_, lo, _)| *lo)
+                        .min()
+                        .expect("nonempty source buckets"),
+                    axis.buckets
+                        .iter()
+                        .map(|(_, _, hi)| *hi)
+                        .max()
+                        .expect("nonempty source buckets"),
+                )
+            })
+            .collect();
+        self.spend_coverage_domain_work(&mut budget, axes.len(), span)?;
+        match self.coverage_region_proof(&axes, &envelope, &expressions, unit)? {
+            Some(true) => return Ok(None),
+            Some(false) => return Ok(Some(BTreeSet::new())),
+            None => {}
+        }
         let limits: Vec<_> = axes.iter().map(|axis| axis.buckets.len()).collect();
         let mut coordinates = vec![0; axes.len()];
         let mut allowed = BTreeSet::new();
-        let mut budget = 65_536usize;
         loop {
-            let ranges: Vec<_> = axes
+            let ranges = axes
                 .iter()
                 .zip(&coordinates)
                 .map(|(axis, index)| {
@@ -10148,53 +10357,13 @@ impl<'a> Interp<'a> {
                     (lo, hi)
                 })
                 .collect();
-            let mut point: Vec<_> = ranges.iter().map(|(lo, _)| *lo).collect();
-            loop {
-                if budget < axes.len() {
-                    return Err(self.error("E0402", "derived predicate classification exceeds the 65536 scalar-candidate limit (14.4-14.5)", span));
-                }
-                budget -= axes.len();
-                let bindings: Vec<_> = axes
-                    .iter()
-                    .zip(&point)
-                    .map(|(axis, value)| {
-                        let value = if matches!(axis.prototype, Value::Bool(_)) {
-                            Value::Bool(*value != 0)
-                        } else {
-                            Value::Int(*value)
-                        };
-                        (axis.binding.clone(), value)
-                    })
-                    .collect();
-                let mut legal = true;
-                for (axis, (_, value)) in axes.iter().zip(&bindings) {
-                    if self.coverage_effect_matches(
-                        &[
-                            axis.options.ignore.clone(),
-                            axis.options.instance_ignore.clone(),
-                            axis.options.illegal.clone(),
-                            axis.options.instance_illegal.clone(),
-                        ],
-                        &axis.source,
-                        value,
-                        unit,
-                    )? {
-                        legal = false;
-                        break;
-                    }
-                }
-                if legal && !self.coverage_multi_matches(&expressions, &bindings, unit)? {
-                    allowed.insert(
-                        axes.iter()
-                            .zip(&coordinates)
-                            .map(|(axis, index)| axis.buckets[*index].0)
-                            .collect(),
-                    );
-                    break;
-                }
-                if !next_coverage_point(&mut point, &ranges) {
-                    break;
-                }
+            if self.coverage_region_witness(&axes, ranges, &expressions, unit, &mut budget, span)? {
+                allowed.insert(
+                    axes.iter()
+                        .zip(&coordinates)
+                        .map(|(axis, index)| axis.buckets[*index].0)
+                        .collect(),
+                );
             }
             if !next_coverage_indices(&mut coordinates, &limits) {
                 break;
@@ -10208,8 +10377,6 @@ impl<'a> Interp<'a> {
         entry: usize,
         group: usize,
     ) -> Result<(), Diagnostic> {
-        let type_name = self.coverage[entry].type_name.clone();
-        let group_name = self.coverage[entry].groups[group].name.clone();
         let unit = self.coverage[entry].groups[group].unit_owner;
         let items: Vec<_> = self.coverage[entry].groups[group]
             .items
@@ -10238,28 +10405,14 @@ impl<'a> Interp<'a> {
             if effects.iter().all(Option::is_none) || domains.is_empty() {
                 continue;
             }
-            let ty = self
-                .types
-                .iter()
-                .find(|ty| ty.name == type_name)
-                .expect("coverage type exists");
-            let declared = ty
-                .covers
-                .iter()
-                .filter(|decl| decl.name == group_name)
-                .flat_map(|decl| &decl.items)
-                .find(|item| item.names.first().is_some_and(|(item, _)| *item == name));
-            let item_type = declared.and_then(|item| item.ty.as_ref()).or_else(|| {
-                ty.fields
-                    .iter()
-                    .find(|field| field.name == name)
-                    .map(|field| &field.ty)
-            });
-            let Some(prototype) = item_type.and_then(|ty| self.coverage_prototype(ty, 0)) else {
+            let span = self
+                .coverage_basic_declaration(entry, group, &name)
+                .map_or(origin_span(), |item| item.span);
+            let Some(prototype) = self.coverage_basic_prototype(entry, group, &name) else {
                 return Err(self.error(
                     "E0402",
                     "coverage bucket effects require a known integral or Boolean item type (14.3)",
-                    declared.map_or(origin_span(), |item| item.span),
+                    span,
                 ));
             };
             let mut budget = 65_536usize;
@@ -12316,7 +12469,7 @@ impl<'a> Interp<'a> {
                 let value = self.eval(inner, frame, me)?;
                 match (op, value) {
                     (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-                    (UnaryOp::Negate, Value::Int(i)) => Ok(Value::Int(-i)),
+                    (UnaryOp::Negate, Value::Int(i)) => i.checked_neg().map(Value::Int).ok_or_else(|| self.error("E0402", "integer negation overflow", *span)),
                     (UnaryOp::Negate, Value::Real(r)) => Ok(Value::Real(-r)),
                     (UnaryOp::Plus, value @ (Value::Int(_) | Value::Real(_))) => Ok(value),
                     (UnaryOp::BitNot, Value::Int(i)) => Ok(Value::Int(!i)),

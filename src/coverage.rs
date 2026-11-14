@@ -22,8 +22,8 @@
 //! excluded buckets from goals. Instance variants bind the containing unit.
 //! Integral/Boolean masks use interval classification or bounded exact
 //! evaluation. Derived scalar predicates bind participating basic values and
-//! transition prev_<source> snapshots; finite tuple masks use bounded exact
-//! classification. Composite operands remain unsupported. Derived histories
+//! transition prev_<source> snapshots; tuple masks use conservative interval
+//! proofs, iterative splitting and bounded concrete checks. Composite operands remain unsupported. Derived histories
 //! retain bucket identities across mask changes.
 //!
 //! Structural option/scope errors report E0224 after composition. The
@@ -37,6 +37,9 @@
 use crate::ast::{CoverGroupDecl, CoverItemDecl, CoverItemKind, Expr, ScalarBase, TypeExpr};
 use crate::lexer::{Token, TokenKind};
 use std::collections::{BTreeMap, BTreeSet};
+
+mod proof;
+pub(crate) use proof::{ScalarDomain, prove_predicate};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ItemOptions {

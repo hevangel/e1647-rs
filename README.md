@@ -80,8 +80,11 @@ Cross/transition `ignore` and `illegal` predicates can use participating
 basic scalar items. Transitions also bind `prev_<source>` to the previous
 sampled value, even inside one bucket. Instance variants additionally bind
 `inst`. Excluded observations do not reach child items; wholly excluded
-combinations leave grades. Finite integral/Boolean classification has a
-65536 scalar-candidate budget per item refresh; wider work reports E0402.
+combinations leave grades. Integral/Boolean classifiers use interval proofs
+for supported comparisons, logic, membership and safe arithmetic, then split
+uncertain ranges and test concrete witnesses. The per-item refresh budget is
+65536 scalar-domain work units, including proofs and concrete checks; excess
+work reports E0402. See `examples/coverage_domain_proofs.e` for wide ranges.
 Real/string/enumeral sources filter observations without finite grades.
 Composite-valued predicate operands remain unsupported; whole-node constant
 filters work over nested sources. See `examples/derived_effects.e`.
