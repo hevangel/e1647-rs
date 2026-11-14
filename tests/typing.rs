@@ -94,6 +94,71 @@ fn traversal_errors_are_rejected_by_cli_and_valid_scopes_execute() {
 }
 
 #[test]
+fn static_type_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures/typing-static");
+}
+
+#[test]
+fn static_type_errors_are_rejected_by_cli_and_valid_scopes_execute() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typing-static");
+    for command in ["elab", "run"] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+            .arg(command)
+            .arg(directory.join("qualified-fields.e"))
+            .output()
+            .expect("CLI starts");
+        assert!(
+            !result.status.success(),
+            "{command} accepted static field mismatches"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("error[E0220]"));
+    }
+    for (file, expected) in [
+        ("runtime.e", "static scopes passed"),
+        ("alias-defaults.e", "alias defaults passed"),
+    ] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+            .arg("run")
+            .arg(directory.join(file))
+            .output()
+            .expect("CLI starts");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(String::from_utf8(result.stdout).unwrap(), expected);
+    }
+}
+
+#[test]
+fn alias_defaults_have_a_bounded_runtime_diagnostic() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typing-static");
+    for name in ["alias-cycle", "alias-depth-ok", "alias-depth-overflow"] {
+        let source = fs::read_to_string(directory.join(format!("{name}.e"))).unwrap();
+        let parsed = e1647::parser::parse(&source);
+        assert!(parsed.diagnostics.is_empty());
+        let elaborated = e1647::elab::elaborate(&parsed.declarations);
+        assert!(elaborated.diagnostics.is_empty());
+        let result = e1647::interp::run(&elaborated, 1);
+        let actual = if result.diagnostics.is_empty() {
+            "OK\n".to_owned()
+        } else {
+            result
+                .diagnostics
+                .iter()
+                .map(|d| format!("{}\n", d.render()))
+                .collect()
+        };
+        assert_eq!(
+            actual,
+            fs::read_to_string(directory.join(format!("{name}.run.expected"))).unwrap(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn inferred_local_fixture_diagnostics_match_expected() {
     check_fixture_directory("fixtures/typing-inference");
 }

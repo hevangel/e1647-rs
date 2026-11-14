@@ -33,8 +33,15 @@ values, so later state matching uses the recorded values. Raw temporal
 
 Type checking traverses nested value operands, `evaluate` and `new ... with`
 bodies, statement values, and temporal rule/wait values. Explicit evaluate,
-bit-slice and table-test results retain known kinds. Static member typing,
-contextual inference and complete name resolution remain unfinished.
+bit-slice and table-test results retain known kinds. Registered `Type::field`
+accesses and `Type::method(...)` signatures also retain kinds, and static
+bodies use their declaring namespace without an instance. Bare static method
+calls remain unsupported; use the qualified form. Contextual inference and
+complete name resolution remain unfinished.
+
+Scalar/list/reference aliases default through their declared representation.
+Defaulting more than 64 aliases reports a bounded diagnostic; cyclic default
+chains are rejected by that bound.
 
 List extrema `min`, `max`, `min_index` and `max_index` accept an optional
 per-item key expression such as `it.score`. They return the selected

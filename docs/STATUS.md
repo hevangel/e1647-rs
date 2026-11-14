@@ -36,6 +36,13 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   `evaluate`, bit-slice and `in_table` results retain known kinds. Index
   kinds, membership compatibility, context-inferred expression types,
   conditional bindings and type-embedded expressions remain incomplete.
+  Registered static field accesses and qualified call signatures retain
+  kinds; static methods/handlers and initializers are checked once in their
+  declaring contexts. Static extensions can inherit omitted annotations
+  from their declaration. Bare field writes work without an instance in
+  static methods/handlers, including inherited fields; unqualified static
+  method calls remain unsupported. Scalar/list/reference alias defaults
+  follow their representation with a 64-alias bound (E0402 on excess).
   Declared method parameters bind within their method, and type-inferring
   local declarations retain known initializer kinds (clause 18),
   including homogeneous list literals and equal-kind ternary branches.

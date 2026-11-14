@@ -880,8 +880,8 @@ struct Interp<'a> {
     /// the clause 35.4 `get_all_annotations()` reads this registry.
     attached_annotations: &'a BTreeMap<String, Vec<crate::elab::AttachedAnnotation>>,
     /// The type whose static method is currently executing (T2.2):
-    /// bare static-field and bare static-method references inside a
-    /// static method resolve against it (`me` does not exist there).
+    /// bare static-field references inside a static method resolve
+    /// against it (`me` does not exist there). Static calls use Type::name.
     static_context: Option<String>,
     /// The declared type expected of the expression currently being
     /// evaluated, when the evaluation site knows one: the declared type
@@ -2090,6 +2090,19 @@ impl<'a> Interp<'a> {
     }
 
     fn default_for(&mut self, ty: &TypeExpr) -> Value {
+        self.default_for_alias_depth(ty, 0)
+    }
+
+    fn default_for_alias_depth(&mut self, ty: &TypeExpr, alias_depth: usize) -> Value {
+        if alias_depth > 64 {
+            let diagnostic = self.error(
+                "E0402",
+                "type alias defaulting exceeds the 64-alias limit",
+                ty.span(),
+            );
+            self.pending_diagnostics.push(diagnostic);
+            return Value::Void;
+        }
         match ty {
             TypeExpr::Scalar { base, .. } => match base {
                 ScalarBase::Bool => Value::Bool(false),
@@ -2152,6 +2165,15 @@ impl<'a> Interp<'a> {
                             name: first.name.clone(),
                         };
                     }
+                }
+                // Scalar/list/reference aliases default through their
+                // declared representation, rather than creating an object
+                // whose type happens to be the alias's name (clause 5).
+                if let Some(declared) = types.iter().find(|declared| declared.name == *name)
+                    && declared.kind == DeclarationKind::Type
+                    && let Some(underlying) = &declared.underlying
+                {
+                    return self.default_for_alias_depth(underlying, alias_depth + 1);
                 }
                 if self.depth > 100 {
                     return Value::Void;
@@ -5667,9 +5689,9 @@ impl<'a> Interp<'a> {
     /// `Type::method(args)` — the static method dispatch (clause
     /// 17.2.2): the composed static blocks of the declaring type run
     /// without a receiver. A static method is not a TCM: its body is an
-    /// atomic region like an inline call, and bare static-field /
-    /// static-method references inside it resolve against
-    /// `static_context` (this type).
+    /// atomic region like an inline call, and bare static-field references
+    /// inside it resolve against `static_context` (this type). Bare method
+    /// calls without a receiver remain unsupported; use Type::name.
     fn call_static_method(
         &mut self,
         type_name: &str,
@@ -13962,28 +13984,39 @@ impl<'a> Interp<'a> {
                     frame.locals.insert(name.clone(), value);
                     return Ok(());
                 }
-                if let Some(index) = me {
-                    // The field's declared type binds the value (T7.1's
-                    // value semantics: a custom numeric copies, a
-                    // scalar converts through numeric_from_*).
+                if let Some(index) = me
+                    && self.instances[index].get(name).is_some()
+                {
+                    // Instance fields precede the static namespace.
                     let declared = self.declared_type_of(name, false, frame, index);
                     let value = self.bind_slot_value(value, declared.as_ref(), span)?;
-                    if self.instances[index].set(name, value.clone()) {
-                        return Ok(());
-                    }
-                    // A static field named bare (T2.1): the write lands
-                    // in the declaring type's store entry — the same
-                    // resolution the read side uses.
-                    if let Some(owner) = self.bare_static_field_owner(me, name) {
-                        self.statics
-                            .entry(owner)
-                            .or_default()
-                            .insert(name.clone(), value);
-                        return Ok(());
-                    }
-                    return Err(self.error("E0401", format!("unknown field '{name}'"), span));
+                    self.instances[index].set(name, value);
+                    return Ok(());
                 }
-                Err(self.error("E0401", format!("unknown identifier '{name}'"), span))
+                // Static methods/on blocks have no instance receiver. Use
+                // the same declaring-owner walk as reads, including parents.
+                if let Some(owner) = self.bare_static_field_owner(me, name) {
+                    let declared = self
+                        .static_fields
+                        .get(&owner)
+                        .and_then(|fields| fields.iter().find(|field| field.name == *name))
+                        .map(|field| field.ty.clone());
+                    let value = self.bind_slot_value(value, declared.as_ref(), span)?;
+                    self.statics
+                        .entry(owner)
+                        .or_default()
+                        .insert(name.clone(), value);
+                    return Ok(());
+                }
+                Err(self.error(
+                    "E0401",
+                    if me.is_some() {
+                        format!("unknown field '{name}'")
+                    } else {
+                        format!("unknown identifier '{name}'")
+                    },
+                    span,
+                ))
             }
             Expr::MemberAccess { object, name, .. } => {
                 // `unit.port$ = value` — simple_port write.

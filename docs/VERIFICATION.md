@@ -4387,3 +4387,75 @@ runtime test or Specman comparison was performed. Index-kind and membership
 compatibility checks, static member typing, conditional is-a bindings,
 contextual inference, define-value typing and type-embedded expressions remain
 unfinished. No full type-system or IEEE conformance claim is made.
+
+
+## 2026-11-14 — Static namespace typing and alias defaults
+
+Qualified static fields now contribute their declared kinds, and qualified
+static calls infer arguments once, check the declaring prototype and retain
+its result kind (2019 4.17.4, 6.9.3, 17.2.2). Exact registry ownership remains
+with E0307; an inherited or instance member is not silently resolved through
+a Type:: access. A declaration is preferred over an extension physically
+earlier in the source. Static extensions inherit omitted parameter/result
+annotations from that declaration for conservative body checking; full
+signature equivalence remains unfinished.
+
+Static initializers, methods and handlers are checked once from the declaring
+registries, not repeatedly through composed inheritance/when views. Source
+provenance in the bounded base chain identifies registered copies even when
+elaboration rewrites a type expression. Static methods/handlers have a
+namespace but no me receiver. Bare static fields follow the same bounded
+owner walk as the runtime, after local lookup. Qualified foreign-event
+handlers use the owner of the handler, not the event's owner. Static
+initializers retain the current runtime's no-receiver/no-bare-namespace
+context. New initializer frames clear and restore the caller static context;
+evaluate retains it. Unregistered/template entries remain conservative.
+
+The positive runtime fixture first exposed two existing failures. A static
+scalar alias defaulted to a fictitious object and failed arithmetic (E0402).
+After alias defaulting was corrected, a bare field write in a static method
+failed E0401 despite the read resolving its declaring owner. Bare writes now
+use the same owner walk outside the instance-only branch, with local/instance
+precedence and the registered field type preserved. Nested calls and foreign
+handlers verify that writes land in the correct shared store.
+
+Shared defaulting follows declared scalar/list/reference/enum alias
+representations rather than constructing an alias object. Up to 64 aliases
+are accepted; excess or recursive default chains report E0402 at the type
+expression. Tests cover a cycle, exactly 64 aliases and 65 aliases, with
+independently specified runtime diagnostics. This is a bounded runtime check,
+not complete alias-cycle validation during name resolution.
+
+Nineteen independently authored fixture sets under
+`tests/fixtures/typing-static/` cover qualified reads/assignments/calls,
+member/index/operator errors, single diagnostics through nested arguments,
+prototype inheritance, declaration order, inherited-entry deduplication,
+static handler ownership, bare parent fields, new/evaluate context isolation,
+initializer context, define precedence, alias representations and depth
+boundaries. Three test functions add the diagnostic fixtures, CLI rejection
+and two successful runtime scope/default programs, plus exact runtime alias
+boundary diagnostics.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 476 passed, 0 failed (21 test binaries),
+  including all nineteen new fixture sets and all fourteen typing tests.
+- `cargo test --test typing` — 14 passed, 0 failed, including CLI execution
+  of the static scopes and alias defaults programs and all three alias
+  boundary cases.
+- Additional CLI elab audit: 176 pre-existing successful fixture declarations
+  produced no E022x type diagnostics. Existing expected files were unchanged.
+- `git diff --check` — passed.
+
+Reference scope: independently authored tests against the registered static
+model and existing 2019 migration plan/evaluator rules. Inspection of the
+lawful local 2016 PDF did not supply qualification for the newer static-method
+rules. No 2019 standard text or vendor output was copied; no external pins
+were changed. No Specman comparison, local all-feature run or WASM runtime
+run was performed. Bare static method calls still lack runtime dispatch and
+remain unknown to the checker; qualified Type:: calls are supported. General
+name resolution, static initialization ordering/forward references, template
+static registration, signature equivalence, contextual inference and full
+constant/type resolution remain unfinished. No IEEE conformance is claimed.

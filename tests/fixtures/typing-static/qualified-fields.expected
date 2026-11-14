@@ -1,0 +1,6 @@
+10:25: error[E0220]: variable initialization: a value of kind 'int' cannot be stored into 'string'
+11:26: error[E0220]: assignment: a value of kind 'string' cannot be stored into 'int'
+12:18: error[E0221]: 'child_s' has no field or method 'absent'
+13:18: error[E0222]: indexing a value of kind 'int' — only a list is indexable
+14:18: error[E0223]: the left operand of the arithmetic operator is 'string' — a number is required
+15:23: error[E0220]: variable initialization: a value of kind 'int' cannot be stored into 'bool'
