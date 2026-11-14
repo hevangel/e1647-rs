@@ -265,9 +265,27 @@ browser sandbox API is not started.
   nothing, and floating-point weight totals avoid u64 sum overflow.
   Checked u64 products keep large combination domains ungradeable rather
   than overflowing; transition totals avoid host-pointer-width arithmetic.
-  Derived sources (crosses/transitions over other derived items), their
-  ignore/illegal predicates and exact side-effectful filter ordering still
-  require further implementation/qualification. The 14.9 coverage
+  Derived nodes can reference earlier basic/derived names in their group.
+  Observation keys reference stable basic bucket indices or parent key
+  indices, independently of display labels. Each source retains its previous
+  observation and current-round freshness. Transition descendants run from
+  a declaration-ordered work set as their source is produced; crosses run
+  in declaration order after basic sampling and produce further transitions.
+  Filtering a parent produces no child source; filtering a transition still
+  advances its parent history. Hidden nodes remain sampling sources.
+  A linear pass recomputes nested validity and combination counts against
+  current basic masks, preserving original keys for mask restoration. Empty
+  source domains dominate unknown/unrepresentable products. Unbucketed
+  strings/reals retain value labels while grades remain unavailable.
+  E0224 validates source arity, unique names and earlier declarations in the
+  merged base-then-extension order. A 65536 expanded scalar-component cap
+  bounds tuple expansion separately from bucket cardinality. Cycles are
+  rejected as invalid forward/self references; iterative processing avoids
+  recursive source-graph walks. The library round API requires begin_sample,
+  sample for each basic source, then record_crosses to finalize derived stats;
+  completing the same round twice does not add duplicate derived samples.
+  Derived ignore/illegal predicates and exact side-effectful filter ordering
+  still require further implementation/qualification. The 14.9 coverage
   configuration (`CoverageConfig`: the coverage mode per 14.2's NOTE
   and `max_int_buckets` per 14.3's bracket) is honored through the
   `build_with_config` builder API and `set_config(cover, ...)` (29.9).

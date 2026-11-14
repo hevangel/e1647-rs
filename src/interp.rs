@@ -10193,37 +10193,38 @@ impl<'a> Interp<'a> {
         }
     }
 
-    // Transition filters run at their source observation; cross filters
-    // run after all basic source expressions for the current round.
-    fn prepare_derived_sampling(
-        &mut self,
-        entry: usize,
-        group: usize,
-        owner: usize,
-        source: Option<&str>,
-    ) {
-        let items: Vec<_> = self.coverage[entry].groups[group]
-            .derived
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| match source {
-                Some(source) => item.sources.len() == 1 && item.sources[0] == source,
-                None => item.sources.len() > 1,
-            })
-            .map(|(index, item)| (index, item.options.when.clone()))
+    fn prepare_derived_item(&mut self, entry: usize, group: usize, owner: usize, index: usize) {
+        let when = self.coverage[entry].groups[group].derived[index]
+            .options
+            .when
+            .clone();
+        let collect = match when {
+            Some(expr) => match self.coverage_boolean(&expr, owner, None) {
+                Ok(value) => value,
+                Err(diagnostic) => {
+                    self.pending_diagnostics.push(diagnostic);
+                    false
+                }
+            },
+            None => true,
+        };
+        self.coverage[entry].groups[group].derived[index].collect = collect;
+    }
+
+    fn sample_transition_graph(&mut self, entry: usize, group: usize, owner: usize, source: &str) {
+        let mut pending: BTreeSet<_> = self.coverage[entry].groups[group]
+            .transitions_from(source)
+            .into_iter()
             .collect();
-        for (index, when) in items {
-            let collect = match when {
-                Some(expr) => match self.coverage_boolean(&expr, owner, None) {
-                    Ok(value) => value,
-                    Err(diagnostic) => {
-                        self.pending_diagnostics.push(diagnostic);
-                        false
-                    }
-                },
-                None => true,
-            };
-            self.coverage[entry].groups[group].derived[index].collect = collect;
+        let mut seen = BTreeSet::new();
+        while let Some(index) = pending.pop_first() {
+            if !seen.insert(index) {
+                continue;
+            }
+            self.prepare_derived_item(entry, group, owner, index);
+            if let Some(name) = self.coverage[entry].groups[group].record_transition(index) {
+                pending.extend(self.coverage[entry].groups[group].transitions_from(&name));
+            }
         }
     }
 
@@ -10345,13 +10346,9 @@ impl<'a> Interp<'a> {
                             continue;
                         }
                         Ok(false) => {
-                            self.prepare_derived_sampling(
-                                entry_index,
-                                group_index,
-                                owner,
-                                Some(&name),
-                            );
-                            self.coverage[entry_index].groups[group_index].sample(&name, &value)
+                            self.coverage[entry_index].groups[group_index]
+                                .sample_basic(&name, &value);
+                            self.sample_transition_graph(entry_index, group_index, owner, &name);
                         }
                         Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
                     }
@@ -10359,8 +10356,18 @@ impl<'a> Interp<'a> {
                 Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
             }
         }
-        self.prepare_derived_sampling(entry_index, group_index, owner, None);
-        self.coverage[entry_index].groups[group_index].record_crosses();
+        for index in 0..self.coverage[entry_index].groups[group_index].derived.len() {
+            if self.coverage[entry_index].groups[group_index].derived[index].kind
+                != crate::ast::CoverItemKind::Cross
+            {
+                continue;
+            }
+            self.prepare_derived_item(entry_index, group_index, owner, index);
+            if let Some(name) = self.coverage[entry_index].groups[group_index].record_cross(index) {
+                self.sample_transition_graph(entry_index, group_index, owner, &name);
+            }
+        }
+        self.coverage[entry_index].groups[group_index].refresh_derived();
     }
 
     /// Whether the running statement may suspend to the scheduler: a

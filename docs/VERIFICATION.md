@@ -4036,3 +4036,79 @@ other derived items, full option typing, text metadata, real/enumeral
 ranges and procedural overrides remain unfinished. Exact side-effectful
 filter ordering and the inherited grading model still need differential
 qualification. This is regression evidence, not IEEE conformance.
+
+
+## 2026-11-13 — Coverage source graphs and nested histories
+
+On `agent/coverage-source-graphs`, based on PR #71, crosses and transitions
+can consume earlier basic or derived coverage items in the same group
+(IEEE 1647-2019, 14.4/14.5). Source names share a validated group namespace;
+unknown/forward/self references, duplicates and invalid source counts report
+E0224. Base declarations precede their extensions in the merged graph,
+including when the extension physically precedes the base. The parser now
+records individual coverage-item start positions rather than reusing the
+group header for their spans, so structural diagnostics point to the item.
+
+Source observations retain their previous value, current-round freshness
+and a stable basic-bucket or parent-key identity. Iterative transition work
+sets follow declaration order as sources are produced; declaration-ordered
+crosses can consume fresh crosses/transitions and produce further children.
+Filtered parents supply no child source; filtered child transitions still
+advance parent history. Hidden parents remain usable sources. Repeating
+the library round-completion call does not duplicate derived observations.
+
+The refresh pass propagates current basic masks through all parent-key
+references and recomputes possible-combination counts without enumerating
+the Cartesian product. Restoring unit masks restores original legal history;
+excluded observations remain absent. Empty domains dominate unknown or
+unrepresentable products. Duplicate display labels retain distinct bucket
+identities. Unbucketed strings/reals retain actual value labels while their
+derived coverage remains ungraded. Nested transition labels are parenthesized
+to preserve their structure.
+
+Expanded source tuples are capped at 65536 scalar components, diagnosed
+with E0224 before execution. This is an implementation resource policy,
+separate from the bucket/product bounds and not a standard restriction.
+A boundary library test executes a sixteen-level transition chain through
+seventeen observations, producing a final value with exactly 65536 scalar
+components without recursive history walks. The next level is diagnosed.
+
+Thirty-three independently authored fixture sets in
+`tests/fixtures/coverage-graphs/` cover all basic cross/transition source
+combinations, mixed chains, filter history and order, stale-parent prevention,
+hidden/default names, paused collection, per-unit histories, dynamic mask
+removal/restoration, duplicate labels, out-of-range values, unbucketed
+strings/reals, empty/unbounded products, extension order, invalid names/arity
+and graph limits. Additional library and CLI tests check round idempotence,
+nested history rendering and the resource boundary. README, status, roadmap,
+architecture, CLI help and the E0224 allocation describe the behavior.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 465 passed, 0 failed (19 test binaries),
+  including all four graph tests and all thirty-three fixture sets.
+- `cargo run -- run examples/coverage_graphs.e --seed 1 --coverage` —
+  passed: four events, two nested transition observations and two distinct
+  combinations out of sixteen, grade 0.125 (CLI rounds this to 12%).
+- `git diff --check` — passed.
+
+The new diagnostic fixtures exposed and drove the item-span fix. Two early
+fixture helpers used contextual keyword spellings that the expression
+parser does not accept; the independent fixtures now use ordinary names.
+Existing fixtures passed without changes. A Git object-write permission
+failure in the working checkout was recovered by a fresh isolated checkout;
+all 144 changed/new files were SHA-256 verified after transfer. Formatting,
+Clippy and all 465 tests passed again there before submission. No security
+settings were changed. No local all-feature, WASM runtime or Specman
+comparison was performed.
+
+Reference basis: previously inspected current cross/transition rows in the
+lawful local 2016 redline, using the migration plan's 2019 clause mapping.
+No standard text/images or vendor output committed. Derived ignore/illegal
+predicates and instance variants, full option typing, procedural overrides,
+radix/implicit buckets and real/enumeral ranges remain unfinished. Nested
+Cartesian-product grading and exact side-effectful filter ordering still
+need differential qualification. This is regression evidence, not IEEE
+conformance.

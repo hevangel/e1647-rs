@@ -2540,6 +2540,7 @@ impl Parser {
             }
             if self.at_keyword("item") || self.at_keyword("cross") || self.at_keyword("transition")
             {
+                let item_start = self.peek().expect("coverage item token exists").start;
                 let kind = if self.at_keyword("item") {
                     crate::ast::CoverItemKind::Item
                 } else if self.at_keyword("cross") {
@@ -2596,7 +2597,7 @@ impl Parser {
                     ty,
                     expr,
                     using,
-                    span: (start, end),
+                    span: (item_start, end),
                 });
             } else {
                 // A group-level option entry (`per_instance = TRUE;`,

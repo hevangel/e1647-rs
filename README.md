@@ -80,9 +80,14 @@ Crosses and transitions accept their own `when`, `no_collect`,
 `instance_no_collect`, `at_least` and `weight` options. A filtered transition
 still follows consecutive legal source observations. Derived goals inherit
 item → group → runtime precedence; zero goals are ungraded, and hidden
-items leave group grades. These options currently operate over basic-item
-sources; crossing/transiting other derived items remains unfinished.
-Run `examples/coverage_derived.e` for a filtered cross/transition example.
+items leave group grades. Crosses and transitions can consume previously
+named basic, cross or transition items in the same group. Nested histories
+preserve bucket identities and per-unit masks; filtered parents provide no
+fresh child source. E0224 diagnoses unknown/forward references, duplicate
+names and malformed source counts. Expanded tuples are limited to 65536
+scalar components; this is a resource bound, not a standard restriction.
+Run `examples/coverage_derived.e` for a filtered cross/transition example
+and `examples/coverage_graphs.e` for nested transition history.
 
 Coverage groups can use `per_unit_instance` (or
 `per_unit_instance = unit_type`) to keep separate counts for containing
