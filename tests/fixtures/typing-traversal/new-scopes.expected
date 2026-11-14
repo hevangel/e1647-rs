@@ -1,0 +1,3 @@
+9:45: error[E0220]: assignment: a value of kind 'string' cannot be stored into 'int'
+9:60: error[E0220]: assignment: a value of kind 'int' cannot be stored into 'string'
+10:64: error[E0220]: variable initialization: a value of kind 'string' cannot be stored into 'int'

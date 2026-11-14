@@ -35,7 +35,12 @@
 //! `table`/`table_row` receivers and constructs the checker cannot pin
 //! down also stay unchecked. The pass
 //! runs over composed types (post `like`/`extend` fold), so extended
-//! members are visible.
+//! members are visible. Nested value operands, scoped evaluate/new bodies,
+//! statement value children and temporal rule/wait values are traversed.
+//! Explicit evaluate, slice and table-test results retain known kinds;
+//! cast results, implicit contexts, static references and type-embedded
+//! expressions remain conservative. Index-kind/membership compatibility
+//! and conditional is-a bindings still need separate typing rules.
 //!
 //! ## Diagnostic codes
 //!
@@ -229,13 +234,13 @@ struct TypeChecker<'a> {
     /// The enclosing composed type (the `me`/`self` receiver).
     me_type: Option<&'a str>,
     diagnostics: Vec<Diagnostic>,
-    /// Option evaluation resolves defines before sampled bindings/fields.
-    /// Define value kinds remain unknown until constant typing is complete.
-    coverage_defines: Option<&'a BTreeMap<String, Expr>>,
+    /// Runtime lookup resolves defines before locals and fields. Their
+    /// value kinds stay unknown until constant typing is complete.
+    defines: &'a BTreeMap<String, Expr>,
 }
 
 impl<'a> TypeChecker<'a> {
-    fn new(types: &'a [ElaboratedType]) -> Self {
+    fn new(types: &'a [ElaboratedType], defines: &'a BTreeMap<String, Expr>) -> Self {
         let mut enumeral_table = BTreeMap::new();
         for t in types {
             if t.kind == DeclarationKind::Type {
@@ -251,7 +256,7 @@ impl<'a> TypeChecker<'a> {
             return_ty: None,
             me_type: None,
             diagnostics: Vec::new(),
-            coverage_defines: None,
+            defines,
         }
     }
 
@@ -396,7 +401,7 @@ impl<'a> TypeChecker<'a> {
                 };
                 self.bind_local(name, declared.unwrap_or(inferred));
             }
-            Stmt::Assign { target, value, .. } => {
+            Stmt::Assign { target, value, .. } | Stmt::RgfAssign { target, value, .. } => {
                 let value_ty = self.infer(value);
                 let target_ty = self.infer(target);
                 self.check_assignable(&value_ty, &target_ty, value.span(), "assignment");
@@ -462,7 +467,15 @@ impl<'a> TypeChecker<'a> {
                 self.check_body(body);
                 self.pop_scope();
             }
-            Stmt::ForTo { var, body, .. } => {
+            Stmt::ForTo {
+                var,
+                from,
+                to,
+                body,
+                ..
+            } => {
+                self.infer(from);
+                self.infer(to);
                 self.push_scope();
                 self.bind_local(var, Ty::Int);
                 self.check_body(body);
@@ -487,12 +500,34 @@ impl<'a> TypeChecker<'a> {
                 }
                 self.pop_scope();
             }
-            // The remaining statement kinds — `print`/`gen`/`wait`/
-            // `sync`/`emit`/`start`/`compute`/`stop_run`/`break`/
-            // `continue`/`seq do`/temporal waits/`rgf=` — are not
-            // walked in this stage; the interpreter reports its own
-            // run-time diagnostics for them.
-            _ => {}
+            Stmt::Print { exprs, .. } => {
+                for expr in exprs {
+                    self.infer(expr);
+                }
+            }
+            Stmt::Gen { expr, .. } => {
+                self.infer(expr);
+            }
+            Stmt::Wait { cycles, .. } => {
+                self.infer(cycles);
+            }
+            Stmt::Emit { target, .. } => {
+                self.infer(target);
+            }
+            Stmt::Start { call, .. } | Stmt::Compute { call, .. } => {
+                self.infer(call);
+            }
+            Stmt::WaitTemporal { te, .. } => self.check_temporal(te),
+            Stmt::Sync { te, .. } => {
+                if let Some(te) = te {
+                    self.check_temporal(te);
+                }
+            }
+            // These nodes carry no expression children.
+            Stmt::StopRun { .. }
+            | Stmt::Break { .. }
+            | Stmt::Continue { .. }
+            | Stmt::SeqDo { .. } => {}
         }
     }
 
@@ -521,8 +556,9 @@ impl<'a> TypeChecker<'a> {
                 self.infer_member(&object_ty, field, base.span())
             }
             Expr::Call { callee, args, span } => self.infer_call(callee, args, *span),
-            Expr::Index { base, span, .. } => {
+            Expr::Index { base, index, span } => {
                 let base_ty = self.infer(base);
+                self.infer(index);
                 if let Ty::List(element) = base_ty {
                     *element
                 } else if has_opinion(&base_ty) {
@@ -538,18 +574,36 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     Ty::Unknown
                 }
-                // The index expression itself is unchecked (v1).
             }
             Expr::Binary { op, lhs, rhs, span } => self.infer_binary(*op, lhs, rhs, *span),
             Expr::Unary { op, expr, span } => self.infer_unary(*op, expr, *span),
-            Expr::New { ty, .. } => match ty {
-                Some(TypeExpr::Named { name, .. }) if sync_type(name) => Ty::Sync,
-                Some(TypeExpr::Named { name, .. }) => Ty::Object(name.clone()),
-                Some(TypeExpr::TemplateRef { name, args, .. }) => {
-                    Ty::Object(crate::ast::template_instance_name(name, args))
-                }
-                _ => Ty::Unknown,
-            },
+            Expr::New { ty, inits, .. } => {
+                let result = match ty {
+                    Some(TypeExpr::Named { name, .. }) if sync_type(name) => Ty::Sync,
+                    Some(TypeExpr::Named { name, .. }) if name == "instance_iterator" => {
+                        Ty::Iterator
+                    }
+                    Some(TypeExpr::Named { name, .. }) => Ty::Object(name.clone()),
+                    Some(TypeExpr::TemplateRef { name, args, .. }) => {
+                        Ty::Object(crate::ast::template_instance_name(name, args))
+                    }
+                    _ => Ty::Unknown,
+                };
+                // The runtime's with block has a fresh frame and the new
+                // object as me. Caller locals and return types do not apply.
+                let old_me = self.me_type;
+                let old_return = self.return_ty.take();
+                let old_locals = std::mem::take(&mut self.locals);
+                self.me_type = match &result {
+                    Ty::Object(name) => self.find_type(name).map(|ty| ty.name.as_str()),
+                    _ => None,
+                };
+                self.check_body(inits);
+                self.locals = old_locals;
+                self.return_ty = old_return;
+                self.me_type = old_me;
+                result
+            }
             Expr::ListConcat { items, .. } => {
                 let mut element = None;
                 for item in items {
@@ -572,12 +626,142 @@ impl<'a> TypeChecker<'a> {
                 let right = self.infer(else_expr);
                 shared_kind(left, right)
             }
-            Expr::InSet { .. } => Ty::Bool,
-            Expr::IsA { .. } => Ty::Bool,
-            // `in_table`, casts, `chosen_from`, `evaluate`, static
-            // access, temporals-as-expressions, string matches: the
-            // shapes this stage does not pin down.
-            _ => Ty::Unknown,
+            Expr::InSet { element, set, .. } => {
+                self.infer(element);
+                self.check_set(set);
+                Ty::Bool
+            }
+            Expr::IsA { expr, .. } => {
+                self.infer(expr);
+                // Conditional name bindings still require flow-sensitive
+                // resolution; this traversal does not narrow the operand.
+                Ty::Bool
+            }
+            Expr::CastAs { expr, .. } => {
+                self.infer(expr);
+                // Several runtime casts preserve the input value. Do not
+                // assume that the spelled target determines its value kind.
+                Ty::Unknown
+            }
+            Expr::BitSlice {
+                base, high, low, ..
+            } => {
+                self.infer(base);
+                self.infer(high);
+                self.infer(low);
+                Ty::Int
+            }
+            Expr::InTable { tuple, rows, .. } => {
+                for expr in tuple {
+                    self.infer(expr);
+                }
+                for row in rows {
+                    for item in row {
+                        match item {
+                            crate::ast::TableElem::Scalar(expr) => {
+                                self.infer(expr);
+                            }
+                            crate::ast::TableElem::Set(set) => self.check_set(set),
+                            crate::ast::TableElem::TypeSet { .. } => {}
+                        }
+                    }
+                }
+                Ty::Bool
+            }
+            Expr::SetLiteral { items, .. } => {
+                self.check_set(items);
+                Ty::Unknown // Set kinds are outside the current lattice.
+            }
+            Expr::ChosenFrom { target, list, .. } => {
+                self.infer(target);
+                self.infer(list);
+                Ty::Unknown // A generation directive, not an ordinary value.
+            }
+            Expr::Select { arms, .. } => {
+                for arm in arms {
+                    self.infer(&arm.weight);
+                }
+                // Choice tokens include a separate distribution grammar.
+                Ty::Unknown
+            }
+            Expr::Evaluate { ty, var, body, .. } => {
+                let result = ty
+                    .as_ref()
+                    .map(|ty| self.type_of(ty))
+                    .unwrap_or(Ty::Unknown);
+                self.push_scope();
+                self.bind_local(var.as_deref().unwrap_or("value"), result.clone());
+                self.check_body(body);
+                self.pop_scope();
+                result
+            }
+            // Leaves without ordinary expression children. Static member
+            // resolution and type-embedded expressions need separate scopes.
+            Expr::Formal { .. }
+            | Expr::HdlPath { .. }
+            | Expr::StaticAccess { .. }
+            | Expr::AnnotationTypeRef { .. }
+            | Expr::SetOfValues { .. } => Ty::Unknown,
+        }
+    }
+
+    fn check_set(&mut self, set: &crate::ast::InSetExpr) {
+        match set {
+            crate::ast::InSetExpr::Items(items) => {
+                for item in items {
+                    self.infer(item);
+                }
+            }
+            crate::ast::InSetExpr::Range(low, high) => {
+                self.infer(low);
+                self.infer(high);
+            }
+            crate::ast::InSetExpr::Expr(expr) => {
+                self.infer(expr);
+            }
+        }
+    }
+
+    /// Traverse temporal value children without inventing an event type or
+    /// imposing a new temporal operand rule (clauses 11-13).
+    fn check_temporal(&mut self, te: &crate::ast::TemporalExpr) {
+        use crate::ast::TemporalExpr;
+        match te {
+            TemporalExpr::True { expr } | TemporalExpr::EdgeSample { expr, .. } => {
+                self.infer(expr);
+            }
+            TemporalExpr::Repeat { low, high, te, .. } => {
+                if let Some(low) = low {
+                    self.infer(low);
+                }
+                // ~[n] stores one written expression as both bounds.
+                if high != low
+                    && let Some(high) = high
+                {
+                    self.infer(high);
+                }
+                self.check_temporal(te);
+            }
+            TemporalExpr::Sequence { items } => {
+                for item in items {
+                    self.check_temporal(item);
+                }
+            }
+            TemporalExpr::Yield { lhs, rhs }
+            | TemporalExpr::And(lhs, rhs)
+            | TemporalExpr::Or(lhs, rhs)
+            | TemporalExpr::Sampled {
+                te: lhs,
+                event: rhs,
+            } => {
+                self.check_temporal(lhs);
+                self.check_temporal(rhs);
+            }
+            TemporalExpr::Not(te)
+            | TemporalExpr::Fail(te)
+            | TemporalExpr::Eventually(te)
+            | TemporalExpr::Group(te) => self.check_temporal(te),
+            TemporalExpr::EventRef { .. } | TemporalExpr::Cycle => {}
         }
     }
 
@@ -600,13 +784,11 @@ impl<'a> TypeChecker<'a> {
                 None => Ty::Unknown,
             };
         }
-        if let Some(defines) = self.coverage_defines {
-            if name.ends_with('$') || defines.contains_key(name) {
-                return Ty::Unknown;
-            }
-            if matches!(name, "TEST_DONE" | "MAX_INT" | "MIN_INT" | "MAX_UINT") {
-                return Ty::Int;
-            }
+        if name.ends_with('$') || self.defines.contains_key(name) {
+            return Ty::Unknown;
+        }
+        if matches!(name, "TEST_DONE" | "MAX_INT" | "MIN_INT" | "MAX_UINT") {
+            return Ty::Int;
         }
         if name == "NULL" {
             return Ty::Void;
@@ -647,6 +829,11 @@ impl<'a> TypeChecker<'a> {
                 .as_ref()
                 .map(|rt| self.type_of(rt))
                 .unwrap_or(Ty::Void);
+        }
+        if t.events.iter().any(|event| event.name == name)
+            || t.ports.iter().any(|port| port.name == name)
+        {
+            return Ty::Unknown;
         }
         // When-only members exist conditionally; a type with `when`
         // views stays silent on unknown members.
@@ -702,10 +889,8 @@ impl<'a> TypeChecker<'a> {
                     .as_ref()
                     .map(|rt| self.type_of(rt))
                     .unwrap_or(Ty::Void);
-                self.check_args(method, args);
-                for arg in args {
-                    self.infer(arg);
-                }
+                let argument_types: Vec<_> = args.iter().map(|arg| self.infer(arg)).collect();
+                self.check_args(method, args, &argument_types);
                 return_ty
             }
             Expr::MemberAccess {
@@ -750,9 +935,7 @@ impl<'a> TypeChecker<'a> {
                         _ => element.as_ref().clone(),
                     };
                 }
-                for arg in args {
-                    self.infer(arg);
-                }
+                let argument_types: Vec<_> = args.iter().map(|arg| self.infer(arg)).collect();
                 match &object_ty {
                     Ty::Object(_) => {
                         // The receiver's method call: check the
@@ -761,7 +944,7 @@ impl<'a> TypeChecker<'a> {
                         if let Some(method) =
                             t.and_then(|t| t.methods.iter().find(|m| m.name.as_str() == name))
                         {
-                            self.check_args(method, args);
+                            self.check_args(method, args, &argument_types);
                         }
                         self.infer_member(&object_ty, name, *member_span)
                     }
@@ -786,15 +969,13 @@ impl<'a> TypeChecker<'a> {
             // resolution is the plain one (4.17.3).
             Expr::QualifiedField { base, field, .. } => {
                 let object_ty = self.infer(base);
-                for arg in args {
-                    self.infer(arg);
-                }
+                let argument_types: Vec<_> = args.iter().map(|arg| self.infer(arg)).collect();
                 if let Ty::Object(_) = &object_ty {
                     let t = self.find_type(type_name_of(&object_ty));
                     if let Some(method) =
                         t.and_then(|t| t.methods.iter().find(|m| m.name.as_str() == field))
                     {
-                        self.check_args(method, args);
+                        self.check_args(method, args, &argument_types);
                         return method
                             .return_type
                             .as_ref()
@@ -804,9 +985,9 @@ impl<'a> TypeChecker<'a> {
                 }
                 Ty::Unknown
             }
-            // Static calls, casts and any other callee shape: the
-            // checker does not pin them down (v1).
+            // Unknown callee kinds still have expression children.
             _ => {
+                self.infer(callee);
                 for arg in args {
                     self.infer(arg);
                 }
@@ -817,7 +998,7 @@ impl<'a> TypeChecker<'a> {
 
     /// Check call arguments against the composed signature's typed
     /// parameters.
-    fn check_args(&mut self, method: &MethodDecl, args: &[Expr]) {
+    fn check_args(&mut self, method: &MethodDecl, args: &[Expr], kinds: &[Ty]) {
         for (position, arg) in args.iter().enumerate() {
             let Some(param) = method.params.get(position) else {
                 break;
@@ -826,8 +1007,7 @@ impl<'a> TypeChecker<'a> {
                 continue;
             };
             let target = self.type_of(param_ty);
-            let value = self.infer(arg);
-            self.check_assignable(&value, &target, arg.span(), "argument");
+            self.check_assignable(&kinds[position], &target, arg.span(), "argument");
         }
     }
 
@@ -1107,7 +1287,7 @@ fn check_coverage_options<'a>(
 /// so sibling access resolves). The diagnostics join the elaboration
 /// diagnostics (the CLI prints both).
 pub fn check_types(elaborated: &Elaborated) -> Vec<Diagnostic> {
-    let mut checker = TypeChecker::new(&elaborated.types);
+    let mut checker = TypeChecker::new(&elaborated.types, &elaborated.defines);
     for t in &elaborated.types {
         checker.me_type = Some(&t.name);
         checker.return_ty = None;
@@ -1148,11 +1328,13 @@ pub fn check_types(elaborated: &Elaborated) -> Vec<Diagnostic> {
                 }
             }
         }
-        checker.coverage_defines = Some(&elaborated.defines);
         check_coverage_options(&mut checker, t, &coverage_kinds);
-        checker.coverage_defines = None;
         for on in &t.ons {
             checker.check_body(&on.body);
+        }
+        for rule in &t.expects {
+            checker.check_temporal(&rule.te);
+            checker.check_body(&rule.else_body);
         }
         for method in &t.methods {
             checker.return_ty = method.return_type.as_ref();

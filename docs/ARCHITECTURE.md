@@ -212,6 +212,30 @@ browser sandbox API is not started.
   also remains unknown. This is declaration inference, with no
   flow-sensitive narrowing or interprocedural inference; full name
   resolution remains a gap.
+  Expression traversal is exhaustive over the AST's ordinary value children:
+  membership elements and sets, casts, bit slices, table tuples/rows, set
+  literals, select weights, chosen-from targets/lists and unknown callees.
+  Type-embedded expressions and raw select choice tokens retain their own
+  unresolved scope/grammar. Cast result kinds stay unknown because the
+  evaluator's fallback preserves its input. Explicit `evaluate` results,
+  slices and `in_table` results have known kinds. An evaluate body gets a
+  scoped result local and keeps the owner/caller context; a new initializer
+  gets a fresh locals frame, no enclosing return type, and the known new
+  object as its receiver. Implicit evaluate/new types remain unknown here.
+  All statement value children now traverse, including loop bounds, print,
+  gen, emit, rgf assignment, wait, start and compute. The recorded foreach
+  index-name path is structural, not treated as an evaluated expression.
+  Temporal rule/wait propositions, edge operands and repeat bounds traverse
+  recursively, as do rule else actions; event reference paths remain
+  structural. A cloned exact-count repeat bound is checked once. This adds
+  no temporal execution support or new temporal operand typing rule.
+  Events/ports have unknown value kinds rather than false missing-member
+  errors. Known method arguments are inferred once, then validated against
+  their signatures without re-traversing them. Index-kind checks, membership
+  compatibility, static member typing and conditional `is a` bindings still
+  require further work. Define and predefined constant precedence now
+  applies across every checked context, preventing same-named fields or
+  locals from supplying the wrong kind; define values remain unknown.
 - `src/elab.rs` — member composition: `like` chains and `extend` blocks fold
   into one composed member list per `struct`/`unit` (inheritance-cycle,
   cross-declaration duplicate-field and unmodified-method-redefinition

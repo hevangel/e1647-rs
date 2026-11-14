@@ -1,0 +1,3 @@
+4:25: error[E0220]: variable initialization: a value of kind 'int' cannot be stored into 'string'
+5:25: error[E0220]: variable initialization: a value of kind 'bool' cannot be stored into 'string'
+6:25: error[E0220]: variable initialization: a value of kind 'int' cannot be stored into 'string'

@@ -1,0 +1,7 @@
+11:15: error[E0223]: the left operand of the arithmetic operator is 'string' — a number is required
+12:13: error[E0221]: 'child_s' has no field or method 'absent'
+13:15: error[E0223]: the left operand of the arithmetic operator is 'string' — a number is required
+14:14: error[E0221]: 'child_s' has no field or method 'absent'
+15:20: error[E0223]: the left operand of the arithmetic operator is 'string' — a number is required
+16:26: error[E0223]: the left operand of the arithmetic operator is 'string' — a number is required
+17:16: error[E0220]: assignment: a value of kind 'string' cannot be stored into 'int'
