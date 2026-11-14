@@ -27,7 +27,8 @@
 //!
 //! The pass walks methods, field init values, `keep` constraints,
 //! `on` bodies and coverage item expressions, including synthesized
-//! `when` views. Coverage options remain raw tokens and are unchecked;
+//! `when` views. Coverage option types remain unchecked here; structural
+//! option syntax and unit scopes are checked during elaboration;
 //! `table`/`table_row` receivers and constructs the checker cannot pin
 //! down also stay unchecked. The pass
 //! runs over composed types (post `like`/`extend` fold), so extended

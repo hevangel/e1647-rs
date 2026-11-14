@@ -57,6 +57,16 @@ configuration categories/options and `set_config_max` remain unsupported.
 Run the independently authored example with
 `cargo run -- run examples/coverage_config.e --seed 1 --coverage`.
 
+Coverage groups can use `per_unit_instance` (or
+`per_unit_instance = unit_type`) to keep separate counts for containing
+units. Group/basic-item `when` expressions filter sampling; per-unit
+`instance_no_collect = inst.flag` expressions filter presentation.
+`no_collect` hides an item while preserving its values for crosses and
+transitions. See `examples/coverage_units.e` for a runnable unit example.
+Scope follows the field tree under `sys`; shared objects use their first
+visited path, with the existing bounded instance walk. A detached owner
+without the requested containing unit reports an error.
+
 ## From Slopman to Rustman
 
 In keeping with this repository's policy of honest staged claims, the

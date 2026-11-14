@@ -3774,3 +3774,71 @@ images or proprietary output were committed. This is implementation
 regression evidence, not differential qualification or conformance.
 Per-unit-instance storage, dynamic coverage filters, the remaining range
 parameters and the broader configuration API are still unfinished.
+
+## 2026-11-12 — Per-unit coverage and sampling filters
+
+Coverage groups now accept header `using` options and collect separate
+per-unit groups for `per_unit_instance [= unit_type]` (14.2, 14.2.2).
+The default scope for a unit declaration is its context unit type; a
+struct requires an explicit unit type. The bounded, visited-set instance
+walk chooses the nearest matching unit through inheritance and flattened
+lists, keeps first-visited alias paths, and terminates on cycles.
+Unsampled units retain zero-hit groups. A sampled detached owner without
+the requested containing unit reports E0402 at the sampling action.
+
+Group/basic-item `when` expressions evaluate in a fresh owning-struct
+frame, without inheriting the emitting method's locals. Group/item
+`instance_no_collect` expressions bind `inst` to the associated unit for
+report visibility (14.2.2, 14.3.4). Visibility is refreshed for grade/report
+queries. Hidden groups/items keep sampling storage internally; the reported
+view removes them and the per-unit schema placeholders. Hidden source
+items therefore still feed crosses/transitions. Crosses require all
+sources to be sampled in the current round; transitions keep their last
+sampled source value, and every declared transition over that source
+updates. Same-named items in different groups resolve within their group.
+
+Structural option-expression/scope validation runs after composition and
+reports E0224, registered in the module header and diagnostic allocation
+catalogue. It rejects missing/unknown/non-unit scopes and scope changes
+after group/item instance_no_collect. Full option type checking is still
+unfinished; non-Boolean runtime filters report E0402. The older regression
+that used instance_no_collect without per_unit_instance now declares the
+required scope explicitly.
+
+Eighteen independently authored fixture sets under
+`tests/fixtures/coverage-instances/` cover separate units, unsampled holes,
+ancestor/nearest/inherited scope, shared aliases in lists, cycles,
+procedural sampling, group/item filters, emitter-local isolation, hidden
+sources, multiple transitions, same-named group items, complex header
+expressions, detached owners, malformed expressions and invalid/frozen
+scopes. A CLI test checks unit path labels and elab rejection of bad
+scopes. README/status/roadmap/architecture/CLI help describe behavior and
+limits; `examples/coverage_units.e` demonstrates collection.
+
+Verification on `agent/coverage-unit-instances` (based on PR #67):
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 454 passed, 0 failed.
+- `cargo test --test coverage_instances` — 2 passed, 0 failed,
+  covering all eighteen fixture sets and the CLI checks.
+- `cargo run -- run examples/coverage_units.e --seed 1 --coverage` —
+  passed; sys.a and sys.b each report one sample and grade 50%.
+- `git diff --check` — passed.
+
+Initial fixture iterations caught reserved event naming and a unit-reference
+type unsupported by the existing frontend; the independently authored
+fixtures were corrected while preserving their isolation/cycle checks.
+The initial legacy scope regression failed until its required scope was
+made explicit. The final checks above pass. No local all-feature, WASM
+or Specman comparison was run.
+
+Reference basis: read-only visual study of the lawful local 2016 redline
+coverage options and type/instance relationship pages, with 2019 clause
+numbers mapped through the migration plan. No standard text, images or
+vendor output were committed. This is regression evidence, not differential
+qualification or conformance. Unit association is limited to the existing
+bounded primary field-tree walk. General ignore/illegal/radix semantics,
+instance_ignore/instance_illegal, remaining range parameters, derived-item
+filters, item using-also overrides, full option type checking and the
+broader runtime configuration API remain gaps.

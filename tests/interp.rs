@@ -2742,7 +2742,7 @@ fn no_collect_group_option_suppresses_the_group() {
     // 14.3.2: "if one or both of no_collect and instance_no_collect
     // options of the group are evaluated to TRUE, the group shall not
     // be presented under that instance." The constant TRUE spelling is
-    // not presented at all — not sampled, not graded, not reported.
+    // omitted from the reported view and its grade.
     let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
          no_collect = TRUE;\n        item cur: uint using ranges = {\n            \
@@ -2761,7 +2761,7 @@ fn instance_no_collect_groups_are_not_presented_either() {
     // no_collect on the group) suppresses presentation the same way.
     let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
-         instance_no_collect = TRUE;\n        item cur: uint;\n    };\n    run() is also {\n        \
+         per_unit_instance;\n        instance_no_collect = TRUE;\n        item cur: uint;\n    };\n    run() is also {\n        \
          cur = 0; emit cov_e;\n    };\n};\n",
         1,
     );
