@@ -12,10 +12,15 @@
 //! gate sampling in the owning struct context. Crosses require every
 //! source in the current round; transitions retain the last sampled value.
 //!
+//! Basic-item ignore/illegal predicates exclude observations and wholly
+//! excluded buckets from goals. Instance variants bind the containing unit.
+//! Integral/Boolean masks use interval classification or bounded exact
+//! evaluation. Derived histories retain bucket identities across mask changes.
+//!
 //! Structural option/scope errors report E0224 after composition. The
 //! interpreter evaluates Boolean filters and per-unit visibility. Full
-//! option type checking, instance_ignore/instance_illegal, general
-//! ignore/illegal/radix semantics, real/enumeral ranges and general
+//! option type checking, derived-item ignore/illegal filters, radix
+//! semantics, real/enumeral ranges and general
 //! constant/type resolution for range parameters,
 //! item `using also` overrides and the wider runtime configuration API
 //! remain unfinished. No conformance is claimed.
@@ -26,6 +31,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ItemOptions {
+    pub ignore: Option<Expr>,
+    pub illegal: Option<Expr>,
+    pub instance_ignore: Option<Expr>,
+    pub instance_illegal: Option<Expr>,
     pub hidden: bool,
     pub when: Option<Expr>,
     pub instance_no_collect: Option<Expr>,
@@ -43,6 +52,8 @@ pub(crate) struct GroupOptions {
 /// (1 unless a `range(...)` clause says otherwise) and the hits so far.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverBucket {
+    /// No legal, non-ignored values remain in this bucket.
+    pub excluded: bool,
     /// Preserve range-local precedence over item/group/global defaults.
     pub(crate) explicit_goal: bool,
     pub label: String,
@@ -84,13 +95,16 @@ impl CoverItemData {
         let covered = self
             .buckets
             .iter()
-            .filter(|bucket| bucket.goal > 0 && bucket.hits >= bucket.goal)
+            .filter(|bucket| !bucket.excluded && bucket.goal > 0 && bucket.hits >= bucket.goal)
             .count();
         Some(covered as f64 / total as f64)
     }
 
     pub fn graded_bucket_count(&self) -> usize {
-        self.buckets.iter().filter(|bucket| bucket.goal > 0).count()
+        self.buckets
+            .iter()
+            .filter(|bucket| !bucket.excluded && bucket.goal > 0)
+            .count()
     }
 }
 
@@ -120,12 +134,20 @@ impl CoverInstanceData {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DerivedKey {
+    labels: Vec<String>,
+    buckets: Vec<Option<usize>>,
+    hits: u64,
+}
+
 /// A derived coverage item (14.4/14.5): a cross over the group's items
 /// or a transition over one item's consecutive samples. Each sampling
 /// event records one combination — the crossed items' bucket labels,
 /// or the base item's previous→current labels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverDerivedData {
+    keys: Vec<DerivedKey>,
     /// The 14.4/14.5 default names: `cross_a__b` and
     /// `transition__base`.
     pub name: String,
@@ -155,7 +177,20 @@ impl CoverDerivedData {
         Some(self.combos.len() as f64 / total as f64)
     }
 
-    fn record(&mut self, combo: &str) {
+    fn record(&mut self, combo: &str, labels: Vec<String>, buckets: Vec<Option<usize>>) {
+        if let Some(key) = self
+            .keys
+            .iter_mut()
+            .find(|key| key.labels == labels && key.buckets == buckets)
+        {
+            key.hits += 1;
+        } else {
+            self.keys.push(DerivedKey {
+                labels,
+                buckets,
+                hits: 1,
+            });
+        }
         self.samples += 1;
         if let Some(entry) = self.combos.iter_mut().find(|(seen, _)| seen == combo) {
             entry.1 += 1;
@@ -184,6 +219,7 @@ pub struct CoverGroupData {
     /// Each item's containing-bucket label (or raw value) at the last
     /// sampling event — the transition source (14.5's previous-value).
     last_values: BTreeMap<String, String>,
+    last_buckets: BTreeMap<String, Option<usize>>,
     round_items: BTreeSet<String>,
 }
 
@@ -244,7 +280,11 @@ impl CoverGroupData {
         let mut weighted_sum = 0.0f64;
         let mut weight_total = 0u64;
         for item in &per_instance {
-            for bucket in item.buckets.iter().filter(|bucket| bucket.goal > 0) {
+            for bucket in item
+                .buckets
+                .iter()
+                .filter(|bucket| !bucket.excluded && bucket.goal > 0)
+            {
                 let instance = CoverInstanceData {
                     name: format!("{}=={}", item.name, bucket.label),
                     hits: bucket.hits,
@@ -282,7 +322,7 @@ impl CoverGroupData {
             if item.options.hidden || !item.per_instance {
                 continue;
             }
-            for bucket in &item.buckets {
+            for bucket in item.buckets.iter().filter(|bucket| !bucket.excluded) {
                 instances.push(CoverInstanceData {
                     name: format!("{}=={}", item.name, bucket.label),
                     hits: bucket.hits,
@@ -304,6 +344,14 @@ impl CoverGroupData {
         self.round_items.insert(item_name.to_owned());
         let item = self.items.iter().find(|item| item.name == item_name);
         let as_int = value_to_int(value);
+        let bucket = item.and_then(|item| {
+            as_int.and_then(|value| {
+                item.buckets
+                    .iter()
+                    .position(|bucket| value >= bucket.lo && value <= bucket.hi)
+            })
+        });
+        let previous_bucket = self.last_buckets.get(item_name).copied().flatten();
         // The bucket label this value lands in (14.3's bucket model),
         // or the raw value when the item is unbucketed.
         let label = item.and_then(|item| item_label(item, as_int));
@@ -316,10 +364,15 @@ impl CoverGroupData {
                 .iter_mut()
                 .filter(|derived| derived.sources == vec![item_name])
             {
-                derived.record(&format!("{previous}→{label}"));
+                derived.record(
+                    &format!("{previous}→{label}"),
+                    vec![previous.clone(), label.clone()],
+                    vec![previous_bucket, bucket],
+                );
             }
         }
         self.last_values.insert(item_name.to_owned(), label.clone());
+        self.last_buckets.insert(item_name.to_owned(), bucket);
         // The crosses over combinations including this item record
         // after all items have their fresh labels, from record_round's
         // final pass — nothing to do here.
@@ -349,6 +402,69 @@ impl CoverGroupData {
         }
     }
 
+    /// Rebuild derived presentation/grade data from stable source bucket
+    /// identities. Original observations remain available if unit masks change.
+    pub(crate) fn refresh_derived(&mut self) {
+        for derived in &mut self.derived {
+            let source_items: Vec<_> = derived
+                .sources
+                .iter()
+                .filter_map(|name| self.items.iter().find(|item| item.name == *name))
+                .collect();
+            derived.total_combos = if source_items.len() != derived.sources.len()
+                || source_items.iter().any(|item| item.buckets.is_empty())
+            {
+                None
+            } else if source_items.len() == 1 {
+                let count = source_items[0]
+                    .buckets
+                    .iter()
+                    .filter(|bucket| !bucket.excluded)
+                    .count() as u64;
+                count.checked_mul(count)
+            } else {
+                source_items.iter().try_fold(1u64, |total, item| {
+                    total.checked_mul(
+                        item.buckets
+                            .iter()
+                            .filter(|bucket| !bucket.excluded)
+                            .count() as u64,
+                    )
+                })
+            };
+            derived.combos.clear();
+            derived.samples = 0;
+            for key in &derived.keys {
+                let valid = key.buckets.iter().enumerate().all(|(position, bucket)| {
+                    let source = if derived.sources.len() == 1 {
+                        source_items.first()
+                    } else {
+                        source_items.get(position)
+                    };
+                    source.is_some_and(|item| {
+                        item.buckets.is_empty()
+                            || bucket.is_some_and(|index| {
+                                item.buckets
+                                    .get(index)
+                                    .is_some_and(|bucket| !bucket.excluded)
+                            })
+                    })
+                });
+                if valid {
+                    let rendered = if derived.sources.len() == 1 {
+                        format!("{}→{}", key.labels[0], key.labels[1])
+                    } else {
+                        format!("({})", key.labels.join(", "))
+                    };
+                    derived.samples += key.hits;
+                    // Equal display names do not merge distinct bucket
+                    // identities or reduce the number of covered goals.
+                    derived.combos.push((rendered, key.hits));
+                }
+            }
+        }
+    }
+
     /// The cross pass of one sampling event (14.4): record each cross
     /// item's combination from its sources' current labels.
     pub fn record_crosses(&mut self) {
@@ -372,9 +488,14 @@ impl CoverGroupData {
             let Some(labels) = labels else { continue };
             let combo = format!("({})", labels.join(", "));
             if let Some(derived) = self.derived.iter_mut().find(|derived| derived.name == name) {
-                derived.record(&combo);
+                let buckets = sources
+                    .iter()
+                    .map(|source| self.last_buckets.get(source).copied().flatten())
+                    .collect();
+                derived.record(&combo, labels, buckets);
             }
         }
+        self.refresh_derived();
     }
 }
 
@@ -445,6 +566,8 @@ pub struct CoverageConfig {
     pub max_int_buckets: u64,
     /// Default hit goal, overridden by group, item and range settings.
     pub at_least: u64,
+    /// Report illegal observations immediately instead of at check time.
+    pub check_illegal_immediately: bool,
 }
 
 impl Default for CoverageConfig {
@@ -453,6 +576,7 @@ impl Default for CoverageConfig {
             mode: true,
             max_int_buckets: 16,
             at_least: 1,
+            check_illegal_immediately: false,
         }
     }
 }
@@ -508,6 +632,7 @@ pub(crate) fn build_types(
                 derived,
                 samples: 0,
                 last_values: BTreeMap::new(),
+                last_buckets: BTreeMap::new(),
                 round_items: BTreeSet::new(),
             });
         }
@@ -634,6 +759,7 @@ fn build_derived(decl: &CoverGroupDecl, items: &[CoverItemData]) -> Vec<CoverDer
                 let name = scan_string_option(&entry.using, "name")
                     .unwrap_or_else(|| format!("transition__{base}"));
                 derived.push(CoverDerivedData {
+                    keys: Vec::new(),
                     name,
                     sources: vec![base.clone()],
                     samples: 0,
@@ -666,6 +792,7 @@ fn build_derived(decl: &CoverGroupDecl, items: &[CoverItemData]) -> Vec<CoverDer
                 let name = scan_string_option(&entry.using, "name")
                     .unwrap_or_else(|| format!("cross_{}", sources.join("__")));
                 derived.push(CoverDerivedData {
+                    keys: Vec::new(),
                     name,
                     sources,
                     samples: 0,
@@ -842,6 +969,7 @@ fn scan_string_option(tokens: &[Token], name: &str) -> Option<String> {
 fn bool_buckets() -> Vec<CoverBucket> {
     vec![
         CoverBucket {
+            excluded: false,
             explicit_goal: false,
             label: "FALSE".to_owned(),
             lo: 0,
@@ -850,6 +978,7 @@ fn bool_buckets() -> Vec<CoverBucket> {
             hits: 0,
         },
         CoverBucket {
+            excluded: false,
             explicit_goal: false,
             label: "TRUE".to_owned(),
             lo: 1,
@@ -866,6 +995,7 @@ fn bool_buckets() -> Vec<CoverBucket> {
 fn default_int_buckets(max: u64) -> Vec<CoverBucket> {
     (0..max)
         .map(|value| CoverBucket {
+            excluded: false,
             explicit_goal: false,
             label: format!("{value}"),
             lo: value as i128,
@@ -1049,6 +1179,7 @@ fn parse_ranges(using: &[Token]) -> Result<Vec<CoverBucket>, crate::diagnostic::
                 format!("{start}..{end}")
             };
             buckets.push(CoverBucket {
+                excluded: false,
                 explicit_goal: goal.is_some(),
                 label,
                 lo: start,
@@ -1276,6 +1407,10 @@ fn hidden_option(tokens: &[Token]) -> Result<bool, crate::diagnostic::Diagnostic
 
 fn item_options(item: &CoverItemDecl) -> Result<ItemOptions, crate::diagnostic::Diagnostic> {
     Ok(ItemOptions {
+        ignore: option_expr(&item.using, "ignore")?,
+        illegal: option_expr(&item.using, "illegal")?,
+        instance_ignore: option_expr(&item.using, "instance_ignore")?,
+        instance_illegal: option_expr(&item.using, "instance_illegal")?,
         hidden: hidden_option(&item.using)?,
         when: option_expr(&item.using, "when")?,
         instance_no_collect: option_expr(&item.using, "instance_no_collect")?,
@@ -1344,8 +1479,24 @@ fn group_options(
 /// so inherited and extended groups use the same scope as execution.
 pub(crate) fn validate_types(
     types: &[crate::elab::ElaboratedType],
+    defines: &BTreeMap<String, Expr>,
 ) -> Vec<crate::diagnostic::Diagnostic> {
     let mut diagnostics = Vec::new();
+    let mut constants: BTreeSet<String> = defines.keys().cloned().collect();
+    for ty in types {
+        constants.extend(ty.enumerals.iter().map(|value| value.name.clone()));
+    }
+    constants.extend(
+        [
+            "MAX_INT",
+            "MIN_INT",
+            "MAX_UINT",
+            "MAX_LONGINT",
+            "MIN_LONGINT",
+            "MAX_LONGUINT",
+        ]
+        .map(str::to_owned),
+    );
     for ty in types {
         let mut seen = BTreeSet::new();
         for decl in &ty.covers {
@@ -1408,6 +1559,28 @@ pub(crate) fn validate_types(
                         }
                     }
                 }
+                if let Ok(effect_options) = item_options(item)
+                    && let Some((name, _)) = item.names.first()
+                {
+                    for (effect, per_unit) in [
+                        (&effect_options.ignore, false),
+                        (&effect_options.illegal, false),
+                        (&effect_options.instance_ignore, true),
+                        (&effect_options.instance_illegal, true),
+                    ] {
+                        if let Some(expr) = effect {
+                            if item.kind != CoverItemKind::Item {
+                                diagnostics.push(option_error(&item.using, "derived-item ignore/illegal filters are not implemented (14.3)"));
+                            } else if per_unit && options.unit_scope.is_none() {
+                                diagnostics.push(option_error(&item.using, "instance_ignore/instance_illegal require per_unit_instance (14.3.4)"));
+                            } else if let Err(diagnostic) =
+                                validate_effect(expr, name, per_unit, &constants)
+                            {
+                                diagnostics.push(diagnostic);
+                            }
+                        }
+                    }
+                }
                 match item_options(item) {
                     Err(diagnostic) => diagnostics.push(diagnostic),
                     Ok(item_options)
@@ -1435,7 +1608,322 @@ pub(crate) fn for_report(coverage: &[TypeCoverage]) -> Vec<TypeCoverage> {
         entry.groups.retain(CoverGroupData::is_reported);
         for group in &mut entry.groups {
             group.items.retain(|item| !item.options.hidden);
+            for item in &mut group.items {
+                item.buckets.retain(|bucket| !bucket.excluded);
+            }
         }
     }
     result
+}
+
+fn validate_effect(
+    expr: &Expr,
+    item: &str,
+    per_unit: bool,
+    constants: &BTreeSet<String>,
+) -> Result<(), crate::diagnostic::Diagnostic> {
+    let invalid = || {
+        crate::diagnostic::Diagnostic::new(
+            "E0224",
+            "ignore/illegal predicates require their item, constants and permitted inst fields (14.3)",
+            expr.span().0,
+            expr.span().1,
+        )
+    };
+    match expr {
+        Expr::Ident { name, .. }
+            if name == item || constants.contains(name) || (per_unit && name == "inst") =>
+        {
+            Ok(())
+        }
+        Expr::IntLiteral { .. }
+        | Expr::BitLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::BoolLiteral { .. } => Ok(()),
+        Expr::Paren { expr, .. } | Expr::Unary { expr, .. } => {
+            validate_effect(expr, item, per_unit, constants)
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            validate_effect(lhs, item, per_unit, constants)?;
+            validate_effect(rhs, item, per_unit, constants)
+        }
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            validate_effect(cond, item, per_unit, constants)?;
+            validate_effect(then_expr, item, per_unit, constants)?;
+            validate_effect(else_expr, item, per_unit, constants)
+        }
+        Expr::MemberAccess { object, .. } if per_unit && inst_path(object) => {
+            validate_effect(object, item, per_unit, constants)
+        }
+        Expr::Index { base, index, .. } if per_unit && inst_path(base) => {
+            validate_effect(base, item, per_unit, constants)?;
+            validate_effect(index, item, per_unit, constants)
+        }
+        Expr::ListConcat { items, .. } => {
+            for expr in items {
+                validate_effect(expr, item, per_unit, constants)?;
+            }
+            Ok(())
+        }
+        Expr::InSet { element, set, .. } => {
+            validate_effect(element, item, per_unit, constants)?;
+            for expr in inset_expressions(set) {
+                validate_effect(expr, item, per_unit, constants)?;
+            }
+            Ok(())
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn inst_path(expr: &Expr) -> bool {
+    match expr {
+        Expr::Ident { name, .. } => name == "inst",
+        Expr::MemberAccess { object, .. }
+        | Expr::Index { base: object, .. }
+        | Expr::Paren { expr: object, .. } => inst_path(object),
+        _ => false,
+    }
+}
+
+fn inset_expressions(set: &crate::ast::InSetExpr) -> Vec<&Expr> {
+    match set {
+        crate::ast::InSetExpr::Items(items) => items.iter().collect(),
+        crate::ast::InSetExpr::Range(lo, hi) => vec![lo, hi],
+        crate::ast::InSetExpr::Expr(expr) => vec![expr],
+    }
+}
+
+fn uses_item(expr: &Expr, item: &str) -> bool {
+    match expr {
+        Expr::Ident { name, .. } => name == item,
+        Expr::Paren { expr, .. }
+        | Expr::Unary { expr, .. }
+        | Expr::MemberAccess { object: expr, .. } => uses_item(expr, item),
+        Expr::Binary { lhs, rhs, .. } => uses_item(lhs, item) || uses_item(rhs, item),
+        Expr::Index { base, index, .. } => uses_item(base, item) || uses_item(index, item),
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => uses_item(cond, item) || uses_item(then_expr, item) || uses_item(else_expr, item),
+        Expr::ListConcat { items, .. } => items.iter().any(|expr| uses_item(expr, item)),
+        Expr::InSet { element, set, .. } => {
+            uses_item(element, item)
+                || inset_expressions(set)
+                    .iter()
+                    .any(|expr| uses_item(expr, item))
+        }
+        _ => false,
+    }
+}
+
+fn bare_item(expr: &Expr, item: &str) -> bool {
+    match expr {
+        Expr::Ident { name, .. } => name == item,
+        Expr::Paren { expr, .. } => bare_item(expr, item),
+        _ => false,
+    }
+}
+
+pub(crate) type Intervals = Vec<(i128, i128)>;
+pub(crate) type EffectEval<'a> = dyn FnMut(&Expr, Option<i128>) -> Result<crate::interp::Value, crate::diagnostic::Diagnostic>
+    + 'a;
+
+/// Exact scalar predicate classification for comparisons/membership and
+/// Boolean compositions, with bounded enumeration for other pure shapes.
+pub(crate) fn effect_intervals(
+    expr: &Expr,
+    item: &str,
+    domain: (i128, i128),
+    prototype: &crate::interp::Value,
+    budget: &mut usize,
+    evaluate: &mut EffectEval<'_>,
+) -> Result<Intervals, crate::diagnostic::Diagnostic> {
+    use crate::{
+        ast::{BinaryOp, UnaryOp},
+        interp::{
+            Value, canonical_set, complement_interval_set, intersect_interval_sets,
+            union_interval_sets,
+        },
+    };
+    let error = |message| {
+        crate::diagnostic::Diagnostic::new("E0402", message, expr.span().0, expr.span().1)
+    };
+    let boolean = |value: Value| match value {
+        Value::Bool(value) => Ok(value),
+        _ => Err(error(
+            "coverage ignore/illegal predicate expects a Boolean value (14.3)",
+        )),
+    };
+    let scalar = |value: Value| match (prototype, value) {
+        (Value::Int(_), Value::Int(value)) => Ok(value),
+        (Value::Bool(_), Value::Bool(value)) => Ok(i128::from(value)),
+        _ => Err(error(
+            "coverage effect comparison requires compatible scalar values (14.3)",
+        )),
+    };
+    if !uses_item(expr, item) {
+        return Ok(if boolean(evaluate(expr, None)?)? {
+            vec![domain]
+        } else {
+            Vec::new()
+        });
+    }
+    match expr {
+        Expr::Paren { expr, .. } => {
+            return effect_intervals(expr, item, domain, prototype, budget, evaluate);
+        }
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+            ..
+        } => {
+            return Ok(complement_interval_set(
+                &effect_intervals(expr, item, domain, prototype, budget, evaluate)?,
+                domain,
+            ));
+        }
+        Expr::Binary { op, lhs, rhs, .. }
+            if matches!(
+                op,
+                BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::Imply
+            ) =>
+        {
+            let left = effect_intervals(lhs, item, domain, prototype, budget, evaluate)?;
+            let active = if *op == BinaryOp::LogicalOr {
+                complement_interval_set(&left, domain)
+            } else {
+                left.clone()
+            };
+            let mut right = Vec::new();
+            for subdomain in active {
+                right = union_interval_sets(
+                    &right,
+                    &effect_intervals(rhs, item, subdomain, prototype, budget, evaluate)?,
+                );
+            }
+            return Ok(match op {
+                BinaryOp::LogicalAnd => right,
+                BinaryOp::LogicalOr => union_interval_sets(&left, &right),
+                _ => union_interval_sets(&complement_interval_set(&left, domain), &right),
+            });
+        }
+        Expr::Binary { op, lhs, rhs, .. }
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+            ) =>
+        {
+            let pair = if bare_item(lhs, item) && !uses_item(rhs, item) {
+                Some((rhs.as_ref(), true))
+            } else if bare_item(rhs, item) && !uses_item(lhs, item) {
+                Some((lhs.as_ref(), false))
+            } else {
+                None
+            };
+            if let Some((constant, left)) = pair {
+                if matches!(prototype, Value::Bool(_))
+                    && !matches!(op, BinaryOp::Eq | BinaryOp::NotEq)
+                {
+                    return Err(error(
+                        "Boolean coverage effects support equality comparisons (14.3)",
+                    ));
+                }
+                let value = scalar(evaluate(constant, None)?)?;
+                let set = match (op, left) {
+                    (BinaryOp::Eq, _) => vec![(value, value)],
+                    (BinaryOp::NotEq, _) => complement_interval_set(&[(value, value)], domain),
+                    (BinaryOp::Lt, true) | (BinaryOp::Gt, false) => value
+                        .checked_sub(1)
+                        .map(|hi| vec![(i128::MIN, hi)])
+                        .unwrap_or_default(),
+                    (BinaryOp::Le, true) | (BinaryOp::Ge, false) => vec![(i128::MIN, value)],
+                    (BinaryOp::Gt, true) | (BinaryOp::Lt, false) => value
+                        .checked_add(1)
+                        .map(|lo| vec![(lo, i128::MAX)])
+                        .unwrap_or_default(),
+                    _ => vec![(value, i128::MAX)],
+                };
+                return Ok(intersect_interval_sets(&set, &[domain]));
+            }
+        }
+        Expr::InSet { element, set, .. }
+            if bare_item(element, item)
+                && !inset_expressions(set)
+                    .iter()
+                    .any(|expr| uses_item(expr, item)) =>
+        {
+            let set = match set {
+                crate::ast::InSetExpr::Items(items) => {
+                    let mut values = Vec::new();
+                    for expr in items {
+                        let value = scalar(evaluate(expr, None)?)?;
+                        values.push((value, value));
+                    }
+                    canonical_set(values)
+                }
+                crate::ast::InSetExpr::Range(lo, hi) => canonical_set(vec![(
+                    scalar(evaluate(lo, None)?)?,
+                    scalar(evaluate(hi, None)?)?,
+                )]),
+                crate::ast::InSetExpr::Expr(expr) => match evaluate(expr, None)? {
+                    Value::Set(values) => values,
+                    Value::List(list) => {
+                        let mut values = Vec::new();
+                        for value in list.items.borrow().iter() {
+                            let value = scalar(value.clone())?;
+                            values.push((value, value));
+                        }
+                        canonical_set(values)
+                    }
+                    _ => {
+                        return Err(error(
+                            "coverage membership effects require a set or list (14.3)",
+                        ));
+                    }
+                },
+            };
+            return Ok(intersect_interval_sets(&set, &[domain]));
+        }
+        _ => {}
+    }
+    if domain.1.abs_diff(domain.0) >= *budget as u128 {
+        return Err(error(
+            "wide arithmetic coverage predicates exceed the 65536 value classification limit (14.3)",
+        ));
+    }
+    let mut result = Vec::new();
+    let mut start = None;
+    let mut value = domain.0;
+    loop {
+        *budget -= 1;
+        if boolean(evaluate(expr, Some(value))?)? {
+            if start.is_none() {
+                start = Some(value);
+            }
+        } else if let Some(lo) = start.take() {
+            result.push((lo, value - 1));
+        }
+        if value == domain.1 {
+            break;
+        }
+        value += 1;
+    }
+    if let Some(lo) = start {
+        result.push((lo, domain.1));
+    }
+    Ok(result)
 }

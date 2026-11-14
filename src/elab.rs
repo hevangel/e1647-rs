@@ -1538,9 +1538,10 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         static_events: static_registry(declarations),
         static_ons: static_registry(declarations),
     };
-    result
-        .diagnostics
-        .extend(crate::coverage::validate_types(&result.types));
+    result.diagnostics.extend(crate::coverage::validate_types(
+        &result.types,
+        &result.defines,
+    ));
     result
 }
 

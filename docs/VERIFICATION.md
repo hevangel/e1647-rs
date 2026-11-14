@@ -3901,3 +3901,69 @@ shared behavior and has not been differentially qualified. Real/enumeral
 bounds, user-defined constant-name resolution, typed item-domain/precision
 proofs, broader coverage options and procedural goal overrides remain gaps.
 This is regression evidence, not IEEE conformance.
+
+
+## 2026-11-13 — Basic coverage ignore/illegal predicates
+
+On `agent/coverage-ignore-illegal`, based on PR #69, implemented basic-item
+`ignore`, `illegal`, `instance_ignore` and `instance_illegal` predicates
+(IEEE 1647-2019, 14.3/14.3.4), plus the Boolean runtime coverage setting
+`check_illegal_immediately` (29.9). Global predicates admit their own item
+and constants; instance predicates additionally admit associated-unit
+`inst` field/index paths. Calls, owner/local access, instance options
+without unit scope and derived-item filters report E0224. Non-Boolean
+results and unsupported classification report E0402.
+
+Ignored/illegal observations never enter basic hits or derived histories.
+Wholly excluded buckets leave grades, holes and the returned report;
+partially excluded buckets retain their legal goals. Comparisons, scalar
+membership and Boolean compositions classify integer/Boolean intervals;
+other pure expressions enumerate with a shared 65536-candidate budget per
+item refresh. Short circuit domains avoid evaluating guarded arithmetic
+on irrelevant values. A failing classification cannot partially commit a
+group's masks. Integer division/remainder overflow now reports E0402
+rather than panicking on i128 minimum divided by minus one.
+
+Derived keys preserve bucket indices independently of display names.
+Current masks filter recorded combinations and recompute denominators;
+restoring masks exposes earlier legal history, while excluded observations
+remain absent. Out-of-range bucketed observations do not create impossible
+derived goals. Immediate illegal observations report at sampling; deferred
+observations flush after check hooks, with a final flush after finalize or
+stop. The original DUT-error summary includes these failures.
+
+Thirty-two independently authored fixture sets in
+`tests/fixtures/coverage-effects/` cover basic and per-unit predicates,
+partial/fully excluded bins, unsampled holes, crosses/transitions, equal
+bucket labels, dynamic unit masks and history restoration, Boolean/string
+items, negative modulo, guarded division, immediate/deferred/stop/finalize
+reporting, global/instance OR composition, signed extrema, wide arithmetic,
+integer overflow and scope/type diagnostics. A CLI test checks exclusion
+and immediate ordering. README, status, roadmap, architecture, CLI help and
+the diagnostic allocation describe the new behavior and limitations.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 458 passed, 0 failed (17 test binaries).
+- `cargo test --test coverage_effects` — 2 passed, 0 failed, including all
+  thirty-two fixture sets; also included in the final full-suite result.
+- `cargo run -- run examples/coverage_effects.e --seed 1 --coverage` —
+  completed with the intended one DUT error for value 5; six sampling
+  events, four legal item samples, four graded buckets hit, grade 100%.
+- `git diff --check` — passed.
+
+Clippy initially found two collapsible-if style errors; both were corrected
+before the final checks. Existing coverage fixtures passed unchanged.
+No local all-feature, WASM runtime or Specman comparison was performed.
+
+Reference basis: the lawful local 2016 redline coverage option tables and
+shared coverage behavior, using the migration plan's 2019 clause mapping;
+no standard text/images or vendor output committed. Ignore currently takes
+precedence over illegal on overlap. That precedence, mutable-mask behavior
+and exact deferred-phase placement have not been reference-qualified.
+Real/enumeral ranges, derived-item filters, general option type checking,
+complete typed-domain/precision proofs and wider configuration remain gaps.
+Unbucketed real/string items filter observed values without bucket-domain
+classification. This is regression evidence, not IEEE conformance.

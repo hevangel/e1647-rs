@@ -785,6 +785,7 @@ struct Interp<'a> {
     coverage: Vec<crate::coverage::TypeCoverage>,
     coverage_config: crate::coverage::CoverageConfig,
     coverage_was_enabled: bool,
+    coverage_illegal_pending: Vec<String>,
     /// Set by `stop_run()`; unwinds the whole run.
     stop_requested: bool,
     /// Failed `check that` conditions (`dut_error`), reported like
@@ -1208,6 +1209,7 @@ fn run_inner(
             ..Default::default()
         },
         coverage_was_enabled: false,
+        coverage_illegal_pending: Vec::new(),
         stop_requested: false,
         dut_errors: 0,
         defines,
@@ -1500,6 +1502,7 @@ fn run_inner(
         // monitoring did not already fire.
         interp.run_phase_on_tree(sys_index, "check", &mut diagnostics);
     }
+    interp.flush_coverage_illegal();
     // 11.4: the quit-time re-check of the rules the live passes did not
     // already fire — the streaming monitors consume any log growth since
     // the last boundary and report their end-of-run verdicts (12.3.3:
@@ -1521,6 +1524,7 @@ fn run_inner(
             interp.call_phase_method(index, "finalize", &mut diagnostics);
         }
     }
+    interp.flush_coverage_illegal();
     // Specman closes every run with a DUT-error count; mirror it.
     if interp.dut_errors > 0 {
         interp.output.push_str(&format!(
@@ -1529,6 +1533,7 @@ fn run_inner(
         ));
     }
     interp.prepare_coverage_instances(true);
+    interp.refresh_coverage_effects();
     // Field init-value failures collected during instance creation
     // (clause 6.9.1/6.9.4) join the run's diagnostics.
     diagnostics.append(&mut interp.pending_diagnostics);
@@ -6443,6 +6448,16 @@ impl<'a> Interp<'a> {
                     }
                     config.max_int_buckets = count as u64;
                 }
+                "check_illegal_immediately" => {
+                    let Value::Bool(enabled) = self.eval(&pair[1], frame, me)? else {
+                        return Err(self.error(
+                            "E0402",
+                            "check_illegal_immediately expects a Boolean value",
+                            pair[1].span(),
+                        ));
+                    };
+                    config.check_illegal_immediately = enabled;
+                }
                 "at_least" => {
                     let Value::Int(goal) = self.eval(&pair[1], frame, me)? else {
                         return Err(self.error(
@@ -6567,6 +6582,7 @@ impl<'a> Interp<'a> {
     /// `get_overall_grade()`.
     fn compute_overall_grade_value(&mut self) -> f64 {
         self.prepare_coverage_instances(true);
+        self.refresh_coverage_effects();
         if !self.coverage_was_enabled {
             self.overall_grade = Some(0.0);
             return 0.0;
@@ -9856,6 +9872,216 @@ impl<'a> Interp<'a> {
         }
     }
 
+    fn coverage_effect_value(
+        &mut self,
+        expr: &Expr,
+        item: &str,
+        value: &Value,
+        candidate: Option<i128>,
+        unit: Option<usize>,
+    ) -> Result<Value, Diagnostic> {
+        let mut frame = Frame::default();
+        let value = match (value, candidate) {
+            (Value::Int(_), Some(value)) => Value::Int(value),
+            (Value::Bool(_), Some(value)) => Value::Bool(value != 0),
+            (_, None) => value.clone(),
+            _ => {
+                return Err(self.error(
+                    "E0402",
+                    "unsupported coverage predicate scalar domain (14.3)",
+                    expr.span(),
+                ));
+            }
+        };
+        frame.locals.insert(item.to_owned(), value);
+        if let Some(unit) = unit {
+            frame.locals.insert("inst".to_owned(), Value::Object(unit));
+        }
+        self.eval(expr, &mut frame, None)
+    }
+
+    fn coverage_effect_matches(
+        &mut self,
+        expressions: &[Option<Expr>],
+        item: &str,
+        value: &Value,
+        unit: Option<usize>,
+    ) -> Result<bool, Diagnostic> {
+        for expr in expressions.iter().flatten() {
+            match self.coverage_effect_value(expr, item, value, None, unit)? {
+                Value::Bool(true) => return Ok(true),
+                Value::Bool(false) => {}
+                _ => {
+                    return Err(self.error(
+                        "E0402",
+                        "coverage ignore/illegal predicate expects a Boolean value (14.3)",
+                        expr.span(),
+                    ));
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn coverage_prototype(&self, ty: &TypeExpr, depth: u32) -> Option<Value> {
+        if depth > 32 {
+            return None;
+        }
+        match ty {
+            TypeExpr::Scalar {
+                base: crate::ast::ScalarBase::Bool,
+                ..
+            } => Some(Value::Bool(false)),
+            TypeExpr::Scalar {
+                base: crate::ast::ScalarBase::Real | crate::ast::ScalarBase::String,
+                ..
+            } => None,
+            TypeExpr::Scalar { .. } => Some(Value::Int(0)),
+            TypeExpr::Named { name, .. } => self
+                .types
+                .iter()
+                .find(|ty| ty.name == *name)
+                .and_then(|ty| ty.underlying.as_ref())
+                .and_then(|ty| self.coverage_prototype(ty, depth + 1)),
+            _ => None,
+        }
+    }
+
+    fn refresh_coverage_group_effects(
+        &mut self,
+        entry: usize,
+        group: usize,
+    ) -> Result<(), Diagnostic> {
+        let type_name = self.coverage[entry].type_name.clone();
+        let group_name = self.coverage[entry].groups[group].name.clone();
+        let unit = self.coverage[entry].groups[group].unit_owner;
+        let items: Vec<_> = self.coverage[entry].groups[group]
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.name.clone(),
+                    item.options.clone(),
+                    item.buckets
+                        .iter()
+                        .map(|bucket| (bucket.lo, bucket.hi))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        // Commit masks only after the entire group has been classified. A
+        // failing predicate must not leave a partially updated denominator.
+        let mut masks = Vec::new();
+        for (item_index, (name, options, domains)) in items.into_iter().enumerate() {
+            let effects = [
+                options.ignore,
+                options.instance_ignore,
+                options.illegal,
+                options.instance_illegal,
+            ];
+            if effects.iter().all(Option::is_none) || domains.is_empty() {
+                continue;
+            }
+            let ty = self
+                .types
+                .iter()
+                .find(|ty| ty.name == type_name)
+                .expect("coverage type exists");
+            let declared = ty
+                .covers
+                .iter()
+                .filter(|decl| decl.name == group_name)
+                .flat_map(|decl| &decl.items)
+                .find(|item| item.names.first().is_some_and(|(item, _)| *item == name));
+            let item_type = declared.and_then(|item| item.ty.as_ref()).or_else(|| {
+                ty.fields
+                    .iter()
+                    .find(|field| field.name == name)
+                    .map(|field| &field.ty)
+            });
+            let Some(prototype) = item_type.and_then(|ty| self.coverage_prototype(ty, 0)) else {
+                return Err(self.error(
+                    "E0402",
+                    "coverage bucket effects require a known integral or Boolean item type (14.3)",
+                    declared.map_or(origin_span(), |item| item.span),
+                ));
+            };
+            let mut budget = 65_536usize;
+            for (bucket, domain) in domains.into_iter().enumerate() {
+                let mut excluded = Vec::new();
+                for expr in effects.iter().flatten() {
+                    // Match the observation path's short circuit: later
+                    // predicates are irrelevant for already excluded values.
+                    for remaining in complement_interval_set(&excluded, domain) {
+                        let mut evaluate = |expr: &Expr, candidate| {
+                            self.coverage_effect_value(expr, &name, &prototype, candidate, unit)
+                        };
+                        let matching = crate::coverage::effect_intervals(
+                            expr,
+                            &name,
+                            remaining,
+                            &prototype,
+                            &mut budget,
+                            &mut evaluate,
+                        )?;
+                        excluded = union_interval_sets(&excluded, &matching);
+                    }
+                }
+                masks.push((
+                    item_index,
+                    bucket,
+                    complement_interval_set(&excluded, domain).is_empty(),
+                ));
+            }
+        }
+        for (item, bucket, excluded) in masks {
+            self.coverage[entry].groups[group].items[item].buckets[bucket].excluded = excluded;
+        }
+        self.coverage[entry].groups[group].refresh_derived();
+        Ok(())
+    }
+
+    fn refresh_coverage_effects(&mut self) {
+        if !self.coverage_was_enabled {
+            return;
+        }
+        let groups: Vec<_> = self
+            .coverage
+            .iter()
+            .enumerate()
+            .flat_map(|(entry, data)| {
+                data.groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, group)| group.is_reported())
+                    .map(move |(group, _)| (entry, group))
+            })
+            .collect();
+        for (entry, group) in groups {
+            if let Err(diagnostic) = self.refresh_coverage_group_effects(entry, group)
+                && !self.pending_diagnostics.contains(&diagnostic)
+            {
+                self.pending_diagnostics.push(diagnostic);
+            }
+        }
+    }
+
+    fn report_coverage_illegal(&mut self, message: String) {
+        if self.coverage_config.check_illegal_immediately {
+            self.dut_errors += 1;
+            self.output.push_str(&format!("dut_error: {message}\n"));
+        } else {
+            self.coverage_illegal_pending.push(message);
+        }
+    }
+
+    fn flush_coverage_illegal(&mut self) {
+        for message in std::mem::take(&mut self.coverage_illegal_pending) {
+            self.dut_errors += 1;
+            self.output.push_str(&format!("dut_error: {message}\n"));
+        }
+    }
+
     fn prepare_coverage_instances(&mut self, refresh_visibility: bool) {
         if !self.coverage_was_enabled {
             return;
@@ -9988,6 +10214,13 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        if let Err(diagnostic) = self.refresh_coverage_group_effects(entry_index, group_index) {
+            if !self.pending_diagnostics.contains(&diagnostic) {
+                self.pending_diagnostics.push(diagnostic);
+            }
+            return;
+        }
+        let unit = self.coverage[entry_index].groups[group_index].unit_owner;
         let type_name = self.instances[owner].type_name.clone();
         let group_name = self.coverage[entry_index].groups[group_index].name.clone();
         let sources: Vec<_> = self
@@ -10004,12 +10237,12 @@ impl<'a> Interp<'a> {
         let items: Vec<_> = self.coverage[entry_index].groups[group_index]
             .items
             .iter()
-            .map(|item| (item.name.clone(), item.options.when.clone()))
+            .map(|item| (item.name.clone(), item.options.clone()))
             .collect();
         self.coverage[entry_index].groups[group_index].begin_sample();
         let mut frame = Frame::default();
-        for (name, filter) in items {
-            if let Some(expr) = &filter {
+        for (name, options) in items {
+            if let Some(expr) = &options.when {
                 match self.coverage_boolean(expr, owner, None) {
                     Ok(true) => {}
                     Ok(false) => continue,
@@ -10029,7 +10262,40 @@ impl<'a> Interp<'a> {
                 }),
             };
             match value {
-                Ok(value) => self.coverage[entry_index].groups[group_index].sample(&name, &value),
+                Ok(value) => {
+                    match self.coverage_effect_matches(
+                        &[options.ignore, options.instance_ignore],
+                        &name,
+                        &value,
+                        unit,
+                    ) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(diagnostic) => {
+                            self.pending_diagnostics.push(diagnostic);
+                            continue;
+                        }
+                    }
+                    match self.coverage_effect_matches(
+                        &[options.illegal, options.instance_illegal],
+                        &name,
+                        &value,
+                        unit,
+                    ) {
+                        Ok(true) => {
+                            let path = self.coverage[entry_index].groups[group_index]
+                                .unit_instance
+                                .as_ref()
+                                .map_or(String::new(), |path| format!("@{path}"));
+                            self.report_coverage_illegal(format!("illegal coverage value {} in '{type_name}.{group_name}.{name}{path}'", self.format_value(&value)));
+                            continue;
+                        }
+                        Ok(false) => {
+                            self.coverage[entry_index].groups[group_index].sample(&name, &value)
+                        }
+                        Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
+                    }
+                }
                 Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
             }
         }
@@ -12783,7 +13049,12 @@ impl<'a> Interp<'a> {
                     if b == 0 {
                         return Err(self.error("E0403", "division by zero", span));
                     }
-                    let value = if op == Div { a / b } else { a % b };
+                    let value = if op == Div {
+                        a.checked_div(b)
+                    } else {
+                        a.checked_rem(b)
+                    }
+                    .ok_or_else(|| self.error("E0402", "integer division overflow", span))?;
                     Ok(Value::Int(precision.cast_operand(value)))
                 }
                 _ => {
@@ -13923,7 +14194,7 @@ fn wrap_to_width(value: i128, bits: u32, unsigned: bool) -> i128 {
 
 /// Intersection of two canonical interval sets (sorted, disjoint): a
 /// two-pointer sweep; the result is canonical again.
-fn intersect_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
+pub(crate) fn intersect_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
     let mut result = Vec::new();
     let mut i = 0usize;
     let mut j = 0usize;
@@ -13944,7 +14215,7 @@ fn intersect_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128,
 
 /// Union of two canonical interval sets: concatenation plus the
 /// canonicalization merge.
-fn union_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
+pub(crate) fn union_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
     let mut all = a.to_vec();
     all.extend_from_slice(b);
     canonical_set(all)
@@ -13952,7 +14223,10 @@ fn union_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i12
 
 /// The complement of a canonical interval set within `domain` (the
 /// field type's full range): the gaps between the set's intervals.
-fn complement_interval_set(set: &[(i128, i128)], domain: (i128, i128)) -> Vec<(i128, i128)> {
+pub(crate) fn complement_interval_set(
+    set: &[(i128, i128)],
+    domain: (i128, i128),
+) -> Vec<(i128, i128)> {
     let mut result = Vec::new();
     let mut cursor = domain.0;
     for &(low, high) in set {
@@ -14382,7 +14656,7 @@ fn rgf_atom_side(
 
 /// Canonicalize intervals (5.2.12): sort, merge overlapping and
 /// neighboring ones, drop empties.
-fn canonical_set(mut intervals: Vec<(i128, i128)>) -> Vec<(i128, i128)> {
+pub(crate) fn canonical_set(mut intervals: Vec<(i128, i128)>) -> Vec<(i128, i128)> {
     intervals.retain(|(lo, hi)| lo <= hi);
     intervals.sort();
     let mut merged: Vec<(i128, i128)> = Vec::new();
