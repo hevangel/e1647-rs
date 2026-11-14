@@ -27,8 +27,9 @@
 //! retain bucket identities across mask changes.
 //!
 //! Structural option/scope errors report E0224 after composition. The
-//! interpreter evaluates Boolean filters and per-unit visibility. Full
-//! option type checking, predicates over composite-valued sources, radix
+//! interpreter evaluates Boolean filters and per-unit visibility. The
+//! conservative type pass checks supported Boolean option expressions in
+//! their owner/source/unit scopes. Full option type checking, predicates over composite-valued sources, radix
 //! semantics, real/enumeral ranges and general
 //! constant/type resolution for range parameters,
 //! item `using also` overrides and the wider runtime configuration API
@@ -1590,7 +1591,9 @@ fn hidden_option(tokens: &[Token]) -> Result<bool, crate::diagnostic::Diagnostic
     }
 }
 
-fn item_options(item: &CoverItemDecl) -> Result<ItemOptions, crate::diagnostic::Diagnostic> {
+pub(crate) fn item_options(
+    item: &CoverItemDecl,
+) -> Result<ItemOptions, crate::diagnostic::Diagnostic> {
     Ok(ItemOptions {
         ignore: option_expr(&item.using, "ignore")?,
         illegal: option_expr(&item.using, "illegal")?,
@@ -1602,7 +1605,7 @@ fn item_options(item: &CoverItemDecl) -> Result<ItemOptions, crate::diagnostic::
     })
 }
 
-fn group_options(
+pub(crate) fn group_options(
     ty: &crate::elab::ElaboratedType,
     name: &str,
 ) -> Result<GroupOptions, crate::diagnostic::Diagnostic> {

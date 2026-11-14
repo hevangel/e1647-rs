@@ -2,7 +2,7 @@
 
 The IEEE 1647-2019 migration phases below are complete; the broader
 milestones remain partial. Recent work adds conservative type checking
-(now including coverage items), bounded polynomial constraint solving
+(now including coverage items and Boolean options), bounded polynomial constraint solving
 and streaming temporal rule monitors. Remaining work includes full name
 resolution/type inference, temporal edge expressions, call-stack
 continuations for suspended TCM calls, the remaining coverage options,
@@ -233,8 +233,10 @@ not imply full language support or IEEE conformance.
       Scalar/list aliases resolve with bounded recursion. Unknown or
       ambiguous kinds and custom numeric dispatch remain conservative;
       there is no flow-sensitive or interprocedural inference. Coverage
-      options remain unchecked raw tokens and full name resolution is
-      still missing
+      Boolean options now report definite mismatches in their owner,
+      sampled-source and selected-unit contexts. Define kinds, composite
+      predicate operands, other option types and full name resolution
+      remain unfinished
 - [ ] Differential corpus against an authorized reference simulator where
       available (started: Specman reference runs via EDA Playground are
       recorded in docs/VERIFICATION.md; no automated differential harness yet)

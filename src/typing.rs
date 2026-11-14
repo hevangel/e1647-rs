@@ -27,8 +27,11 @@
 //!
 //! The pass walks methods, field init values, `keep` constraints,
 //! `on` bodies and coverage item expressions, including synthesized
-//! `when` views. Coverage option types remain unchecked here; structural
-//! option syntax and unit scopes are checked during elaboration;
+//! `when` views. Effective Boolean coverage filters, visibility and
+//! ignore/illegal predicates use their owner/source/unit binding scopes.
+//! Define kinds and composite inputs remain unknown; other option types
+//! are not checked here. Structural option syntax and unit scopes are
+//! checked during elaboration;
 //! `table`/`table_row` receivers and constructs the checker cannot pin
 //! down also stay unchecked. The pass
 //! runs over composed types (post `like`/`extend` fold), so extended
@@ -226,6 +229,9 @@ struct TypeChecker<'a> {
     /// The enclosing composed type (the `me`/`self` receiver).
     me_type: Option<&'a str>,
     diagnostics: Vec<Diagnostic>,
+    /// Option evaluation resolves defines before sampled bindings/fields.
+    /// Define value kinds remain unknown until constant typing is complete.
+    coverage_defines: Option<&'a BTreeMap<String, Expr>>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -245,6 +251,7 @@ impl<'a> TypeChecker<'a> {
             return_ty: None,
             me_type: None,
             diagnostics: Vec::new(),
+            coverage_defines: None,
         }
     }
 
@@ -574,12 +581,32 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    fn check_coverage_boolean(&mut self, expr: Option<&Expr>, option: &str) {
+        if let Some(expr) = expr {
+            let value = self.infer(expr);
+            self.check_assignable(
+                &value,
+                &Ty::Bool,
+                expr.span(),
+                &format!("coverage {option}"),
+            );
+        }
+    }
+
     fn infer_ident(&mut self, name: &str) -> Ty {
         if name == "me" || name == "self" {
             return match self.me_type {
                 Some(type_name) => Ty::Object(type_name.to_owned()),
                 None => Ty::Unknown,
             };
+        }
+        if let Some(defines) = self.coverage_defines {
+            if name.ends_with('$') || defines.contains_key(name) {
+                return Ty::Unknown;
+            }
+            if matches!(name, "TEST_DONE" | "MAX_INT" | "MIN_INT" | "MAX_UINT") {
+                return Ty::Int;
+            }
         }
         if name == "NULL" {
             return Ty::Void;
@@ -989,9 +1016,92 @@ fn check_field_inits(checker: &mut TypeChecker, fields: &[crate::ast::Field]) {
     }
 }
 
+/// Check effective Boolean options with the same binding frames as the
+/// sampler (14.2-14.5). Source names are locals only in effect predicates;
+/// `when` reads the owner, and instance visibility also binds `inst`.
+fn check_coverage_options<'a>(
+    checker: &mut TypeChecker<'a>,
+    owner: &'a ElaboratedType,
+    kinds: &BTreeMap<String, BTreeMap<String, Ty>>,
+) {
+    let mut seen = std::collections::BTreeSet::new();
+    for group in &owner.covers {
+        if !seen.insert(&group.name) {
+            continue;
+        }
+        let Ok(options) = crate::coverage::group_options(owner, &group.name) else {
+            continue; // Structural errors already belong to elaboration.
+        };
+        checker.check_coverage_boolean(options.when.as_ref(), "when");
+        checker.push_scope();
+        if let Some(scope) = &options.unit_scope {
+            checker.bind_local("inst", Ty::Object(scope.clone()));
+        }
+        checker.check_coverage_boolean(options.instance_no_collect.as_ref(), "instance_no_collect");
+        checker.pop_scope();
+        for item in owner
+            .covers
+            .iter()
+            .filter(|decl| decl.name == group.name)
+            .flat_map(|decl| &decl.items)
+        {
+            let Ok(item_options) = crate::coverage::item_options(item) else {
+                continue;
+            };
+            checker.check_coverage_boolean(item_options.when.as_ref(), "when");
+            checker.push_scope();
+            if let Some(scope) = &options.unit_scope {
+                checker.bind_local("inst", Ty::Object(scope.clone()));
+            }
+            checker.check_coverage_boolean(
+                item_options.instance_no_collect.as_ref(),
+                "instance_no_collect",
+            );
+            checker.pop_scope();
+
+            // Ignore/illegal frames have no owner receiver. Basic item
+            // aliases shadow owner fields; derived inputs bind only their
+            // participating basic sources, with prev_ snapshots for a
+            // transition. Composite-valued inputs remain unknown.
+            checker.me_type = None;
+            checker.push_scope();
+            for (name, _) in &item.names {
+                let kind = kinds
+                    .get(&group.name)
+                    .and_then(|group| group.get(name))
+                    .cloned()
+                    .unwrap_or(Ty::Unknown);
+                checker.bind_local(name, kind.clone());
+                if item.kind == crate::ast::CoverItemKind::Transition {
+                    checker.bind_local(&format!("prev_{name}"), kind);
+                }
+            }
+            // The evaluator inserts the implicit unit after source
+            // bindings, even if a basic item itself was named inst.
+            if let Some(scope) = &options.unit_scope {
+                checker.bind_local("inst", Ty::Object(scope.clone()));
+            }
+            for (name, expr) in [
+                ("ignore", &item_options.ignore),
+                ("illegal", &item_options.illegal),
+            ] {
+                checker.check_coverage_boolean(expr.as_ref(), name);
+            }
+            for (name, expr) in [
+                ("instance_ignore", &item_options.instance_ignore),
+                ("instance_illegal", &item_options.instance_illegal),
+            ] {
+                checker.check_coverage_boolean(expr.as_ref(), name);
+            }
+            checker.pop_scope();
+            checker.me_type = Some(&owner.name);
+        }
+    }
+}
+
 /// The type-check pass over every composed type's members — method
 /// bodies, field init values, `keep` constraints, `on` bodies and
-/// coverage items (14.3). The
+/// coverage items and effective Boolean options (14.2-14.5). The
 /// `when` blocks' members are checked through their synthesized
 /// when-view types (which carry the block's fields as ordinary fields,
 /// so sibling access resolves). The diagnostics join the elaboration
@@ -1005,6 +1115,7 @@ pub fn check_types(elaborated: &Elaborated) -> Vec<Diagnostic> {
         for constraint in &t.constraints {
             checker.infer(&constraint.expr);
         }
+        let mut coverage_kinds = BTreeMap::<String, BTreeMap<String, Ty>>::new();
         for group in &t.covers {
             for item in &group.items {
                 if item.kind != crate::ast::CoverItemKind::Item {
@@ -1024,8 +1135,22 @@ pub fn check_types(elaborated: &Elaborated) -> Vec<Diagnostic> {
                     let target = checker.type_of(ty);
                     checker.check_assignable(&value, &target, span, "coverage item");
                 }
+                if let Some((name, _)) = item.names.first() {
+                    let kind = item
+                        .ty
+                        .as_ref()
+                        .map(|ty| checker.type_of(ty))
+                        .unwrap_or(value);
+                    coverage_kinds
+                        .entry(group.name.clone())
+                        .or_default()
+                        .insert(name.clone(), kind);
+                }
             }
         }
+        checker.coverage_defines = Some(&elaborated.defines);
+        check_coverage_options(&mut checker, t, &coverage_kinds);
+        checker.coverage_defines = None;
         for on in &t.ons {
             checker.check_body(&on.body);
         }
