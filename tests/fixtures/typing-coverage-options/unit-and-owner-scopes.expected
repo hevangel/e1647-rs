@@ -1,0 +1,2 @@
+9:84: error[E0220]: coverage instance_no_collect: a value of kind 'int' cannot be stored into 'bool'
+11:31: error[E0220]: coverage instance_ignore: a value of kind 'int' cannot be stored into 'bool'

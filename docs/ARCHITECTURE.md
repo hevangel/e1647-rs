@@ -191,9 +191,19 @@ browser sandbox API is not started.
   same-named field. An explicit item type checks compatibility (E0220),
   and expression traversal checks missing members, indexing and operand
   kinds (E0221–E0223). Unknown kinds stay silent. Cross/transition names
-  refer to items rather than owner fields; coverage option types remain
-  unchecked by this pass. Supported option syntax and unit scopes are
-  checked during elaboration. Typed method parameters bind within their method scope.
+  refer to items rather than owner fields. Effective Boolean options are
+  checked using the shared coverage option parser: `when` uses the owner,
+  instance visibility also binds the selected unit as `inst`, and
+  ignore/illegal predicates bind sampled basic sources without an owner
+  receiver, including `prev_<source>` for transitions. Instance effects
+  also bind `inst`; it takes precedence over a same-named source. Each
+  expression must be compatible with bool (E0220); ordinary conservative
+  traversal also reports E0221-E0223. Unknown kinds, define constants and
+  composite-valued sources remain conservative. Group extensions use the
+  final effective options. Scopes are discarded before checking methods
+  and other types. This does not add complete name resolution or type
+  checking for every option/expression form. Supported option syntax and
+  unit scopes are checked during elaboration. Typed method parameters bind within their method scope.
   Local `var x := e` declarations retain known initializer kinds,
   including homogeneous list literals and equal-kind ternary branches
   (clause 18). Scalar/list aliases resolve with a depth bound; recursive

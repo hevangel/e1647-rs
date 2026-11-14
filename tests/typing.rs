@@ -19,6 +19,43 @@ fn coverage_type_fixture_diagnostics_match_expected() {
 }
 
 #[test]
+fn coverage_option_type_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures/typing-coverage-options");
+}
+
+#[test]
+fn coverage_options_are_checked_by_the_cli_and_valid_scopes_execute() {
+    let directory =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typing-coverage-options");
+    for command in ["elab", "run"] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+            .arg(command)
+            .arg(directory.join("boolean-values.e"))
+            .output()
+            .expect("CLI starts");
+        assert!(
+            !result.status.success(),
+            "{command} accepted non-Boolean options"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("error[E0220]: coverage when"));
+    }
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+        .arg("run")
+        .arg(directory.join("runtime.e"))
+        .output()
+        .expect("CLI starts");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        "scope checks passed"
+    );
+}
+
+#[test]
 fn inferred_local_fixture_diagnostics_match_expected() {
     check_fixture_directory("fixtures/typing-inference");
 }

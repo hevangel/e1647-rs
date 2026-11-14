@@ -1,0 +1,1 @@
+4:40: error[E0220]: coverage ignore: a value of kind 'owner_u' cannot be stored into 'bool'

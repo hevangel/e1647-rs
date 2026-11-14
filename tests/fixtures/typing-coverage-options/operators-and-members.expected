@@ -1,0 +1,4 @@
+4:46: error[E0223]: the left operand of the arithmetic operator is 'string' — a number is required
+4:83: error[E0221]: 'scope_u' has no field or method 'missing'
+5:37: error[E0223]: the right operand of the arithmetic operator is 'string' — a number is required
+5:70: error[E0221]: 'scope_u' has no field or method 'missing'

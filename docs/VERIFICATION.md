@@ -4268,3 +4268,55 @@ option typing and typed-domain/precision proofs remain unfinished. Exact
 IEEE grading, mutable masks and side-effectful filter/report ordering still
 require differential qualification. This is regression evidence, not IEEE
 conformance.
+
+
+## 2026-11-14 — Conservative Boolean coverage option typing
+
+The post-composition type pass now checks the effective `when`,
+`instance_no_collect`, `ignore`, `illegal`, `instance_ignore` and
+`instance_illegal` expressions using the coverage model's shared option
+parser (2019 clauses 14.2-14.5). Definite non-Boolean results report E0220;
+ordinary conservative expression traversal also reports missing members,
+non-list indexing and incompatible operands (E0221-E0223). Structural option
+errors remain E0224 from elaboration; no diagnostic code was added.
+
+Sampling filters read the owner rather than item aliases. Visibility reads
+the owner and the selected unit as `inst`. Effect predicates have no owner
+receiver and bind sampled basic values, including transition `prev_`
+snapshots. In per-unit groups the implicit `inst` binding takes precedence
+over a same-named source, matching the evaluator. Basic kind lookup uses the
+existing sampled-expression check once, so its diagnostics are not duplicated.
+Group extensions use the final effective options. Scoped bindings are removed
+before checking methods and other types. Define names remain unknown before
+local/field lookup, preserving runtime precedence without guessing their
+value kinds; supported predefined integer constants keep their runtime kind.
+
+Thirteen independently authored fixture sets under
+`tests/fixtures/typing-coverage-options/` cover non-Boolean results on all six
+option forms, aliases versus owner fields, selected-unit types, transition
+snapshots, inheritance and physically earlier extensions, synthesized when
+views, scope isolation, last effective options, member/index/operator and
+method-argument diagnostics, define/predefined precedence, implicit-unit
+shadowing, unknown expressions and valid execution. Two test functions add
+the byte-exact fixture contract and CLI rejection/execution checks.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 471 passed, 0 failed (21 test binaries).
+- The focused `cargo test --test typing` passed its first seven new fixture
+  sets and CLI checks; subsequent full-suite verification passed all thirteen
+  final fixture sets and all nine typing tests.
+- An additional CLI `elab` audit of all 139 existing successful coverage
+  fixtures across the eight coverage/runtime fixture directories accepted all
+  139. Their expected diagnostic files were unchanged.
+- `git diff --check` — passed.
+
+Reference scope: independently authored checks against the repository's
+existing Boolean option evaluation and 2019 coverage clause mapping. No
+standard text, vendor output or external source was copied. No Specman run,
+local all-feature run or WASM runtime run was performed. This extends the
+conservative checker; define-value inference, composite source operands,
+complete expression/name resolution and other option types remain incomplete.
+It provides no IEEE conformance claim.

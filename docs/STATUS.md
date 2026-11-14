@@ -25,7 +25,7 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   and `template extend` blocks apply to the instances whose actuals
   match; static members register per type. After composition, the
   conservative type check ([`typing`]) walks every method body, field
-  init value, `keep` constraint, `on` body, coverage item and synthesized
+  init value, `keep` constraint, `on` body, coverage item/Boolean option and synthesized
   `when` view, and reports definite mismatches only: a value that cannot be
   the target it is stored into (E0220), a member a known when-less
   receiver does not have (E0221), indexing a non-list (E0222), an
@@ -178,8 +178,10 @@ reading, nothing else.
   views; local declarations propagate known initializer kinds, but
   ambiguous kinds stay unknown and there is no interprocedural type
   inference or full name-resolution pass. Supported coverage option
-  syntax and unit scopes are checked, but full option type checking
-  remains unfinished).
+  syntax and unit scopes are checked. Boolean filters/visibility and
+  ignore/illegal predicates report definite type mismatches with owner,
+  sampled-source and selected-unit bindings. Define kinds, composite
+  operands and full option type checking remain unfinished).
 - Temporal edge expressions (`change/rise/fall`) still lack raw sampled
   value history. Propositions and repeat bounds now retain their sampled
   values: rules sample before each global cycle closes and at quit;
