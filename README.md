@@ -74,7 +74,15 @@ holes. Illegal observations add DUT errors after check hooks by default;
 `set_config(cover, check_illegal_immediately, TRUE)` reports them at sampling.
 The example is `examples/coverage_effects.e`. Simultaneous ignore/illegal
 matches currently prefer ignore; this policy and deferred phase ordering
-have not been compared against Specman. Derived-item filters remain gaps.
+have not been compared against Specman. Derived ignore/illegal predicates remain gaps.
+
+Crosses and transitions accept their own `when`, `no_collect`,
+`instance_no_collect`, `at_least` and `weight` options. A filtered transition
+still follows consecutive legal source observations. Derived goals inherit
+item → group → runtime precedence; zero goals are ungraded, and hidden
+items leave group grades. These options currently operate over basic-item
+sources; crossing/transiting other derived items remains unfinished.
+Run `examples/coverage_derived.e` for a filtered cross/transition example.
 
 Coverage groups can use `per_unit_instance` (or
 `per_unit_instance = unit_type`) to keep separate counts for containing

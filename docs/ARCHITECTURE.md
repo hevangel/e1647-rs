@@ -253,7 +253,21 @@ browser sandbox API is not started.
   their own (14.9.3/14.9.4), `no_collect`/`instance_no_collect`
   (group, 14.2.2; item, 14.3.4) suppress presentation while retaining
   sampling storage, and the cross/transition `name` option
-  renames the derived item (14.4/14.5). The 14.9 coverage
+  renames the derived item (14.4/14.5). Derived `when` filters run with fresh
+  owner frames: transitions at the source observation, crosses after basic
+  sources for the round. Filtering a transition does not rewind the last
+  legal source observation. Derived visibility options keep collected data
+  but remove presentation and grade contributions, including per-unit
+  visibility changes. Goals count combinations reaching their required
+  hits, with item > group > runtime defaults; zero goals are ungraded.
+  Weights scale derived contributions within the same per-type aggregate
+  used by ordinary and mixed per-instance groups. Zero weights contribute
+  nothing, and floating-point weight totals avoid u64 sum overflow.
+  Checked u64 products keep large combination domains ungradeable rather
+  than overflowing; transition totals avoid host-pointer-width arithmetic.
+  Derived sources (crosses/transitions over other derived items), their
+  ignore/illegal predicates and exact side-effectful filter ordering still
+  require further implementation/qualification. The 14.9 coverage
   configuration (`CoverageConfig`: the coverage mode per 14.2's NOTE
   and `max_int_buckets` per 14.3's bracket) is honored through the
   `build_with_config` builder API and `set_config(cover, ...)` (29.9).

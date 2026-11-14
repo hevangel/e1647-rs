@@ -1,0 +1,8 @@
+derived_u.cg@sys.a samples=1 grade=0.000
+cross_n__flag samples=0 combinations=0 total=Some(4) goal=1 weight=1 grade=Some(0.0)
+transition__n samples=0 combinations=0 total=Some(4) goal=1 weight=1 grade=Some(0.0)
+derived_u.cg@sys.b samples=2 grade=0.250
+cross_n__flag samples=2 combinations=1 total=Some(4) goal=1 weight=1 grade=Some(0.25)
+transition__n samples=1 combinations=1 total=Some(4) goal=1 weight=1 grade=Some(0.25)
+(FALSE, FALSE) hits=2
+FALSE→FALSE hits=1

@@ -8,9 +8,12 @@
 //! `per_instance` partitions grades by item bucket. `per_unit_instance`
 //! instead collects separate groups for containing unit objects. Hidden
 //! groups/items retain their sampling storage for derived items, then are
-//! removed from the reported view. Group/basic-item `when` expressions
+//! removed from the reported view. Group/basic/derived `when` expressions
 //! gate sampling in the owning struct context. Crosses require every
 //! source in the current round; transitions retain the last sampled value.
+//! Derived hit goals follow item > group > runtime defaults; weights use
+//! item > group > 1.
+//! presentation-only hiding leaves underlying sampling data intact.
 //!
 //! Basic-item ignore/illegal predicates exclude observations and wholly
 //! excluded buckets from goals. Instance variants bind the containing unit.
@@ -147,6 +150,14 @@ struct DerivedKey {
 /// or the base item's previous→current labels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverDerivedData {
+    pub(crate) options: ItemOptions,
+    pub(crate) collect: bool,
+    explicit_goal: bool,
+    explicit_weight: bool,
+    /// Required observations per derived combination; zero is ungraded.
+    pub goal: u64,
+    /// Weight in the group's per-type grade.
+    pub weight: u64,
     keys: Vec<DerivedKey>,
     /// The 14.4/14.5 default names: `cross_a__b` and
     /// `transition__base`.
@@ -168,13 +179,18 @@ pub struct CoverDerivedData {
 
 impl CoverDerivedData {
     /// The derived item's grade: the fraction of combinations observed
-    /// at least once; `None` when not gradeable.
+    /// reaching the hit goal; `None` when ungradeable or the goal is zero.
     pub fn grade(&self) -> Option<f64> {
         let total = self.total_combos?;
-        if total == 0 {
+        if total == 0 || self.goal == 0 {
             return None;
         }
-        Some(self.combos.len() as f64 / total as f64)
+        let covered = self
+            .combos
+            .iter()
+            .filter(|(_, hits)| *hits >= self.goal)
+            .count();
+        Some(covered as f64 / total as f64)
     }
 
     fn record(&mut self, combo: &str, labels: Vec<String>, buckets: Vec<Option<usize>>) {
@@ -235,83 +251,63 @@ impl CoverGroupData {
         !self.options.hidden && (self.options.unit_scope.is_none() || self.unit_owner.is_some())
     }
     /// The group's grade (14.3/14.4.2). With no `per_instance` items:
-    /// the plain average of the gradeable items' (basic and derived)
+    /// the weighted average of the gradeable items' (basic and derived)
     /// grades. With `per_instance` items: "the grade of the cover
     /// group is the weighted grades of all the per_instance items" —
     /// one weighted unit per instance (per valid bucket), plus the
     /// per_type data as one bucket (14.4.2's "sum of all valid buckets
     /// for all the per_instance items +1 (the per_type bucket)"), whose
-    /// grade is the average of the per_type items' grades. `None` when
+    /// grade is the weighted average of the per_type items' grades. `None` when
     /// nothing is gradeable.
     pub fn grade(&self) -> Option<f64> {
-        let per_instance: Vec<&CoverItemData> = self
+        // The same weighted per-type aggregate participates whether or
+        // not this group also contains per-instance basic items.
+        let mut per_type_sum = 0.0;
+        let mut per_type_weight = 0.0;
+        for item in self
             .items
             .iter()
-            .filter(|item| {
-                !item.options.hidden && item.per_instance && item.graded_bucket_count() > 0
-            })
-            .collect();
-        if per_instance.is_empty() {
-            // The weighted average of the gradeable items' (basic and
-            // derived) grades; weight 1 when the option is absent.
-            let mut weighted_sum = 0.0f64;
-            let mut weight_total = 0u64;
-            for item in self
-                .items
-                .iter()
-                .filter(|item| !item.options.hidden && !item.per_instance)
-            {
-                if let Some(grade) = item.grade() {
-                    weighted_sum += grade * item.weight as f64;
-                    weight_total += item.weight;
-                }
+            .filter(|item| !item.options.hidden && !item.per_instance)
+        {
+            if let Some(grade) = item.grade() {
+                per_type_sum += grade * item.weight as f64;
+                per_type_weight += item.weight as f64;
             }
-            for item in &self.derived {
-                if let Some(grade) = item.grade() {
-                    weighted_sum += grade;
-                    weight_total += 1;
-                }
-            }
-            if weight_total == 0 {
-                return None;
-            }
-            return Some(weighted_sum / weight_total as f64);
         }
-        let mut weighted_sum = 0.0f64;
-        let mut weight_total = 0u64;
-        for item in &per_instance {
+        for item in self.derived.iter().filter(|item| !item.options.hidden) {
+            if let Some(grade) = item.grade() {
+                per_type_sum += grade * item.weight as f64;
+                per_type_weight += item.weight as f64;
+            }
+        }
+        let per_type_grade = (per_type_weight > 0.0).then(|| per_type_sum / per_type_weight);
+        let mut weighted_sum = 0.0;
+        let mut weight_total = 0.0;
+        let mut has_instances = false;
+        for item in self
+            .items
+            .iter()
+            .filter(|item| !item.options.hidden && item.per_instance)
+        {
             for bucket in item
                 .buckets
                 .iter()
                 .filter(|bucket| !bucket.excluded && bucket.goal > 0)
             {
-                let instance = CoverInstanceData {
-                    name: format!("{}=={}", item.name, bucket.label),
-                    hits: bucket.hits,
-                    goal: bucket.goal,
-                    weight: item.weight,
-                };
-                weighted_sum += instance.grade() * instance.weight as f64;
-                weight_total += instance.weight;
+                has_instances = true;
+                let grade = if bucket.hits >= bucket.goal { 1.0 } else { 0.0 };
+                weighted_sum += grade * item.weight as f64;
+                weight_total += item.weight as f64;
             }
         }
-        // The per_type bucket: one unit whose grade is the average of
-        // the per_type (non-per-instance) gradeable items.
-        let per_type_grades: Vec<f64> = self
-            .items
-            .iter()
-            .filter(|item| !item.options.hidden && !item.per_instance)
-            .filter_map(|item| item.grade())
-            .collect();
-        if !per_type_grades.is_empty() {
-            let per_type_grade = per_type_grades.iter().sum::<f64>() / per_type_grades.len() as f64;
-            weighted_sum += per_type_grade;
-            weight_total += 1;
+        if !has_instances {
+            return per_type_grade;
         }
-        if weight_total == 0 {
-            return None;
+        if let Some(grade) = per_type_grade {
+            weighted_sum += grade;
+            weight_total += 1.0;
         }
-        Some(weighted_sum / weight_total as f64)
+        (weight_total > 0.0).then(|| weighted_sum / weight_total)
     }
 
     /// The per-instance units (14.4.2) of the group's `per_instance`
@@ -362,7 +358,7 @@ impl CoverGroupData {
             for derived in self
                 .derived
                 .iter_mut()
-                .filter(|derived| derived.sources == vec![item_name])
+                .filter(|derived| derived.collect && derived.sources == vec![item_name])
             {
                 derived.record(
                     &format!("{previous}→{label}"),
@@ -471,7 +467,7 @@ impl CoverGroupData {
         let crosses: Vec<(String, Vec<String>)> = self
             .derived
             .iter()
-            .filter(|derived| derived.sources.len() > 1)
+            .filter(|derived| derived.collect && derived.sources.len() > 1)
             .map(|derived| (derived.name.clone(), derived.sources.clone()))
             .collect();
         for (name, sources) in crosses {
@@ -621,7 +617,7 @@ pub(crate) fn build_types(
                 .iter()
                 .filter_map(|item| build_item(item, config))
                 .collect();
-            let derived = build_derived(decl, &items);
+            let derived = build_derived(decl, &items, config);
             groups.push(CoverGroupData {
                 options: group_options(ty, &decl.name).unwrap_or_default(),
                 unit_instance: None,
@@ -651,7 +647,8 @@ pub(crate) fn build_types(
                         .iter()
                         .filter_map(|item| build_item(item, config)),
                 );
-                base.derived.extend(build_derived(decl, &base.items));
+                base.derived
+                    .extend(build_derived(decl, &base.items, config));
             }
         }
         // Group-level options: `per_instance = TRUE` marks every item
@@ -692,13 +689,25 @@ pub(crate) fn build_types(
                     if let Ok(Some(value)) = coverage_goal(entry) {
                         group_at_least = Some(value);
                     }
-                    if let Some(Some(value)) = scan_uint_option(entry, "weight") {
+                    if let Ok(Some(value)) = coverage_weight(entry) {
                         group_weight = Some(value);
                     }
                 }
             }
             if group_at_least.is_none() && group_weight.is_none() {
                 continue;
+            }
+            for item in &mut group.derived {
+                if !item.explicit_goal
+                    && let Some(goal) = group_at_least
+                {
+                    item.goal = goal;
+                }
+                if !item.explicit_weight
+                    && let Some(weight) = group_weight
+                {
+                    item.weight = weight;
+                }
             }
             for decl in &matching {
                 for entry in &decl.items {
@@ -723,12 +732,17 @@ pub(crate) fn build_types(
                         }
                     }
                     if let Some(weight) = group_weight
-                        && scan_uint_option(&entry.using, "weight").is_none()
+                        && coverage_weight(&entry.using).ok().flatten().is_none()
                     {
                         item.weight = weight;
                     }
                 }
             }
+        }
+        // Extensions can add a source after a derived declaration was
+        // first built. Recompute totals against the final group schema.
+        for group in &mut groups {
+            group.refresh_derived();
         }
         result.push(TypeCoverage {
             type_name: ty.name.clone(),
@@ -740,7 +754,11 @@ pub(crate) fn build_types(
 
 /// Synthesize a group's derived items (14.4/14.5) from its recorded
 /// cross/transition entries, with totals over the basic items' buckets.
-fn build_derived(decl: &CoverGroupDecl, items: &[CoverItemData]) -> Vec<CoverDerivedData> {
+fn build_derived(
+    decl: &CoverGroupDecl,
+    items: &[CoverItemData],
+    config: &CoverageConfig,
+) -> Vec<CoverDerivedData> {
     let mut derived = Vec::new();
     for entry in &decl.items {
         match entry.kind {
@@ -752,13 +770,25 @@ fn build_derived(decl: &CoverGroupDecl, items: &[CoverItemData]) -> Vec<CoverDer
                     .iter()
                     .find(|item| &item.name == base)
                     .filter(|item| !item.buckets.is_empty())
-                    .map(|item| (item.buckets.len() * item.buckets.len()) as u64);
+                    .and_then(|item| {
+                        let count = item.buckets.len() as u64;
+                        count.checked_mul(count)
+                    });
                 // 14.5: "If no name is specified for the transition item
                 // with the name option, it gets a default name of
                 // transition item-name" (two underscores).
                 let name = scan_string_option(&entry.using, "name")
                     .unwrap_or_else(|| format!("transition__{base}"));
                 derived.push(CoverDerivedData {
+                    options: item_options(entry).unwrap_or_default(),
+                    collect: true,
+                    explicit_goal: coverage_goal(&entry.using).ok().flatten().is_some(),
+                    explicit_weight: coverage_weight(&entry.using).ok().flatten().is_some(),
+                    goal: coverage_goal(&entry.using)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(config.at_least),
+                    weight: coverage_weight(&entry.using).ok().flatten().unwrap_or(1),
                     keys: Vec::new(),
                     name,
                     sources: vec![base.clone()],
@@ -782,7 +812,7 @@ fn build_derived(decl: &CoverGroupDecl, items: &[CoverItemData]) -> Vec<CoverDer
                         if item.buckets.is_empty() {
                             None
                         } else {
-                            Some(product * item.buckets.len() as u64)
+                            product.checked_mul(item.buckets.len() as u64)
                         }
                     })
                 });
@@ -792,6 +822,15 @@ fn build_derived(decl: &CoverGroupDecl, items: &[CoverItemData]) -> Vec<CoverDer
                 let name = scan_string_option(&entry.using, "name")
                     .unwrap_or_else(|| format!("cross_{}", sources.join("__")));
                 derived.push(CoverDerivedData {
+                    options: item_options(entry).unwrap_or_default(),
+                    collect: true,
+                    explicit_goal: coverage_goal(&entry.using).ok().flatten().is_some(),
+                    explicit_weight: coverage_weight(&entry.using).ok().flatten().is_some(),
+                    goal: coverage_goal(&entry.using)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(config.at_least),
+                    weight: coverage_weight(&entry.using).ok().flatten().unwrap_or(1),
                     keys: Vec::new(),
                     name,
                     sources,
@@ -837,7 +876,7 @@ fn group_event_path(decl: &CoverGroupDecl) -> Option<String> {
 /// `using` tokens carry them, the 14.3 defaults otherwise.
 fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItemData> {
     if item.kind != CoverItemKind::Item {
-        // cross/transition items are recorded, not collected yet.
+        // Cross/transition schemas are built separately below.
         return None;
     }
     let name = item
@@ -852,9 +891,7 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
         .flatten()
         .unwrap_or(config.at_least);
     let per_instance = scan_bool_option(&item.using, "per_instance").unwrap_or(false);
-    let weight = scan_uint_option(&item.using, "weight")
-        .unwrap_or_default()
-        .unwrap_or(1);
+    let weight = coverage_weight(&item.using).ok().flatten().unwrap_or(1);
     let ranges = match parse_ranges(&item.using) {
         Ok(ranges) => ranges,
         Err(_) => {
@@ -916,24 +953,6 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
         per_instance,
         weight,
     })
-}
-
-/// Scan `name = <uint>` in recorded option tokens; `None` when the
-/// option is absent, `Some(None)` when present but not a readable
-/// uint.
-fn scan_uint_option(tokens: &[Token], name: &str) -> Option<Option<u64>> {
-    for index in 0..tokens.len() {
-        if token_word(&tokens[index]) == Some(name) && token_kind_is(tokens.get(index + 1)?, "=") {
-            let value = tokens.get(index + 2)?;
-            return Some(match &value.kind {
-                TokenKind::Number(text) => {
-                    crate::interp::parse_int_literal(text).map(|v| v.max(0) as u64)
-                }
-                _ => None,
-            });
-        }
-    }
-    None
 }
 
 /// Scan `name = TRUE|FALSE` in recorded option tokens.
@@ -1315,6 +1334,22 @@ fn coverage_goal(tokens: &[Token]) -> Result<Option<u64>, crate::diagnostic::Dia
         .transpose()
 }
 
+fn coverage_weight(tokens: &[Token]) -> Result<Option<u64>, crate::diagnostic::Diagnostic> {
+    option_value(tokens, "weight")
+        .map(|tokens| {
+            constant_integer(tokens)
+                .ok()
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or_else(|| {
+                    option_error(
+                        tokens,
+                        "coverage weights require nonnegative constant u64 values (14.3-14.5)",
+                    )
+                })
+        })
+        .transpose()
+}
+
 fn token_word(token: &Token) -> Option<&str> {
     match &token.kind {
         TokenKind::Identifier(word) | TokenKind::Keyword(word) => Some(word.as_str()),
@@ -1455,6 +1490,7 @@ fn group_options(
                 options.unit_scope = Some(scope);
             }
             coverage_goal(entry)?;
+            coverage_weight(entry)?;
             options.hidden |= hidden_option(entry)?;
             if let Some(expr) = option_expr(entry, "when")? {
                 options.when = Some(expr);
@@ -1536,27 +1572,30 @@ pub(crate) fn validate_types(
                 .filter(|group| group.name == decl.name)
                 .flat_map(|group| &group.items)
             {
-                if item.kind == CoverItemKind::Item {
-                    if let Err(diagnostic) = coverage_goal(&item.using) {
+                if let Err(diagnostic) = coverage_goal(&item.using) {
+                    diagnostics.push(diagnostic);
+                }
+                if let Err(diagnostic) = coverage_weight(&item.using) {
+                    diagnostics.push(diagnostic);
+                }
+                if item.kind == CoverItemKind::Item
+                    && let Some(tokens) = option_value(&item.using, "ranges")
+                {
+                    let unsupported = match &item.ty {
+                        Some(TypeExpr::Scalar {
+                            base: ScalarBase::String,
+                            ..
+                        }) => Some("coverage ranges are not permitted for string items (14.3)"),
+                        Some(TypeExpr::Scalar {
+                            base: ScalarBase::Real,
+                            ..
+                        }) => Some("real coverage ranges are not implemented (14.3)"),
+                        _ => None,
+                    };
+                    if let Some(message) = unsupported {
+                        diagnostics.push(option_error(tokens, message));
+                    } else if let Err(diagnostic) = parse_ranges(&item.using) {
                         diagnostics.push(diagnostic);
-                    }
-                    if let Some(tokens) = option_value(&item.using, "ranges") {
-                        let unsupported = match &item.ty {
-                            Some(TypeExpr::Scalar {
-                                base: ScalarBase::String,
-                                ..
-                            }) => Some("coverage ranges are not permitted for string items (14.3)"),
-                            Some(TypeExpr::Scalar {
-                                base: ScalarBase::Real,
-                                ..
-                            }) => Some("real coverage ranges are not implemented (14.3)"),
-                            _ => None,
-                        };
-                        if let Some(message) = unsupported {
-                            diagnostics.push(option_error(tokens, message));
-                        } else if let Err(diagnostic) = parse_ranges(&item.using) {
-                            diagnostics.push(diagnostic);
-                        }
                     }
                 }
                 if let Ok(effect_options) = item_options(item)
@@ -1607,6 +1646,7 @@ pub(crate) fn for_report(coverage: &[TypeCoverage]) -> Vec<TypeCoverage> {
     for entry in &mut result {
         entry.groups.retain(CoverGroupData::is_reported);
         for group in &mut entry.groups {
+            group.derived.retain(|item| !item.options.hidden);
             group.items.retain(|item| !item.options.hidden);
             for item in &mut group.items {
                 item.buckets.retain(|bucket| !bucket.excluded);

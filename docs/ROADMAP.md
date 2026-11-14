@@ -406,7 +406,11 @@ not imply full language support or IEEE conformance.
       and per-unit instance variants exclude observations and whole buckets;
       illegal values produce immediate or deferred DUT errors. Interval masks
       and bounded arithmetic classification preserve derived bucket identity.
-      Exact overlap/phase behavior still needs reference qualification
+      Cross/transition when, visibility, hit-goal and weight options run over
+      basic sources. Derived grades enter the weighted per-type aggregate in
+      mixed per-instance groups; filtered transitions retain source history.
+      Derived sources and derived ignore/illegal predicates remain gaps.
+      Exact overlap/phase/filter-side-effect behavior needs qualification
 - [~] Part 2 predefined routine library — started with the reflection
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`
       (5.10.5/5.10.6 — the argument parses as a type) build the

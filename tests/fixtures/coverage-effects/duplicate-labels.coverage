@@ -1,4 +1,4 @@
-sys.cg samples=4 grade=0.875
+sys.cg samples=4 grade=0.852
 n buckets=3 grade=1.000 samples=3
 same [0..0] goal=1 hits=1
 same [1..1] goal=1 hits=1
