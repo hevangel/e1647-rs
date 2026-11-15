@@ -4537,3 +4537,64 @@ No Specman comparison, local all-feature run or WASM runtime run was performed.
 General bidirectional/flow-sensitive inference, constant/type-embedded
 resolution, full signatures/name resolution and custom numeric/subtype
 inference remain unfinished. No IEEE conformance is claimed.
+
+
+## 2026-11-14 — list indexes, membership typing and contained lists
+
+Known list indexes now reject definite non-integer/non-enumeral kinds with
+E0223 (5.2.11). Unknown receivers remain conservative; E0222 still reports
+a definitely non-list receiver. Index expressions receive their own integer
+context rather than inheriting a stored result's kind, including assignment
+indexes. Existing enum-to-index conversion limits remain runtime limitations;
+accepting an enum kind here is conservative, not a new native conversion claim.
+
+Membership (4.11.6) checks known right-hand list/set containers and compatible
+scalar or contained-list element kinds. Declared sets, literals and
+set_of_values/full_set_of_values retain a Set kind with no scalar-domain
+metadata. Unknown/custom numeric kinds and fine numeric/enum domain questions
+stay conservative. Native inferred set values can supply contextual hints.
+Operand traversal/evaluation runs once; a Boolean membership result context
+does not leak into its operands. A dedicated E0122 golden pins the currently
+unresolved untyped-evaluate operand context.
+
+Native list-to-list membership now means order-independent containment,
+including repeated left values needing distinct right matches. Iterative
+augmenting paths allow reassignment of a prior match when mixed int/real
+comparison rounding gives overlapping candidates. Scalar membership keeps
+ordinary equality dispatch. Inputs are snapshotted before comparisons, and
+neither list is consumed or reordered. Set/range membership tests scalar or
+contained-list values against integer intervals; Boolean/enumeral values use
+their indices. Repetition does not consume distinct set entries. Enum range
+bounds use the existing set-literal conversion. Real-valued set membership
+and full scalar-domain validation remain gaps.
+
+Eleven independently authored fixture pairs under
+`tests/fixtures/typing-membership/` cover invalid index kinds, assignments,
+non-list bases, incompatible membership elements/containers, aliases/sets,
+known method/static results, nested diagnostic traversal, unknowns and valid
+types. Positive execution covers order, duplicate counts, empties, negation,
+strings/booleans/enumerals, object/null identities, input preservation,
+single receiver/argument evaluation, contextual index evaluate, inferred sets
+and overlapping numeric candidates. An independently generated histogram
+oracle checks all 225 ordered pairs of binary-valued lists of lengths 0–3.
+The existing traversal membership golden gains one definite invalid-container
+diagnostic on its arithmetic result; its other diagnostics are unchanged.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 483 passed, 0 failed (21 test binaries).
+- `cargo test --test typing` — 21 passed, 0 failed.
+- CLI elab audit: 176 pre-existing successful fixture declarations produced
+  no E0220–E0223 diagnostics.
+- `git diff --check` — passed.
+
+Reference scope: the local lawful 2016 redline's list-index and membership
+pages were visually inspected; code/docs cite the 2019 clause map already
+used by the migration/parser. This is shared-subset implementation evidence,
+not independent 2019 or commercial-simulator qualification. No standard text,
+images or vendor output is committed; external pins are unchanged. No Specman
+comparison, local all-feature run or WASM runtime run was performed. Full name
+resolution, set-domain typing, type-embedded scopes and general inference
+remain unfinished. No IEEE conformance is claimed.

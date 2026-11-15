@@ -45,6 +45,13 @@ expression bodies establish their own contexts. Unknown contexts still need
 an explicit type; general bidirectional inference and full name resolution
 remain unfinished.
 
+Known list indexes and membership operands now receive definite-kind checks.
+Membership accepts scalar lookup and list containment; list-to-list containment
+respects duplicate counts without changing either input. Integer/Boolean/
+enumeral sets support scalar and contained-list queries. Empty lists are
+contained. Full set-domain typing, real-valued set membership and reference
+qualification remain unfinished.
+
 Scalar/list/reference aliases default through their declared representation.
 Defaulting more than 64 aliases reports a bounded diagnostic; cyclic default
 chains are rejected by that bound.

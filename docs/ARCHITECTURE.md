@@ -240,8 +240,14 @@ browser sandbox API is not started.
   no temporal execution support or new temporal operand typing rule.
   Events/ports have unknown value kinds rather than false missing-member
   errors. Known method arguments are inferred once, then validated against
-  their signatures without re-traversing them. Index-kind checks, membership
-  compatibility and conditional `is a` bindings still require further work. Define and predefined constant precedence now
+  their signatures without re-traversing them. Known list indexes require
+  integer/enum kinds (E0223); their integer context is independent of the
+  result's context. Membership unwraps a contained list's item kind before
+  comparison, checks known list/set containers and rejects definite element
+  mismatches (4.11.6). Declared sets, literals and set_of_values have a Set kind;
+  scalar domains and unsupported numeric conversions remain conservative.
+  Operand traversal runs once without inheriting the Boolean result context.
+  Conditional `is a` bindings still require further work. Define and predefined constant precedence now
   applies across every checked context, preventing same-named fields or
   locals from supplying the wrong kind; define values remain unknown.
   Registered `Type::field` accesses read kinds from the exact declaring
@@ -273,6 +279,14 @@ browser sandbox API is not started.
   restore expected types. E0122/E0402 remain the runtime diagnostics when a
   required evaluate/new context is unavailable. No numeric-width inference,
   full subtype inference or type-embedded resolution is added here.
+  Native membership compares list items through ordinary equality, with
+  input snapshots and distinct candidate matches for list-to-list containment.
+  Iterative augmenting paths avoid a greedy mismatch when mixed numeric
+  equality gives overlapping candidates; no recursive search is used. Set
+  membership checks each scalar or left list item against canonical intervals,
+  converting Boolean/enumeral values to their indices. Set multiplicity is
+  irrelevant. Real-valued set membership and full domain qualification remain
+  gaps. Inferred native set values also supply a contextual set hint.
 - `src/elab.rs` — member composition: `like` chains and `extend` blocks fold
   into one composed member list per `struct`/`unit` (inheritance-cycle,
   cross-declaration duplicate-field and unmodified-method-redefinition

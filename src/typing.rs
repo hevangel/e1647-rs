@@ -16,7 +16,8 @@
 //!   conditionally, so a type with `when` views stays silent — E0221);
 //! - indexing a definitely non-list value (E0222);
 //! - an operator applied to definitely incompatible operand kinds
-//!   (string against a number, an object in arithmetic — E0223).
+//!   (string against a number, an object in arithmetic — E0223),
+//!   including invalid list-index and membership operand kinds.
 //!
 //! Declared parameter kinds are visible in their method bodies, and
 //! `var x := expression` keeps an inferable initializer kind (clause 18).
@@ -46,8 +47,10 @@
 //! bodies establish their own scoped hints. Materialized templates retain
 //! object kinds and concatenation flattens list operands. Cast results,
 //! unresolved contexts/statics and type-embedded expressions remain
-//! conservative. Index-kind/membership compatibility
-//! and conditional is-a bindings still need separate typing rules.
+//! conservative. Known list indexes require integer/enum kinds; membership
+//! validates known containers and scalar/list element compatibility (4.11.6).
+//! The built-in set kind retains no scalar-domain information. Conditional
+//! is-a bindings and full set/numeric domain rules still need further work.
 //!
 //! ## Diagnostic codes
 //!
@@ -78,6 +81,8 @@ pub enum Ty {
     Enum(String),
     /// A list of the element kind (the element may be `Unknown`).
     List(Box<Ty>),
+    /// The built-in set representation; its scalar domain is not tracked.
+    Set,
     /// A struct/unit/interface value (the name is the canonical
     /// composed name; a template instance names the instance).
     Object(String),
@@ -99,6 +104,7 @@ impl Ty {
             Ty::Str => "string".to_owned(),
             Ty::Enum(type_name) => type_name.clone(),
             Ty::List(element) => format!("list of {}", element.name()),
+            Ty::Set => "set".to_owned(),
             Ty::Object(name) => name.clone(),
             Ty::Sync => "resource-sharing object".to_owned(),
             Ty::Iterator => "instance_iterator".to_owned(),
@@ -336,6 +342,9 @@ impl<'a> TypeChecker<'a> {
                 Ty::List(Box::new(self.type_of_at_depth(element, depth + 1)))
             }
             TypeExpr::Named { name, .. } => {
+                if name == "set" {
+                    return Ty::Set;
+                }
                 if sync_type(name) {
                     return Ty::Sync;
                 }
@@ -595,9 +604,19 @@ impl<'a> TypeChecker<'a> {
             }
             Expr::Call { callee, args, span } => self.infer_call(callee, args, *span),
             Expr::Index { base, index, span } => {
-                let base_ty = self.infer(base);
-                self.infer(index);
+                let base_ty = self.infer_with_hint(None, base);
+                let index_ty = self.infer_with_hint(Some(Ty::Int), index);
                 if let Ty::List(element) = base_ty {
+                    if has_opinion(&index_ty) && !matches!(index_ty, Ty::Int | Ty::Enum(_)) {
+                        self.diagnostics.push(self.error(
+                            "E0223",
+                            format!(
+                                "list index has kind '{}' — an integer is required",
+                                index_ty.name()
+                            ),
+                            index.span(),
+                        ));
+                    }
                     *element
                 } else if has_opinion(&base_ty) {
                     self.diagnostics.push(self.error(
@@ -672,9 +691,8 @@ impl<'a> TypeChecker<'a> {
                 let right = self.infer(else_expr);
                 shared_kind(left, right)
             }
-            Expr::InSet { element, set, .. } => {
-                self.infer(element);
-                self.check_set(set);
+            Expr::InSet { element, set, span } => {
+                self.check_membership(element, set, *span);
                 Ty::Bool
             }
             Expr::IsA { expr, .. } => {
@@ -716,7 +734,7 @@ impl<'a> TypeChecker<'a> {
             }
             Expr::SetLiteral { items, .. } => {
                 self.check_set(items);
-                Ty::Unknown // Set kinds are outside the current lattice.
+                Ty::Set
             }
             Expr::ChosenFrom { target, list, .. } => {
                 self.infer(target);
@@ -749,10 +767,71 @@ impl<'a> TypeChecker<'a> {
             } => self.static_field(type_name, member).unwrap_or(Ty::Unknown),
             // Leaves without ordinary expression children. Type-embedded
             // expressions still need their own scopes.
-            Expr::Formal { .. }
-            | Expr::HdlPath { .. }
-            | Expr::AnnotationTypeRef { .. }
-            | Expr::SetOfValues { .. } => Ty::Unknown,
+            Expr::Formal { .. } | Expr::HdlPath { .. } | Expr::AnnotationTypeRef { .. } => {
+                Ty::Unknown
+            }
+            Expr::SetOfValues { .. } => Ty::Set,
+        }
+    }
+
+    /// Membership accepts a scalar or a contained list (4.11.6). Do not
+    /// confuse list containment with comparing a list against one scalar.
+    /// The set representation erases its scalar domain, so domain-specific
+    /// enum/bool/numeric compatibility remains conservative.
+    fn check_membership(
+        &mut self,
+        element: &Expr,
+        set: &crate::ast::InSetExpr,
+        span: crate::ast::Span,
+    ) {
+        let kind = self.infer_with_hint(None, element);
+        let item = match &kind {
+            Ty::List(item) => item.as_ref(),
+            kind => kind,
+        };
+        match set {
+            crate::ast::InSetExpr::Items(items) => {
+                for value in items {
+                    let other = self.infer_with_hint(None, value);
+                    self.check_comparison(item, &other, value.span());
+                }
+            }
+            crate::ast::InSetExpr::Range(low, high) => {
+                let low_kind = self.infer_with_hint(None, low);
+                let high_kind = self.infer_with_hint(None, high);
+                for (kind, location) in [
+                    (item, element.span()),
+                    (&low_kind, low.span()),
+                    (&high_kind, high.span()),
+                ] {
+                    self.check_set_scalar(kind, location);
+                }
+            }
+            crate::ast::InSetExpr::Expr(container) => {
+                let container_kind = self.infer_with_hint(None, container);
+                match container_kind {
+                    Ty::List(other) => self.check_comparison(item, &other, span),
+                    Ty::Set => self.check_set_scalar(item, element.span()),
+                    Ty::Unknown => {}
+                    kind => self.diagnostics.push(self.error(
+                        "E0223",
+                        format!("membership requires a list or set, got '{}'", kind.name()),
+                        container.span(),
+                    )),
+                }
+            }
+        }
+    }
+
+    fn check_set_scalar(&mut self, kind: &Ty, span: crate::ast::Span) {
+        // Real/numeric conversion and enumeral domains need finer types;
+        // reject only definitely non-scalar families here (5.2.12).
+        if has_opinion(kind) && !matches!(kind, Ty::Int | Ty::Real | Ty::Enum(_) | Ty::Bool) {
+            self.diagnostics.push(self.error(
+                "E0223",
+                format!("set membership operand has kind '{}' — a numeric, boolean or enumeral value is required", kind.name()),
+                span,
+            ));
         }
     }
 

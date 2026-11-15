@@ -248,7 +248,9 @@ not imply full language support or IEEE conformance.
       qualified calls. Result metadata persists through TCM suspension;
       expression bodies and calls isolate outer hints. Template-instance
       kinds propagate and concatenation inference flattens list operands.
-      Index-kind/membership checks, general bidirectional inference,
+      Known list indexes and membership containers/element kinds now receive
+      definite-kind checks; sets retain a kind without scalar-domain metadata.
+      General bidirectional inference, full set-domain/numeric checks,
       conditional bindings and type-embedded expressions remain incomplete. Registered
       static fields and qualified call signatures now retain kinds. Static
       initializers/methods/handlers are checked once in their declaring
@@ -339,6 +341,8 @@ not imply full language support or IEEE conformance.
       numeric expression aggregates and the predicate queries `has`,
       `count`, `all` and `all_indices`; other expression-taking forms
       remain documented gaps reporting `E0405`),
+      list containment with duplicate counts (4.11.6), scalar/list membership
+      in integer/Boolean/enumeral sets, and
       struct instances, sequence `do` (generates the item in place; the
       `keeping` block is not enforced), and `gen`. The optional `do`
       sugar on `if`/`while` — including the one-statement

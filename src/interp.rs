@@ -2758,7 +2758,16 @@ impl<'a> Interp<'a> {
                         }
                     }
                     Expr::Index { base, index, span } => {
-                        let index_value = self.eval(index, frame, me)?;
+                        let index_value = self.eval_with_hint(
+                            Some(TypeExpr::Scalar {
+                                base: ScalarBase::Int,
+                                width: None,
+                                span: index.span(),
+                            }),
+                            index,
+                            frame,
+                            me,
+                        )?;
                         let Value::Int(i) = index_value else {
                             return Err(self.error(
                                 "E0402",
@@ -9401,7 +9410,7 @@ impl<'a> Interp<'a> {
         me: Option<usize>,
         span: crate::ast::Span,
     ) -> Result<i128, Diagnostic> {
-        let value = self.eval(expr, frame, me)?;
+        let value = self.eval_with_hint(None, expr, frame, me)?;
         match &value {
             Value::Int(v) => Ok(*v),
             Value::Bool(b) => Ok(*b as i128),
@@ -12419,8 +12428,11 @@ impl<'a> Interp<'a> {
                 result
             }
             Expr::Index { base, index, span } => {
-                let base_value = self.eval(base, frame, me)?;
-                let index_value = self.eval(index, frame, me)?;
+                let base_value = self.eval_with_hint(None, base, frame, me)?;
+                let index_value = self.eval_with_hint(
+                            Some(TypeExpr::Scalar { base: ScalarBase::Int, width: None, span: index.span() }),
+                            index, frame, me,
+                        )?;
                 let (Value::List(list), Value::Int(i)) = (&base_value, &index_value) else {
                     return Err(self.error(
                         "E0402",
@@ -12663,105 +12675,53 @@ impl<'a> Interp<'a> {
                 Ok(Value::Int((value >> l) & mask))
             }
             Expr::InSet { element, set, span } => {
-                let value = self.eval(element, frame, me)?;
+                let value = self.eval_with_hint(None, element, frame, me)?;
                 let contained = match set {
                     crate::ast::InSetExpr::Items(items) => {
-                        let mut found = false;
-                        for item in items {
-                            let item_value = self.eval(item, frame, me)?;
-                            if matches!(
-                                self.apply_binary(
-                                    BinaryOp::Eq,
-                                    value.clone(),
-                                    item_value,
-                                    *span,
-                                    &Precision::unbounded(),
-                                )?,
-                                Value::Bool(true)
-                            ) {
-                                found = true;
-                                break;
+                        if let Value::List(list) = &value {
+                            // A bracket literal denotes a set: repetition on
+                            // the left does not consume a distinct set member.
+                            let mut candidates = Vec::with_capacity(items.len());
+                            for item in items {
+                                candidates.push(self.eval_with_hint(None, item, frame, me)?);
                             }
+                            let values = list.items.borrow().clone();
+                            self.list_membership(&values, &candidates, false, *span)?
+                        } else {
+                            let mut found = false;
+                            for item in items {
+                                let item_value = self.eval_with_hint(None, item, frame, me)?;
+                                if self.membership_equal(&value, &item_value, *span)? {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            found
                         }
-                        found
                     }
                     crate::ast::InSetExpr::Range(low, high) => {
-                        let Value::Int(low_v) = self.eval(low, frame, me)? else {
-                            return Err(self.error(
-                                "E0402",
-                                "range bound must be an integer",
-                                *span,
-                            ));
-                        };
-                        let Value::Int(high_v) = self.eval(high, frame, me)? else {
-                            return Err(self.error(
-                                "E0402",
-                                "range bound must be an integer",
-                                *span,
-                            ));
-                        };
-                        let Value::Int(v) = &value else {
-                            return Err(self.error(
-                                "E0402",
-                                "range membership expects an integer",
-                                *span,
-                            ));
-                        };
-                        low_v <= *v && *v <= high_v
+                        let low = self.set_literal_bound(low, frame, me, *span)?;
+                        let high = self.set_literal_bound(high, frame, me, *span)?;
+                        self.set_membership(&value, &[(low, high)], *span)?
                     }
-                    // A general set expression (4.11.6's set-exp): the
-                    // operand evaluates to a set — membership over its
-                    // intervals — or to a list, whose items are compared
-                    // item-by-item.
                     crate::ast::InSetExpr::Expr(set_expr) => {
-                        let container = self.eval(set_expr, frame, me)?;
+                        let container = self.eval_with_hint(None, set_expr, frame, me)?;
                         match container {
-                            Value::Set(intervals) => match &value {
-                                Value::Int(v) => {
-                                    intervals.iter().any(|(lo, hi)| *lo <= *v && *v <= *hi)
-                                }
-                                Value::Bool(b) => {
-                                    let v = *b as i128;
-                                    intervals.iter().any(|(lo, hi)| *lo <= v && v <= *hi)
-                                }
-                                _ => {
-                                    return Err(self.error(
-                                        "E0402",
-                                        "set membership expects an integer, boolean or enumerand",
-                                        *span,
-                                    ));
-                                }
-                            },
+                            Value::Set(intervals) => self.set_membership(&value, &intervals, *span)?,
                             Value::List(list) => {
                                 let items = list.items.borrow().clone();
-                                let mut found = false;
-                                for item in items {
-                                    if matches!(
-                                        self.apply_binary(
-                                            BinaryOp::Eq,
-                                            value.clone(),
-                                            item,
-                                            *span,
-                                            &Precision::unbounded(),
-                                        )?,
-                                        Value::Bool(true)
-                                    ) {
-                                        found = true;
-                                        break;
-                                    }
+                                if let Value::List(left) = &value {
+                                    let values = left.items.borrow().clone();
+                                    self.list_membership(&values, &items, true, *span)?
+                                } else {
+                                    self.list_membership(&[value], &items, false, *span)?
                                 }
-                                found
                             }
-                            other => {
-                                return Err(self.error(
-                                    "E0402",
-                                    format!(
-                                        "'in' expects a set or list, got {}",
-                                        self.value_kind(&other)
-                                    ),
-                                    *span,
-                                ));
-                            }
+                            other => return Err(self.error(
+                                "E0402",
+                                format!("'in' expects a set or list, got {}", self.value_kind(&other)),
+                                *span,
+                            )),
                         }
                     }
                 };
@@ -13041,6 +13001,129 @@ impl<'a> Interp<'a> {
         }
     }
 
+    fn membership_equal(
+        &mut self,
+        left: &Value,
+        right: &Value,
+        span: crate::ast::Span,
+    ) -> Result<bool, Diagnostic> {
+        Ok(matches!(
+            self.apply_binary(
+                BinaryOp::Eq,
+                left.clone(),
+                right.clone(),
+                span,
+                &Precision::unbounded()
+            )?,
+            Value::Bool(true)
+        ))
+    }
+
+    /// List containment is order-independent and respects multiplicity
+    /// (4.11.6). Snapshot inputs before comparisons, which can dispatch
+    /// custom numeric methods and mutate their original lists.
+    fn list_membership(
+        &mut self,
+        values: &[Value],
+        candidates: &[Value],
+        consume: bool,
+        span: crate::ast::Span,
+    ) -> Result<bool, Diagnostic> {
+        if !consume {
+            for value in values {
+                let mut found = false;
+                for candidate in candidates {
+                    if self.membership_equal(value, candidate, span)? {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        // Find a distinct match for every left item. A greedy first match
+        // is insufficient: mixed int/real comparisons can round two distinct
+        // integers to one real. Iterative augmenting paths can move an earlier
+        // match without recursion or mutating either input list.
+        let mut left_matches = vec![None; values.len()];
+        let mut right_matches: Vec<Option<usize>> = vec![None; candidates.len()];
+        for root in 0..values.len() {
+            let mut parents: Vec<Option<usize>> = vec![None; candidates.len()];
+            let mut queue = std::collections::VecDeque::from([root]);
+            let mut free = None;
+            'search: while let Some(left) = queue.pop_front() {
+                for (right, candidate) in candidates.iter().enumerate() {
+                    if parents[right].is_some()
+                        || !self.membership_equal(&values[left], candidate, span)?
+                    {
+                        continue;
+                    }
+                    parents[right] = Some(left);
+                    if let Some(owner) = right_matches[right] {
+                        queue.push_back(owner);
+                    } else {
+                        free = Some(right);
+                        break 'search;
+                    }
+                }
+            }
+            let Some(mut right) = free else {
+                return Ok(false);
+            };
+            loop {
+                let left = parents[right].expect("the augmenting path visited this candidate");
+                let previous = left_matches[left].replace(right);
+                right_matches[right] = Some(left);
+                match previous {
+                    Some(previous) => right = previous,
+                    None => break,
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn set_membership(
+        &self,
+        value: &Value,
+        intervals: &[(i128, i128)],
+        span: crate::ast::Span,
+    ) -> Result<bool, Diagnostic> {
+        // Values of a contained list are tested independently against the
+        // set; list multiplicity is relevant only against another list.
+        let scalar = |value: &Value| -> Result<bool, Diagnostic> {
+            let index = match value {
+                Value::Int(value) => Some(*value),
+                Value::Bool(value) => Some(*value as i128),
+                Value::Enum { type_name, name } => self.enumeral_index(type_name, name),
+                _ => None,
+            }
+            .ok_or_else(|| {
+                self.error(
+                    "E0402",
+                    "set membership expects an integer, boolean or enumerand",
+                    span,
+                )
+            })?;
+            Ok(intervals
+                .iter()
+                .any(|(low, high)| *low <= index && index <= *high))
+        };
+        if let Value::List(list) = value {
+            for item in list.items.borrow().iter() {
+                if !scalar(item)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        } else {
+            scalar(value)
+        }
+    }
+
     /// The runtime half of `expr is [not] a <type>` (clause 4.17.1). Scalar
     /// kinds match by value shape (integers are one runtime value, so
     /// `is a int` and `is a uint` both accept it); named types match by
@@ -13294,6 +13377,10 @@ impl<'a> Interp<'a> {
                 lists.insert(identity, Some(result.clone()));
                 result
             }
+            Value::Set(_) => TypeExpr::Named {
+                name: "set".to_owned(),
+                span,
+            },
             Value::InstanceIterator(_) => TypeExpr::Named {
                 name: "instance_iterator".to_owned(),
                 span,

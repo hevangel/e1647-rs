@@ -1,0 +1,5 @@
+5:23: error[E0223]: membership requires a list or set, got 'int'
+6:23: error[E0223]: membership requires a list or set, got 'string'
+7:23: error[E0223]: membership requires a list or set, got 'bool'
+8:23: error[E0223]: membership requires a list or set, got 'NULL'
+9:23: error[E0223]: membership requires a list or set, got 'child_s'

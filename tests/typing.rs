@@ -9,6 +9,87 @@ use std::path::Path;
 /// This is the byte-exact contract for the E0220–E0223 family; the
 /// `tests/fixtures/` harness above covers the parser's own contract.
 #[test]
+fn membership_type_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures/typing-membership");
+}
+
+#[test]
+fn list_containment_matches_exhaustive_histogram_oracle() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typing-membership/oracle.e");
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+        .arg("run")
+        .arg(fixture)
+        .output()
+        .expect("CLI starts");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        "225 containment cases passed"
+    );
+}
+
+#[test]
+fn membership_errors_are_rejected_and_valid_containment_executes() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typing-membership");
+    for command in ["elab", "run"] {
+        for file in [
+            "indexes.e",
+            "list-kinds.e",
+            "containers.e",
+            "sets.e",
+            "known-results.e",
+        ] {
+            let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+                .arg(command)
+                .arg(directory.join(file))
+                .output()
+                .expect("CLI starts");
+            assert!(!result.status.success(), "{command} accepted {file}");
+            assert!(String::from_utf8_lossy(&result.stderr).contains("error[E0223]"));
+        }
+    }
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+        .arg("run")
+        .arg(directory.join("runtime.e"))
+        .output()
+        .expect("CLI starts");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        "membership checks passed"
+    );
+}
+
+#[test]
+fn membership_does_not_leak_its_boolean_result_context() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typing-membership");
+    let source = fs::read_to_string(directory.join("hint-boundary.e")).unwrap();
+    let parsed = e1647::parser::parse(&source);
+    assert!(parsed.diagnostics.is_empty());
+    let elaborated = e1647::elab::elaborate(&parsed.declarations);
+    assert!(elaborated.diagnostics.is_empty());
+    let result = e1647::interp::run(&elaborated, 1);
+    let actual = result
+        .diagnostics
+        .iter()
+        .map(|d| format!("{}\n", d.render()))
+        .collect::<String>();
+    assert_eq!(
+        actual,
+        fs::read_to_string(directory.join("hint-boundary.run.expected")).unwrap()
+    );
+}
+
+#[test]
 fn type_fixture_diagnostics_match_expected() {
     check_fixture_directory("fixtures-type");
 }

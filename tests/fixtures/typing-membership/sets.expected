@@ -1,0 +1,9 @@
+8:18: error[E0223]: set membership operand has kind 'string' — a numeric, boolean or enumeral value is required
+9:18: error[E0223]: set membership operand has kind 'child_s' — a numeric, boolean or enumeral value is required
+10:18: error[E0223]: set membership operand has kind 'NULL' — a numeric, boolean or enumeral value is required
+11:18: error[E0223]: set membership operand has kind 'child_s' — a numeric, boolean or enumeral value is required
+11:28: error[E0223]: set membership operand has kind 'string' — a numeric, boolean or enumeral value is required
+12:18: error[E0223]: set membership operand has kind 'string' — a numeric, boolean or enumeral value is required
+13:28: error[E0223]: the comparison compares 'child_s' with 'int'
+13:30: error[E0223]: the comparison compares 'child_s' with 'int'
+14:23: error[E0220]: variable initialization: a value of kind 'set' cannot be stored into 'int'

@@ -33,9 +33,13 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   stays silent. Traversal includes nested membership/casts/slices/tables,
   scoped `evaluate` and `new ... with` bodies, all statement value children,
   and temporal rule/wait proposition and repeat-bound expressions. Explicit
-  `evaluate`, bit-slice and `in_table` results retain known kinds. Index
-  kinds, membership compatibility, general bidirectional inference,
-  conditional bindings and type-embedded expressions remain incomplete.
+  `evaluate`, bit-slice and `in_table` results retain known kinds. Known
+  list indexes require integer/enum kinds; membership checks known container
+  and scalar/list element compatibility. A set kind represents declared sets,
+  literals and set_of_values results, without tracking scalar domains. Unknown
+  receivers/operands stay conservative. General bidirectional inference,
+  conditional bindings, type-embedded expressions and full set-domain typing
+  remain incomplete.
   Known declaration/assignment/field/parameter/return kinds now contextually
   type untyped evaluate/new bodies. Runtime contexts include indexed/static
   targets, qualified calls, supported inferred-value shapes and return
@@ -69,6 +73,12 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   report their end-of-run verdicts when their windows close. The
   clause 33 blocking TCMs (`up()`/`down()`/`lock()`) yield at the call
   and park blocked calls on a per-object FIFO wake pass.
+- **Membership.** Scalar/list membership (4.11.6) executes over lists and
+  integer/Boolean/enumeral sets. List-to-list containment is order-independent
+  and requires distinct matches for repeated left values. Iterative matching
+  handles overlapping mixed numeric comparisons; operands are evaluated once
+  and comparisons use snapshots. Set membership tests each left item without
+  consuming set entries. Real-valued set membership remains unsupported.
 - **Randomization.** `gen` is a seeded rejection sampler by default;
   for translatable `keep` constraints it solves instead: linear
   problems through the backend conjunction solver (the
