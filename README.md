@@ -172,6 +172,12 @@ every claim matched by its tests, and one day, when enough tokens have been
 burned, Slopman will quietly become Rustman. Same letter; less slime. Until
 then, no conformance is claimed, and no cleanliness either.
 
+A [differential case runner](qualification/README.md) checks selected native
+outputs and can compare an explicitly configured authorized reference
+adapter. Its initial corpus is verified natively; it has no qualified Specman
+adapter or new reference results yet. CI native-only success is not simulator
+compatibility evidence.
+
 ## Goals
 
 - Implement the language from independently developed Rust source code.

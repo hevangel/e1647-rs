@@ -259,9 +259,14 @@ not imply full language support or IEEE conformance.
       scope, with omitted extension annotations inherited from the prototype.
       Bare static-field writes and alias defaulting are corrected; bare
       static method calls and full signature-equivalence checks remain gaps
-- [ ] Differential corpus against an authorized reference simulator where
-      available (started: Specman reference runs via EDA Playground are
-      recorded in docs/VERIFICATION.md; no automated differential harness yet)
+- [~] Differential corpus against an authorized reference simulator where
+      available — earlier Specman reference runs via EDA Playground are
+      recorded in docs/VERIFICATION.md. The manifest-driven runner in
+      scripts/qualify.py checks native outputs and explicit reference-adapter
+      envelopes against independent expected values; CI runs native-only
+      candidates and protocol tests. A licensed Specman adapter and actual
+      differential qualification of the new cases remain unfinished; see
+      qualification/README.md
 
 ## M2 — Elaboration and randomization
 - [~] `extend`, `when`, units, structs and inheritance — elaboration

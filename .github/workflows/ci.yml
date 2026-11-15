@@ -14,6 +14,11 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
+      - name: Qualification runner protocol tests
+        run: python3 -m unittest discover -s tests -p qualification_runner_test.py
+      - run: cargo build --bin e1647
+      - name: Native candidate cases (no reference run)
+        run: python3 scripts/qualify.py --native-only
 
   # The pumpkin solver backend is verified here: it is a pure-Rust crate,
   # but its build script needs a C compiler, which the local windows-gnu

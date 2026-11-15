@@ -669,6 +669,26 @@ Remaining boundaries (the detailed behavior inventory is in STATUS.md):
   browser sandbox API and WASM runtime qualification. WASM compilation alone
   is verified by CI.
 
+## Qualification runner
+
+`scripts/qualify.py` is a Python standard-library process boundary around the
+native CLI and an explicitly configured local reference adapter. A manifest
+identifies self-contained source cases, seeds, clause references and independent
+expected values. Both backends use the same staged source snapshot; source
+mutation and mismatched adapter case/hash/seed identities fail the comparison.
+Native markers require a completion sentinel and an exact result map. A
+reference adapter must report execution success plus tool/version/host-profile
+metadata, which remain operator-supplied assertions rather than attestation.
+
+Reports contain owned case values, fingerprints and status categories, not
+raw process output or command arguments. Native-only mode explicitly records
+reference-not-run and has a separate scope. Protocol fixture processes in the
+Python unit tests exercise failure handling; CI separately builds the real
+native executable and checks the three candidate programs. No qualified
+Specman adapter, imported dependency bundle or actual differential result for
+this new corpus is provided yet. See qualification/README.md for the adapter
+contract, timeout/cleanup boundaries and qualification limits.
+
 ## The 2019 migration stages (PRs #40–#49)
 
 Design notes for the IEEE 1647-2019 feature phases; per-phase honest

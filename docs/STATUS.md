@@ -197,6 +197,17 @@ Recognised-but-unimplemented 2019 library names (the full list sits in
 **E0419** with their clause at run time instead of failing as unknown
 names.
 
+## Differential qualification infrastructure
+
+`scripts/qualify.py` checks a self-contained manifest corpus against independently
+expected values. It supports native-only checks and a configured reference
+adapter with strict case/source/seed identity and success envelopes. Reports
+retain owned result data and fingerprints, not vendor output dumps. The initial
+three candidates pass natively and CI verifies the runner protocol. No licensed
+Specman adapter or actual reference comparison of these candidates is qualified
+yet; native-only reports explicitly record reference-not-run. See
+[qualification/README.md](../qualification/README.md).
+
 ## Tests and the two revisions
 
 The suite targets **2019 only** — there is no 2016 mode and no

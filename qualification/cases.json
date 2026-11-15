@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "event-owners",
+      "source": "tests/fixtures/qualification/event-owners.e",
+      "seed": 1,
+      "clauses": [
+        "11.1",
+        "13.2.2",
+        "17.1.2"
+      ],
+      "expected": {
+        "first_a": "1",
+        "first_b": "0",
+        "final_a": "1",
+        "final_b": "1"
+      }
+    },
+    {
+      "id": "list-containment",
+      "source": "tests/fixtures/qualification/list-containment.e",
+      "seed": 1,
+      "clauses": [
+        "4.11.6"
+      ],
+      "expected": {
+        "insufficient": "0",
+        "contained": "1",
+        "source_size": "3"
+      }
+    },
+    {
+      "id": "contextual-values",
+      "source": "tests/fixtures/qualification/contextual-values.e",
+      "seed": 1,
+      "clauses": [
+        "4.17.7",
+        "6.3",
+        "17.1"
+      ],
+      "expected": {
+        "constructor": "7",
+        "returned": "9"
+      }
+    }
+  ]
+}

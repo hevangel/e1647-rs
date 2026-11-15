@@ -4814,3 +4814,65 @@ path/name resolution, first-class event values, distinct same-cycle samples,
 full event-specific compound timelines and precise HDL event ordering remain
 gaps. One global cycle log is still used despite independent owner identities
 and rule/wait sampling contexts. No IEEE conformance is claimed.
+
+
+## 2026-11-15 — reproducible qualification case runner
+
+The planned EDA Playground reference comparison could not start: browser
+inventory reported that the browser access host was unavailable, with no
+browser sessions exposed. No account credentials were read or submitted,
+no CAPTCHA/login was attempted and no new Specman result is claimed.
+The repository EDA Playground skill was read; its reference-run recording
+requirements remain applicable when the service becomes accessible.
+
+Independent work adds scripts/qualify.py, a manifest-driven native/reference
+adapter runner using the Python standard library. It requires an explicit
+native-only or reference-command mode. Both backends receive the same staged
+source snapshot and seed; adapters must echo the exact case/hash/seed identity
+and execution status. Tool name/version/host profile are adapter-reported
+metadata. Commands use argv arrays without a shell. Failure exits, timeouts,
+invalid/duplicate/missing markers, malformed envelopes, failed adapter status,
+source mutation and disagreement with the independent oracle all fail.
+Matching unexpected answers from both backends do not pass.
+
+Reports retain source/command/native-launcher fingerprints, clause references,
+owned result values and status categories. They do not contain raw stdout,
+stderr or command arguments. Native-only reports use
+native_expected_values_only and explicitly mark comparison not_run and
+reference not_requested. No real simulator adapter is supplied or qualified;
+the owned protocol fixture process is test-only evidence of runner mechanics.
+
+Three independently authored, self-contained code-segment cases under
+tests/fixtures/qualification/ cover instance event ownership, list
+multiplicity and contextual constructor/return values. Their expected marker
+maps were specified independently in qualification/cases.json, with native
+diagnostic/output goldens. A Rust test checks all three through the frontend
+and native interpreter. CI adds Python protocol tests, a native binary build
+and an explicit native-only corpus run. README/status/roadmap/architecture
+state the distinction between infrastructure and reference qualification.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 494 passed, 0 failed (25 test binaries).
+- `py -m unittest discover -s tests -p qualification_runner_test.py` —
+  14 passed, including real owned subprocesses for success, mismatches,
+  malformed/failed responses, source mutation/deletion, timeout, output cap,
+  failed exits and report privacy. This is not a reference simulator run.
+- `py scripts/qualify.py --native
+  B:/e1647-rs/local/tcm-continuations-review/target/debug/e1647.exe
+  --native-only --report B:/e1647-rs/local/qualification-native.json` —
+  3 cases passed; each native status ok, comparison not_run and reference
+  not_requested. The generated report remains ignored local data.
+- `git diff --check` — passed.
+
+Python 3.13 private temporary-directory ACLs prevented the restricted token
+from writing staged input. The Python checks passed with normal user access;
+no ACL or security policy was weakened. Work staging remains under gitignored
+local/qualification-work. The adapter owns simulator descendant cleanup;
+process timeout alone does not prove every simulator child/session stopped.
+The output cap is checked after capture, not a streaming memory bound.
+Imported dependency staging, a licensed Specman adapter and live comparison
+of these candidates remain unfinished. No local all-feature, WASM runtime
+or commercial-simulator run was performed. No IEEE conformance is claimed.
