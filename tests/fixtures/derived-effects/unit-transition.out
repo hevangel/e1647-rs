@@ -1,0 +1,2 @@
+dut_error: illegal derived coverage value (n=TRUE, prev_n=FALSE) in 'prev_u.cg.transition__n@sys.a'
+Checking is complete - 1 DUT error(s).

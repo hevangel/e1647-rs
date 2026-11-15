@@ -1,0 +1,4 @@
+probe_s.cg@sys.a samples=2 grade=1.000
+n samples=2 hits=[1,1]
+probe_s.cg@sys.b samples=0 grade=0.000
+n samples=0 hits=[0,0]

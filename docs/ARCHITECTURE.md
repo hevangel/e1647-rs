@@ -191,8 +191,19 @@ browser sandbox API is not started.
   same-named field. An explicit item type checks compatibility (E0220),
   and expression traversal checks missing members, indexing and operand
   kinds (E0221–E0223). Unknown kinds stay silent. Cross/transition names
-  refer to items rather than owner fields; raw coverage options remain
-  unchecked. Typed method parameters bind within their method scope.
+  refer to items rather than owner fields. Effective Boolean options are
+  checked using the shared coverage option parser: `when` uses the owner,
+  instance visibility also binds the selected unit as `inst`, and
+  ignore/illegal predicates bind sampled basic sources without an owner
+  receiver, including `prev_<source>` for transitions. Instance effects
+  also bind `inst`; it takes precedence over a same-named source. Each
+  expression must be compatible with bool (E0220); ordinary conservative
+  traversal also reports E0221-E0223. Unknown kinds, define constants and
+  composite-valued sources remain conservative. Group extensions use the
+  final effective options. Scopes are discarded before checking methods
+  and other types. This does not add complete name resolution or type
+  checking for every option/expression form. Supported option syntax and
+  unit scopes are checked during elaboration. Typed method parameters bind within their method scope.
   Local `var x := e` declarations retain known initializer kinds,
   including homogeneous list literals and equal-kind ternary branches
   (clause 18). Scalar/list aliases resolve with a depth bound; recursive
@@ -201,6 +212,44 @@ browser sandbox API is not started.
   also remains unknown. This is declaration inference, with no
   flow-sensitive narrowing or interprocedural inference; full name
   resolution remains a gap.
+  Expression traversal is exhaustive over the AST's ordinary value children:
+  membership elements and sets, casts, bit slices, table tuples/rows, set
+  literals, select weights, chosen-from targets/lists and unknown callees.
+  Type-embedded expressions and raw select choice tokens retain their own
+  unresolved scope/grammar. Cast result kinds stay unknown because the
+  evaluator's fallback preserves its input. Explicit `evaluate` results,
+  slices and `in_table` results have known kinds. An evaluate body gets a
+  scoped result local and keeps the owner/caller context; a new initializer
+  gets a fresh locals frame, no enclosing return type, and the known new
+  object as its receiver. Implicit evaluate/new types remain unknown here.
+  All statement value children now traverse, including loop bounds, print,
+  gen, emit, rgf assignment, wait, start and compute. The recorded foreach
+  index-name path is structural, not treated as an evaluated expression.
+  Temporal rule/wait propositions, edge operands and repeat bounds traverse
+  recursively, as do rule else actions; event reference paths remain
+  structural. A cloned exact-count repeat bound is checked once. This adds
+  no temporal execution support or new temporal operand typing rule.
+  Events/ports have unknown value kinds rather than false missing-member
+  errors. Known method arguments are inferred once, then validated against
+  their signatures without re-traversing them. Index-kind checks, membership
+  compatibility and conditional `is a` bindings still require further work. Define and predefined constant precedence now
+  applies across every checked context, preventing same-named fields or
+  locals from supplying the wrong kind; define values remain unknown.
+  Registered `Type::field` accesses read kinds from the exact declaring
+  registry; qualified calls check arguments once against that owner's
+  prototype and retain the declared result kind. E0307 still owns invalid
+  static-member shape/ownership checks. Static entries are checked once
+  from their registries, skipping inherited/synthesized copies. A static
+  method/handler has its declaring namespace but no `me`; bare static fields
+  follow the bounded base-chain lookup after locals. Static initializers
+  have neither receiver nor a bare static namespace, matching current runtime
+  initialization. A declaration is preferred over physically earlier
+  extension blocks; omitted extension annotations inherit by parameter
+  position/result. Explicit annotations keep their own kinds; full extension
+  signature equivalence is not checked. Unregistered/template entries stay
+  conservative. New initializers clear the caller's static context and restore
+  it afterward. Bare static method calls remain unsupported in the runtime
+  and unknown to this checker; qualified calls are the supported form.
 - `src/elab.rs` — member composition: `like` chains and `extend` blocks fold
   into one composed member list per `struct`/`unit` (inheritance-cycle,
   cross-declaration duplicate-field and unmodified-method-redefinition
@@ -237,7 +286,7 @@ browser sandbox API is not started.
   take the 14.3 defaults (16 buckets for integers — "0 through 15" —
   two for booleans; anything else is ungradeable with a note). The
   interpreter samples a group when its event fires: each item's
-  recorded expression evaluates in the emitting frame (or the named
+  recorded expression evaluates in its owning struct (or the named
   field is read) and the value lands in the containing bucket;
   out-of-range values are ungradeable (14.3: "goals of 0"). Grades
   are covered-buckets-per-item, averaged over gradeable items; cross/
@@ -250,9 +299,73 @@ browser sandbox API is not started.
   per_type bucket), `weight = N` scales the grade contribution, the
   group-level `at_least`/`weight` spellings apply to items without
   their own (14.9.3/14.9.4), `no_collect`/`instance_no_collect`
-  (group, 14.2.2; item, 14.3.4) drop the group/item from the
-  collected model when TRUE, and the cross/transition `name` option
-  renames the derived item (14.4/14.5). The 14.9 coverage
+  (group, 14.2.2; item, 14.3.4) suppress presentation while retaining
+  sampling storage, and the cross/transition `name` option
+  renames the derived item (14.4/14.5). Derived `when` filters run with fresh
+  owner frames: transitions at the source observation, crosses after basic
+  sources for the round. Filtering a transition does not rewind the last
+  legal source observation. Derived visibility options keep collected data
+  but remove presentation and grade contributions, including per-unit
+  visibility changes. Goals count combinations reaching their required
+  hits, with item > group > runtime defaults; zero goals are ungraded.
+  Weights scale derived contributions within the same per-type aggregate
+  used by ordinary and mixed per-instance groups. Zero weights contribute
+  nothing, and floating-point weight totals avoid u64 sum overflow.
+  Checked u64 products keep large combination domains ungradeable rather
+  than overflowing; transition totals avoid host-pointer-width arithmetic.
+  Derived nodes can reference earlier basic/derived names in their group.
+  Observation keys reference stable basic bucket indices or parent key
+  indices, independently of display labels. Each source retains its previous
+  observation and current-round freshness. Transition descendants run from
+  a declaration-ordered work set as their source is produced; crosses run
+  in declaration order after basic sampling and produce further transitions.
+  Filtering a parent produces no child source; filtering a transition still
+  advances its parent history. Hidden nodes remain sampling sources.
+  A linear pass recomputes nested validity and combination counts against
+  current basic masks, preserving original keys for mask restoration. Empty
+  source domains dominate unknown/unrepresentable products. Unbucketed
+  strings/reals retain value labels while grades remain unavailable.
+  E0224 validates source arity, unique names and earlier declarations in the
+  merged base-then-extension order. A 65536 expanded scalar-component cap
+  bounds tuple expansion separately from bucket cardinality. Cycles are
+  rejected as invalid forward/self references; iterative processing avoids
+  recursive source-graph walks. The library round API requires begin_sample,
+  sample for each basic source, then record_crosses to finalize derived stats;
+  completing the same round twice does not add duplicate derived samples.
+  Scalar basic observations additionally retain owned value snapshots, separate
+  from labels/identities. Cross predicates bind their participating basic items;
+  transition predicates bind the source and prev_<source>. Instance variants
+  also bind the unit as inst. Pure-expression validation rejects owner/local
+  access, calls and direct composite-valued operands (E0224). Runtime Boolean
+  checks are E0402. Ignore short circuits illegal, using the existing overlap
+  policy and immediate/deferred DUT reporting. Suppressed derived observations
+  do not become child sources; basic source history still advances.
+  Derived integral/Boolean classification first proves uniform outcomes over
+  the remaining source envelope. `coverage/proof.rs` propagates conservative
+  integer intervals and total Boolean domains, respecting short-circuit logic,
+  conditionals and membership evaluation order. Arithmetic bounds require
+  checked endpoints; possible storage overflow stays unknown. Singleton inputs
+  use the real evaluator. Constant/name lookup respects define/predefined
+  precedence and the implicit inst binding. The current predicate-frame numeric
+  semantics are preserved; this adds no field-width precision support.
+  Uniform results retain the full source domain or exclude the node without
+  Cartesian enumeration. Otherwise bucket tuples use an iterative box work
+  list, exact proofs and concrete lower-end witnesses. Unknown boxes split the
+  first referenced varying axis; a sign-biased u128 midpoint handles the full
+  i128 domain without overflow. Basic ignore/illegal predicates participate in
+  every proof/check. A shared 65536 scalar-domain work budget charges each
+  interval proof and concrete check by its axis count. Excess work diagnoses
+  E0402 instead of inventing a mask. No recursive box search is used.
+  Basic source declaration/prototype lookup is shared with the basic classifier
+  and filters by Item kind, preventing earlier extension transitions from
+  shadowing aliased source types. Integer-minimum negation reports E0402 rather
+  than panicking. Constant prefixes can still exclude nodes before domain work.
+  All basic and derived masks commit together after successful classification.
+  Unbucketed real/string/enumeral sources filter points only and remain ungraded.
+  Constant predicates work over nested sources; source-dependent classification
+  over mixed composite inputs remains E0402. Composite-valued predicates,
+  general wide-domain classification, typed-domain/precision proofs and exact
+  side-effectful filter ordering still need implementation/qualification. The 14.9 coverage
   configuration (`CoverageConfig`: the coverage mode per 14.2's NOTE
   and `max_int_buckets` per 14.3's bracket) is honored through the
   `build_with_config` builder API and `set_config(cover, ...)` (29.9).
@@ -260,11 +373,49 @@ browser sandbox API is not started.
   which starts disabled. It validates category/option keyword positions
   before evaluating values and commits option changes together. Mode
   changes gate emit-driven and procedural sampling without clearing data.
-  Before sampling, `max_int_buckets` changes rebuild the schema from the
+  Before sampling, `max_int_buckets`/`at_least` changes rebuild the schema from the
   composed type declarations; after sampling they report E0402. The
   runtime resource bound is 65536 buckets per default integer item.
-  `range(...)`'s numeric parameters beyond
-  bounds/label are recorded, not applied.
+  Per-unit groups keep a schema plus one collection per containing unit,
+  labelled by `CoverGroupData::unit_instance`. The bounded, visited-set
+  instance walk resolves the nearest requested unit through inheritance,
+  flattened lists and cycles; aliases use the first visited path.
+  Unsampled units keep zero-hit groups. Structural option/scope errors
+  report E0224 after composition. `when` expressions use a fresh owner
+  frame; per-unit presentation expressions bind `inst` to the associated
+  unit. Crosses require current-round source values, and transitions keep
+  previous sampled values separately. The returned report view removes
+  hidden items/groups and per-unit schema placeholders. Full option type
+  checking, derived-item ignore/illegal filters and radix remain unfinished.
+  Basic-item ignore/illegal predicates run in fresh frames with only their
+  item, constants, and (for instance variants) the associated `inst`. Calls
+  and owner/local access are rejected with E0224. Non-Boolean results and
+  unsupported wide classification report E0402. Comparisons, membership
+  and logical compositions classify integral/Boolean intervals exactly;
+  other pure shapes enumerate with a shared 65536-candidate budget per item
+  refresh. Short circuit domains prevent evaluating guarded arithmetic on
+  excluded values. Masks commit atomically per group and refresh at sampling,
+  grade computation and final reporting. Partial buckets remain gradeable;
+  fully ignored/illegal buckets leave the denominator and report view.
+  Legal observations retain their original counts; ignored/illegal observations
+  are never recorded. Derived keys retain bucket indices separately from
+  display names, enabling current masks to filter historical combinations
+  and recompute possible-combination totals. Restoring masks reveals earlier
+  legal history. Unbucketed real/string items filter actual observations only.
+  Illegal observations queue DUT errors until after check hooks, with a final
+  flush after finalize/stop; check_illegal_immediately reports at observation.
+  Ignore takes precedence over illegal on overlap. This precedence, mutable
+  masks and exact reporting-phase placement are not reference-qualified.
+  Predicate arithmetic uses the interpreter's current scalar model; complete
+  typed-domain and precision proofs remain future work.
+  Integral `range(...)` construction parses positional name/width/goal
+  parameters, subdivides inclusive bounds and uses stable automatic bucket
+  labels. Range-local goal metadata preserves precedence over item/group/
+  global defaults. Zero-goal buckets retain counts but leave the bucket-grade
+  denominator; they do not report holes. Checked i128 constant arithmetic
+  rejects overflow/division errors, and construction is capped at 65536
+  buckets per item. General constant-name/type resolution, real/enumeral
+  bounds and item-domain width proofs remain unfinished.
 - `src/interp.rs` — interpreter for the statement subset (codes
   `E0401`–`E0413`). List values (clause 4.11.4's `list_ptr==`) carry
   reference identity: a `Value::List` holds its items behind a shared
@@ -422,10 +573,11 @@ clause 14 coverage model (basic and derived items collect and grade;
 per_instance items grade per bucket with holes and the weighted
 group grade; the group/item `no_collect`/`instance_no_collect`
 options, the cross/transition `name` option and the group-level
-`at_least`/`weight` apply; the bool-exp option forms with the
-implicit `inst` variable, the per-unit-instance scoping
-(14.2.2/14.3.4), the `radix`/`when`/`never` option semantics (the
-option tables were not previously inspected) remain unmodeled.
+`at_least`/`weight` apply; per-unit scoping, `instance_no_collect` with
+`inst` and group/basic-item `when` filters run. Full option type checking,
+derived-item ignore/illegal, real/enumeral ranges and general constant/type
+resolution, radix/never and
+derived-item filter semantics remain unmodeled.
 The coverage subset of `set_config()` is wired; other categories,
 options and `set_config_max()` remain gaps), integer width
 truncation, evaluation of MVL literals, `detach`/`delay`/`exec` TEs, select
@@ -465,8 +617,12 @@ limits live in the PR bodies and the module headers.
   `BTreeMap<TypeName, BTreeMap<FieldName, Value>>` created at program
   start; keys come from elaboration's static-member registries (the
   declaring base or `extend` target). `Type::member` validates the
-  declared-in-exactly-T rule (E0307); `when` subtypes never own store
-  keys; static `on` blocks compose per type and run with no `me`.
+  declared-in-exactly-T rule (E0307). Bare field writes use the same owner
+  walk as reads even without an instance receiver; locals and actual
+  instance fields take precedence. Alias defaults recursively use their
+  declared representation; more than 64 aliases produce E0402 rather than
+  a fictitious alias object or unbounded recursion. `when` subtypes never
+  own store keys; static `on` blocks compose per type and run with no `me`.
 - **Interface attachment (6.13)** — an `interface` composes to its own
   ElaboratedType whose methods are the transitive signatures; a
   struct's `implementing` set composes through the same walk as like

@@ -3774,3 +3774,688 @@ images or proprietary output were committed. This is implementation
 regression evidence, not differential qualification or conformance.
 Per-unit-instance storage, dynamic coverage filters, the remaining range
 parameters and the broader configuration API are still unfinished.
+
+## 2026-11-12 — Per-unit coverage and sampling filters
+
+Coverage groups now accept header `using` options and collect separate
+per-unit groups for `per_unit_instance [= unit_type]` (14.2, 14.2.2).
+The default scope for a unit declaration is its context unit type; a
+struct requires an explicit unit type. The bounded, visited-set instance
+walk chooses the nearest matching unit through inheritance and flattened
+lists, keeps first-visited alias paths, and terminates on cycles.
+Unsampled units retain zero-hit groups. A sampled detached owner without
+the requested containing unit reports E0402 at the sampling action.
+
+Group/basic-item `when` expressions evaluate in a fresh owning-struct
+frame, without inheriting the emitting method's locals. Group/item
+`instance_no_collect` expressions bind `inst` to the associated unit for
+report visibility (14.2.2, 14.3.4). Visibility is refreshed for grade/report
+queries. Hidden groups/items keep sampling storage internally; the reported
+view removes them and the per-unit schema placeholders. Hidden source
+items therefore still feed crosses/transitions. Crosses require all
+sources to be sampled in the current round; transitions keep their last
+sampled source value, and every declared transition over that source
+updates. Same-named items in different groups resolve within their group.
+
+Structural option-expression/scope validation runs after composition and
+reports E0224, registered in the module header and diagnostic allocation
+catalogue. It rejects missing/unknown/non-unit scopes and scope changes
+after group/item instance_no_collect. Full option type checking is still
+unfinished; non-Boolean runtime filters report E0402. The older regression
+that used instance_no_collect without per_unit_instance now declares the
+required scope explicitly.
+
+Eighteen independently authored fixture sets under
+`tests/fixtures/coverage-instances/` cover separate units, unsampled holes,
+ancestor/nearest/inherited scope, shared aliases in lists, cycles,
+procedural sampling, group/item filters, emitter-local isolation, hidden
+sources, multiple transitions, same-named group items, complex header
+expressions, detached owners, malformed expressions and invalid/frozen
+scopes. A CLI test checks unit path labels and elab rejection of bad
+scopes. README/status/roadmap/architecture/CLI help describe behavior and
+limits; `examples/coverage_units.e` demonstrates collection.
+
+Verification on `agent/coverage-unit-instances` (based on PR #67):
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 454 passed, 0 failed.
+- `cargo test --test coverage_instances` — 2 passed, 0 failed,
+  covering all eighteen fixture sets and the CLI checks.
+- `cargo run -- run examples/coverage_units.e --seed 1 --coverage` —
+  passed; sys.a and sys.b each report one sample and grade 50%.
+- `git diff --check` — passed.
+
+Initial fixture iterations caught reserved event naming and a unit-reference
+type unsupported by the existing frontend; the independently authored
+fixtures were corrected while preserving their isolation/cycle checks.
+The initial legacy scope regression failed until its required scope was
+made explicit. The final checks above pass. No local all-feature, WASM
+or Specman comparison was run.
+
+Reference basis: read-only visual study of the lawful local 2016 redline
+coverage options and type/instance relationship pages, with 2019 clause
+numbers mapped through the migration plan. No standard text, images or
+vendor output were committed. This is regression evidence, not differential
+qualification or conformance. Unit association is limited to the existing
+bounded primary field-tree walk. General ignore/illegal/radix semantics,
+instance_ignore/instance_illegal, remaining range parameters, derived-item
+filters, item using-also overrides, full option type checking and the
+broader runtime configuration API remain gaps.
+
+## 2026-11-12 — Integral coverage range parameters and goal precedence
+
+Integral `range(...)` entries now parse their positional name, bucket width
+and hit-goal parameters (14.3). A positive width subdivides inclusive
+bounds, preserving a short final bucket. Named ranges require an undefined
+width; constant string concatenation is supported for names. Integer
+bounds/widths/goals use checked i128 literal/predefined-limit arithmetic,
+including negative values and parenthesized expressions. Unsupported
+constants, overflow, division by zero, invalid widths/goals, reversed/open
+bounds and malformed parameters report E0224 with source spans.
+Construction is capped at 65536 buckets per item, including aggregate
+entries and extreme signed domains, before attempting unbounded allocation.
+
+Range-local goal metadata preserves range > item > group > global
+precedence. `set_config(cover, at_least, N)` supplies the default before
+sampling; changing it after sampling reports E0402 without resetting hits.
+Zero-goal buckets retain counts but leave bucket-grade denominators and do
+not show holes, including per-instance report entries. Bare per_instance
+flags are recognized. Unnamed ranges receive stable bucket labels so
+crosses/transitions use bucket identity rather than the raw sampled value.
+
+Twenty-nine independently authored fixture sets in
+`tests/fixtures/coverage-ranges/` pin subdivision/tails, negative bounds,
+constant expressions and names, goal precedence, zero-goal grading and
+holes, unnamed bucket identity, per-unit copies, overlapping-first-match
+behavior, full signed-domain bounds, exact construction limits, malformed
+parameters, overflow/zero-division, invalid goals, late changes and explicit
+real/string range diagnostics. A CLI test verifies zero-goal reporting.
+README, status, roadmap, architecture, CLI help and the E0224 allocation
+are updated. `examples/coverage_ranges.e` demonstrates four graded buckets
+plus an ungraded optional bucket.
+
+Verification on `agent/coverage-range-options` (based on PR #68):
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 456 passed, 0 failed.
+- `cargo test --test coverage_ranges` — 2 passed, 0 failed; all
+  twenty-nine fixture sets and the CLI check are also in the final suite.
+- `cargo run -- run examples/coverage_ranges.e --seed 1 --coverage` —
+  passed; ten samples, three of four graded buckets covered, grade 75%,
+  with the zero-goal optional bucket excluded from that denominator.
+- `git diff --check` — passed.
+
+The implementation replaces the earlier numeric-argument heuristic and
+prevents item/group defaults from overwriting explicit range goals. Initial
+compilation caught incorrect operator variant spellings; these were fixed
+before the final checks. No local all-feature, WASM or Specman comparison
+was performed.
+
+Reference basis: read-only visual inspection of the lawful local 2016
+redline coverage range/goal tables and grading prose, using the migration
+plan's 2019 clause mapping. No standard text/images or vendor output were
+committed. The zero-goal exclusion is this implementation's reading of the
+shared behavior and has not been differentially qualified. Real/enumeral
+bounds, user-defined constant-name resolution, typed item-domain/precision
+proofs, broader coverage options and procedural goal overrides remain gaps.
+This is regression evidence, not IEEE conformance.
+
+
+## 2026-11-13 — Basic coverage ignore/illegal predicates
+
+On `agent/coverage-ignore-illegal`, based on PR #69, implemented basic-item
+`ignore`, `illegal`, `instance_ignore` and `instance_illegal` predicates
+(IEEE 1647-2019, 14.3/14.3.4), plus the Boolean runtime coverage setting
+`check_illegal_immediately` (29.9). Global predicates admit their own item
+and constants; instance predicates additionally admit associated-unit
+`inst` field/index paths. Calls, owner/local access, instance options
+without unit scope and derived-item filters report E0224. Non-Boolean
+results and unsupported classification report E0402.
+
+Ignored/illegal observations never enter basic hits or derived histories.
+Wholly excluded buckets leave grades, holes and the returned report;
+partially excluded buckets retain their legal goals. Comparisons, scalar
+membership and Boolean compositions classify integer/Boolean intervals;
+other pure expressions enumerate with a shared 65536-candidate budget per
+item refresh. Short circuit domains avoid evaluating guarded arithmetic
+on irrelevant values. A failing classification cannot partially commit a
+group's masks. Integer division/remainder overflow now reports E0402
+rather than panicking on i128 minimum divided by minus one.
+
+Derived keys preserve bucket indices independently of display names.
+Current masks filter recorded combinations and recompute denominators;
+restoring masks exposes earlier legal history, while excluded observations
+remain absent. Out-of-range bucketed observations do not create impossible
+derived goals. Immediate illegal observations report at sampling; deferred
+observations flush after check hooks, with a final flush after finalize or
+stop. The original DUT-error summary includes these failures.
+
+Thirty-two independently authored fixture sets in
+`tests/fixtures/coverage-effects/` cover basic and per-unit predicates,
+partial/fully excluded bins, unsampled holes, crosses/transitions, equal
+bucket labels, dynamic unit masks and history restoration, Boolean/string
+items, negative modulo, guarded division, immediate/deferred/stop/finalize
+reporting, global/instance OR composition, signed extrema, wide arithmetic,
+integer overflow and scope/type diagnostics. A CLI test checks exclusion
+and immediate ordering. README, status, roadmap, architecture, CLI help and
+the diagnostic allocation describe the new behavior and limitations.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 458 passed, 0 failed (17 test binaries).
+- `cargo test --test coverage_effects` — 2 passed, 0 failed, including all
+  thirty-two fixture sets; also included in the final full-suite result.
+- `cargo run -- run examples/coverage_effects.e --seed 1 --coverage` —
+  completed with the intended one DUT error for value 5; six sampling
+  events, four legal item samples, four graded buckets hit, grade 100%.
+- `git diff --check` — passed.
+
+Clippy initially found two collapsible-if style errors; both were corrected
+before the final checks. Existing coverage fixtures passed unchanged.
+No local all-feature, WASM runtime or Specman comparison was performed.
+
+Reference basis: the lawful local 2016 redline coverage option tables and
+shared coverage behavior, using the migration plan's 2019 clause mapping;
+no standard text/images or vendor output committed. Ignore currently takes
+precedence over illegal on overlap. That precedence, mutable-mask behavior
+and exact deferred-phase placement have not been reference-qualified.
+Real/enumeral ranges, derived-item filters, general option type checking,
+complete typed-domain/precision proofs and wider configuration remain gaps.
+Unbucketed real/string items filter observed values without bucket-domain
+classification. This is regression evidence, not IEEE conformance.
+
+
+## 2026-11-13 — Derived coverage collection and grading options
+
+On `agent/derived-coverage-options`, based on PR #70, cross and transition
+items now apply `when`, `no_collect`, `instance_no_collect`, `at_least` and
+`weight` (IEEE 1647-2019, 14.4/14.5). Transition filters run with a fresh
+owner frame at the legal source observation; cross filters run after the
+round's basic sources. Suppression of a derived sample does not suppress
+basic collection or rewind the previous legal source value. Per-unit
+presentation expressions bind `inst` to the associated unit; hiding leaves
+sampling storage intact and excludes presentation/grade contributions.
+
+Derived grades count combinations reaching their hit goal. Item-local
+goals override group defaults, which override runtime at_least; weights
+use item > group > 1. Zero goals are ungraded and zero weights contribute
+nothing. Derived items now participate in the weighted per-type aggregate
+of mixed per-instance groups, fixing their earlier omission. Three existing
+coverage-effect fixture grades changed: ignore-cross-transition and
+ignore-precedence are 0.806, duplicate-labels is 0.852 (three-decimal
+rendering). Their sample/hit histories are unchanged. Weight parsing now
+uses checked constant u64 validation (basic/group spellings included),
+with E0224 for malformed, negative, fractional or overflowing values.
+
+Weight sums use floating-point totals rather than overflowing u64 sums.
+Derived combination products use checked u64 multiplication, including a
+transition with 65536 source buckets (4294967296 possible pairs) without
+host-pointer-width multiplication. Totals refresh against the final merged
+schema, so later group extensions can supply sources. Unsupported product
+sizes remain ungradeable rather than panicking. CLI output includes derived
+goals and weights. The generic Boolean-option diagnostic now cites clause
+14, covering both basic and derived options.
+
+Twenty-five independently authored fixture sets in
+`tests/fixtures/coverage-derived/` cover filter/history behavior, fresh owner
+frames and method predicates, multiple transitions over one source, stale
+cross prevention, visibility restoration, per-unit filters, local/group/
+runtime goal precedence, extension defaults, weights and mixed instance
+grades, zero goals/weights, maximal weights, product overflow, the largest
+transition domain and spanned scope/type/value diagnostics. A library test
+checks hidden data retention and a CLI test checks goal/weight reporting.
+`examples/coverage_derived.e` demonstrates two filtered derived items.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 461 passed, 0 failed (18 test binaries).
+- `cargo test --test coverage_derived` — 3 passed, 0 failed; the fixture,
+  library and CLI tests are included in the final full-suite result.
+- `cargo run -- run examples/coverage_derived.e --seed 1 --coverage` —
+  passed: six events, each derived item has three samples and two observed
+  combinations; one combination reaches goal 2, giving both grades and
+  the group grade 25%.
+- `git diff --check` — passed.
+
+The first new-fixture run exposed an expected-output formatting mismatch
+(0 versus the interpreter's real-valued 0.0), corrected before the final
+run. Clippy found one nested-if style issue, also corrected. No local
+all-feature, WASM runtime or Specman comparison was performed.
+
+Reference basis: visual inspection of current cross/transition option
+rows in the lawful local 2016 redline, excluding deleted rows, with the
+migration plan's 2019 clause mapping. No standard text/images or vendor
+output committed. Derived ignore/illegal predicates, crossing/transiting
+other derived items, full option typing, text metadata, real/enumeral
+ranges and procedural overrides remain unfinished. Exact side-effectful
+filter ordering and the inherited grading model still need differential
+qualification. This is regression evidence, not IEEE conformance.
+
+
+## 2026-11-13 — Coverage source graphs and nested histories
+
+On `agent/coverage-source-graphs`, based on PR #71, crosses and transitions
+can consume earlier basic or derived coverage items in the same group
+(IEEE 1647-2019, 14.4/14.5). Source names share a validated group namespace;
+unknown/forward/self references, duplicates and invalid source counts report
+E0224. Base declarations precede their extensions in the merged graph,
+including when the extension physically precedes the base. The parser now
+records individual coverage-item start positions rather than reusing the
+group header for their spans, so structural diagnostics point to the item.
+
+Source observations retain their previous value, current-round freshness
+and a stable basic-bucket or parent-key identity. Iterative transition work
+sets follow declaration order as sources are produced; declaration-ordered
+crosses can consume fresh crosses/transitions and produce further children.
+Filtered parents supply no child source; filtered child transitions still
+advance parent history. Hidden parents remain usable sources. Repeating
+the library round-completion call does not duplicate derived observations.
+
+The refresh pass propagates current basic masks through all parent-key
+references and recomputes possible-combination counts without enumerating
+the Cartesian product. Restoring unit masks restores original legal history;
+excluded observations remain absent. Empty domains dominate unknown or
+unrepresentable products. Duplicate display labels retain distinct bucket
+identities. Unbucketed strings/reals retain actual value labels while their
+derived coverage remains ungraded. Nested transition labels are parenthesized
+to preserve their structure.
+
+Expanded source tuples are capped at 65536 scalar components, diagnosed
+with E0224 before execution. This is an implementation resource policy,
+separate from the bucket/product bounds and not a standard restriction.
+A boundary library test executes a sixteen-level transition chain through
+seventeen observations, producing a final value with exactly 65536 scalar
+components without recursive history walks. The next level is diagnosed.
+
+Thirty-three independently authored fixture sets in
+`tests/fixtures/coverage-graphs/` cover all basic cross/transition source
+combinations, mixed chains, filter history and order, stale-parent prevention,
+hidden/default names, paused collection, per-unit histories, dynamic mask
+removal/restoration, duplicate labels, out-of-range values, unbucketed
+strings/reals, empty/unbounded products, extension order, invalid names/arity
+and graph limits. Additional library and CLI tests check round idempotence,
+nested history rendering and the resource boundary. README, status, roadmap,
+architecture, CLI help and the E0224 allocation describe the behavior.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 465 passed, 0 failed (19 test binaries),
+  including all four graph tests and all thirty-three fixture sets.
+- `cargo run -- run examples/coverage_graphs.e --seed 1 --coverage` —
+  passed: four events, two nested transition observations and two distinct
+  combinations out of sixteen, grade 0.125 (CLI rounds this to 12%).
+- `git diff --check` — passed.
+
+The new diagnostic fixtures exposed and drove the item-span fix. Two early
+fixture helpers used contextual keyword spellings that the expression
+parser does not accept; the independent fixtures now use ordinary names.
+Existing fixtures passed without changes. A Git object-write permission
+failure in the working checkout was recovered by a fresh isolated checkout;
+all 144 changed/new files were SHA-256 verified after transfer. Formatting,
+Clippy and all 465 tests passed again there before submission. No security
+settings were changed. No local all-feature, WASM runtime or Specman
+comparison was performed.
+
+Reference basis: previously inspected current cross/transition rows in the
+lawful local 2016 redline, using the migration plan's 2019 clause mapping.
+No standard text/images or vendor output committed. Derived ignore/illegal
+predicates and instance variants, full option typing, procedural overrides,
+radix/implicit buckets and real/enumeral ranges remain unfinished. Nested
+Cartesian-product grading and exact side-effectful filter ordering still
+need differential qualification. This is regression evidence, not IEEE
+conformance.
+
+
+## 2026-11-13 — Derived scalar ignore/illegal predicates
+
+On `agent/derived-coverage-effects`, based on PR #72, cross/transition
+`ignore`, `illegal`, `instance_ignore` and `instance_illegal` predicates
+operate over participating basic scalar items (IEEE 1647-2019, 14.4/14.5).
+Transitions additionally bind `prev_<source>`. Owned snapshots retain
+integer, Boolean, real, string and enumeral values independently of bucket
+labels and later field updates. Alias/source-expression values are captured
+once at observation; classification never evaluates the source expression.
+Predicate frames contain their inputs/constants and, for instance variants,
+the associated unit as `inst`. Owner/local access, calls and composite-valued
+operands remain E0224; non-Boolean results are E0402.
+
+Ignored/illegal derived observations do not enter histories or become child
+sources. Basic source history still advances. Illegal values use the existing
+immediate/deferred DUT reporting, including the final stop/finalize flush.
+Classification inspects domains without producing DUT errors. Ignore retains
+precedence over illegal, using the existing explicitly unqualified overlap
+policy.
+
+For bucketed integral/Boolean inputs, classification retains a bucket tuple
+only after finding a legal scalar witness. It considers the basic sources'
+ignore/illegal filters, including partially excluded bins, and the derived
+predicates in short-circuit order. The per-derived-item refresh budget is
+65536 scalar-candidate visits; exceeding it reports E0402 before committing
+masks. Constant prefixes can exclude whole nodes without enumeration,
+including nested or unbucketed sources. All basic and derived masks commit
+together after every classifier succeeds. Finite masks propagate through
+parent-key identities and restore original legal history when unit masks
+are restored. Unbucketed real/string/enumeral inputs filter actual points
+without acquiring finite grades.
+
+Unit scope now freezes after instance_ignore/instance_illegal as well as
+instance_no_collect (14.3.4). E0224's scope-freeze diagnostic says instance
+coverage options, and its existing fixture was updated. The old negative
+derived-rejected fixture became a positive derived-ignore fixture with the
+new expected result; its group grade is 0.792 under the existing mixed
+per-instance model. Other existing fixtures are unchanged.
+
+Thirty-five independently authored fixture sets in
+`tests/fixtures/derived-effects/` cover scalar crosses, prev-source transitions,
+partial bins, source-filter legality, fresh frames and expression snapshots,
+Boolean/string/real/enumeral observations, immediate/deferred/stop errors,
+unsampled illegal domains, guarded arithmetic, nested parent filtering and
+constant masks, per-unit variants and mask restoration, scope freezing,
+resource bounds, atomic basic/derived mask failure and unsupported/type
+boundaries. A CLI test checks DUT ordering and retained-combination grades.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 467 passed, 0 failed (20 test binaries),
+  including both derived-effect tests and all thirty-five fixture sets.
+- `cargo test --test derived_effects` — 2 passed, 0 failed.
+- `cargo run -- run examples/derived_effects.e --seed 1 --coverage` —
+  passed: four events, two retained non-stuttering transitions, both goals
+  reached, grade 100%.
+- `git diff --check` — passed.
+
+Initial compilation caught a shadowed validator parameter in list expressions;
+it was corrected before the checks. An early fixture-generation script had
+a syntax typo, corrected before any new fixture files were generated. No
+local all-feature, WASM runtime or Specman comparison was performed.
+
+Reference basis: the previously inspected current cross/transition option
+rows in the lawful local 2016 redline, with the migration plan's 2019 clause
+mapping. No standard text/images or vendor output committed. Composite-valued
+predicate operands and source-dependent classification over mixed composite
+inputs remain diagnosed (E0224/E0402); whole-node constant predicates work.
+General wide-domain classification, complete option typing and typed-domain/
+precision proofs remain unfinished. Point-only unbucketed filtering does not
+retroactively reclassify individual historical points; finite masks remove
+whole tuples. Overlap precedence, mutable-mask semantics, Cartesian-product
+grading and exact reporting/filter ordering still need differential evidence.
+This is regression evidence, not IEEE conformance.
+
+
+## 2026-11-13 — Conservative coverage domain proofs
+
+On `agent/coverage-domain-proofs`, based on PR #73, derived integral/Boolean
+classification uses conservative interval proofs, iterative splitting and
+ordinary concrete checks (IEEE 1647-2019 coverage, 14.4/14.5). The proof
+module is `src/coverage/proof.rs`. A known result guarantees the same Boolean
+value without evaluation errors across a region; unknown results retain
+ordinary evaluation. Supported proofs include relational comparisons,
+Boolean logic/conditionals, membership and checked arithmetic bounds.
+
+Short-circuit and list-membership order are preserved. Potentially shielded
+errors remain unknown until a selected branch or concrete check reaches
+them. Arithmetic intervals require checked endpoints; wrapping/overflow
+regions do not become unlimited-mathematics proofs. Singleton inputs use the
+actual evaluator. Name domains honor define/predefined precedence and the
+implicit inst binding. This preserves the current predicate-frame numeric
+model; it adds no field-width precision support or general type proof.
+
+A uniform proof over the source envelope can retain its full domain or
+exclude a node without enumerating Cartesian tuples. Uncertain bucket
+regions use an iterative work list, uniform proofs and concrete lower-end
+witnesses. The first referenced varying axis splits, using an overflow-safe
+sign-biased u128 midpoint over the full i128 storage domain. Basic source
+filters participate in the proof/check sequence. The 65536 scalar-domain
+work budget charges region proofs and concrete checks by their axis count;
+excess work remains E0402 and all masks still commit atomically.
+
+The previous n == n resource fixtures now have an exact exclusion proof.
+Their three resource/transaction cases use a non-symbolic remainder tautology
+instead and retain their negative boundary checks; diagnostic wording now
+identifies scalar-domain work rather than only scalar candidates. Other
+existing expected results are unchanged.
+
+A regression first reproduced false E0402 when a physically earlier group
+extension's transition shadowed an aliased basic source declaration. Basic
+and derived classifiers now share declaration/prototype lookup that selects
+Item kind, preserving alias type and declaration spans. A second fixture
+checks named scalar aliases. Separately, negating the internal integer
+minimum now returns E0402 integer negation overflow instead of panicking.
+
+Thirty-one independently authored fixture sets in
+`tests/fixtures/domain-proofs/` cover billion-value and full-storage signed
+ranges, inequality witnesses, comparisons, safe arithmetic bounds, guarded
+division, membership order, conditional/logical proofs, partial basic masks,
+per-unit thresholds, predefined-name precedence, integer wrapping/error
+boundaries and both alias regressions. An additional independent oracle
+compares masks and hit counts against all 25 concrete input pairs in fourteen
+small-domain programs (350 samples), including division guards and membership
+short circuits. No new dependencies or external reference modifications.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 469 passed, 0 failed (21 test binaries),
+  including both domain-proof tests and all thirty-one fixture sets.
+- `cargo test --test domain_proofs` — 2 passed, 0 failed.
+- `cargo run -- run examples/coverage_domain_proofs.e --seed 1 --coverage` —
+  passed: four events over two billion-wide ranges, two legal samples in one
+  retained combination, grade 100%.
+- `git diff --check` — passed.
+
+The alias fixture failed with the old lookup before the fix and passed
+with the shared lookup. All newly authored domain fixtures passed; the
+independent oracle agrees with concrete sampling for every program. No
+local all-feature, WASM runtime or Specman comparison was performed.
+
+Reference scope: independently authored arithmetic/proof logic against the
+repository's evaluator and existing coverage model, retaining the lawful
+reference basis and 2019 clause mapping recorded in preceding entries.
+No standard text/images or vendor output committed. Unproved nonlinear or
+wide shapes can still exhaust the work budget. Composite predicates, full
+option typing and typed-domain/precision proofs remain unfinished. Exact
+IEEE grading, mutable masks and side-effectful filter/report ordering still
+require differential qualification. This is regression evidence, not IEEE
+conformance.
+
+
+## 2026-11-14 — Conservative Boolean coverage option typing
+
+The post-composition type pass now checks the effective `when`,
+`instance_no_collect`, `ignore`, `illegal`, `instance_ignore` and
+`instance_illegal` expressions using the coverage model's shared option
+parser (2019 clauses 14.2-14.5). Definite non-Boolean results report E0220;
+ordinary conservative expression traversal also reports missing members,
+non-list indexing and incompatible operands (E0221-E0223). Structural option
+errors remain E0224 from elaboration; no diagnostic code was added.
+
+Sampling filters read the owner rather than item aliases. Visibility reads
+the owner and the selected unit as `inst`. Effect predicates have no owner
+receiver and bind sampled basic values, including transition `prev_`
+snapshots. In per-unit groups the implicit `inst` binding takes precedence
+over a same-named source, matching the evaluator. Basic kind lookup uses the
+existing sampled-expression check once, so its diagnostics are not duplicated.
+Group extensions use the final effective options. Scoped bindings are removed
+before checking methods and other types. Define names remain unknown before
+local/field lookup, preserving runtime precedence without guessing their
+value kinds; supported predefined integer constants keep their runtime kind.
+
+Thirteen independently authored fixture sets under
+`tests/fixtures/typing-coverage-options/` cover non-Boolean results on all six
+option forms, aliases versus owner fields, selected-unit types, transition
+snapshots, inheritance and physically earlier extensions, synthesized when
+views, scope isolation, last effective options, member/index/operator and
+method-argument diagnostics, define/predefined precedence, implicit-unit
+shadowing, unknown expressions and valid execution. Two test functions add
+the byte-exact fixture contract and CLI rejection/execution checks.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 471 passed, 0 failed (21 test binaries).
+- The focused `cargo test --test typing` passed its first seven new fixture
+  sets and CLI checks; subsequent full-suite verification passed all thirteen
+  final fixture sets and all nine typing tests.
+- An additional CLI `elab` audit of all 139 existing successful coverage
+  fixtures across the eight coverage/runtime fixture directories accepted all
+  139. Their expected diagnostic files were unchanged.
+- `git diff --check` — passed.
+
+Reference scope: independently authored checks against the repository's
+existing Boolean option evaluation and 2019 coverage clause mapping. No
+standard text, vendor output or external source was copied. No Specman run,
+local all-feature run or WASM runtime run was performed. This extends the
+conservative checker; define-value inference, composite source operands,
+complete expression/name resolution and other option types remain incomplete.
+It provides no IEEE conformance claim.
+
+
+## 2026-11-14 — Nested value and temporal type-check traversal
+
+The conservative checker previously skipped children of membership, casts,
+slices, table tests, set literals, selects, chosen-from directives and scoped
+expression bodies. For example, an absent member used only as a list index
+could pass the CLI's type gate. The pass now traverses ordinary expression
+children with an exhaustive Expr match, and statement value children with an
+exhaustive Stmt match. Raw distribution choices, type-embedded expressions,
+recorded foreach index-name paths and temporal event-reference paths retain
+their separate unresolved grammar/scope rather than being interpreted as
+ordinary values. This is traversal, not complete name resolution.
+
+An `evaluate` body (2019 4.17.7) gets a scoped result local, preserving the
+owner and other caller locals; an explicit result type propagates its kind.
+Implicit result types remain unknown here. A `new ... with` body (6.3) gets
+a fresh locals frame, the explicit new object as receiver, and no enclosing
+return type, matching the interpreter. All contexts restore after checking.
+New instance_iterator expressions now retain the iterator kind rather than
+being mistaken for ordinary struct objects. Slices and table tests retain
+Int and Bool results respectively; cast results remain unknown because the
+runtime fallback preserves the input value.
+
+Nested statement values in print/gen/emit/wait/start/compute, rgf assignments
+and counted-loop bounds now traverse. Temporal rule/wait propositions, edge
+operands and repeat bounds traverse recursively (clauses 11-13), as do rule
+else actions. The duplicated bound representation of a single written
+exact-count true-match repeat is checked once. Event/port members remain
+unknown rather than producing false missing-field errors. No new temporal
+operand rule or execution support was added. Known method arguments now infer
+once before signature validation, avoiding duplicate nested diagnostics on
+bare, member and subtype-qualified calls.
+
+Seventeen independently authored fixture sets under
+`tests/fixtures/typing-traversal/` cover every newly traversed value family,
+statement contexts, temporal composition, scope restoration/isolation,
+explicit and implicit contexts, known result propagation, legitimate
+unknowns/events/ports, composed when-view coverage and single diagnostics
+through nested calls. A define/predefined name collision fixture first
+reproduced three false E0220 diagnostics: the checker was using same-named
+fields rather than runtime constants. Lookup now respects that precedence
+in every checked context, with define values left unknown. The fixture and
+its runtime checks pass after the fix. Two new test functions provide the
+byte-exact fixture contract plus CLI rejection and valid execution checks.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 473 passed, 0 failed (21 test binaries),
+  including all seventeen new fixture sets and all eleven typing tests.
+- `cargo test --test typing` — 11 passed, 0 failed on the final seventeen
+  fixture sets; CLI elab/run rejected hidden operand errors and valid runtime
+  scope checks produced their independently specified output.
+- Additional CLI elab audit: all 176 pre-existing successful fixture
+  declarations inspected produced no E022x type diagnostics. Existing
+  expected diagnostics were unchanged.
+- `git diff --check` — passed.
+
+Reference scope: independently authored traversal/scoping checks against the
+repository's evaluator and existing 2019 clause mapping. No standard text,
+vendor output or external code was copied. No local all-feature run, WASM
+runtime test or Specman comparison was performed. Index-kind and membership
+compatibility checks, static member typing, conditional is-a bindings,
+contextual inference, define-value typing and type-embedded expressions remain
+unfinished. No full type-system or IEEE conformance claim is made.
+
+
+## 2026-11-14 — Static namespace typing and alias defaults
+
+Qualified static fields now contribute their declared kinds, and qualified
+static calls infer arguments once, check the declaring prototype and retain
+its result kind (2019 4.17.4, 6.9.3, 17.2.2). Exact registry ownership remains
+with E0307; an inherited or instance member is not silently resolved through
+a Type:: access. A declaration is preferred over an extension physically
+earlier in the source. Static extensions inherit omitted parameter/result
+annotations from that declaration for conservative body checking; full
+signature equivalence remains unfinished.
+
+Static initializers, methods and handlers are checked once from the declaring
+registries, not repeatedly through composed inheritance/when views. Source
+provenance in the bounded base chain identifies registered copies even when
+elaboration rewrites a type expression. Static methods/handlers have a
+namespace but no me receiver. Bare static fields follow the same bounded
+owner walk as the runtime, after local lookup. Qualified foreign-event
+handlers use the owner of the handler, not the event's owner. Static
+initializers retain the current runtime's no-receiver/no-bare-namespace
+context. New initializer frames clear and restore the caller static context;
+evaluate retains it. Unregistered/template entries remain conservative.
+
+The positive runtime fixture first exposed two existing failures. A static
+scalar alias defaulted to a fictitious object and failed arithmetic (E0402).
+After alias defaulting was corrected, a bare field write in a static method
+failed E0401 despite the read resolving its declaring owner. Bare writes now
+use the same owner walk outside the instance-only branch, with local/instance
+precedence and the registered field type preserved. Nested calls and foreign
+handlers verify that writes land in the correct shared store.
+
+Shared defaulting follows declared scalar/list/reference/enum alias
+representations rather than constructing an alias object. Up to 64 aliases
+are accepted; excess or recursive default chains report E0402 at the type
+expression. Tests cover a cycle, exactly 64 aliases and 65 aliases, with
+independently specified runtime diagnostics. This is a bounded runtime check,
+not complete alias-cycle validation during name resolution.
+
+Nineteen independently authored fixture sets under
+`tests/fixtures/typing-static/` cover qualified reads/assignments/calls,
+member/index/operator errors, single diagnostics through nested arguments,
+prototype inheritance, declaration order, inherited-entry deduplication,
+static handler ownership, bare parent fields, new/evaluate context isolation,
+initializer context, define precedence, alias representations and depth
+boundaries. Three test functions add the diagnostic fixtures, CLI rejection
+and two successful runtime scope/default programs, plus exact runtime alias
+boundary diagnostics.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 476 passed, 0 failed (21 test binaries),
+  including all nineteen new fixture sets and all fourteen typing tests.
+- `cargo test --test typing` — 14 passed, 0 failed, including CLI execution
+  of the static scopes and alias defaults programs and all three alias
+  boundary cases.
+- Additional CLI elab audit: 176 pre-existing successful fixture declarations
+  produced no E022x type diagnostics. Existing expected files were unchanged.
+- `git diff --check` — passed.
+
+Reference scope: independently authored tests against the registered static
+model and existing 2019 migration plan/evaluator rules. Inspection of the
+lawful local 2016 PDF did not supply qualification for the newer static-method
+rules. No 2019 standard text or vendor output was copied; no external pins
+were changed. No Specman comparison, local all-feature run or WASM runtime
+run was performed. Bare static method calls still lack runtime dispatch and
+remain unknown to the checker; qualified Type:: calls are supported. General
+name resolution, static initialization ordering/forward references, template
+static registration, signature equivalence, contextual inference and full
+constant/type resolution remain unfinished. No IEEE conformance is claimed.

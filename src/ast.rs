@@ -532,8 +532,8 @@ pub struct OnDecl {
 /// A `cover <event> is { .. };` coverage group (clause 14.2). The
 /// sampling event is recorded; items, crosses and transitions are
 /// recorded structurally, and every option clause (`using ...`) is kept
-/// as raw tokens — the option semantics (weights, at_least, per_instance)
-/// belong to the coverage data model, a later milestone.
+/// as raw tokens. The coverage model parses supported options with their
+/// original spans; the type pass checks effective Boolean expressions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverGroupDecl {
     pub name: String,

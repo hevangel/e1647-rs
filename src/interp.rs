@@ -714,6 +714,46 @@ struct SimTrigger {
     span: crate::ast::Span,
 }
 
+struct CoverageAxis {
+    binding: String,
+    source: String,
+    prototype: Value,
+    options: crate::coverage::ItemOptions,
+    buckets: Vec<(usize, i128, i128)>,
+}
+
+fn next_coverage_indices(indices: &mut [usize], limits: &[usize]) -> bool {
+    for (index, limit) in indices.iter_mut().zip(limits).rev() {
+        if *index + 1 < *limit {
+            *index += 1;
+            return true;
+        }
+        *index = 0;
+    }
+    false
+}
+
+fn coverage_point_bindings(axes: &[CoverageAxis], ranges: &[(i128, i128)]) -> Vec<(String, Value)> {
+    axes.iter()
+        .zip(ranges)
+        .map(|(axis, (lo, _))| {
+            let value = if matches!(axis.prototype, Value::Bool(_)) {
+                Value::Bool(*lo != 0)
+            } else {
+                Value::Int(*lo)
+            };
+            (axis.binding.clone(), value)
+        })
+        .collect()
+}
+
+fn coverage_midpoint(lo: i128, hi: i128) -> i128 {
+    let sign = 1u128 << 127;
+    let lo = (lo as u128) ^ sign;
+    let hi = (hi as u128) ^ sign;
+    ((lo + (hi - lo) / 2) ^ sign) as i128
+}
+
 struct Interp<'a> {
     types: &'a [crate::elab::ElaboratedType],
     instances: Vec<ObjectInstance>,
@@ -785,6 +825,7 @@ struct Interp<'a> {
     coverage: Vec<crate::coverage::TypeCoverage>,
     coverage_config: crate::coverage::CoverageConfig,
     coverage_was_enabled: bool,
+    coverage_illegal_pending: Vec<String>,
     /// Set by `stop_run()`; unwinds the whole run.
     stop_requested: bool,
     /// Failed `check that` conditions (`dut_error`), reported like
@@ -839,8 +880,8 @@ struct Interp<'a> {
     /// the clause 35.4 `get_all_annotations()` reads this registry.
     attached_annotations: &'a BTreeMap<String, Vec<crate::elab::AttachedAnnotation>>,
     /// The type whose static method is currently executing (T2.2):
-    /// bare static-field and bare static-method references inside a
-    /// static method resolve against it (`me` does not exist there).
+    /// bare static-field references inside a static method resolve
+    /// against it (`me` does not exist there). Static calls use Type::name.
     static_context: Option<String>,
     /// The declared type expected of the expression currently being
     /// evaluated, when the evaluation site knows one: the declared type
@@ -1208,6 +1249,7 @@ fn run_inner(
             ..Default::default()
         },
         coverage_was_enabled: false,
+        coverage_illegal_pending: Vec::new(),
         stop_requested: false,
         dut_errors: 0,
         defines,
@@ -1276,7 +1318,7 @@ fn run_inner(
             output: interp.output,
             diagnostics: interp.pending_diagnostics,
             coverage: if interp.coverage_was_enabled {
-                interp.coverage
+                crate::coverage::for_report(&interp.coverage)
             } else {
                 Vec::new()
             },
@@ -1500,6 +1542,7 @@ fn run_inner(
         // monitoring did not already fire.
         interp.run_phase_on_tree(sys_index, "check", &mut diagnostics);
     }
+    interp.flush_coverage_illegal();
     // 11.4: the quit-time re-check of the rules the live passes did not
     // already fire — the streaming monitors consume any log growth since
     // the last boundary and report their end-of-run verdicts (12.3.3:
@@ -1521,6 +1564,7 @@ fn run_inner(
             interp.call_phase_method(index, "finalize", &mut diagnostics);
         }
     }
+    interp.flush_coverage_illegal();
     // Specman closes every run with a DUT-error count; mirror it.
     if interp.dut_errors > 0 {
         interp.output.push_str(&format!(
@@ -1528,6 +1572,8 @@ fn run_inner(
             interp.dut_errors
         ));
     }
+    interp.prepare_coverage_instances(true);
+    interp.refresh_coverage_effects();
     // Field init-value failures collected during instance creation
     // (clause 6.9.1/6.9.4) join the run's diagnostics.
     diagnostics.append(&mut interp.pending_diagnostics);
@@ -1535,7 +1581,7 @@ fn run_inner(
         output: interp.output,
         diagnostics,
         coverage: if interp.coverage_was_enabled {
-            interp.coverage
+            crate::coverage::for_report(&interp.coverage)
         } else {
             Vec::new()
         },
@@ -2044,6 +2090,19 @@ impl<'a> Interp<'a> {
     }
 
     fn default_for(&mut self, ty: &TypeExpr) -> Value {
+        self.default_for_alias_depth(ty, 0)
+    }
+
+    fn default_for_alias_depth(&mut self, ty: &TypeExpr, alias_depth: usize) -> Value {
+        if alias_depth > 64 {
+            let diagnostic = self.error(
+                "E0402",
+                "type alias defaulting exceeds the 64-alias limit",
+                ty.span(),
+            );
+            self.pending_diagnostics.push(diagnostic);
+            return Value::Void;
+        }
         match ty {
             TypeExpr::Scalar { base, .. } => match base {
                 ScalarBase::Bool => Value::Bool(false),
@@ -2106,6 +2165,15 @@ impl<'a> Interp<'a> {
                             name: first.name.clone(),
                         };
                     }
+                }
+                // Scalar/list/reference aliases default through their
+                // declared representation, rather than creating an object
+                // whose type happens to be the alias's name (clause 5).
+                if let Some(declared) = types.iter().find(|declared| declared.name == *name)
+                    && declared.kind == DeclarationKind::Type
+                    && let Some(underlying) = &declared.underlying
+                {
+                    return self.default_for_alias_depth(underlying, alias_depth + 1);
                 }
                 if self.depth > 100 {
                     return Value::Void;
@@ -5621,9 +5689,9 @@ impl<'a> Interp<'a> {
     /// `Type::method(args)` — the static method dispatch (clause
     /// 17.2.2): the composed static blocks of the declaring type run
     /// without a receiver. A static method is not a TCM: its body is an
-    /// atomic region like an inline call, and bare static-field /
-    /// static-method references inside it resolve against
-    /// `static_context` (this type).
+    /// atomic region like an inline call, and bare static-field references
+    /// inside it resolve against `static_context` (this type). Bare method
+    /// calls without a receiver remain unsupported; use Type::name.
     fn call_static_method(
         &mut self,
         type_name: &str,
@@ -6442,6 +6510,32 @@ impl<'a> Interp<'a> {
                     }
                     config.max_int_buckets = count as u64;
                 }
+                "check_illegal_immediately" => {
+                    let Value::Bool(enabled) = self.eval(&pair[1], frame, me)? else {
+                        return Err(self.error(
+                            "E0402",
+                            "check_illegal_immediately expects a Boolean value",
+                            pair[1].span(),
+                        ));
+                    };
+                    config.check_illegal_immediately = enabled;
+                }
+                "at_least" => {
+                    let Value::Int(goal) = self.eval(&pair[1], frame, me)? else {
+                        return Err(self.error(
+                            "E0402",
+                            "at_least expects an integer",
+                            pair[1].span(),
+                        ));
+                    };
+                    config.at_least = u64::try_from(goal).map_err(|_| {
+                        self.error(
+                            "E0402",
+                            "at_least must be a nonnegative u64 value",
+                            pair[1].span(),
+                        )
+                    })?;
+                }
                 _ => {
                     return Err(self.error(
                         "E0419",
@@ -6451,7 +6545,9 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        if config.max_int_buckets != self.coverage_config.max_int_buckets {
+        if config.max_int_buckets != self.coverage_config.max_int_buckets
+            || config.at_least != self.coverage_config.at_least
+        {
             if self
                 .coverage
                 .iter()
@@ -6460,7 +6556,11 @@ impl<'a> Interp<'a> {
             {
                 return Err(self.error(
                     "E0402",
-                    "max_int_buckets cannot change after coverage sampling starts",
+                    if config.max_int_buckets != self.coverage_config.max_int_buckets {
+                        "max_int_buckets cannot change after coverage sampling starts"
+                    } else {
+                        "at_least cannot change after coverage sampling starts"
+                    },
                     span,
                 ));
             }
@@ -6543,6 +6643,8 @@ impl<'a> Interp<'a> {
     /// prose normalises is Specman-internal). Stores the value for
     /// `get_overall_grade()`.
     fn compute_overall_grade_value(&mut self) -> f64 {
+        self.prepare_coverage_instances(true);
+        self.refresh_coverage_effects();
         if !self.coverage_was_enabled {
             self.overall_grade = Some(0.0);
             return 0.0;
@@ -6550,7 +6652,7 @@ impl<'a> Interp<'a> {
         let mut sum = 0.0f64;
         let mut count = 0usize;
         for entry in &self.coverage {
-            for group in &entry.groups {
+            for group in entry.groups.iter().filter(|group| group.is_reported()) {
                 if let Some(grade) = group.grade() {
                     sum += grade;
                     count += 1;
@@ -6590,7 +6692,7 @@ impl<'a> Interp<'a> {
             .groups
             .iter()
             .enumerate()
-            .filter(|(_, group)| group.name == group_name)
+            .filter(|(_, group)| group.name == group_name && group.unit_owner.is_none())
             .map(|(index, _)| index)
             .collect();
         if group_indices.is_empty() {
@@ -6610,7 +6712,7 @@ impl<'a> Interp<'a> {
         let mut frame = Frame::default();
         for owner in instance_indices {
             for group_index in &group_indices {
-                self.sample_group_on_instance(entry_index, *group_index, owner, &mut frame);
+                self.sample_group_on_instance(entry_index, *group_index, owner, &mut frame, span);
             }
         }
         Ok(())
@@ -9567,7 +9669,7 @@ impl<'a> Interp<'a> {
         self.temporal_log[self.cycle as usize].record(path);
         self.wake_tcm_listeners(path);
         self.run_on_blocks(path, owner, span)?;
-        self.sample_cover_groups(path, owner, frame);
+        self.sample_cover_groups(path, owner, frame, span);
         Ok(())
     }
 
@@ -9740,7 +9842,13 @@ impl<'a> Interp<'a> {
     /// fired: each item's recorded expression evaluates in the emitting
     /// frame, or the item's field is read from the owner, and the value
     /// lands in the item's buckets.
-    fn sample_cover_groups(&mut self, path: &str, owner: Option<usize>, frame: &mut Frame) {
+    fn sample_cover_groups(
+        &mut self,
+        path: &str,
+        owner: Option<usize>,
+        frame: &mut Frame,
+        span: crate::ast::Span,
+    ) {
         let Some(owner) = owner else {
             return;
         };
@@ -9756,11 +9864,13 @@ impl<'a> Interp<'a> {
             .groups
             .iter()
             .enumerate()
-            .filter(|(_, group)| group.event_path.as_deref() == Some(path))
+            .filter(|(_, group)| {
+                group.event_path.as_deref() == Some(path) && group.unit_owner.is_none()
+            })
             .map(|(index, _)| index)
             .collect();
         for group_index in group_indices {
-            self.sample_group_on_instance(entry_index, group_index, owner, frame);
+            self.sample_group_on_instance(entry_index, group_index, owner, frame, span);
         }
     }
 
@@ -9770,59 +9880,985 @@ impl<'a> Interp<'a> {
     /// the cross items read the round's labels afterwards (14.4). The
     /// shared path of the emit-driven sampling (14.2) and the
     /// procedural `covers.sample_cg()` sampling (14.8.2.10).
+    fn coverage_unit_for(&self, owner: usize, scope: &str) -> Option<(usize, String)> {
+        let root = self
+            .instances
+            .iter()
+            .position(|instance| instance.type_name == "sys")?;
+        let paths = self.walk_instance_tree(root);
+        let path = paths
+            .iter()
+            .find(|path| path.last().is_some_and(|item| item.instance == owner))?;
+        self.coverage_unit_on_path(path, scope)
+    }
+
+    fn coverage_unit_on_path(
+        &self,
+        path: &[InstancePathItem],
+        scope: &str,
+    ) -> Option<(usize, String)> {
+        for position in (0..path.len()).rev() {
+            let unit = path[position].instance;
+            let name = &self.instances[unit].type_name;
+            if self
+                .types
+                .iter()
+                .any(|ty| ty.name == *name && ty.kind == DeclarationKind::Unit)
+                && self.type_is_a(name, scope)
+            {
+                return Some((unit, render_iterator_path(&path[..=position], "sys")));
+            }
+        }
+        None
+    }
+
+    fn coverage_boolean(
+        &mut self,
+        expr: &Expr,
+        owner: usize,
+        unit: Option<usize>,
+    ) -> Result<bool, Diagnostic> {
+        // Coverage options use their declaring struct context, never
+        // the locals of the method that happened to emit the event.
+        let mut frame = Frame::default();
+        if let Some(unit) = unit {
+            frame.locals.insert("inst".to_owned(), Value::Object(unit));
+        }
+        match self.eval(expr, &mut frame, Some(owner))? {
+            Value::Bool(value) => Ok(value),
+            _ => Err(self.error(
+                "E0402",
+                "coverage option expects a Boolean value (clause 14)",
+                expr.span(),
+            )),
+        }
+    }
+
+    fn coverage_effect_value(
+        &mut self,
+        expr: &Expr,
+        item: &str,
+        value: &Value,
+        candidate: Option<i128>,
+        unit: Option<usize>,
+    ) -> Result<Value, Diagnostic> {
+        let mut frame = Frame::default();
+        let value = match (value, candidate) {
+            (Value::Int(_), Some(value)) => Value::Int(value),
+            (Value::Bool(_), Some(value)) => Value::Bool(value != 0),
+            (_, None) => value.clone(),
+            _ => {
+                return Err(self.error(
+                    "E0402",
+                    "unsupported coverage predicate scalar domain (14.3)",
+                    expr.span(),
+                ));
+            }
+        };
+        frame.locals.insert(item.to_owned(), value);
+        if let Some(unit) = unit {
+            frame.locals.insert("inst".to_owned(), Value::Object(unit));
+        }
+        self.eval(expr, &mut frame, None)
+    }
+
+    fn coverage_effect_matches(
+        &mut self,
+        expressions: &[Option<Expr>],
+        item: &str,
+        value: &Value,
+        unit: Option<usize>,
+    ) -> Result<bool, Diagnostic> {
+        for expr in expressions.iter().flatten() {
+            match self.coverage_effect_value(expr, item, value, None, unit)? {
+                Value::Bool(true) => return Ok(true),
+                Value::Bool(false) => {}
+                _ => {
+                    return Err(self.error(
+                        "E0402",
+                        "coverage ignore/illegal predicate expects a Boolean value (14.3)",
+                        expr.span(),
+                    ));
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn coverage_prototype(&self, ty: &TypeExpr, depth: u32) -> Option<Value> {
+        if depth > 32 {
+            return None;
+        }
+        match ty {
+            TypeExpr::Scalar {
+                base: crate::ast::ScalarBase::Bool,
+                ..
+            } => Some(Value::Bool(false)),
+            TypeExpr::Scalar {
+                base: crate::ast::ScalarBase::Real | crate::ast::ScalarBase::String,
+                ..
+            } => None,
+            TypeExpr::Scalar { .. } => Some(Value::Int(0)),
+            TypeExpr::Named { name, .. } => self
+                .types
+                .iter()
+                .find(|ty| ty.name == *name)
+                .and_then(|ty| ty.underlying.as_ref())
+                .and_then(|ty| self.coverage_prototype(ty, depth + 1)),
+            _ => None,
+        }
+    }
+
+    fn coverage_multi_matches(
+        &mut self,
+        expressions: &[Option<Expr>],
+        bindings: &[(String, Value)],
+        unit: Option<usize>,
+    ) -> Result<bool, Diagnostic> {
+        for expr in expressions.iter().flatten() {
+            let mut frame = Frame::default();
+            frame.locals.extend(bindings.iter().cloned());
+            if let Some(unit) = unit {
+                frame.locals.insert("inst".to_owned(), Value::Object(unit));
+            }
+            match self.eval(expr, &mut frame, None)? {
+                Value::Bool(true) => return Ok(true),
+                Value::Bool(false) => {}
+                _ => {
+                    return Err(self.error(
+                        "E0402",
+                        "derived coverage predicate expects a Boolean value (14.4-14.5)",
+                        expr.span(),
+                    ));
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn coverage_basic_declaration(
+        &self,
+        entry: usize,
+        group: usize,
+        name: &str,
+    ) -> Option<&crate::ast::CoverItemDecl> {
+        self.types
+            .iter()
+            .find(|ty| ty.name == self.coverage[entry].type_name)?
+            .covers
+            .iter()
+            .filter(|decl| decl.name == self.coverage[entry].groups[group].name)
+            .flat_map(|decl| &decl.items)
+            .find(|item| {
+                item.kind == crate::ast::CoverItemKind::Item
+                    && item.names.first().is_some_and(|(source, _)| source == name)
+            })
+    }
+
+    fn coverage_basic_prototype(&self, entry: usize, group: usize, name: &str) -> Option<Value> {
+        let ty = self
+            .types
+            .iter()
+            .find(|ty| ty.name == self.coverage[entry].type_name)?;
+        let item = self.coverage_basic_declaration(entry, group, name);
+        let ty = item.and_then(|item| item.ty.as_ref()).or_else(|| {
+            ty.fields
+                .iter()
+                .find(|field| field.name == name)
+                .map(|field| &field.ty)
+        })?;
+        self.coverage_prototype(ty, 0)
+    }
+
+    fn coverage_domain_variable(&self, name: &str, unit: Option<usize>) -> bool {
+        !matches!(name, "me" | "self" | "NULL" | "TEST_DONE")
+            && !name.ends_with('$')
+            && !self.defines.contains_key(name)
+            && predefined_constant(name).is_none()
+            && !(name == "inst" && unit.is_some())
+    }
+
+    fn coverage_region_proof(
+        &mut self,
+        axes: &[CoverageAxis],
+        ranges: &[(i128, i128)],
+        expressions: &[Option<Expr>],
+        unit: Option<usize>,
+    ) -> Result<Option<bool>, Diagnostic> {
+        for (axis, bounds) in axes.iter().zip(ranges) {
+            let domains = if self.coverage_domain_variable(&axis.source, unit) {
+                BTreeMap::from([(
+                    axis.source.clone(),
+                    crate::coverage::ScalarDomain::new(&axis.prototype, *bounds),
+                )])
+            } else {
+                BTreeMap::new()
+            };
+            let value = if matches!(axis.prototype, Value::Bool(_)) {
+                Value::Bool(bounds.0 != 0)
+            } else {
+                Value::Int(bounds.0)
+            };
+            for expr in [
+                &axis.options.ignore,
+                &axis.options.instance_ignore,
+                &axis.options.illegal,
+                &axis.options.instance_illegal,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let mut evaluate = |expr: &Expr| {
+                    self.coverage_effect_value(expr, &axis.source, &value, None, unit)
+                };
+                match crate::coverage::prove_predicate(expr, &domains, &mut evaluate)? {
+                    Some(true) => return Ok(Some(false)),
+                    Some(false) => {}
+                    None => return Ok(None),
+                }
+            }
+        }
+        let domains = axes
+            .iter()
+            .zip(ranges)
+            .filter(|(axis, _)| self.coverage_domain_variable(&axis.binding, unit))
+            .map(|(axis, bounds)| {
+                (
+                    axis.binding.clone(),
+                    crate::coverage::ScalarDomain::new(&axis.prototype, *bounds),
+                )
+            })
+            .collect();
+        let bindings = coverage_point_bindings(axes, ranges);
+        for expr in expressions.iter().flatten() {
+            let mut evaluate = |expr: &Expr| {
+                let mut frame = Frame::default();
+                frame.locals.extend(bindings.iter().cloned());
+                if let Some(unit) = unit {
+                    frame.locals.insert("inst".to_owned(), Value::Object(unit));
+                }
+                self.eval(expr, &mut frame, None)
+            };
+            match crate::coverage::prove_predicate(expr, &domains, &mut evaluate)? {
+                Some(true) => return Ok(Some(false)),
+                Some(false) => {}
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(true))
+    }
+
+    fn spend_coverage_domain_work(
+        &self,
+        budget: &mut usize,
+        amount: usize,
+        span: crate::ast::Span,
+    ) -> Result<(), Diagnostic> {
+        if *budget < amount {
+            return Err(self.error("E0402", "derived predicate classification exceeds the 65536 scalar-domain work limit (14.4-14.5)", span));
+        }
+        *budget -= amount;
+        Ok(())
+    }
+
+    fn coverage_region_witness(
+        &mut self,
+        axes: &[CoverageAxis],
+        ranges: Vec<(i128, i128)>,
+        expressions: &[Option<Expr>],
+        unit: Option<usize>,
+        budget: &mut usize,
+        span: crate::ast::Span,
+    ) -> Result<bool, Diagnostic> {
+        let varying: Vec<_> = axes
+            .iter()
+            .map(|axis| {
+                expressions
+                    .iter()
+                    .flatten()
+                    .any(|expr| crate::coverage::uses_item(expr, &axis.binding))
+                    || [
+                        &axis.options.ignore,
+                        &axis.options.instance_ignore,
+                        &axis.options.illegal,
+                        &axis.options.instance_illegal,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|expr| crate::coverage::uses_item(expr, &axis.source))
+            })
+            .collect();
+        let mut pending = vec![ranges];
+        while let Some(ranges) = pending.pop() {
+            self.spend_coverage_domain_work(budget, axes.len(), span)?;
+            match self.coverage_region_proof(axes, &ranges, expressions, unit)? {
+                Some(true) => return Ok(true),
+                Some(false) => continue,
+                None => {}
+            }
+            self.spend_coverage_domain_work(budget, axes.len(), span)?;
+            let bindings = coverage_point_bindings(axes, &ranges);
+            let mut legal = true;
+            for (axis, (_, value)) in axes.iter().zip(&bindings) {
+                if self.coverage_effect_matches(
+                    &[
+                        axis.options.ignore.clone(),
+                        axis.options.instance_ignore.clone(),
+                        axis.options.illegal.clone(),
+                        axis.options.instance_illegal.clone(),
+                    ],
+                    &axis.source,
+                    value,
+                    unit,
+                )? {
+                    legal = false;
+                    break;
+                }
+            }
+            if legal && !self.coverage_multi_matches(expressions, &bindings, unit)? {
+                return Ok(true);
+            }
+            if let Some(axis) = ranges
+                .iter()
+                .zip(&varying)
+                .position(|((lo, hi), used)| *used && lo < hi)
+            {
+                let mid = coverage_midpoint(ranges[axis].0, ranges[axis].1);
+                let mut higher = ranges.clone();
+                higher[axis].0 = mid + 1; // mid is strictly below hi
+                let mut lower = ranges;
+                lower[axis].1 = mid;
+                pending.push(higher);
+                pending.push(lower);
+            }
+        }
+        Ok(false)
+    }
+
+    fn classify_derived_effects(
+        &mut self,
+        entry: usize,
+        group: usize,
+        index: usize,
+        masks: &BTreeMap<(usize, usize), bool>,
+    ) -> Result<Option<BTreeSet<Vec<usize>>>, Diagnostic> {
+        let item = &self.coverage[entry].groups[group].derived[index];
+        let options = item.options.clone();
+        let sources = item.sources.clone();
+        let transition = item.kind == crate::ast::CoverItemKind::Transition;
+        let expressions = [
+            options.ignore,
+            options.instance_ignore,
+            options.illegal,
+            options.instance_illegal,
+        ];
+        let unit = self.coverage[entry].groups[group].unit_owner;
+        let mut names = sources.clone();
+        if transition {
+            names.extend(sources.iter().map(|source| format!("prev_{source}")));
+        }
+        let mut dependent = false;
+        let mut span = origin_span();
+        // Only fold a constant prefix: later expressions may be guarded by
+        // a source-dependent ignore predicate and must retain short circuit.
+        for expr in expressions.iter().flatten() {
+            span = expr.span();
+            if names
+                .iter()
+                .any(|name| crate::coverage::uses_item(expr, name))
+            {
+                dependent = true;
+                break;
+            }
+            if self.coverage_multi_matches(&[Some(expr.clone())], &[], unit)? {
+                return Ok(Some(BTreeSet::new()));
+            }
+        }
+        if !dependent {
+            return Ok(None);
+        }
+        let basics: Vec<_> = self.coverage[entry].groups[group]
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (index, item.clone()))
+            .collect();
+        let mut axes = Vec::new();
+        let inputs: Vec<_> = if transition {
+            vec![
+                (format!("prev_{}", sources[0]), sources[0].clone()),
+                (sources[0].clone(), sources[0].clone()),
+            ]
+        } else {
+            sources
+                .iter()
+                .map(|source| (source.clone(), source.clone()))
+                .collect()
+        };
+        if inputs
+            .iter()
+            .any(|(_, source)| !basics.iter().any(|(_, item)| item.name == *source))
+        {
+            return Err(self.error(
+                "E0402",
+                "derived predicate classification over composite sources is not implemented (14.4-14.5)",
+                span,
+            ));
+        }
+        for (binding, source) in inputs {
+            let Some((item_index, item)) = basics.iter().find(|(_, item)| item.name == source)
+            else {
+                return Err(self.error("E0402", "derived predicate classification over composite sources is not implemented (14.4-14.5)", span));
+            };
+            if item.buckets.is_empty() {
+                return Ok(None);
+            } // ungradeable: point filtering only
+            let Some(prototype) = self.coverage_basic_prototype(entry, group, &source) else {
+                return Err(self.error(
+                    "E0402",
+                    "derived predicate buckets require integral or Boolean sources (14.4-14.5)",
+                    span,
+                ));
+            };
+            let buckets = item
+                .buckets
+                .iter()
+                .enumerate()
+                .filter(|(bucket, data)| {
+                    !masks
+                        .get(&(*item_index, *bucket))
+                        .copied()
+                        .unwrap_or(data.excluded)
+                })
+                .map(|(bucket, data)| (bucket, data.lo, data.hi))
+                .collect();
+            axes.push(CoverageAxis {
+                binding,
+                source,
+                prototype,
+                options: item.options.clone(),
+                buckets,
+            });
+        }
+        if axes.iter().any(|axis| axis.buckets.is_empty()) {
+            return Ok(Some(BTreeSet::new()));
+        }
+        let mut budget = 65_536usize;
+        let envelope: Vec<_> = axes
+            .iter()
+            .map(|axis| {
+                (
+                    axis.buckets
+                        .iter()
+                        .map(|(_, lo, _)| *lo)
+                        .min()
+                        .expect("nonempty source buckets"),
+                    axis.buckets
+                        .iter()
+                        .map(|(_, _, hi)| *hi)
+                        .max()
+                        .expect("nonempty source buckets"),
+                )
+            })
+            .collect();
+        self.spend_coverage_domain_work(&mut budget, axes.len(), span)?;
+        match self.coverage_region_proof(&axes, &envelope, &expressions, unit)? {
+            Some(true) => return Ok(None),
+            Some(false) => return Ok(Some(BTreeSet::new())),
+            None => {}
+        }
+        let limits: Vec<_> = axes.iter().map(|axis| axis.buckets.len()).collect();
+        let mut coordinates = vec![0; axes.len()];
+        let mut allowed = BTreeSet::new();
+        loop {
+            let ranges = axes
+                .iter()
+                .zip(&coordinates)
+                .map(|(axis, index)| {
+                    let (_, lo, hi) = axis.buckets[*index];
+                    (lo, hi)
+                })
+                .collect();
+            if self.coverage_region_witness(&axes, ranges, &expressions, unit, &mut budget, span)? {
+                allowed.insert(
+                    axes.iter()
+                        .zip(&coordinates)
+                        .map(|(axis, index)| axis.buckets[*index].0)
+                        .collect(),
+                );
+            }
+            if !next_coverage_indices(&mut coordinates, &limits) {
+                break;
+            }
+        }
+        Ok(Some(allowed))
+    }
+
+    fn refresh_coverage_group_effects(
+        &mut self,
+        entry: usize,
+        group: usize,
+    ) -> Result<(), Diagnostic> {
+        let unit = self.coverage[entry].groups[group].unit_owner;
+        let items: Vec<_> = self.coverage[entry].groups[group]
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.name.clone(),
+                    item.options.clone(),
+                    item.buckets
+                        .iter()
+                        .map(|bucket| (bucket.lo, bucket.hi))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        // Commit masks only after the entire group has been classified. A
+        // failing predicate must not leave a partially updated denominator.
+        let mut masks = Vec::new();
+        for (item_index, (name, options, domains)) in items.into_iter().enumerate() {
+            let effects = [
+                options.ignore,
+                options.instance_ignore,
+                options.illegal,
+                options.instance_illegal,
+            ];
+            if effects.iter().all(Option::is_none) || domains.is_empty() {
+                continue;
+            }
+            let span = self
+                .coverage_basic_declaration(entry, group, &name)
+                .map_or(origin_span(), |item| item.span);
+            let Some(prototype) = self.coverage_basic_prototype(entry, group, &name) else {
+                return Err(self.error(
+                    "E0402",
+                    "coverage bucket effects require a known integral or Boolean item type (14.3)",
+                    span,
+                ));
+            };
+            let mut budget = 65_536usize;
+            for (bucket, domain) in domains.into_iter().enumerate() {
+                let mut excluded = Vec::new();
+                for expr in effects.iter().flatten() {
+                    // Match the observation path's short circuit: later
+                    // predicates are irrelevant for already excluded values.
+                    for remaining in complement_interval_set(&excluded, domain) {
+                        let mut evaluate = |expr: &Expr, candidate| {
+                            self.coverage_effect_value(expr, &name, &prototype, candidate, unit)
+                        };
+                        let matching = crate::coverage::effect_intervals(
+                            expr,
+                            &name,
+                            remaining,
+                            &prototype,
+                            &mut budget,
+                            &mut evaluate,
+                        )?;
+                        excluded = union_interval_sets(&excluded, &matching);
+                    }
+                }
+                masks.push((
+                    item_index,
+                    bucket,
+                    complement_interval_set(&excluded, domain).is_empty(),
+                ));
+            }
+        }
+        let prospective: BTreeMap<_, _> = masks
+            .iter()
+            .map(|(item, bucket, excluded)| ((*item, *bucket), *excluded))
+            .collect();
+        let mut derived_masks = Vec::new();
+        for index in 0..self.coverage[entry].groups[group].derived.len() {
+            derived_masks.push(self.classify_derived_effects(entry, group, index, &prospective)?);
+        }
+        for (item, bucket, excluded) in masks {
+            self.coverage[entry].groups[group].items[item].buckets[bucket].excluded = excluded;
+        }
+        for (item, allowed) in self.coverage[entry].groups[group]
+            .derived
+            .iter_mut()
+            .zip(derived_masks)
+        {
+            item.allowed = allowed;
+        }
+        self.coverage[entry].groups[group].refresh_derived();
+        Ok(())
+    }
+
+    fn refresh_coverage_effects(&mut self) {
+        if !self.coverage_was_enabled {
+            return;
+        }
+        let groups: Vec<_> = self
+            .coverage
+            .iter()
+            .enumerate()
+            .flat_map(|(entry, data)| {
+                data.groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, group)| group.is_reported())
+                    .map(move |(group, _)| (entry, group))
+            })
+            .collect();
+        for (entry, group) in groups {
+            if let Err(diagnostic) = self.refresh_coverage_group_effects(entry, group)
+                && !self.pending_diagnostics.contains(&diagnostic)
+            {
+                self.pending_diagnostics.push(diagnostic);
+            }
+        }
+    }
+
+    fn report_coverage_illegal(&mut self, message: String) {
+        if self.coverage_config.check_illegal_immediately {
+            self.dut_errors += 1;
+            self.output.push_str(&format!("dut_error: {message}\n"));
+        } else {
+            self.coverage_illegal_pending.push(message);
+        }
+    }
+
+    fn flush_coverage_illegal(&mut self) {
+        for message in std::mem::take(&mut self.coverage_illegal_pending) {
+            self.dut_errors += 1;
+            self.output.push_str(&format!("dut_error: {message}\n"));
+        }
+    }
+
+    fn prepare_coverage_instances(&mut self, refresh_visibility: bool) {
+        if !self.coverage_was_enabled {
+            return;
+        }
+        let Some(root) = self
+            .instances
+            .iter()
+            .position(|instance| instance.type_name == "sys")
+        else {
+            return;
+        };
+        let paths = self.walk_instance_tree(root);
+        let mut plans = Vec::new();
+        for (entry_index, entry) in self.coverage.iter().enumerate() {
+            for (group_index, group) in entry.groups.iter().enumerate() {
+                if group.unit_owner.is_some() {
+                    continue;
+                }
+                let Some(scope) = &group.options.unit_scope else {
+                    continue;
+                };
+                for path in &paths {
+                    let owner = path
+                        .last()
+                        .expect("instance walk path is nonempty")
+                        .instance;
+                    if self.instances[owner].type_name == entry.type_name
+                        && let Some((unit, label)) = self.coverage_unit_on_path(path, scope)
+                    {
+                        plans.push((entry_index, group_index, owner, unit, label));
+                    }
+                }
+            }
+        }
+        let mut refreshed = BTreeSet::new();
+        for (entry, base, owner, unit, path) in plans {
+            if !refreshed.insert((entry, base, unit)) {
+                continue;
+            }
+            let name = self.coverage[entry].groups[base].name.clone();
+            let index = if let Some(index) = self.coverage[entry]
+                .groups
+                .iter()
+                .position(|group| group.name == name && group.unit_owner == Some(unit))
+            {
+                index
+            } else {
+                let mut group = self.coverage[entry].groups[base].clone();
+                group.unit_owner = Some(unit);
+                group.unit_instance = Some(path);
+                self.coverage[entry].groups.push(group);
+                self.coverage[entry].groups.len() - 1
+            };
+            if !refresh_visibility {
+                continue;
+            }
+            let options = self.coverage[entry].groups[base].options.clone();
+            let items: Vec<_> = self.coverage[entry].groups[base]
+                .items
+                .iter()
+                .map(|item| item.options.clone())
+                .collect();
+            let hidden = match &options.instance_no_collect {
+                Some(expr) => match self.coverage_boolean(expr, owner, Some(unit)) {
+                    Ok(value) => value,
+                    Err(diagnostic) => {
+                        self.pending_diagnostics.push(diagnostic);
+                        true
+                    }
+                },
+                None => false,
+            };
+            self.coverage[entry].groups[index].options.hidden = options.hidden || hidden;
+            let derived: Vec<_> = self.coverage[entry].groups[base]
+                .derived
+                .iter()
+                .map(|item| item.options.clone())
+                .collect();
+            for (item_index, item) in derived.iter().enumerate() {
+                let hidden = match &item.instance_no_collect {
+                    Some(expr) => match self.coverage_boolean(expr, owner, Some(unit)) {
+                        Ok(value) => value,
+                        Err(diagnostic) => {
+                            self.pending_diagnostics.push(diagnostic);
+                            true
+                        }
+                    },
+                    None => false,
+                };
+                self.coverage[entry].groups[index].derived[item_index]
+                    .options
+                    .hidden = item.hidden || hidden;
+            }
+            for (item_index, item) in items.iter().enumerate() {
+                let hidden = match &item.instance_no_collect {
+                    Some(expr) => match self.coverage_boolean(expr, owner, Some(unit)) {
+                        Ok(value) => value,
+                        Err(diagnostic) => {
+                            self.pending_diagnostics.push(diagnostic);
+                            true
+                        }
+                    },
+                    None => false,
+                };
+                self.coverage[entry].groups[index].items[item_index]
+                    .options
+                    .hidden = item.hidden || hidden;
+            }
+        }
+    }
+
+    fn prepare_derived_item(&mut self, entry: usize, group: usize, owner: usize, index: usize) {
+        let options = self.coverage[entry].groups[group].derived[index]
+            .options
+            .clone();
+        let mut collect = match options.when {
+            Some(expr) => match self.coverage_boolean(&expr, owner, None) {
+                Ok(value) => value,
+                Err(diagnostic) => {
+                    self.pending_diagnostics.push(diagnostic);
+                    false
+                }
+            },
+            None => true,
+        };
+        if collect
+            && let Some(bindings) = self.coverage[entry].groups[group].derived_bindings(index)
+        {
+            let unit = self.coverage[entry].groups[group].unit_owner;
+            match self.coverage_multi_matches(
+                &[options.ignore, options.instance_ignore],
+                &bindings,
+                unit,
+            ) {
+                Ok(true) => collect = false,
+                Err(diagnostic) => {
+                    self.pending_diagnostics.push(diagnostic);
+                    collect = false;
+                }
+                Ok(false) => match self.coverage_multi_matches(
+                    &[options.illegal, options.instance_illegal],
+                    &bindings,
+                    unit,
+                ) {
+                    Ok(true) => {
+                        let data = &self.coverage[entry];
+                        let group = &data.groups[group];
+                        let suffix = group
+                            .unit_instance
+                            .as_ref()
+                            .map_or(String::new(), |path| format!("@{path}"));
+                        let values = bindings
+                            .iter()
+                            .map(|(name, value)| format!("{name}={}", self.format_value(value)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let message = format!(
+                            "illegal derived coverage value ({values}) in '{}.{}.{}{suffix}'",
+                            data.type_name, group.name, group.derived[index].name
+                        );
+                        self.report_coverage_illegal(message);
+                        collect = false;
+                    }
+                    Ok(false) => {}
+                    Err(diagnostic) => {
+                        self.pending_diagnostics.push(diagnostic);
+                        collect = false;
+                    }
+                },
+            }
+        }
+        self.coverage[entry].groups[group].derived[index].collect = collect;
+    }
+
+    fn sample_transition_graph(&mut self, entry: usize, group: usize, owner: usize, source: &str) {
+        let mut pending: BTreeSet<_> = self.coverage[entry].groups[group]
+            .transitions_from(source)
+            .into_iter()
+            .collect();
+        let mut seen = BTreeSet::new();
+        while let Some(index) = pending.pop_first() {
+            if !seen.insert(index) {
+                continue;
+            }
+            self.prepare_derived_item(entry, group, owner, index);
+            if let Some(name) = self.coverage[entry].groups[group].record_transition(index) {
+                pending.extend(self.coverage[entry].groups[group].transitions_from(&name));
+            }
+        }
+    }
+
     fn sample_group_on_instance(
         &mut self,
         entry_index: usize,
-        group_index: usize,
+        mut group_index: usize,
         owner: usize,
-        frame: &mut Frame,
+        _emitting_frame: &mut Frame,
+        span: crate::ast::Span,
     ) {
         if !self.coverage_config.mode {
             return;
         }
+        let settings = self.coverage[entry_index].groups[group_index]
+            .options
+            .clone();
+        if let Some(scope) = &settings.unit_scope {
+            let Some((unit, _)) = self.coverage_unit_for(owner, scope) else {
+                self.pending_diagnostics.push(self.error(
+                    "E0402",
+                    format!("coverage owner has no containing unit of type '{scope}' (14.2)"),
+                    span,
+                ));
+                return;
+            };
+            self.prepare_coverage_instances(false);
+            let name = self.coverage[entry_index].groups[group_index].name.clone();
+            group_index = self.coverage[entry_index]
+                .groups
+                .iter()
+                .position(|group| group.name == name && group.unit_owner == Some(unit))
+                .expect("prepared coverage instance");
+        }
+        if let Some(expr) = &settings.when {
+            match self.coverage_boolean(expr, owner, None) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(diagnostic) => {
+                    self.pending_diagnostics.push(diagnostic);
+                    return;
+                }
+            }
+        }
+        if let Err(diagnostic) = self.refresh_coverage_group_effects(entry_index, group_index) {
+            if !self.pending_diagnostics.contains(&diagnostic) {
+                self.pending_diagnostics.push(diagnostic);
+            }
+            return;
+        }
+        let unit = self.coverage[entry_index].groups[group_index].unit_owner;
         let type_name = self.instances[owner].type_name.clone();
-        // The items' recorded declarations (expression or field name),
-        // looked up in the elaborated type's cover groups by name.
-        let types: &[crate::elab::ElaboratedType] = self.types;
-        let item_sources: Vec<(String, Option<Expr>)> = types
+        let group_name = self.coverage[entry_index].groups[group_index].name.clone();
+        let sources: Vec<_> = self
+            .types
             .iter()
-            .find(|t| t.name == type_name)
-            .map(|ty| {
-                ty.covers
-                    .iter()
-                    .flat_map(|decl| decl.items.iter())
-                    .filter(|item| item.kind == crate::ast::CoverItemKind::Item)
-                    .filter_map(|item| {
-                        let name = item.names.first().map(|(name, _)| name.clone())?;
-                        Some((name, item.expr.clone()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.coverage[entry_index].groups[group_index].samples += 1;
-        let item_names: Vec<String> = self.coverage[entry_index].groups[group_index]
+            .find(|ty| ty.name == type_name)
+            .into_iter()
+            .flat_map(|ty| &ty.covers)
+            .filter(|group| group.name == group_name)
+            .flat_map(|group| &group.items)
+            .filter(|item| item.kind == crate::ast::CoverItemKind::Item)
+            .map(|item| (item.names[0].0.clone(), item.expr.clone()))
+            .collect();
+        let items: Vec<_> = self.coverage[entry_index].groups[group_index]
             .items
             .iter()
-            .map(|item| item.name.clone())
+            .map(|item| (item.name.clone(), item.options.clone()))
             .collect();
-        for name in item_names {
-            let Some((_, expr)) = item_sources
-                .iter()
-                .find(|(source_name, _)| *source_name == name)
-            else {
+        self.coverage[entry_index].groups[group_index].begin_sample();
+        let mut frame = Frame::default();
+        for (name, options) in items {
+            if let Some(expr) = &options.when {
+                match self.coverage_boolean(expr, owner, None) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(diagnostic) => {
+                        self.pending_diagnostics.push(diagnostic);
+                        continue;
+                    }
+                }
+            }
+            let Some((_, expr)) = sources.iter().find(|(source, _)| *source == name) else {
                 continue;
             };
             let value = match expr {
-                Some(expr) => self.eval(expr, frame, Some(owner)).ok(),
-                None => self.instances[owner].get(&name).cloned(),
+                Some(expr) => self.eval(expr, &mut frame, Some(owner)),
+                None => self.instances[owner].get(&name).cloned().ok_or_else(|| {
+                    self.error("E0401", format!("unknown coverage field '{name}'"), span)
+                }),
             };
-            if let Some(value) = value {
-                self.coverage[entry_index].groups[group_index].sample(&name, &value);
+            match value {
+                Ok(value) => {
+                    match self.coverage_effect_matches(
+                        &[options.ignore, options.instance_ignore],
+                        &name,
+                        &value,
+                        unit,
+                    ) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(diagnostic) => {
+                            self.pending_diagnostics.push(diagnostic);
+                            continue;
+                        }
+                    }
+                    match self.coverage_effect_matches(
+                        &[options.illegal, options.instance_illegal],
+                        &name,
+                        &value,
+                        unit,
+                    ) {
+                        Ok(true) => {
+                            let path = self.coverage[entry_index].groups[group_index]
+                                .unit_instance
+                                .as_ref()
+                                .map_or(String::new(), |path| format!("@{path}"));
+                            self.report_coverage_illegal(format!("illegal coverage value {} in '{type_name}.{group_name}.{name}{path}'", self.format_value(&value)));
+                            continue;
+                        }
+                        Ok(false) => {
+                            self.coverage[entry_index].groups[group_index]
+                                .sample_basic(&name, &value);
+                            self.sample_transition_graph(entry_index, group_index, owner, &name);
+                        }
+                        Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
+                    }
+                }
+                Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
             }
         }
-        // The cross items record after all of their sources have
-        // this round's labels (14.4).
-        self.coverage[entry_index].groups[group_index].record_crosses();
+        for index in 0..self.coverage[entry_index].groups[group_index].derived.len() {
+            if self.coverage[entry_index].groups[group_index].derived[index].kind
+                != crate::ast::CoverItemKind::Cross
+            {
+                continue;
+            }
+            self.prepare_derived_item(entry_index, group_index, owner, index);
+            if let Some(name) = self.coverage[entry_index].groups[group_index].record_cross(index) {
+                self.sample_transition_graph(entry_index, group_index, owner, &name);
+            }
+        }
+        self.coverage[entry_index].groups[group_index].refresh_derived();
     }
 
     /// Whether the running statement may suspend to the scheduler: a
@@ -10689,7 +11725,7 @@ impl<'a> Interp<'a> {
             self.atomic_depth -= 1;
             self.depth -= 1;
         }
-        self.sample_cover_groups(&path, None, frame);
+        self.sample_cover_groups(&path, None, frame, span);
         Ok(())
     }
 
@@ -11455,7 +12491,7 @@ impl<'a> Interp<'a> {
                 let value = self.eval(inner, frame, me)?;
                 match (op, value) {
                     (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-                    (UnaryOp::Negate, Value::Int(i)) => Ok(Value::Int(-i)),
+                    (UnaryOp::Negate, Value::Int(i)) => i.checked_neg().map(Value::Int).ok_or_else(|| self.error("E0402", "integer negation overflow", *span)),
                     (UnaryOp::Negate, Value::Real(r)) => Ok(Value::Real(-r)),
                     (UnaryOp::Plus, value @ (Value::Int(_) | Value::Real(_))) => Ok(value),
                     (UnaryOp::BitNot, Value::Int(i)) => Ok(Value::Int(!i)),
@@ -12572,7 +13608,12 @@ impl<'a> Interp<'a> {
                     if b == 0 {
                         return Err(self.error("E0403", "division by zero", span));
                     }
-                    let value = if op == Div { a / b } else { a % b };
+                    let value = if op == Div {
+                        a.checked_div(b)
+                    } else {
+                        a.checked_rem(b)
+                    }
+                    .ok_or_else(|| self.error("E0402", "integer division overflow", span))?;
                     Ok(Value::Int(precision.cast_operand(value)))
                 }
                 _ => {
@@ -12943,28 +13984,39 @@ impl<'a> Interp<'a> {
                     frame.locals.insert(name.clone(), value);
                     return Ok(());
                 }
-                if let Some(index) = me {
-                    // The field's declared type binds the value (T7.1's
-                    // value semantics: a custom numeric copies, a
-                    // scalar converts through numeric_from_*).
+                if let Some(index) = me
+                    && self.instances[index].get(name).is_some()
+                {
+                    // Instance fields precede the static namespace.
                     let declared = self.declared_type_of(name, false, frame, index);
                     let value = self.bind_slot_value(value, declared.as_ref(), span)?;
-                    if self.instances[index].set(name, value.clone()) {
-                        return Ok(());
-                    }
-                    // A static field named bare (T2.1): the write lands
-                    // in the declaring type's store entry — the same
-                    // resolution the read side uses.
-                    if let Some(owner) = self.bare_static_field_owner(me, name) {
-                        self.statics
-                            .entry(owner)
-                            .or_default()
-                            .insert(name.clone(), value);
-                        return Ok(());
-                    }
-                    return Err(self.error("E0401", format!("unknown field '{name}'"), span));
+                    self.instances[index].set(name, value);
+                    return Ok(());
                 }
-                Err(self.error("E0401", format!("unknown identifier '{name}'"), span))
+                // Static methods/on blocks have no instance receiver. Use
+                // the same declaring-owner walk as reads, including parents.
+                if let Some(owner) = self.bare_static_field_owner(me, name) {
+                    let declared = self
+                        .static_fields
+                        .get(&owner)
+                        .and_then(|fields| fields.iter().find(|field| field.name == *name))
+                        .map(|field| field.ty.clone());
+                    let value = self.bind_slot_value(value, declared.as_ref(), span)?;
+                    self.statics
+                        .entry(owner)
+                        .or_default()
+                        .insert(name.clone(), value);
+                    return Ok(());
+                }
+                Err(self.error(
+                    "E0401",
+                    if me.is_some() {
+                        format!("unknown field '{name}'")
+                    } else {
+                        format!("unknown identifier '{name}'")
+                    },
+                    span,
+                ))
             }
             Expr::MemberAccess { object, name, .. } => {
                 // `unit.port$ = value` — simple_port write.
@@ -13712,7 +14764,7 @@ fn wrap_to_width(value: i128, bits: u32, unsigned: bool) -> i128 {
 
 /// Intersection of two canonical interval sets (sorted, disjoint): a
 /// two-pointer sweep; the result is canonical again.
-fn intersect_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
+pub(crate) fn intersect_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
     let mut result = Vec::new();
     let mut i = 0usize;
     let mut j = 0usize;
@@ -13733,7 +14785,7 @@ fn intersect_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128,
 
 /// Union of two canonical interval sets: concatenation plus the
 /// canonicalization merge.
-fn union_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
+pub(crate) fn union_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
     let mut all = a.to_vec();
     all.extend_from_slice(b);
     canonical_set(all)
@@ -13741,7 +14793,10 @@ fn union_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i12
 
 /// The complement of a canonical interval set within `domain` (the
 /// field type's full range): the gaps between the set's intervals.
-fn complement_interval_set(set: &[(i128, i128)], domain: (i128, i128)) -> Vec<(i128, i128)> {
+pub(crate) fn complement_interval_set(
+    set: &[(i128, i128)],
+    domain: (i128, i128),
+) -> Vec<(i128, i128)> {
     let mut result = Vec::new();
     let mut cursor = domain.0;
     for &(low, high) in set {
@@ -14171,7 +15226,7 @@ fn rgf_atom_side(
 
 /// Canonicalize intervals (5.2.12): sort, merge overlapping and
 /// neighboring ones, drop empties.
-fn canonical_set(mut intervals: Vec<(i128, i128)>) -> Vec<(i128, i128)> {
+pub(crate) fn canonical_set(mut intervals: Vec<(i128, i128)>) -> Vec<(i128, i128)> {
     intervals.retain(|(lo, hi)| lo <= hi);
     intervals.sort();
     let mut merged: Vec<(i128, i128)> = Vec::new();

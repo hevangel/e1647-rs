@@ -21,8 +21,8 @@
 > `chosen_from`, custom numeric types, tables, annotations, the clause
 > 33 resource-sharing structs (`semaphore`/`rdv_semaphore`/`locker`),
 > and the reflection catalogue with `instance_iterator`. A full type
-> system (a conservative definite-mismatch check includes coverage items,
-> typed parameters and inferred locals),
+> system (a conservative definite-mismatch check includes coverage items
+> and Boolean options, typed parameters and inferred locals),
 > full temporal value history, general constraint solving and general
 > testbench execution do **not** exist yet, and no
 > IEEE conformance is claimed.
@@ -30,6 +30,18 @@
 Temporal rules and waits retain sampled proposition and repeat-bound
 values, so later state matching uses the recorded values. Raw temporal
 `change`/`rise`/`fall` expressions remain unsupported.
+
+Type checking traverses nested value operands, `evaluate` and `new ... with`
+bodies, statement values, and temporal rule/wait values. Explicit evaluate,
+bit-slice and table-test results retain known kinds. Registered `Type::field`
+accesses and `Type::method(...)` signatures also retain kinds, and static
+bodies use their declaring namespace without an instance. Bare static method
+calls remain unsupported; use the qualified form. Contextual inference and
+complete name resolution remain unfinished.
+
+Scalar/list/reference aliases default through their declared representation.
+Defaulting more than 64 aliases reports a bounded diagnostic; cyclic default
+chains are rejected by that bound.
 
 List extrema `min`, `max`, `min_index` and `max_index` accept an optional
 per-item key expression such as `it.score`. They return the selected
@@ -54,8 +66,63 @@ without clearing counts; `count_only` also collects counts. Boolean
 values can enable or disable collection. The bucket limit accepts
 0–65536 and can change before the first sampling event. Other
 configuration categories/options and `set_config_max` remain unsupported.
+`set_config(cover, at_least, N)` sets the default hit goal before sampling.
+Range goals override item goals, which override group/global defaults.
+Integral ranges support a bucket width and per-range goal, for example
+`range([0..9], "", 3, 2)` creates buckets 0–2, 3–5, 6–8 and 9, each
+with goal 2. A named range uses `UNDEF` for its width. Zero-goal buckets
+retain counts but do not contribute to bucket grades or show holes.
+Explicit range construction is limited to 65536 buckets per item;
+real/enumeral bounds and general constant/type resolution remain gaps.
 Run the independently authored example with
 `cargo run -- run examples/coverage_config.e --seed 1 --coverage`.
+The range example is `examples/coverage_ranges.e`.
+
+Basic items accept `ignore` and `illegal` Boolean predicates over their own
+value and constants. Per-unit `instance_ignore` and `instance_illegal`
+also bind `inst` to the containing unit. Excluded observations do not add
+hits or derived combinations; wholly excluded buckets leave grades and
+holes. Illegal observations add DUT errors after check hooks by default;
+`set_config(cover, check_illegal_immediately, TRUE)` reports them at sampling.
+The example is `examples/coverage_effects.e`. Simultaneous ignore/illegal
+matches currently prefer ignore; this policy and deferred phase ordering
+have not been compared against Specman.
+
+Cross/transition `ignore` and `illegal` predicates can use participating
+basic scalar items. Transitions also bind `prev_<source>` to the previous
+sampled value, even inside one bucket. Instance variants additionally bind
+`inst`. Excluded observations do not reach child items; wholly excluded
+combinations leave grades. Integral/Boolean classifiers use interval proofs
+for supported comparisons, logic, membership and safe arithmetic, then split
+uncertain ranges and test concrete witnesses. The per-item refresh budget is
+65536 scalar-domain work units, including proofs and concrete checks; excess
+work reports E0402. See `examples/coverage_domain_proofs.e` for wide ranges.
+Real/string/enumeral sources filter observations without finite grades.
+Composite-valued predicate operands remain unsupported; whole-node constant
+filters work over nested sources. See `examples/derived_effects.e`.
+
+Crosses and transitions accept their own `when`, `no_collect`,
+`instance_no_collect`, `at_least` and `weight` options. A filtered transition
+still follows consecutive legal source observations. Derived goals inherit
+item → group → runtime precedence; zero goals are ungraded, and hidden
+items leave group grades. Crosses and transitions can consume previously
+named basic, cross or transition items in the same group. Nested histories
+preserve bucket identities and per-unit masks; filtered parents provide no
+fresh child source. E0224 diagnoses unknown/forward references, duplicate
+names and malformed source counts. Expanded tuples are limited to 65536
+scalar components; this is a resource bound, not a standard restriction.
+Run `examples/coverage_derived.e` for a filtered cross/transition example
+and `examples/coverage_graphs.e` for nested transition history.
+
+Coverage groups can use `per_unit_instance` (or
+`per_unit_instance = unit_type`) to keep separate counts for containing
+units. Group/basic-item `when` expressions filter sampling; per-unit
+`instance_no_collect = inst.flag` expressions filter presentation.
+`no_collect` hides an item while preserving its values for crosses and
+transitions. See `examples/coverage_units.e` for a runnable unit example.
+Scope follows the field tree under `sys`; shared objects use their first
+visited path, with the existing bounded instance walk. A detached owner
+without the requested containing unit reports an error.
 
 ## From Slopman to Rustman
 

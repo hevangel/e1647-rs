@@ -1,0 +1,5 @@
+9:25: error[E0220]: variable initialization: a value of kind 'int' cannot be stored into 'string'
+10:23: error[E0220]: argument: a value of kind 'string' cannot be stored into 'int'
+11:23: error[E0223]: the left operand of the arithmetic operator is 'string' — a number is required
+12:18: error[E0221]: 'child_s' has no field or method 'absent'
+13:37: error[E0223]: the left operand of the arithmetic operator is 'string' — a number is required
