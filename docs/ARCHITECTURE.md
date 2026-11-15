@@ -516,7 +516,7 @@ browser sandbox API is not started.
   their own samples before global cycles close (including inline time
   advances) and at quit. Runtime rules are materialized once per physical
   created instance, including later allocations, with independent monitor,
-  sample context and birth-cycle log window. Uninstantiated types create no
+  sample context and registration-cycle log window. Uninstantiated types create no
   monitors. Failure actions execute on the declaring instance. A wait's
   age survives repeated checks, while the next span/start gets a fresh budget. The pure core reads these historical values,
   and numeric repeats read their bound at the path's starting state;
