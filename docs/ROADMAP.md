@@ -398,9 +398,14 @@ not imply full language support or IEEE conformance.
       in value expressions, unresolved receiver types and `on` blocks
       remain atomic. Combined execution/typing fixtures verify saved parameter
       and return metadata through nested waits, resource calls, entry events
-      and composed bodies. Compute arguments receive parameter hints; root
-      event emissions share bare/sys-qualified log spellings without duplicate
-      on/coverage processing. General per-instance event identity remains a gap
+      and composed bodies. Compute arguments receive parameter hints. Physical
+      event identities isolate owners across waits/entry clocks/edge sampling;
+      bare/dotted/alias spellings agree without duplicate on/coverage work.
+      Callee parameter scopes bind entry events. Each created instance owns
+      rule monitors and failure/sample contexts; new instances join monitoring.
+      Static temporal event paths parse. Rechecked waits preserve age and new
+      waits reset it. Active event-reference rebinding, indexed temporal path
+      syntax and complete event-specific timelines remain gaps
 - [~] Coverage data model and reports — started: `src/coverage.rs`
       builds buckets and grades from the recorded groups (14.3's
       ranges/defaults, 14.6 merging), the interpreter samples on the

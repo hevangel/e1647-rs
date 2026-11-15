@@ -27,8 +27,9 @@ use std::collections::BTreeSet;
 
 /// One state of a path (12.1.1.9): which events occurred in this
 /// sampling period, plus scoped proposition and numeric-bound samples.
-/// Event paths are dotted strings (`"sys.any"`, `"clk"`), matching
-/// [`TemporalExpr::EventRef`] paths.
+/// Event identities are opaque string keys matching EventRef paths.
+/// External callers may use dotted names; the interpreter binds physical
+/// instance keys before feeding this pure core.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct State {
     occurred: BTreeSet<String>,

@@ -497,10 +497,16 @@ browser sandbox API is not started.
   park through the scheduler's event wake pass. Compute argument evaluation
   uses the same pure parameter-context lookup as ordinary/started calls.
   Parameter/return metadata survives nested suspension and composed-body
-  transitions. A resolved sys event records and wakes both bare and
-  sys-qualified spellings. On actions execute once, and coverage selects
-  matching root groups once; aliases do not duplicate samples. Arbitrary
-  instance/event-path equivalence remains incomplete. Value-expression calls,
+  transitions. Instance event keys encode physical owner plus event/port
+  name. Static event keys retain Type::event; bare/dotted/me/self/alias paths
+  bind in the owning frame. Emission receiver expressions evaluate once and
+  on/coverage processing occurs once for the physical owner. TCM entry paths
+  bind to the callee and already evaluated parameter values, not its caller.
+  Temporal expressions bind dotted event paths at rule registration or wait
+  entry, retaining those identities through suspension; the pure core still
+  accepts opaque string event keys. Static temporal paths use one
+  type-qualified segment. Indexed temporal path syntax and active event
+  reference rebinding remain unsupported. Value-expression calls,
   receivers whose types cannot be resolved before evaluation, `on`
   blocks and check failure bodies remain atomic. Temporal waits
   (`@event`, sequences, propositions, event
@@ -508,7 +514,11 @@ browser sandbox API is not started.
   every turn (12.3.2); propositions and repeat bounds retain sampled
   results in each state, scoped to the individual wait. Rules retain
   their own samples before global cycles close (including inline time
-  advances) and at quit. The pure core reads these historical values,
+  advances) and at quit. Runtime rules are materialized once per physical
+  created instance, including later allocations, with independent monitor,
+  sample context and birth-cycle log window. Uninstantiated types create no
+  monitors. Failure actions execute on the declaring instance. A wait's
+  age survives repeated checks, while the next span/start gets a fresh budget. The pure core reads these historical values,
   and numeric repeats read their bound at the path's starting state;
   callbacks remain available for external caller-supplied paths. Missing
   history does not fall back to present-day values. This is expression
@@ -626,8 +636,9 @@ Remaining boundaries (the detailed behavior inventory is in STATUS.md):
   suspend with saved frames. Temporal histories still share one global
   timeline; per-instance/event-specific compound timelines, edge-width
   legality, real/MVL/custom-numeric edges and distinct same-cycle samples
-  remain gaps. Bare/sys root-event aliases do not resolve arbitrary instance
-  event identity. Precise e/HDL event ordering remains unfinished.
+  remain gaps. Dotted physical event identity is resolved; indexed temporal
+  paths and rebinding event references during active attempts remain gaps.
+  Precise e/HDL event ordering remains unfinished.
 - The remaining coverage semantics: composite-valued predicates, mixed
   composite classification, real/enumeral ranges, full option/domain typing,
   general constant/type resolution and radix/never behavior. Basic and derived

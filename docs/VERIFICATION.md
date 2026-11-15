@@ -4748,3 +4748,69 @@ General expression continuations, name resolution/types, general solving,
 remaining coverage/libraries, per-instance temporal/event identity, precise
 HDL ordering and browser runtime qualification remain unfinished. No IEEE
 conformance is claimed.
+
+
+## 2026-11-15 — instance event identities and rule ownership
+
+Instance events (11.1–11.2, 12.2.5) now use a physical owner plus event/port
+name as their internal log/wake key. Bare, dotted, me/self and object-alias
+references resolve to that identity; same-named events on distinct instances
+remain separate. Static event identities stay type-qualified. The temporal
+parser accepts Type::event paths, including static object fields followed by
+an instance event. The pure temporal core retains its opaque string-key API.
+
+Emission receiver expressions, including calls and indexes, evaluate once.
+Their spelling is only a label; the resolved owner drives wake-up, on actions
+and coverage collection. Invalid non-object receivers report E0402 at their
+member expression. Parenthesized static emissions retain static dispatch.
+TCM entry events bind in the callee/prototype parameter scope using already
+evaluated arguments, for both started and nested compute calls. Every-cycle
+standalone event references bind to the global cycle atom.
+
+Rules (11.4) are materialized once per created physical instance, rather
+than once per declared type with every expression/failure body evaluated on
+sys. Each owns a monitor, expression-sampling context, registration-cycle
+window and retirement flag. Later allocations join monitoring; declarations
+without instances create no monitors. Aliases do not duplicate monitors.
+Inherited rules apply to their actual derived instances. Wait event paths bind
+at entry and retain their identity across resumption. Rules bind event paths
+at registration; active reference rebinding remains outside this subset.
+
+A suspended wait previously reset its age on every recheck, bypassing the
+existing 1000-cycle wait guard until the global 5000-cycle budget. Its span
+and starting state now distinguish continued checks from a new wait. The
+wrong-owner fixture expires at cycle 1002 after 1001 waiting cycles; a separate
+fixture completes two successive waits whose total duration exceeds 1000
+cycles while each remains within its own budget. These are implementation
+resource limits, not a standard-language timeout rule.
+
+Fifteen independently authored fixture sets under
+`tests/fixtures/instance-events/` cover owner isolation, receiver/local aliases,
+already-emitted entry clocks, me/self, parameter clocks, per-instance rule
+expressions and failure actions, unused declarations, clocked edge histories,
+late-created objects, inherited rules and alias deduplication, static versus
+instance events, static object fields, event ports, single evaluation of
+call/index receivers, exact receiver/timeout diagnostics and wait-age reset.
+All pass parsing/elaboration/conservative typing. Thirteen execute through the
+native CLI with exact output; two use native diagnostic goldens. A second test
+asserts coverage samples exactly twice for sys.a and once for sys.b across
+aliased emissions. Existing fixture goldens remain unchanged.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 493 passed, 0 failed (24 test binaries).
+- `cargo test --test instance_events` — 2 passed, 0 failed, covering all
+  fifteen fixture sets and the coverage-owner assertions.
+- `git diff --check` — passed.
+
+Reference scope: independently authored behavior tests against the existing
+2019 event, temporal-member and TCM model; no new standard text or vendor
+output was copied, and no external pins changed. No Specman comparison,
+local all-feature run or WASM runtime run was performed. Indexed temporal
+path syntax, rebinding event references during active attempts, unresolved
+path/name resolution, first-class event values, distinct same-cycle samples,
+full event-specific compound timelines and precise HDL event ordering remain
+gaps. One global cycle log is still used despite independent owner identities
+and rule/wait sampling contexts. No IEEE conformance is claimed.

@@ -79,10 +79,16 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   are retained across resumption. Calls embedded in value expressions
   and receivers whose type cannot be resolved before evaluation still
   use atomic dispatch. Compute arguments receive declared parameter hints,
-  including contextual constructors and evaluate expressions. Emissions whose
-  owner resolves to sys share bare and sys-qualified log/wake spellings;
-  on actions and coverage sample once. Other instances retain the existing
-  path model; this does not provide general per-instance event identity.
+  including contextual constructors and evaluate expressions. Physical event
+  keys distinguish owners and unify bare/dotted/alias references. Emission
+  receivers evaluate once, including calls/indexes; on actions and coverage
+  sample once. Entry events bind in the callee's owner/parameter scope.
+  Static Type::event paths also parse in temporal expressions. Every created
+  instance owns rule monitors and expression/failure-action contexts; new
+  instances join monitoring, while unused declarations create no monitors.
+  Event references bind at wait/rule entry. Active reference rebinding,
+  indexed temporal path syntax and full event-specific timelines remain gaps.
+  A suspended wait keeps its age across rechecks; successive waits reset it.
 - **Membership.** Scalar/list membership (4.11.6) executes over lists and
   integer/Boolean/enumeral sets. List-to-list containment is order-independent
   and requires distinct matches for repeated left values. Iterative matching
@@ -230,8 +236,8 @@ reading, nothing else.
   waits sample when checked, with a separate context for each suspended
   wait. Rescans use those recorded values, including through mutable
   list references. This is expression-result history, not an arbitrary
-  snapshot of every variable or a general event-specific/per-instance
-  timeline. Real/MVL/custom-numeric edges and static edge-width checks
+  snapshot of every variable or a general event-specific timeline. Physical
+  event/rule ownership is per instance, but all use one global cycle log. Real/MVL/custom-numeric edges and static edge-width checks
   remain unsupported. Multiple occurrences in one virtual cycle collapse
   to the cycle's sample.
   Unbounded obligation windows exhaust when the run ends — that is the

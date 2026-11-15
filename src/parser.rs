@@ -2872,6 +2872,12 @@ impl Parser {
         let (start, _) = self.current_span();
         let (first, _) = self.expect_word("E0102", "expected the event name after '@'")?;
         let mut first = first;
+        if self.eat_punct("::") {
+            let (event, _) =
+                self.expect_word("E0102", "expected a static event name after '::'")?;
+            first.push_str("::");
+            first.push_str(&event);
+        }
         while self.at_punct("$") {
             self.bump();
             first.push('$');

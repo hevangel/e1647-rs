@@ -61,9 +61,17 @@ Statement-position calls and `compute` preserve nested callee frames
 across waits and blocking resource calls. Calls inside value expressions
 and receivers whose types cannot be resolved before evaluation remain
 atomic. Compute arguments now receive the same declared parameter contexts
-as ordinary/started calls. Root-event emissions are visible under both bare
-and `sys.event` spellings; hooks and coverage still run once per emission.
-General per-instance event identity remains incomplete.
+as ordinary/started calls. Instance events use physical owner identities:
+bare, dotted and object-alias references resolve to the same event, while
+same-named events on different instances stay separate. Emission receivers
+(including indexed/call receivers) evaluate once; hooks and coverage sample
+once. Static event paths also work in temporal expressions.
+
+Each created instance owns its expect/assume monitors and expression samples;
+failure actions run on that instance. Newly created instances join monitoring,
+and declarations without instances create no monitors. Event paths bind when
+waits/rules begin; rebinding during an active attempt, full event-specific
+timelines and multiple distinct samples within one cycle remain gaps.
 
 List extrema `min`, `max`, `min_index` and `max_index` accept an optional
 per-item key expression such as `it.score`. They return the selected

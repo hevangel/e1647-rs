@@ -520,6 +520,15 @@ struct Frame {
     return_type: Option<TypeExpr>,
 }
 
+struct InstanceRule {
+    declaration: crate::ast::ExpectDecl,
+    owner: usize,
+    te: crate::ast::TemporalExpr,
+    monitor: crate::temporal::RuleMonitor,
+    start: usize,
+    retired: bool,
+}
+
 struct TemporalEdgeHistory {
     context: u64,
     routine: crate::ast::EdgeRoutine,
@@ -807,11 +816,12 @@ struct Interp<'a> {
     port_edges: BTreeMap<(String, String), String>,
     /// The run's temporal log (clause 12): one state per virtual cycle,
     /// recording which events occurred in it. `emit` writes here and
-    /// temporal `wait`s and `expect` rules read it. One global
-    /// timeline: all events share the per-cycle states.
+    /// temporal waits and per-instance rules read it. Physical instance
+    /// event keys isolate owners; events still share one global cycle log.
     temporal_log: Vec<crate::temporal::State>,
-    temporal_rule_owner: Option<usize>,
-    retired_temporal_rules: BTreeSet<u64>,
+    instance_rules: Vec<InstanceRule>,
+    next_rule_instance: usize,
+    rules_enabled: bool,
     sampling_temporal: bool,
     temporal_wait_contexts: BTreeMap<(Option<u64>, usize, usize, Option<usize>), u64>,
     next_temporal_context: u64,
@@ -1248,8 +1258,9 @@ fn run_inner(
         sim_prev: BTreeMap::new(),
         port_edges: collect_port_edge_attributes(elaborated),
         temporal_log: Vec::new(),
-        temporal_rule_owner: None,
-        retired_temporal_rules: BTreeSet::new(),
+        instance_rules: Vec::new(),
+        next_rule_instance: 0,
+        rules_enabled: false,
         sampling_temporal: false,
         temporal_wait_contexts: BTreeMap::new(),
         next_temporal_context: 1u64 << 32,
@@ -1441,19 +1452,8 @@ fn run_inner(
     interp.sample_sim_events();
     // The clause 11.4 live monitoring: one pass per scheduler cycle
     // boundary, over every not-yet-fired rule.
-    let expects: Vec<&crate::ast::ExpectDecl> = elaborated
-        .types
-        .iter()
-        .flat_map(|t| t.expects.iter())
-        .collect();
-    let mut expect_fired = vec![false; expects.len()];
-    // One streaming monitor per rule: the live passes feed it the run
-    // log incrementally and the quit pass reads its end-of-run verdict.
-    let mut rule_monitors: Vec<crate::temporal::RuleMonitor> = expects
-        .iter()
-        .map(|rule| crate::temporal::RuleMonitor::new(&rule.te))
-        .collect();
-    interp.temporal_rule_owner = Some(sys_index);
+    interp.rules_enabled = true;
+    interp.refresh_instance_rules();
     while !interp.coroutines.is_empty() && !interp.stop_requested {
         // The clause 33 wake pass: a blocking call parked a coroutine on
         // a sync object; service the oldest waiter whose condition
@@ -1484,13 +1484,7 @@ fn run_inner(
             // unsatisfiable over the log prefix fires here — the failure
             // is reported (else body runs, DUT error counted) at the
             // cycle it became certain, not deferred to quit.
-            check_expect_rules(
-                &mut interp,
-                &expects,
-                &mut expect_fired,
-                &mut rule_monitors,
-                sys_index,
-            );
+            check_expect_rules(&mut interp, false);
             let mut expired = Vec::new();
             for (position, co) in interp.coroutines.iter_mut().enumerate() {
                 if co.suspended_temporal {
@@ -1519,6 +1513,7 @@ fn run_inner(
         interp.exec_context.clear();
         interp.pending_wake_sync = None;
         interp.current_coroutine_id = Some(co.id);
+        let previous_wait = (co.suspended_temporal, co.span, co.wait_start);
         interp.resume_wait_start = co.wait_start.take();
         let name = match &co.kind {
             CoroutineKind::Main { .. } => "run".to_owned(),
@@ -1533,7 +1528,13 @@ fn run_inner(
         match outcome {
             TurnOutcome::Complete => interp.retire_temporal_waits(co.id),
             TurnOutcome::Suspended => {
-                co.temporal_waited = 0;
+                // Rechecking the same wait must not restart its age guard.
+                // A later wait gets its own span/start and a fresh budget.
+                if !co.suspended_temporal
+                    || previous_wait != (co.suspended_temporal, co.span, co.wait_start)
+                {
+                    co.temporal_waited = 0;
+                }
                 interp.coroutines.push(co);
             }
             TurnOutcome::Error(diagnostic) => {
@@ -1571,13 +1572,7 @@ fn run_inner(
     // the obligation windows exhaust when the run ends — the earliest
     // sound closure point).
     interp.sample_rule_values();
-    check_expect_rules_at_quit(
-        &mut interp,
-        &expects,
-        &mut expect_fired,
-        &mut rule_monitors,
-        sys_index,
-    );
+    check_expect_rules(&mut interp, true);
     // The finalize phase (28.3.3.8): `quit()` then `finalize()` on every
     // live instance, depth-first, sys first.
     if !interp.stop_requested {
@@ -1627,41 +1622,35 @@ fn origin() -> Position {
 /// retires — it is not re-checked. A rule whose TE cannot be evaluated
 /// over the log reports the gap honestly and retires too, so the live
 /// pass never spams.
-fn check_expect_rules(
-    interp: &mut Interp,
-    expects: &[&crate::ast::ExpectDecl],
-    expect_fired: &mut [bool],
-    rule_monitors: &mut [crate::temporal::RuleMonitor],
-    sys_index: usize,
-) {
-    for (rule_index, expect_rule) in expects.iter().enumerate() {
-        if expect_fired[rule_index] || interp.stop_requested {
+fn check_expect_rules(interp: &mut Interp, at_quit: bool) {
+    interp.refresh_instance_rules();
+    for context in 0..interp.instance_rules.len() {
+        if interp.instance_rules[context].retired || interp.stop_requested {
             continue;
         }
-        let kind = format!("{:?}", expect_rule.kind).to_lowercase();
-        let callbacks = historical_temporal_callbacks(rule_index as u64);
-        // The monitor consumes only FINALIZED states: the current
-        // cycle's state is still in progress (this cycle's emits record
-        // into it during turns), so it is handed over at the next
-        // boundary, after the cycle closed. The state index equals the
-        // cycle (pad_log keeps one state per cycle).
-        let final_len = (interp.cycle as usize).min(interp.temporal_log.len());
-        match rule_monitors[rule_index].observe(&interp.temporal_log[..final_len], &callbacks) {
-            Ok(true) => {
-                // The live fire: the streaming monitor matched the
-                // forbidden behavior of an invariant rule — the same
-                // prefix-certain verdict the previous full-rescan pass
-                // computed, now incremental.
-                fire_expect_rule(interp, expect_rule, &kind, sys_index);
-                expect_fired[rule_index] = true;
-                interp.retired_temporal_rules.insert(rule_index as u64);
+        let callbacks = historical_temporal_callbacks(context as u64);
+        let end = if at_quit {
+            interp.temporal_log.len()
+        } else {
+            (interp.cycle as usize).min(interp.temporal_log.len())
+        };
+        let rule = &mut interp.instance_rules[context];
+        let start = rule.start.min(end);
+        let verdict = rule
+            .monitor
+            .observe(&interp.temporal_log[start..end], &callbacks);
+        let kind = format!("{:?}", rule.declaration.kind).to_lowercase();
+        match verdict {
+            Ok(failed) => {
+                if failed || (at_quit && rule.monitor.failed_at_end()) {
+                    rule.retired = true;
+                    let owner = rule.owner;
+                    let declaration = rule.declaration.clone();
+                    fire_expect_rule(interp, &declaration, &kind, owner);
+                }
             }
-            Ok(false) => {}
             Err(err) => {
-                // The rule cannot be evaluated over the log: report the
-                // gap honestly, once, and retire the rule.
-                expect_fired[rule_index] = true;
-                interp.retired_temporal_rules.insert(rule_index as u64);
+                rule.retired = true;
                 interp.output.push_str(&format!(
                     "{kind} rule cannot be evaluated over the run: {err:?}\n"
                 ));
@@ -1671,13 +1660,13 @@ fn check_expect_rules(
 }
 
 /// Fire one expect/assume rule's failure: the `else` body runs on the
-/// sys instance (or, without one, the failure itself is the check
+/// declaring instance (or, without an else body, the failure is the check
 /// error, 11.4).
 fn fire_expect_rule(
     interp: &mut Interp,
     expect_rule: &crate::ast::ExpectDecl,
     kind: &str,
-    sys_index: usize,
+    owner: usize,
 ) {
     if expect_rule.else_body.is_empty() {
         // No `dut_error` clause: the failure itself is the check error
@@ -1688,8 +1677,7 @@ fn fire_expect_rule(
         ));
     } else {
         let mut frame = Frame::default();
-        if let Err(diagnostic) =
-            interp.exec_block(&expect_rule.else_body, &mut frame, Some(sys_index))
+        if let Err(diagnostic) = interp.exec_block(&expect_rule.else_body, &mut frame, Some(owner))
         {
             interp
                 .output
@@ -1698,46 +1686,9 @@ fn fire_expect_rule(
     }
 }
 
-/// The quit-time re-check of the expect/assume rules the live passes
-/// (one per scheduler cycle boundary) did not already fire — 12.3.3:
-/// the rule fails where all possibilities to satisfy it are exhausted.
-/// The `else` body (usually a `dut_error` call) runs on
-/// the sys instance; without one, the failure itself is the check
-/// error. Rules whose TE cannot be evaluated over the log report the
-/// gap honestly.
-fn check_expect_rules_at_quit(
-    interp: &mut Interp,
-    expects: &[&crate::ast::ExpectDecl],
-    expect_fired: &mut [bool],
-    rule_monitors: &mut [crate::temporal::RuleMonitor],
-    sys_index: usize,
-) {
-    for (rule_index, expect_rule) in expects.iter().enumerate() {
-        if expect_fired[rule_index] || interp.stop_requested {
-            continue;
-        }
-        let kind = format!("{:?}", expect_rule.kind).to_lowercase();
-        let callbacks = historical_temporal_callbacks(rule_index as u64);
-        // The monitor catches any log growth since the last boundary,
-        // then its end-of-run verdict decides (equivalent to the
-        // previous whole-log `rule_failed` re-scan).
-        match rule_monitors[rule_index].observe(&interp.temporal_log, &callbacks) {
-            Ok(_) => {}
-            Err(err) => {
-                expect_fired[rule_index] = true;
-                interp.retired_temporal_rules.insert(rule_index as u64);
-                interp.output.push_str(&format!(
-                    "{kind} rule cannot be evaluated over the run: {err:?}\n"
-                ));
-                continue;
-            }
-        }
-        if rule_monitors[rule_index].failed_at_end() {
-            fire_expect_rule(interp, expect_rule, &kind, sys_index);
-            expect_fired[rule_index] = true;
-            interp.retired_temporal_rules.insert(rule_index as u64);
-        }
-    }
+/// Internal physical event identity. The prefix cannot be an e identifier.
+fn instance_event_key(owner: usize, name: &str) -> String {
+    format!("#{owner}::{name}")
 }
 
 fn origin_span() -> crate::ast::Span {
@@ -3090,6 +3041,10 @@ impl<'a> Interp<'a> {
                 }
             },
             Stmt::Emit { target, span } => {
+                let mut target = target;
+                while let Expr::Paren { expr, .. } = target {
+                    target = expr;
+                }
                 // 11.1.3.2: emit causes the event to occur; the action
                 // itself does not consume time.
                 if let Expr::StaticAccess {
@@ -3101,8 +3056,7 @@ impl<'a> Interp<'a> {
                     // instance, the static `on` blocks run with no `me`.
                     self.fire_static_event(type_name, member, *span, frame)?;
                 } else {
-                    let path = self.event_path(target)?;
-                    let owner = self.resolve_event_owner(target, frame, me);
+                    let (path, owner) = self.resolve_emitted_event(target, frame, me)?;
                     self.fire_event(&path, owner, *span, frame)?;
                 }
                 Ok(Flow::Normal)
@@ -3190,18 +3144,17 @@ impl<'a> Interp<'a> {
                 // immediately if the sampling event has already been
                 // emitted for the current tick" — it still runs only
                 // after the starter's turn yields, 17.2.2).
-                let tcm_event = blocks.first().and_then(|block| block.tcm_event.clone());
-                let (wake_event, eligible_at_cycle) =
-                    match tcm_event.map(|event| self.event_path(&event)) {
-                        Some(Ok(path)) if !is_every_cycle_event(&path) => {
-                            if self.event_occurred_this_cycle(&path) {
-                                (None, self.cycle)
-                            } else {
-                                (Some(path), self.cycle + 1)
-                            }
+                let event = self.entry_event_key(&blocks, &values, instance)?;
+                let (wake_event, eligible_at_cycle) = match event {
+                    Some(path) if !is_every_cycle_event(&path) => {
+                        if self.event_occurred_this_cycle(&path) {
+                            (None, self.cycle)
+                        } else {
+                            (Some(path), self.cycle + 1)
                         }
-                        _ => (None, self.cycle + 1),
-                    };
+                    }
+                    _ => (None, self.cycle + 1),
+                };
                 self.coroutines.push(Coroutine {
                     kind: CoroutineKind::Tcm {
                         instance,
@@ -5622,25 +5575,24 @@ impl<'a> Interp<'a> {
                 }
                 // Clause 17.1.2: an inline TCM also synchronizes on
                 // its declared event before its first body action.
-                if let Some(event) = blocks.first().and_then(|block| block.tcm_event.as_ref()) {
-                    let event = self.event_path(event)?;
-                    if !is_every_cycle_event(&event) && !self.event_occurred_this_cycle(&event) {
-                        self.exec_context[call_level].child =
-                            Some(Child::Call(Box::new(call.clone())));
-                        // A synthetic leaf keeps entry distinct from
-                        // the body's first statement on resumption.
-                        self.exec_context.push(PathLevel {
-                            index: 0,
-                            child: None,
-                        });
-                        let flow =
-                            self.suspend_here(caller, call.span, false, self.cycle + 1, true, None);
-                        self.exec_context.pop();
-                        if let Some(pending) = &mut self.pending_suspension {
-                            pending.wake_event = Some(event);
-                        }
-                        return flow;
+                if let Some(event) = self.entry_event_key(&blocks, &call.args, call.receiver)?
+                    && !is_every_cycle_event(&event)
+                    && !self.event_occurred_this_cycle(&event)
+                {
+                    self.exec_context[call_level].child = Some(Child::Call(Box::new(call.clone())));
+                    // A synthetic leaf keeps entry distinct from
+                    // the body's first statement on resumption.
+                    self.exec_context.push(PathLevel {
+                        index: 0,
+                        child: None,
+                    });
+                    let flow =
+                        self.suspend_here(caller, call.span, false, self.cycle + 1, true, None);
+                    self.exec_context.pop();
+                    if let Some(pending) = &mut self.pending_suspension {
+                        pending.wake_event = Some(event);
                     }
+                    return flow;
                 }
                 call.entry_complete = true;
                 resume = None;
@@ -9686,8 +9638,128 @@ impl<'a> Interp<'a> {
         Ok(Value::Void)
     }
 
-    /// Resolve an `emit`/event target expression to its path key.
-    fn event_path(&mut self, target: &Expr) -> Result<String, Diagnostic> {
+    fn entry_event_key(
+        &self,
+        blocks: &[&MethodDecl],
+        args: &[Value],
+        owner: usize,
+    ) -> Result<Option<String>, Diagnostic> {
+        let Some(prototype) = method_prototype(blocks) else {
+            return Ok(None);
+        };
+        let Some(event) = &prototype.tcm_event else {
+            return Ok(None);
+        };
+        let path = self.event_path(event)?;
+        // Entry synchronization precedes the body frame. Object parameters
+        // already have evaluated values; binding their names here is pure.
+        let mut frame = Frame::default();
+        for (parameter, value) in prototype.params.iter().zip(args) {
+            frame.locals.insert(parameter.name.clone(), value.clone());
+        }
+        Ok(Some(self.scoped_event_key(&path, &frame, Some(owner))))
+    }
+
+    fn scoped_event_key(&self, path: &str, frame: &Frame, me: Option<usize>) -> String {
+        if path.starts_with('#') || is_every_cycle_event(path) {
+            return path.to_owned();
+        }
+        let segments: Vec<_> = path.split('.').collect();
+        let name = segments[segments.len() - 1];
+        if segments.len() == 1 {
+            if path.contains("::") {
+                return path.to_owned();
+            }
+            return me.map_or_else(|| path.to_owned(), |owner| instance_event_key(owner, name));
+        }
+        let mut owner = match segments[0] {
+            "sys" => self
+                .instances
+                .iter()
+                .position(|instance| instance.type_name == "sys"),
+            "me" | "self" => me,
+            first => {
+                if let Some((type_name, field)) = first.split_once("::") {
+                    match self
+                        .statics
+                        .get(type_name)
+                        .and_then(|fields| fields.get(field))
+                    {
+                        Some(Value::Object(owner)) => Some(*owner),
+                        _ => None,
+                    }
+                } else if self.defines.contains_key(first) {
+                    None
+                } else {
+                    match frame
+                        .locals
+                        .get(first)
+                        .or_else(|| me.and_then(|owner| self.instances[owner].get(first)))
+                    {
+                        Some(Value::Object(owner)) => Some(*owner),
+                        _ => None,
+                    }
+                }
+            }
+        };
+        for field in &segments[1..segments.len() - 1] {
+            owner = owner.and_then(|owner| match self.instances[owner].get(field) {
+                Some(Value::Object(owner)) => Some(*owner),
+                _ => None,
+            });
+        }
+        owner.map_or_else(|| path.to_owned(), |owner| instance_event_key(owner, name))
+    }
+
+    fn bind_temporal_events(
+        &self,
+        te: &crate::ast::TemporalExpr,
+        frame: &Frame,
+        me: Option<usize>,
+    ) -> crate::ast::TemporalExpr {
+        use crate::ast::TemporalExpr;
+        let mut bound = te.clone();
+        fn bind(interp: &Interp, te: &mut TemporalExpr, frame: &Frame, me: Option<usize>) {
+            match te {
+                TemporalExpr::EventRef { path } => {
+                    let key = interp.scoped_event_key(&path.join("."), frame, me);
+                    if is_every_cycle_event(&key) {
+                        *te = TemporalExpr::Cycle;
+                    } else {
+                        *path = vec![key];
+                    }
+                }
+                TemporalExpr::Sequence { items } => {
+                    for item in items {
+                        bind(interp, item, frame, me);
+                    }
+                }
+                TemporalExpr::Yield { lhs, rhs }
+                | TemporalExpr::And(lhs, rhs)
+                | TemporalExpr::Or(lhs, rhs) => {
+                    bind(interp, lhs, frame, me);
+                    bind(interp, rhs, frame, me);
+                }
+                TemporalExpr::Not(te)
+                | TemporalExpr::Fail(te)
+                | TemporalExpr::Eventually(te)
+                | TemporalExpr::Repeat { te, .. }
+                | TemporalExpr::Group(te) => bind(interp, te, frame, me),
+                TemporalExpr::Sampled { te, event } => {
+                    bind(interp, te, frame, me);
+                    bind(interp, event, frame, me);
+                }
+                TemporalExpr::Cycle
+                | TemporalExpr::True { .. }
+                | TemporalExpr::EdgeSample { .. } => {}
+            }
+        }
+        bind(self, &mut bound, frame, me);
+        bound
+    }
+
+    /// Render a target spelling before binding it to a physical event key.
+    fn event_path(&self, target: &Expr) -> Result<String, Diagnostic> {
         match target {
             Expr::Ident { name, .. } => Ok(name.clone()),
             Expr::MemberAccess { object, name, .. } => {
@@ -9725,25 +9797,48 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn sample_rule_values(&mut self) {
-        let Some(owner) = self.temporal_rule_owner else {
-            return;
-        };
-        if self.sampling_temporal {
+    fn refresh_instance_rules(&mut self) {
+        if !self.rules_enabled {
             return;
         }
+        while self.next_rule_instance < self.instances.len() {
+            let owner = self.next_rule_instance;
+            self.next_rule_instance += 1;
+            let Some(ty) = self
+                .types
+                .iter()
+                .find(|ty| ty.name == self.instances[owner].type_name)
+            else {
+                continue;
+            };
+            let declarations = ty.expects.clone();
+            for declaration in declarations {
+                let te = self.bind_temporal_events(&declaration.te, &Frame::default(), Some(owner));
+                self.instance_rules.push(InstanceRule {
+                    monitor: crate::temporal::RuleMonitor::new(&te),
+                    declaration,
+                    owner,
+                    te,
+                    start: self.cycle as usize,
+                    retired: false,
+                });
+            }
+        }
+    }
+
+    fn sample_rule_values(&mut self) {
+        if !self.rules_enabled || self.sampling_temporal {
+            return;
+        }
+        self.refresh_instance_rules();
         self.sampling_temporal = true;
-        let types = self.types;
-        for (context, rule) in types.iter().flat_map(|ty| ty.expects.iter()).enumerate() {
-            if self.retired_temporal_rules.contains(&(context as u64)) {
+        for context in 0..self.instance_rules.len() {
+            let rule = &self.instance_rules[context];
+            if rule.retired {
                 continue;
             }
-            self.sample_temporal_values(
-                &rule.te,
-                &mut Frame::default(),
-                Some(owner),
-                context as u64,
-            );
+            let (te, owner) = (rule.te.clone(), rule.owner);
+            self.sample_temporal_values(&te, &mut Frame::default(), Some(owner), context as u64);
         }
         self.sampling_temporal = false;
     }
@@ -9886,31 +9981,18 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
         frame: &mut Frame,
     ) -> Result<(), Diagnostic> {
-        self.emitted.insert(path.to_owned());
+        let key = if is_every_cycle_event(path) {
+            path.to_owned()
+        } else {
+            owner.map_or_else(
+                || path.to_owned(),
+                |owner| instance_event_key(owner, path.rsplit('.').next().unwrap_or(path)),
+            )
+        };
+        self.emitted.insert(key.clone());
         self.pad_log();
-        self.temporal_log[self.cycle as usize].record(path);
-        self.wake_tcm_listeners(path);
-        // Emissions resolved to sys are visible under both e and sys.e
-        // (11.1, 12.2.5), including emits through me/an alias of sys.
-        // Record/wake those log spellings, but run actions and coverage
-        // exactly once below. Other instance events keep their existing
-        // path model; this is not general per-instance event resolution.
-        if owner.is_some()
-            && owner
-                == self
-                    .instances
-                    .iter()
-                    .position(|instance| instance.type_name == "sys")
-        {
-            let name = path.rsplit('.').next().unwrap_or(path);
-            for alias in [name.to_owned(), format!("sys.{name}")] {
-                if alias != path {
-                    self.emitted.insert(alias.clone());
-                    self.temporal_log[self.cycle as usize].record(&alias);
-                    self.wake_tcm_listeners(&alias);
-                }
-            }
-        }
+        self.temporal_log[self.cycle as usize].record(&key);
+        self.wake_tcm_listeners(&key);
         self.run_on_blocks(path, owner, span)?;
         self.sample_cover_groups(path, owner, frame, span);
         Ok(())
@@ -10103,12 +10185,7 @@ impl<'a> Interp<'a> {
         else {
             return;
         };
-        let root_event = (self
-            .instances
-            .iter()
-            .position(|instance| instance.type_name == "sys")
-            == Some(owner))
-        .then(|| path.rsplit('.').next().unwrap_or(path));
+        let key = instance_event_key(owner, path.rsplit('.').next().unwrap_or(path));
         let group_indices: Vec<usize> = self.coverage[entry_index]
             .groups
             .iter()
@@ -10116,10 +10193,7 @@ impl<'a> Interp<'a> {
             .filter(|(_, group)| {
                 group.unit_owner.is_none()
                     && group.event_path.as_deref().is_some_and(|event| {
-                        event == path
-                            || root_event.is_some_and(|name| {
-                                event == name || event.strip_prefix("sys.") == Some(name)
-                            })
+                        self.scoped_event_key(event, &Frame::default(), Some(owner)) == key
                     })
             })
             .map(|(index, _)| index)
@@ -11185,18 +11259,23 @@ impl<'a> Interp<'a> {
             self.next_temporal_context += 1;
             context
         });
+        let bound = self
+            .temporal_wait_sampling
+            .get(&context)
+            .map(|sampling| sampling.te.clone())
+            .unwrap_or_else(|| self.bind_temporal_events(te, frame, me));
         self.temporal_wait_sampling
             .entry(context)
             .and_modify(|sampling| {
                 sampling.frame = frame.clone();
             })
             .or_insert_with(|| TemporalWaitSampling {
-                te: te.clone(),
+                te: bound.clone(),
                 frame: frame.clone(),
                 me,
                 observed: 0,
             });
-        let result = self.temporal_wait_in_context(te, span, frame, me, (start, context));
+        let result = self.temporal_wait_in_context(&bound, span, frame, me, (start, context));
         if !matches!(result, Ok(Flow::Suspend)) {
             self.temporal_wait_contexts.remove(&key);
             self.temporal_wait_sampling.remove(&context);
@@ -11872,29 +11951,34 @@ impl<'a> Interp<'a> {
         (booleans, numerics)
     }
 
-    /// The instance whose `on` blocks an emitted event triggers: the
-    /// enclosing instance for a bare event name (the event is local to
-    /// its struct, clause 11.2), or the object the dotted path reads
-    /// through. `None` when no instance resolves — the firing is still
-    /// recorded, but no `on` blocks run.
-    fn resolve_event_owner(
+    /// Resolve an emitted event's receiver once (11.2). Receiver calls and
+    /// indexes may have effects; their textual spelling is only a label.
+    fn resolve_emitted_event(
         &mut self,
         target: &Expr,
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Option<usize> {
+    ) -> Result<(String, Option<usize>), Diagnostic> {
         match target {
-            Expr::Ident { .. } => me,
-            Expr::MemberAccess { object, .. } => {
-                let object_value = self.eval(object, frame, me).ok()?;
-                match object_value {
-                    Value::Object(index) => Some(index),
-                    _ => None,
-                }
+            Expr::Ident { name, .. } => Ok((name.clone(), me)),
+            Expr::MemberAccess {
+                object, name, span, ..
+            } => {
+                let value = self.eval(object, frame, me)?;
+                let Value::Object(owner) = value else {
+                    return Err(self.error(
+                        "E0402",
+                        "event target requires an object receiver",
+                        *span,
+                    ));
+                };
+                Ok((
+                    self.event_path(target).unwrap_or_else(|_| name.clone()),
+                    Some(owner),
+                ))
             }
-            // A static event has no instance owner.
-            Expr::StaticAccess { .. } => None,
-            _ => None,
+            Expr::Paren { expr, .. } => self.resolve_emitted_event(expr, frame, me),
+            _ => Err(self.error("E0402", "unsupported event target", target.span())),
         }
     }
 
