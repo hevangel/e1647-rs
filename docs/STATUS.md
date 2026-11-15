@@ -50,6 +50,12 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   report their end-of-run verdicts when their windows close. The
   clause 33 blocking TCMs (`up()`/`down()`/`lock()`) yield at the call
   and park blocked calls on a per-object FIFO wake pass.
+  Statement-position method calls and `compute` retain callee frames
+  across suspension, including recursive helpers, composed method
+  bodies and entry-event synchronization. Receivers and arguments
+  are retained across resumption. Calls embedded in value expressions
+  and receivers whose type cannot be resolved before evaluation still
+  use atomic dispatch.
 - **Randomization.** `gen` is a seeded rejection sampler by default;
   for translatable `keep` constraints it solves instead: linear
   problems through the backend conjunction solver (the

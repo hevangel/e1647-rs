@@ -4,8 +4,8 @@ The IEEE 1647-2019 migration phases below are complete; the broader
 milestones remain partial. Recent work adds conservative type checking
 (now including coverage items), bounded polynomial constraint solving
 and streaming temporal rule monitors. Remaining work includes full name
-resolution/type inference, temporal edge expressions, call-stack
-continuations for suspended TCM calls, the remaining coverage options,
+resolution/type inference, temporal edge expressions, expression-value
+continuations for suspended calls, the remaining coverage options,
 general constraint solving, differential qualification, HDL event
 ordering and a browser sandbox API. Completed migration checkboxes do
 not imply full language support or IEEE conformance.
@@ -204,9 +204,11 @@ not imply full language support or IEEE conformance.
       suspension re-entry reaches every compound statement now (waits
       inside `if`/`case`/`for`/`for each`/`repeat until` bodies suspend
       and resume through the statement-path cursor), while re-entry
-      into inline method calls and `compute` (a per-coroutine
-      call-stack continuation behind 13.2.2's return-resumes-callee
-      boundary) is not wired —
+      into statement-position method calls and `compute` preserves
+      callee frames, arguments and composed-body positions, including
+      recursive helpers and blocking resource calls. Calls embedded
+      in value expressions remain atomic; receivers whose object type
+      cannot be resolved before evaluation use ordinary dispatch —
       `detach`/`delay`/`exec` TEs, select
       choice policies beyond the constant-expression subset (the
       full choice-expression grammar and soft-order interactions),
@@ -360,8 +362,10 @@ not imply full language support or IEEE conformance.
       `change`/`rise`/`fall` expressions and event-specific/per-instance
       histories remain gaps. Suspension re-enters compound
       statements, including `if`/`case`/`for`/`for each`/`repeat until`;
-      inline calls and `compute` still need call-stack continuations,
-      and `on` blocks remain atomic
+      statement-position calls and `compute` carry call-stack
+      continuations, including TCM entry-event waits. Calls embedded
+      in value expressions, unresolved receiver types and `on` blocks
+      remain atomic
 - [~] Coverage data model and reports — started: `src/coverage.rs`
       builds buckets and grades from the recorded groups (14.3's
       ranges/defaults, 14.6 merging), the interpreter samples on the
