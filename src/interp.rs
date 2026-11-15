@@ -118,11 +118,13 @@
 //! emit-driven (14.2) and the grade is computed lazily (the report, or
 //! `covers.compute_overall_grade()`).
 //!
-//! The parser's `E0122` (an untyped `evaluate { ... }` whose result type
-//! cannot be inferred, clause 4.17.7) is also raised here: the inference
-//! contexts — the declared type of the assignment/`var` target or of the
-//! call's parameter — resolve at run time, so the diagnostic surfaces
-//! when an evaluation actually reaches the untyped block.
+//! E0122 reports an untyped evaluate without a resolved context (4.17.7).
+//! Variables, assignments, fields, parameters and returns supply scoped hints;
+//! new uses named instance/element contexts too (6.3). Method frames retain
+//! parameter/return metadata across suspension. Calls and expression bodies
+//! establish independent hint scopes. These contextual hints are separate
+//! from the existing arithmetic-precision resolver; full type inference is
+//! still unfinished.
 //!
 //! ## List identity (clause 4.11.4)
 //!
@@ -514,6 +516,8 @@ impl ObjectInstance {
 struct Frame {
     locals: std::collections::HashMap<String, Value>,
     local_types: std::collections::HashMap<String, TypeExpr>,
+    /// Kept with the frame across suspension, independently of caller hints.
+    return_type: Option<TypeExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -890,11 +894,6 @@ struct Interp<'a> {
     /// type from it; every site sets it immediately before its eval call
     /// and restores it afterwards.
     expected_type: Option<TypeExpr>,
-    /// The type name an untyped `new` creates with while the enclosing
-    /// `var x: t = new;` initializer evaluates (clause 18: the
-    /// variable's declared type is the instance's): set just before the
-    /// initializer evaluates, cleared right after.
-    new_type_hint: Option<String>,
     /// Field init-value evaluation failures (clause 6.9.1/6.9.4) that
     /// surfaced where no diagnostic can propagate — instance creation
     /// returns an index, not a `Result`. Drained into the run's
@@ -1262,7 +1261,6 @@ fn run_inner(
         attached_annotations: &elaborated.attached_annotations,
         static_context: None,
         expected_type: None,
-        new_type_hint: None,
         pending_diagnostics: Vec::new(),
         type_port_binds: collect_type_port_binds(elaborated),
         type_port_unbound: collect_type_port_unbound(elaborated),
@@ -1291,7 +1289,7 @@ fn run_inner(
         let value = match &field.init {
             Some(init) => {
                 let mut frame = Frame::default();
-                match interp.eval(init, &mut frame, None) {
+                match interp.eval_with_hint(Some(field.ty.clone()), init, &mut frame, None) {
                     Ok(value) => value,
                     Err(diagnostic) => {
                         interp.pending_diagnostics.push(diagnostic);
@@ -1918,6 +1916,14 @@ fn resolve_method_blocks<'a>(
     Ok(blocks)
 }
 
+fn method_prototype<'a>(blocks: &[&'a MethodDecl]) -> Option<&'a MethodDecl> {
+    blocks
+        .iter()
+        .copied()
+        .find(|block| block.modifier.is_none())
+        .or_else(|| blocks.first().copied())
+}
+
 /// Select the recorded expression values for one rule or wait. Missing
 /// historical samples do not fall back to present-day field values.
 fn historical_temporal_callbacks(context: u64) -> crate::temporal::EvalCallbacks<'static> {
@@ -1957,7 +1963,7 @@ impl<'a> Interp<'a> {
                     // and a custom value copies).
                     Some(init) => {
                         let mut frame = Frame::default();
-                        match self.eval(init, &mut frame, None) {
+                        match self.eval_with_hint(Some(field.ty.clone()), init, &mut frame, None) {
                             Ok(value) => {
                                 match self.bind_slot_value(value, Some(&field.ty), origin_span()) {
                                     Ok(value) => value,
@@ -2036,6 +2042,7 @@ impl<'a> Interp<'a> {
                 .unwrap_or_default();
             self.depth += 1;
             self.atomic_depth += 1;
+            let saved_hint = self.expected_type.take();
             for body in &init_blocks {
                 let mut frame = Frame::default();
                 match self.exec_block(body, &mut frame, Some(index)) {
@@ -2044,6 +2051,7 @@ impl<'a> Interp<'a> {
                     Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
                 }
             }
+            self.expected_type = saved_hint;
             self.atomic_depth -= 1;
             self.depth -= 1;
         }
@@ -2679,40 +2687,9 @@ impl<'a> Interp<'a> {
     ) -> Result<Flow, Diagnostic> {
         match statement {
             Stmt::VarDecl { name, ty, init, .. } => {
-                // `var c: cfg = new;` — an untyped `new` in a var
-                // declaration with a declared struct type takes that
-                // type (clause 6.3's typed creation: the target's type
-                // is known). Other untyped `new` uses keep the explicit
-                // not-supported diagnostic below.
-                let inferred_new: Option<Expr> = match (ty, init) {
-                    (
-                        Some(
-                            var_ty @ TypeExpr::Named { .. } | var_ty @ TypeExpr::TemplateRef { .. },
-                        ),
-                        Some(Expr::New {
-                            ty: None,
-                            inits,
-                            span,
-                        }),
-                    ) => Some(Expr::New {
-                        ty: Some(var_ty.clone()),
-                        inits: inits.clone(),
-                        span: *span,
-                    }),
-                    _ => None,
-                };
-                let mut value = match (&inferred_new, init) {
-                    (Some(new_expr), _) => self.eval(new_expr, frame, me)?,
-                    (None, Some(expr)) => {
-                        // The declared type is the inference context for an
-                        // untyped `evaluate { ... }` in the initializer
-                        // (4.17.7); the `var x := e` form declares none.
-                        self.eval_with_hint(ty.clone(), expr, frame, me)?
-                    }
-                    // A declared type without an initializer takes the
-                    // type's default; the type-inferring `:=` form
-                    // always carries an initializer.
-                    (None, None) => match ty {
+                let mut value = match init {
+                    Some(expr) => self.eval_with_hint(ty.clone(), expr, frame, me)?,
+                    None => match ty {
                         Some(ty) => self.default_for(ty),
                         None => {
                             return Err(self.error(
@@ -2756,7 +2733,7 @@ impl<'a> Interp<'a> {
                 // The target's declared type is the inference context for
                 // an untyped `evaluate { ... }` in the assigned value
                 // (4.17.7).
-                let hint = self.static_type_of(target, frame, me);
+                let hint = self.contextual_type_of(target, frame, me);
                 let value = self.eval_with_hint(hint, value, frame, me)?;
                 match target {
                     Expr::HdlPath { path, span } => {
@@ -2831,7 +2808,9 @@ impl<'a> Interp<'a> {
             }
             Stmt::Return { value, .. } => {
                 let value = match value {
-                    Some(expr) => self.eval(expr, frame, me)?,
+                    Some(expr) => {
+                        self.eval_with_hint(frame.return_type.clone(), expr, frame, me)?
+                    }
                     None => Value::Void,
                 };
                 Ok(Flow::Return(value))
@@ -3098,9 +3077,19 @@ impl<'a> Interp<'a> {
                 let Expr::Call { callee, args, .. } = call else {
                     return Err(self.error("E0402", "start expects a method call", *span));
                 };
+                let hints = if args.iter().any(expr_needs_context) {
+                    self.call_arg_hints(callee, args.len(), frame, me)
+                } else {
+                    Vec::new()
+                };
                 let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval(arg, frame, me)?);
+                for (index, arg) in args.iter().enumerate() {
+                    values.push(self.eval_with_hint(
+                        hints.get(index).cloned().flatten(),
+                        arg,
+                        frame,
+                        me,
+                    )?);
                 }
                 let (instance, name) = match callee.as_ref() {
                     Expr::Ident { name, .. } => {
@@ -3933,7 +3922,8 @@ impl<'a> Interp<'a> {
                 span,
             ));
         };
-        let value = self.eval(value, frame, me)?;
+        let hint = self.contextual_type_of(target, frame, me);
+        let value = self.eval_with_hint(hint, value, frame, me)?;
         let numeric = match &value {
             Value::Int(v) => *v,
             Value::Bool(b) => *b as i128,
@@ -5441,7 +5431,11 @@ impl<'a> Interp<'a> {
         }) {
             return Ok(None);
         }
-        let hints = self.call_arg_hints(callee, args.len(), frame, me);
+        let hints = if args.iter().any(expr_needs_context) {
+            self.call_arg_hints(callee, args.len(), frame, me)
+        } else {
+            Vec::new()
+        };
         let mut values = Vec::with_capacity(args.len());
         for (index, arg) in args.iter().enumerate() {
             values.push(self.eval_with_hint(
@@ -5461,6 +5455,48 @@ impl<'a> Interp<'a> {
         };
         self.begin_statement_call(receiver, name, values, *span, frame)
             .map(Some)
+    }
+
+    fn method_frame(
+        &mut self,
+        block: &MethodDecl,
+        prototype: &MethodDecl,
+        args: &[Value],
+        span: crate::ast::Span,
+    ) -> Result<Frame, Diagnostic> {
+        if args.len() != block.params.len() {
+            return Err(self.error(
+                "E0402",
+                format!(
+                    "method '{}' expects {} argument(s), got {}",
+                    block.name,
+                    block.params.len(),
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        let mut frame = Frame {
+            return_type: block
+                .return_type
+                .clone()
+                .or_else(|| prototype.return_type.clone()),
+            ..Frame::default()
+        };
+        for (index, (parameter, arg)) in block.params.iter().zip(args).enumerate() {
+            let declared = parameter.ty.as_ref().or_else(|| {
+                prototype
+                    .params
+                    .get(index)
+                    .and_then(|parameter| parameter.ty.as_ref())
+            });
+            if let Some(ty) = declared {
+                frame.local_types.insert(parameter.name.clone(), ty.clone());
+            }
+            let value = self.bind_slot_value(arg.clone(), declared, span)?;
+            frame.locals.insert(parameter.name.clone(), value);
+        }
+        Ok(frame)
     }
 
     fn begin_statement_call(
@@ -5533,16 +5569,12 @@ impl<'a> Interp<'a> {
                 let mut frame = if resume.is_some() {
                     call.frame.clone()
                 } else {
-                    let mut frame = Frame::default();
-                    for (param, arg) in block.params.iter().zip(&call.args) {
-                        if let Some(ty) = &param.ty {
-                            frame.local_types.insert(param.name.clone(), ty.clone());
-                        }
-                        let value =
-                            self.bind_slot_value(arg.clone(), param.ty.as_ref(), call.span)?;
-                        frame.locals.insert(param.name.clone(), value);
-                    }
-                    frame
+                    self.method_frame(
+                        block,
+                        method_prototype(&blocks).unwrap_or(block),
+                        &call.args,
+                        call.span,
+                    )?
                 };
                 call.frame = frame.clone();
                 self.exec_context[call_level].child = Some(Child::Call(Box::new(call.clone())));
@@ -5642,6 +5674,7 @@ impl<'a> Interp<'a> {
         // inline spin.
         self.atomic_depth += 1;
         let mut result = Value::Void;
+        let prototype = method_prototype(&blocks).expect("resolved method has a block");
         for block in blocks {
             if args.len() != block.params.len() {
                 self.atomic_depth -= 1;
@@ -5656,19 +5689,7 @@ impl<'a> Interp<'a> {
                     span,
                 ));
             }
-            let mut frame = Frame::default();
-            for (param, arg) in block.params.iter().zip(args.iter()) {
-                if let Some(ty) = &param.ty {
-                    frame.local_types.insert(param.name.clone(), ty.clone());
-                }
-                // A parameter binds by value (T7.1): a custom numeric
-                // argument copies, and a scalar argument converts when
-                // the parameter's declared type is a custom numeric
-                // type. The clause 31 dispatch passes struct objects,
-                // which bind unchanged.
-                let bound = self.bind_slot_value(arg.clone(), param.ty.as_ref(), span)?;
-                frame.locals.insert(param.name.clone(), bound);
-            }
+            let mut frame = self.method_frame(block, prototype, &args, span)?;
             match self.exec_block(&block.body, &mut frame, Some(object_index))? {
                 Flow::Return(value) => result = value,
                 Flow::Normal | Flow::Break | Flow::Continue => {}
@@ -5724,6 +5745,7 @@ impl<'a> Interp<'a> {
         let previous_context = self.static_context.take();
         self.static_context = Some(type_name.to_owned());
         let mut result = Value::Void;
+        let prototype = method_prototype(&blocks).expect("resolved method has a block");
         for block in &blocks {
             if args.len() != block.params.len() {
                 self.static_context = previous_context;
@@ -5739,13 +5761,7 @@ impl<'a> Interp<'a> {
                     span,
                 ));
             }
-            let mut frame = Frame::default();
-            for (param, arg) in block.params.iter().zip(args.iter()) {
-                if let Some(ty) = &param.ty {
-                    frame.local_types.insert(param.name.clone(), ty.clone());
-                }
-                frame.locals.insert(param.name.clone(), arg.clone());
-            }
+            let mut frame = self.method_frame(block, prototype, &args, span)?;
             match self.exec_block(&block.body, &mut frame, None)? {
                 Flow::Return(value) => result = value,
                 Flow::Normal | Flow::Break | Flow::Continue => {}
@@ -9129,7 +9145,14 @@ impl<'a> Interp<'a> {
         let mut matches = Vec::new();
         let mut count = 0;
         for (index, item) in items.into_iter().enumerate() {
-            let Value::Bool(selected) = self.eval_list_item(predicate, &item, frame, me)? else {
+            let saved_hint = self.expected_type.replace(TypeExpr::Scalar {
+                base: ScalarBase::Bool,
+                width: None,
+                span: predicate.span(),
+            });
+            let result = self.eval_list_item(predicate, &item, frame, me);
+            self.expected_type = saved_hint;
+            let Value::Bool(selected) = result? else {
                 return Err(self.error(
                     "E0402",
                     format!("{name}() expects a boolean item expression"),
@@ -12113,6 +12136,8 @@ impl<'a> Interp<'a> {
                 self.read_qualified_field(index, qualifiers, field, *field_span, *span)
             }
             Expr::Call { callee, args, span } => {
+                let saved_hint = self.expected_type.take();
+                let result = (|| {
                 if matches!(callee.as_ref(), Expr::Ident { name, .. } if name == "set_config") {
                     return self.set_runtime_config(args, *span, frame, me);
                 }
@@ -12165,11 +12190,9 @@ impl<'a> Interp<'a> {
                 // use it, and best-effort: a builtin or unknown callee
                 // contributes no hints (the call itself reports its own
                 // error).
-                let hints = if args.iter().any(expr_has_untyped_evaluate) {
+                let hints = if args.iter().any(expr_needs_context) {
                     self.call_arg_hints(callee, args.len(), frame, me)
-                } else {
-                    Vec::new()
-                };
+                } else { Vec::new() };
                 let mut values = Vec::with_capacity(args.len());
                 for (position, arg) in args.iter().enumerate() {
                     let hint = hints.get(position).cloned().unwrap_or(None);
@@ -12391,6 +12414,9 @@ impl<'a> Interp<'a> {
                     } => self.call_static_method(type_name, member, values, *span),
                     _ => Err(self.error("E0402", "call target not supported", *span)),
                 }
+                })();
+                self.expected_type = saved_hint;
+                result
             }
             Expr::Index { base, index, span } => {
                 let base_value = self.eval(base, frame, me)?;
@@ -12873,34 +12899,18 @@ impl<'a> Interp<'a> {
                 // monomorphized template instance's canonical name for a
                 // template reference — and runs the `with` assignments
                 // against the fresh instance. An untyped `new` creates
-                // with the enclosing `var x: t = new;`'s declared type
-                // (clause 18) when one is evaluating; other untyped
-                // spellings stay the explicit not-supported diagnostic.
-                let new_name = match ty {
-                    None => match self.new_type_hint.clone() {
-                        Some(name) => name,
-                        None => {
-                            return Err(self.error(
-                                "E0402",
-                                "untyped 'new' instance creation is not supported yet",
-                                *span,
-                            ));
-                        }
-                    },
-                    Some(new_ty) => match new_ty {
-                        TypeExpr::Named { name, .. } => name.clone(),
-                        TypeExpr::TemplateRef { name, args, .. } => {
-                            crate::ast::template_instance_name(name, args)
-                        }
-                        _ => {
-                            return Err(self.error(
-                                "E0402",
-                                "'new' supports named and template-instance types only",
-                                new_ty.span(),
-                            ));
-                        }
-                    },
+                // with a named contextual type supplied by a declaration,
+                // assignment, parameter, return or list element. Missing
+                // instance contexts retain the explicit runtime diagnostic.
+                let context = self.expected_type.as_ref().and_then(|hint| self.resolved_hint_type(hint, 0));
+                let context = match context {
+                    Some(TypeExpr::List { element, .. }) if ty.is_none() => Some(*element),
+                    other => other,
                 };
+                let inferred = ty.as_ref().or(context.as_ref());
+                let new_name = inferred.and_then(|ty| self.creation_type_name(ty)).ok_or_else(|| {
+                    self.error("E0402", if ty.is_none() { "untyped 'new' requires a named instance type context" } else { "'new' supports named and template-instance types only" }, *span)
+                })?;
                 if self.depth > 100 {
                     return Ok(Value::Void);
                 }
@@ -12976,10 +12986,13 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 self.depth += 1;
+                let saved_hint = self.expected_type.take();
                 let index = self.instantiate(&new_name);
                 let mut frame = Frame::default();
-                let flow = self.exec_block(inits, &mut frame, Some(index))?;
+                let flow = self.exec_block(inits, &mut frame, Some(index));
+                self.expected_type = saved_hint;
                 self.depth -= 1;
+                let flow = flow?;
                 // The `with` block is an assignment list; a `stop_run`
                 // inside it unwinds the run like any other statement.
                 if matches!(flow, Flow::Stop) {
@@ -13203,10 +13216,102 @@ impl<'a> Interp<'a> {
         result
     }
 
-    /// The declared type of an expression, when statically known: a
-    /// local's declared type, a field of the enclosing instance, or a
-    /// field reached through names of known instance type. Used as the
-    /// inference context for an untyped `evaluate { ... }` (4.17.7).
+    /// Resolve alias representations with the same finite bound as defaulting.
+    fn resolved_hint_type(&self, ty: &TypeExpr, depth: usize) -> Option<TypeExpr> {
+        if depth > 64 {
+            return None;
+        }
+        if let TypeExpr::Named { name, .. } = ty
+            && let Some(declared) = self
+                .types
+                .iter()
+                .find(|entry| entry.name == *name && entry.kind == DeclarationKind::Type)
+            && let Some(underlying) = &declared.underlying
+        {
+            return self.resolved_hint_type(underlying, depth + 1);
+        }
+        Some(ty.clone())
+    }
+
+    fn creation_type_name(&self, ty: &TypeExpr) -> Option<String> {
+        Self::statement_type_name(&self.resolved_hint_type(ty, 0)?)
+    }
+
+    /// Recover a stable declaration kind for an inferred local. Empty or
+    /// heterogeneous lists and unknown value families supply no type hint.
+    fn value_type_hint(&self, value: &Value, depth: usize) -> Option<TypeExpr> {
+        self.value_type_hint_cached(value, depth, &mut BTreeMap::new())
+    }
+
+    fn value_type_hint_cached(
+        &self,
+        value: &Value,
+        depth: usize,
+        lists: &mut BTreeMap<usize, Option<TypeExpr>>,
+    ) -> Option<TypeExpr> {
+        if depth > 16 {
+            return None;
+        }
+        let span = origin_span();
+        let scalar = |base| TypeExpr::Scalar {
+            base,
+            width: None,
+            span,
+        };
+        Some(match value {
+            Value::Int(_) => scalar(ScalarBase::Int),
+            Value::Bool(_) => scalar(ScalarBase::Bool),
+            Value::Real(_) => scalar(ScalarBase::Real),
+            Value::Str(_) => scalar(ScalarBase::String),
+            Value::Object(index) => TypeExpr::Named {
+                name: self.instances.get(*index)?.type_name.clone(),
+                span,
+            },
+            Value::Enum { type_name, .. } if self.types.iter().any(|ty| ty.name == *type_name) => {
+                TypeExpr::Named {
+                    name: type_name.clone(),
+                    span,
+                }
+            }
+            Value::List(list) => {
+                let identity = Rc::as_ptr(&list.items) as usize;
+                if let Some(cached) = lists.get(&identity) {
+                    return cached.clone();
+                }
+                lists.insert(identity, None); // Includes an in-progress cycle.
+                let items = list.items.borrow();
+                let first = self.value_type_hint_cached(items.first()?, depth + 1, lists)?;
+                if !items.iter().skip(1).all(|item| {
+                    self.value_type_hint_cached(item, depth + 1, lists).as_ref() == Some(&first)
+                }) {
+                    return None;
+                }
+                let result = TypeExpr::List {
+                    element: Box::new(first),
+                    key: None,
+                    span,
+                };
+                lists.insert(identity, Some(result.clone()));
+                result
+            }
+            Value::InstanceIterator(_) => TypeExpr::Named {
+                name: "instance_iterator".to_owned(),
+                span,
+            },
+            _ => return None,
+        })
+    }
+
+    /// Resolve context types without evaluating any receiver/index/argument.
+    fn contextual_type_of(
+        &self,
+        expr: &Expr,
+        frame: &Frame,
+        me: Option<usize>,
+    ) -> Option<TypeExpr> {
+        self.context_type_of(expr, frame, me, 0)
+    }
+
     fn static_type_of(&self, expr: &Expr, frame: &Frame, me: Option<usize>) -> Option<TypeExpr> {
         match expr {
             Expr::Ident { name, .. } => {
@@ -13242,6 +13347,174 @@ impl<'a> Interp<'a> {
         }
     }
 
+    fn context_type_of(
+        &self,
+        expr: &Expr,
+        frame: &Frame,
+        me: Option<usize>,
+        depth: usize,
+    ) -> Option<TypeExpr> {
+        if depth > 64 {
+            return None;
+        }
+        match expr {
+            Expr::Ident { name, span } => {
+                if name == "me" || name == "self" {
+                    return Some(TypeExpr::Named {
+                        name: self.instances.get(me?)?.type_name.clone(),
+                        span: *span,
+                    });
+                }
+                if let Some(ty) = frame.local_types.get(name) {
+                    return Some(ty.clone());
+                }
+                // An inferred local shadows owner fields even when its value
+                // has no recoverable shape. Never borrow a hidden field's type.
+                if let Some(value) = frame.locals.get(name) {
+                    return self.value_type_hint(value, 0);
+                }
+                if let Some(index) = me {
+                    let owner = &self.instances[index].type_name;
+                    if let Some(field) = self
+                        .types
+                        .iter()
+                        .find(|ty| ty.name == *owner)
+                        .and_then(|ty| ty.fields.iter().find(|field| field.name == *name))
+                    {
+                        return Some(field.ty.clone());
+                    }
+                }
+                if let Some(owner) = self.bare_static_field_owner(me, name) {
+                    return self
+                        .static_fields
+                        .get(&owner)?
+                        .iter()
+                        .find(|field| field.name == *name)
+                        .map(|field| field.ty.clone());
+                }
+                None
+            }
+            Expr::MemberAccess { object, name, .. }
+            | Expr::QualifiedField {
+                base: object,
+                field: name,
+                ..
+            } => {
+                let base = self.context_type_of(object, frame, me, depth + 1)?;
+                let owner = self.creation_type_name(&base)?;
+                self.types
+                    .iter()
+                    .find(|ty| ty.name == owner)?
+                    .fields
+                    .iter()
+                    .find(|field| field.name == *name)
+                    .map(|field| field.ty.clone())
+            }
+            Expr::StaticAccess {
+                type_name, member, ..
+            } => self
+                .static_fields
+                .get(type_name)?
+                .iter()
+                .find(|field| field.name == *member)
+                .map(|field| field.ty.clone()),
+            Expr::Index { base, .. } => match self
+                .resolved_hint_type(&self.context_type_of(base, frame, me, depth + 1)?, 0)?
+            {
+                TypeExpr::List { element, .. } => Some(*element),
+                _ => None,
+            },
+            Expr::Ternary {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                let left = self.resolved_hint_type(
+                    &self.context_type_of(then_expr, frame, me, depth + 1)?,
+                    0,
+                )?;
+                let right = self.resolved_hint_type(
+                    &self.context_type_of(else_expr, frame, me, depth + 1)?,
+                    0,
+                )?;
+                (left.render() == right.render()).then_some(left)
+            }
+            Expr::ListConcat { items, .. } => {
+                let mut element: Option<TypeExpr> = None;
+                for item in items {
+                    let kind = self.resolved_hint_type(
+                        &self.context_type_of(item, frame, me, depth + 1)?,
+                        0,
+                    )?;
+                    let kind = match kind {
+                        TypeExpr::List { element, .. } => *element,
+                        kind => kind,
+                    };
+                    if element
+                        .as_ref()
+                        .is_some_and(|previous| previous.render() != kind.render())
+                    {
+                        return None;
+                    }
+                    element = Some(kind);
+                }
+                Some(TypeExpr::List {
+                    element: Box::new(element?),
+                    key: None,
+                    span: expr.span(),
+                })
+            }
+            Expr::Paren { expr, .. } => self.context_type_of(expr, frame, me, depth + 1),
+            Expr::New { ty: Some(ty), .. } | Expr::Evaluate { ty: Some(ty), .. } => {
+                Some(ty.clone())
+            }
+            Expr::Call { callee, .. } => self
+                .context_method(callee, frame, me, depth + 1)?
+                .return_type
+                .clone(),
+            _ => None,
+        }
+    }
+
+    fn context_method(
+        &self,
+        callee: &Expr,
+        frame: &Frame,
+        me: Option<usize>,
+        depth: usize,
+    ) -> Option<&'a MethodDecl> {
+        if depth > 64 {
+            return None;
+        }
+        let (owner, name, is_static) = match callee {
+            Expr::Ident { name, .. } if !crate::builtins::is_builtin_routine(name) => {
+                (self.instances.get(me?)?.type_name.clone(), name, false)
+            }
+            Expr::MemberAccess { object, name, .. }
+            | Expr::QualifiedField {
+                base: object,
+                field: name,
+                ..
+            } => {
+                let ty = self.context_type_of(object, frame, me, depth + 1)?;
+                (self.creation_type_name(&ty)?, name, false)
+            }
+            Expr::StaticAccess {
+                type_name, member, ..
+            } => (type_name.clone(), member, true),
+            _ => return None,
+        };
+        let methods = if is_static {
+            self.static_methods.get(&owner)?
+        } else {
+            &self.types.iter().find(|ty| ty.name == owner)?.methods
+        };
+        methods
+            .iter()
+            .find(|method| method.name == *name && method.modifier.is_none())
+            .or_else(|| methods.iter().find(|method| method.name == *name))
+    }
+
     /// The parameter types of a called method, one per argument position
     /// (`None` where the parameter is untyped, the callee is a builtin,
     /// or the callee cannot be resolved — the call itself reports its
@@ -13254,48 +13527,14 @@ impl<'a> Interp<'a> {
         frame: &Frame,
         me: Option<usize>,
     ) -> Vec<Option<TypeExpr>> {
-        let mut hints: Vec<Option<TypeExpr>> = vec![None; arg_count];
-        // The type the callee is a method of, and the callee's name.
-        let (type_name, method_name) = match callee {
-            Expr::Ident { name, .. } => {
-                if crate::builtins::is_builtin_routine(name) {
-                    return hints;
-                }
-                let Some(index) = me else {
-                    return hints;
-                };
-                (self.instances[index].type_name.clone(), name.clone())
-            }
-            Expr::MemberAccess { object, name, .. } => {
-                let type_name = match self.static_type_of(object, frame, me) {
-                    Some(TypeExpr::Named { name, .. }) => name,
-                    Some(TypeExpr::WhenQualified { value, base, .. }) => {
-                        match when_view_name(&value, &base) {
-                            Some(view) => view,
-                            None => return hints,
-                        }
-                    }
-                    _ => return hints,
-                };
-                (type_name, name.clone())
-            }
-            _ => return hints,
-        };
-        let types: &[crate::elab::ElaboratedType] = self.types;
-        let Some(ty) = types.iter().find(|t| t.name == type_name) else {
-            return hints;
-        };
-        for method in &ty.methods {
-            if method.name != *method_name {
-                continue;
-            }
-            for (position, param) in method.params.iter().enumerate().take(arg_count) {
-                if hints[position].is_none() {
-                    hints[position] = param.ty.clone();
-                }
-            }
-        }
-        hints
+        let method = self.context_method(callee, frame, me, 0);
+        (0..arg_count)
+            .map(|position| {
+                method
+                    .and_then(|method| method.params.get(position))
+                    .and_then(|parameter| parameter.ty.clone())
+            })
+            .collect()
     }
 
     /// Whether one `in_table` row element matches the tuple element's
@@ -15954,70 +16193,72 @@ fn type_set_key(ty: &TypeExpr) -> Option<String> {
     }
 }
 
-/// Whether the expression anywhere contains an `evaluate { ... }` block
-/// without an explicit type — the only case a call argument needs its
-/// parameter's declared type as the inference context (4.17.7).
-fn expr_has_untyped_evaluate(expr: &Expr) -> bool {
+/// Context lookup is only needed for an untyped contextual expression.
+/// Typed expression bodies establish their own scopes and are barriers here.
+fn expr_needs_context(expr: &Expr) -> bool {
     match expr {
-        Expr::Evaluate { ty, .. } => ty.is_none(),
-        Expr::Unary { expr, .. } | Expr::Paren { expr, .. } | Expr::CastAs { expr, .. } => {
-            expr_has_untyped_evaluate(expr)
-        }
-        Expr::Binary { lhs, rhs, .. } => {
-            expr_has_untyped_evaluate(lhs) || expr_has_untyped_evaluate(rhs)
-        }
+        Expr::Evaluate { ty, .. } | Expr::New { ty, .. } => ty.is_none(),
+        Expr::Unary { expr, .. }
+        | Expr::Paren { expr, .. }
+        | Expr::CastAs { expr, .. }
+        | Expr::IsA { expr, .. } => expr_needs_context(expr),
+        Expr::Binary { lhs, rhs, .. } => expr_needs_context(lhs) || expr_needs_context(rhs),
         Expr::Ternary {
             cond,
             then_expr,
             else_expr,
             ..
         } => {
-            expr_has_untyped_evaluate(cond)
-                || expr_has_untyped_evaluate(then_expr)
-                || expr_has_untyped_evaluate(else_expr)
+            expr_needs_context(cond)
+                || expr_needs_context(then_expr)
+                || expr_needs_context(else_expr)
         }
-        Expr::Index { base, index, .. } => {
-            expr_has_untyped_evaluate(base) || expr_has_untyped_evaluate(index)
-        }
+        Expr::Index { base, index, .. } => expr_needs_context(base) || expr_needs_context(index),
         Expr::BitSlice {
             base, high, low, ..
-        } => {
-            expr_has_untyped_evaluate(base)
-                || expr_has_untyped_evaluate(high)
-                || expr_has_untyped_evaluate(low)
+        } => expr_needs_context(base) || expr_needs_context(high) || expr_needs_context(low),
+        Expr::MemberAccess { object, .. } | Expr::QualifiedField { base: object, .. } => {
+            expr_needs_context(object)
         }
-        Expr::MemberAccess { object, .. } => expr_has_untyped_evaluate(object),
         Expr::Call { callee, args, .. } => {
-            expr_has_untyped_evaluate(callee) || args.iter().any(expr_has_untyped_evaluate)
+            expr_needs_context(callee) || args.iter().any(expr_needs_context)
         }
         Expr::InSet { element, set, .. } => {
             let set_has = match set {
-                crate::ast::InSetExpr::Items(items) => items.iter().any(expr_has_untyped_evaluate),
+                crate::ast::InSetExpr::Items(items) => items.iter().any(expr_needs_context),
                 crate::ast::InSetExpr::Range(low, high) => {
-                    expr_has_untyped_evaluate(low) || expr_has_untyped_evaluate(high)
+                    expr_needs_context(low) || expr_needs_context(high)
                 }
-                crate::ast::InSetExpr::Expr(expr) => expr_has_untyped_evaluate(expr),
+                crate::ast::InSetExpr::Expr(expr) => expr_needs_context(expr),
             };
-            expr_has_untyped_evaluate(element) || set_has
+            expr_needs_context(element) || set_has
         }
         Expr::InTable { tuple, rows, .. } => {
-            tuple.iter().any(expr_has_untyped_evaluate)
+            tuple.iter().any(expr_needs_context)
                 || rows.iter().any(|row| {
                     row.iter().any(|element| match element {
-                        crate::ast::TableElem::Scalar(expr) => expr_has_untyped_evaluate(expr),
+                        crate::ast::TableElem::Scalar(expr) => expr_needs_context(expr),
                         crate::ast::TableElem::Set(crate::ast::InSetExpr::Items(items)) => {
-                            items.iter().any(expr_has_untyped_evaluate)
+                            items.iter().any(expr_needs_context)
                         }
                         crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
-                            expr_has_untyped_evaluate(low) || expr_has_untyped_evaluate(high)
+                            expr_needs_context(low) || expr_needs_context(high)
                         }
                         crate::ast::TableElem::Set(crate::ast::InSetExpr::Expr(expr)) => {
-                            expr_has_untyped_evaluate(expr)
+                            expr_needs_context(expr)
                         }
                         crate::ast::TableElem::TypeSet { .. } => false,
                     })
                 })
         }
+        Expr::ListConcat { items, .. } => items.iter().any(expr_needs_context),
+        Expr::SetLiteral { items, .. } => match items {
+            crate::ast::InSetExpr::Items(items) => items.iter().any(expr_needs_context),
+            crate::ast::InSetExpr::Range(low, high) => {
+                expr_needs_context(low) || expr_needs_context(high)
+            }
+            crate::ast::InSetExpr::Expr(expr) => expr_needs_context(expr),
+        },
         _ => false,
     }
 }
@@ -16333,13 +16574,15 @@ impl<'a> Interp<'a> {
                     if co.path.is_empty() {
                         // A fresh `is also` block binds its parameters
                         // from the start-time arguments.
-                        co.frame = Frame::default();
-                        for (param, arg) in block.params.iter().zip(args.iter()) {
-                            if let Some(ty) = &param.ty {
-                                co.frame.local_types.insert(param.name.clone(), ty.clone());
-                            }
-                            co.frame.locals.insert(param.name.clone(), arg.clone());
-                        }
+                        co.frame = match self.method_frame(
+                            block,
+                            method_prototype(&blocks).unwrap_or(block),
+                            &args,
+                            co.span,
+                        ) {
+                            Ok(frame) => frame,
+                            Err(diagnostic) => return TurnOutcome::Error(diagnostic),
+                        };
                     }
                     match self.run_body(&block.body, co) {
                         Ok(Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_)) => {

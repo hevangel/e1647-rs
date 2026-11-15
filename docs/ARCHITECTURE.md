@@ -221,7 +221,16 @@ browser sandbox API is not started.
   slices and `in_table` results have known kinds. An evaluate body gets a
   scoped result local and keeps the owner/caller context; a new initializer
   gets a fresh locals frame, no enclosing return type, and the known new
-  object as its receiver. Implicit evaluate/new types remain unknown here.
+  object as its receiver. Scoped expected kinds now reach evaluate/new
+  from known variables, assignment targets, field initializers, method
+  parameters and returns. Explicit expression annotations take precedence.
+  Calls clear the enclosing hint and bind each argument's parameter hint;
+  list predicates supply Bool. Expression bodies clear the enclosing hint
+  before walking actions; their own declarations/assignments supply hints.
+  Constructor elements can use a surrounding list's element context, and
+  concatenation type inference flattens list operands to match evaluation.
+  Materialized templates retain object kinds. Unknown contexts remain
+  conservative; this is not general bidirectional or flow-sensitive inference.
   All statement value children now traverse, including loop bounds, print,
   gen, emit, rgf assignment, wait, start and compute. The recorded foreach
   index-name path is structural, not treated as an evaluated expression.
@@ -250,6 +259,20 @@ browser sandbox API is not started.
   conservative. New initializers clear the caller's static context and restore
   it afterward. Bare static method calls remain unsupported in the runtime
   and unknown to this checker; qualified calls are the supported form.
+  The runtime carries contextual TypeExpr hints separately from its existing
+  arithmetic-precision lookup. Context lookup inspects metadata without
+  evaluating receivers or indexes: it follows known members, static fields,
+  list elements, declared method results, equal-shaped branches/literals and
+  supported inferred-value shapes. Alias lookup is bounded; inferred list
+  shape recovery is depth-capped and memoizes identities to reject cycles and
+  avoid repeated DAG traversal. Call argument lookup runs only for expressions
+  that can use a hint. Field initializers receive their declaration type.
+  One method-frame builder binds prototype metadata and return types for
+  inline/static/statement calls and started TCMs, preserving it in suspension
+  snapshots. New/init/evaluate bodies isolate caller hints; failure paths
+  restore expected types. E0122/E0402 remain the runtime diagnostics when a
+  required evaluate/new context is unavailable. No numeric-width inference,
+  full subtype inference or type-embedded resolution is added here.
 - `src/elab.rs` — member composition: `like` chains and `extend` blocks fold
   into one composed member list per `struct`/`unit` (inheritance-cycle,
   cross-declaration duplicate-field and unmodified-method-redefinition

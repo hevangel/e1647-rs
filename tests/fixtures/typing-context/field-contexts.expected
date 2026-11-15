@@ -1,0 +1,2 @@
+2:35: error[E0220]: assignment: a value of kind 'string' cannot be stored into 'int'
+3:45: error[E0220]: assignment: a value of kind 'int' cannot be stored into 'bool'

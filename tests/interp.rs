@@ -1520,14 +1520,13 @@ fn compute_calls_inline_and_untyped_params_accept_anything() {
 
 #[test]
 fn new_reports_a_clean_runtime_diagnostic() {
-    // An untyped `new` without a declared type to infer from (here: an
-    // assignment target's field has no type known to `new`) stays
-    // unsupported.
+    // An untyped new in a type-inferring declaration has no context.
+    // Typed assignment targets now supply their declared constructor type.
     let result = run(
         &elaborate(
             &parse(
                 "struct s {\n    v: int;\n};\n\
-             extend sys {\n    p: s;\n    run() is also {\n        p = new;\n    };\n};\n",
+             extend sys {\n    p: s;\n    run() is also {\n        var p := new;\n    };\n};\n",
             )
             .declarations,
         ),

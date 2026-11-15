@@ -4482,3 +4482,58 @@ No local all-feature, WASM runtime or Specman run was performed for this
 integration. Temporal edge execution and nested TCM statement-call
 continuations remain separate integration PRs (#66 and #65). Full language
 support and IEEE conformance remain unclaimed.
+
+
+## 2026-11-14 — contextual evaluate/new typing and native hints
+
+Known declaration, assignment-target, field-initializer, parameter and
+return kinds now supply scoped contexts to untyped `evaluate` (4.17.7)
+and `new` (6.3) bodies. Explicit annotations override surrounding hints.
+Materialized templates retain object kinds; concatenation inference
+flattens list operands like native evaluation. Extension bodies inherit
+omitted parameter/result annotations from the declaration prototype.
+
+Native context lookup follows metadata for indexed/static/qualified targets,
+method results, me/self receivers, equal-shaped branches, list literals and
+supported inferred-local shapes, without evaluating receivers/indexes/args.
+It is separate from arithmetic-precision lookup: ordinary inferred integer
+arithmetic retains its prior unbounded behavior. Inferred locals shadow
+fields even when their shape is unknown; a regression reproduced E0122 for
+a valid contextual argument before correcting that precedence. List-shape
+recovery is depth-bounded and memoized by identity, rejecting cycles without
+repeatedly traversing shared lists. The cyclic-value test deliberately uses
+unchecked malformed native input; it does not claim valid cyclic e lists.
+
+Call arguments get their parameter contexts; list predicates get Bool.
+Calls, init actions and new/evaluate bodies isolate enclosing hints, restoring
+them on error. Shared method-frame construction retains prototype parameter
+metadata and return types through suspension, including started TCMs. The
+runtime retains E0122/E0402 when evaluate/new context is unavailable.
+
+Twenty independently authored fixture pairs in
+`tests/fixtures/typing-context/` cover contextual mismatch diagnostics,
+explicit overrides, fresh scopes, aliases/templates, flattened constructors,
+qualified calls, fields, returns, predicate contexts and missing-context
+boundaries. Four positive CLI programs exercise scopes, field initializers,
+extension metadata and return contexts after TCM suspension. Receiver/index
+counters assert single evaluation. Five runtime diagnostic goldens exercise
+unavailable contexts, call/init boundaries and cyclic-value shape recovery.
+The existing new-scopes golden gains one definite field mismatch exposed by
+contextual checking. The old negative `p = new` runtime test now uses
+`var p := new`, preserving an actually absent context while assignments gain
+support.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 479 passed, 0 failed (21 test binaries).
+- `cargo test --test typing` — 17 passed, 0 failed.
+- CLI elab audit: 176 pre-existing successful fixture declarations produced
+  no E0220–E0223 diagnostics.
+- `git diff --check` — passed.
+
+No Specman comparison, local all-feature run or WASM runtime run was performed.
+General bidirectional/flow-sensitive inference, constant/type-embedded
+resolution, full signatures/name resolution and custom numeric/subtype
+inference remain unfinished. No IEEE conformance is claimed.
