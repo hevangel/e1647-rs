@@ -531,7 +531,10 @@ not imply full language support or IEEE conformance.
       runner checks the pinned xezim profile's exact outputs/diagnostics,
       VCD transitions and HDL code coverage, including both mixed examples;
       see [HDL_QUALIFICATION.md](HDL_QUALIFICATION.md). This is explicit
-      hdl_run/READY qualification, not general scheduler integration
+      hdl_run/READY qualification, not general scheduler integration.
+      The Dockerfile build and actual qualify-hdl/verify services passed
+      locally; a separate CI job builds the image, runs the real profile
+      and retains owned artifact evidence
 - [~] WASM build and browser sandbox API — started: the core library
       (lexer/parser/elaborator/interpreter) compiles for
       `wasm32-unknown-unknown` (CI runs `cargo check --target

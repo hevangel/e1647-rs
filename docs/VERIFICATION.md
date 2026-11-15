@@ -5006,3 +5006,53 @@ protocol reserves exact token lines; standalone sessions do not manage child
 process trees (the Linux runner adds process-group cleanup). Arbitrary signal
 types, large-delay/max-time behavior, general e/HDL scheduling, VHDL/VHPI and
 browser execution remain unqualified. No IEEE conformance is claimed.
+
+
+## 2026-11-15 — Dockerfile and Compose qualification
+
+Follow-up to the explicit HDL profile: the current Dockerfile was built from
+source without updating the xezim pin. `docker build --tag
+e1647-rs-toolchain:hdl-profile .` passed; xezim's release compilation completed
+in 5m25s and the strict owned C bridge build/dependency prefetch also passed.
+The pre-existing latest image was preserved. The new image identity was
+sha256:a301937544b5ba48a37c2315187ff192f1c46be848fcb1ebdf4ef905bdee8d2d,
+with base manifest
+sha256:cc9edbcadf2c27013a642b1d1bb7504e26b1142d6b5ebe58f64cf2eb2bc128ae.
+It reported xezim0.11.3/git058f2bba, Rust/Cargo1.100.0, Python3.13.5 and
+GCC14.2.0; ldd found its runtime libraries.
+
+An ignored image-only override selected the new tag for qualify-hdl and
+verify. Actual commands from the repository worktree:
+
+- `docker compose -f compose.yml -f
+  ../../local/compose-container-qualification.yml run --rm qualify-hdl` —
+  passed: all8 cases plus raw bridge, VCD and HDL coverage assertions. The
+  generated local/hdl-profile/report.json records observed binary/input
+  fingerprints. The retained VCD and HDL coverage files were inspected as
+  present and their checked values confirmed.
+- `docker compose -f compose.yml -f
+  ../../local/compose-container-qualification.yml run --rm verify` — passed:
+  fmt check; Clippy all-targets/all-features with warnings denied;
+  cargo test all-targets/all-features513 passed,0 failed,0 ignored,27 binaries.
+- `cargo fmt --all -- --check` — passed locally.
+- `cargo clippy --all-targets -- -D warnings` — passed locally.
+- `cargo test --all-targets` —504 passed,0 failed,0 ignored,27 binaries locally.
+- `git diff --check` — passed.
+
+A login-shell inspection initially hid Dockerfile PATH tools; the non-login
+shell used by Compose resolved them correctly. An attempted --no-build option
+was unsupported by this Compose version; the actual supported run commands
+above succeeded. Neither invocation issue was treated as simulator evidence
+or as a failed image build. No environment/security settings were changed.
+
+The CI workflow now has a separate check-hdl-profile job: build the pinned
+simulator/current bridge image, record image/tool identity, run the actual
+qualification service and retain only owned staged inputs, reports, VCD and
+HDL coverage as a seven-day artifact. Container-generated evidence ownership
+is assigned to the CI runner user before upload, preserving private staging
+directory modes. Portable unit/oracle jobs remain distinct
+from simulation evidence. This closes the previously unverified Dockerfile/
+Compose path; historical entries correctly describe their earlier scope.
+Floating base/transitive resolutions can change image bytes, so each new image
+must run qualification. No byte-reproducible-build, general e/HDL ordering,
+VHDL, browser-runtime or Specman qualification is claimed.

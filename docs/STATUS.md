@@ -223,8 +223,11 @@ error diagnostics, VCD transitions and HDL code coverage. The native session
 has bounded startup/command/finish handshakes and reaps its owned child on
 failure. Wider/MVL transfers are rejected; E1647_XEZIM_WAVE enables optional
 wave instrumentation. This qualifies explicit hdl_run/READY observations,
-not general e/HDL event ordering. Default cargo/CI tests cover transport and
-frontend mechanics; the real profile is a separate command.
+not general e/HDL event ordering. Default cargo tests cover transport and
+frontend mechanics. A separate CI job builds the current Dockerfile and runs
+the real profile, retaining owned evidence and image identity. The Dockerfile
+image and both qualify-hdl/verify Compose services have also passed locally,
+including 513 all-feature tests; see the profile's recorded build identity.
 
 ## Tests and the two revisions
 

@@ -44,7 +44,8 @@ docker compose run --rm qualify-hdl
 The service builds the current native interpreter and runs:
 
 ```sh
-python3 scripts/qualify_hdl.py --native /opt/target/debug/e1647   --report local/hdl-profile/report.json
+python3 scripts/qualify_hdl.py --native /opt/target/debug/e1647 \
+  --report local/hdl-profile/report.json
 ```
 
 For an existing Linux image containing the pinned xezim and its headers, build
@@ -55,9 +56,11 @@ It supplied xezim 0.11.3 and rustc 1.99.0. `/workspace` was a read-only mount
 of this branch and `/artifacts` an ignored writable host directory:
 
 ```sh
-cc -Wall -Wextra -Werror -shared -fPIC -I/opt/xezim/include   -o /artifacts/bridge.so c/xezim_bridge.c
+cc -Wall -Wextra -Werror -shared -fPIC -I/opt/xezim/include \
+  -o /artifacts/bridge.so c/xezim_bridge.c
 cargo build --locked --target-dir /artifacts/target --bin e1647
-E1647_XEZIM_BRIDGE=/artifacts/bridge.so python3 scripts/qualify_hdl.py   --native /artifacts/target/debug/e1647 --report /artifacts/qualification.json
+E1647_XEZIM_BRIDGE=/artifacts/bridge.so python3 scripts/qualify_hdl.py \
+  --native /artifacts/target/debug/e1647 --report /artifacts/qualification.json
 ```
 
 A different simulator revision fails the profile instead of silently passing
@@ -65,7 +68,49 @@ under another identity. The runner requires Linux, Python 3 and absolute work
 paths containing only letters, digits, `/_.-`. It creates a separate process
 group per invocation and kills that group on its 15-second outer timeout.
 Owned Rust subprocess tests and Python artifact-oracle tests are portable
-mechanical checks; the default CI runs those, not real simulation.
+mechanical checks. The separate check-hdl-profile CI job builds the pinned
+simulator/current bridge image and runs real simulation. It retains the owned
+profile report, staged inputs, VCD, HDL coverage and concrete image/tool identity
+for seven days.
+
+## Dockerfile and Compose verification, 2026-11-15
+
+The current Dockerfile was built and its actual Compose services executed.
+The local tag `e1647-rs-toolchain:hdl-profile` preserved the pre-existing
+`:latest` image. The resulting image identity was
+`sha256:a301937544b5ba48a37c2315187ff192f1c46be848fcb1ebdf4ef905bdee8d2d`.
+The floating rust:1-slim base resolved to
+`sha256:cc9edbcadf2c27013a642b1d1bb7504e26b1142d6b5ebe58f64cf2eb2bc128ae`.
+This image reported Rust/Cargo 1.100.0, Python 3.13.5, GCC 14.2.0 and the
+same pinned xezim 0.11.3 revision. Runtime library resolution succeeded.
+
+```sh
+docker build --tag e1647-rs-toolchain:hdl-profile .
+```
+
+An ignored local override selected only that image for the two services:
+
+```yaml
+services:
+  qualify-hdl:
+    image: e1647-rs-toolchain:hdl-profile
+  verify:
+    image: e1647-rs-toolchain:hdl-profile
+```
+
+Using that override, `docker compose -f compose.yml -f <override> run --rm
+qualify-hdl` passed all eight cases, raw bridge assertions, exact VCD transitions
+and HDL coverage assertions. The verify service passed `cargo fmt --all --
+--check`, `cargo clippy --all-targets --all-features -- -D warnings` and
+`cargo test --all-targets --all-features`: 513 passed, 0 failed, 0 ignored
+across 27 binaries. Default-feature Windows checks separately passed all
+504 tests. Generated reports/artifacts remained under ignored local/.
+
+These observations qualify a concrete build; they do not promise identical
+image bytes from future floating-base or upstream dependency resolutions.
+Each newly built image must pass the profile. No simulator pin was changed.
+Use the non-login shell in the Compose commands: a login shell can replace
+the Dockerfile's PATH and hide otherwise installed tools.
 
 ## Bridge contract and limits
 

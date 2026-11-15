@@ -161,7 +161,8 @@ without the requested containing unit reports an error.
 The native HDL bridge has an [explicit xezim qualification profile](docs/HDL_QUALIFICATION.md)
 covering signed 32-bit transfers, counter edges, errors, VCD and HDL code
 coverage. Startup and command waits are bounded; wider/MVL transfers are
-rejected. This does not qualify general e/HDL event ordering.
+rejected. A separate CI job builds the image and runs the real profile.
+This does not qualify general e/HDL event ordering.
 
 ## From Slopman to Rustman
 

@@ -50,3 +50,35 @@ jobs:
           targets: wasm32-unknown-unknown
       - run: cargo check --target wasm32-unknown-unknown
       - run: cargo check --target wasm32-unknown-unknown --all-targets
+
+
+  # Real native/VPI simulation in the image built from this checkout.
+  # This asserts the explicit xezim profile, not general e/HDL ordering.
+  check-hdl-profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the pinned simulator and current bridge image
+        run: docker compose build toolchain
+      - name: Record the concrete image and tool versions
+        run: |
+          mkdir -p local/hdl-profile
+          docker image inspect e1647-rs-toolchain:latest --format '{{.Id}}' > local/hdl-profile/image-provenance.txt
+          docker compose run --rm toolchain bash -c 'rustc --version && cargo --version && xezim -V && python3 --version && cc -dumpfullversion' >> local/hdl-profile/image-provenance.txt
+      - name: Assert native outputs, VPI errors, VCD and HDL coverage
+        run: docker compose run --rm qualify-hdl
+      - name: Assign generated evidence to the runner user
+        if: always()
+        run: |
+          if docker image inspect e1647-rs-toolchain:latest >/dev/null 2>&1 && [ -d local/hdl-profile ]; then
+            docker compose run --rm toolchain chown -R "$(id -u):$(id -g)" /workspace/local/hdl-profile
+          fi
+      - name: Retain owned profile evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdl-profile-evidence
+          path: local/hdl-profile/
+          if-no-files-found: warn
+          retention-days: 7
