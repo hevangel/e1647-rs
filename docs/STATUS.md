@@ -78,7 +78,11 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   bodies and entry-event synchronization. Receivers and arguments
   are retained across resumption. Calls embedded in value expressions
   and receivers whose type cannot be resolved before evaluation still
-  use atomic dispatch.
+  use atomic dispatch. Compute arguments receive declared parameter hints,
+  including contextual constructors and evaluate expressions. Emissions whose
+  owner resolves to sys share bare and sys-qualified log/wake spellings;
+  on actions and coverage sample once. Other instances retain the existing
+  path model; this does not provide general per-instance event identity.
 - **Membership.** Scalar/list membership (4.11.6) executes over lists and
   integer/Boolean/enumeral sets. List-to-list containment is order-independent
   and requires distinct matches for repeated left values. Iterative matching

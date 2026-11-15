@@ -88,9 +88,9 @@ not imply full language support or IEEE conformance.
       methods and `on` blocks substitute the extension's formals with
       the instance's actuals and append. Typed `new
       <named-or-template-instance> [with { .. }]` instantiates and
-      runs the `with` assignments (clause 6.3); untyped `new` still
-      evaluates to an
-      explicit not-supported diagnostic. Coverage groups (clause 14.2)
+      runs the `with` assignments (clause 6.3); untyped `new` uses known
+      variable/assignment/field/parameter/return contexts and diagnoses
+      unavailable instance contexts. Coverage groups (clause 14.2)
       parse, are recorded, and collect: `cover <event> is [also]
       { item/cross/transition entries; option entries }` and `cover
       <event> is empty;` — item types and sampled expressions are
@@ -396,7 +396,11 @@ not imply full language support or IEEE conformance.
       statement-position calls and `compute` carry call-stack
       continuations, including TCM entry-event waits. Calls embedded
       in value expressions, unresolved receiver types and `on` blocks
-      remain atomic
+      remain atomic. Combined execution/typing fixtures verify saved parameter
+      and return metadata through nested waits, resource calls, entry events
+      and composed bodies. Compute arguments receive parameter hints; root
+      event emissions share bare/sys-qualified log spellings without duplicate
+      on/coverage processing. General per-instance event identity remains a gap
 - [~] Coverage data model and reports — started: `src/coverage.rs`
       builds buckets and grades from the recorded groups (14.3's
       ranges/defaults, 14.6 merging), the interpreter samples on the

@@ -4684,3 +4684,67 @@ Value-expression calls, receivers whose types cannot be resolved before
 evaluation, `on` blocks and check failure bodies still use atomic
 execution. General expression continuations, per-instance event identity,
 temporal edge expressions and precise HDL event ordering remain gaps.
+
+
+## 2026-11-14 — combined execution, coverage and typing integration
+
+This branch joins the pending statement-continuation work (#65,
+0be54b8) and temporal-edge work (#66, 3405510) with the coverage/typing
+stack through #80 (9d747d4). Main had only #67 at integration time;
+this remains a feature-branch review, not a claim that the combined work
+has reached main. Both source histories and their existing fixture files
+are preserved. The verification log retains #66's repaired historical
+entries followed by every later coverage/typing/TCM entry. Active docs and
+CLI claims are reconciled, including stale negative claims about contextual
+new, set literals and statement-call suspension.
+
+Four independently authored fixture sets under
+`tests/fixtures/execution-integration/` exercise the combined behavior:
+
+- Two concurrent nested callers preserve locals and typed parameters across
+  semaphore waits and explicitly clocked temporal edges. Omitted composed
+  method annotations retain prototype kinds; contextual new returns execute
+  after suspension. Constructor counters verify eight new instances beyond
+  the baseline; the original packet references remain unchanged.
+- Nested compute entry events, alias parameter/result types and a contextual
+  constructor on a member compute call retain their frames and arguments.
+  Four constructor invocations beyond the baseline prove arguments are not
+  replayed while parking/resuming the nested calls.
+- Concurrent helpers sample separate unit coverage groups after suspension.
+  Each owner has two samples, one hit in each Boolean bucket and grade 1.0.
+- Root event spellings wake started/temporal waits consistently. A same-named
+  child event does not wake a sys-qualified listener. Bare, sys-qualified,
+  me-qualified and alias-receiver root emissions invoke root on actions once
+  each and contribute exactly four coverage samples, without replay/duplication.
+
+The fixtures exposed two implementation gaps. Bare root emissions were not
+visible as sys-qualified clock/entry events, stranding nested waits until the
+shared cycle budget. Resolved sys emissions now record/wake both bare and
+sys-qualified keys; root coverage selects matching groups once. On actions
+remain single-shot. Other instances retain the existing path model: arbitrary
+instance/event alias resolution and per-instance timelines are not supplied
+by this repair. Compute argument evaluation also lacked parameter hints;
+it now uses the same guarded metadata-only lookup and scoped evaluation as
+ordinary/started calls, fixing E0402 for its contextual constructor argument.
+
+Verification on the combined implementation:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 491 passed, 0 failed (23 test binaries).
+- The integration test binary contains three tests, covering all four new
+  fixture sets through parse/elaboration/type checking/native CLI plus exact
+  unit-owner and root-alias coverage assertions.
+- Existing #65 and #66 fixture/test files compare byte-for-byte unchanged
+  against their submitted heads.
+- `git diff --check` — passed; no conflict markers remain in src/docs/tests.
+
+The initial combined baseline passed before the new integration fixtures;
+their first run then reproduced the root clock/entry-path failure and missing
+compute constructor context. Both are fixed in the final all-target result.
+The coverage assertion uses the API's fractional grade (1.0), not percent.
+No Specman comparison, local all-feature run or WASM runtime run was performed.
+General expression continuations, name resolution/types, general solving,
+remaining coverage/libraries, per-instance temporal/event identity, precise
+HDL ordering and browser runtime qualification remain unfinished. No IEEE
+conformance is claimed.

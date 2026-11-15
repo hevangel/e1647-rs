@@ -16,7 +16,7 @@
 > executes it: `e1647 run` generates seeded-random data under `keep`
 > constraints, drives the Table 1 execution phases, runs TCMs on the
 > clause 13 scheduler, monitors temporal `expect`/`assume` rules and
-> collects coverage. The IEEE 1647-2019 feature set runs: static
+> collects coverage. Selected IEEE 1647-2019 additions run: static
 > members, interfaces, the template rework, range-generated fields,
 > `chosen_from`, custom numeric types, tables, annotations, the clause
 > 33 resource-sharing structs (`semaphore`/`rdv_semaphore`/`locker`),
@@ -60,7 +60,10 @@ chains are rejected by that bound.
 Statement-position calls and `compute` preserve nested callee frames
 across waits and blocking resource calls. Calls inside value expressions
 and receivers whose types cannot be resolved before evaluation remain
-atomic.
+atomic. Compute arguments now receive the same declared parameter contexts
+as ordinary/started calls. Root-event emissions are visible under both bare
+and `sys.event` spellings; hooks and coverage still run once per emission.
+General per-instance event identity remains incomplete.
 
 List extrema `min`, `max`, `min_index` and `max_index` accept an optional
 per-item key expression such as `it.score`. They return the selected

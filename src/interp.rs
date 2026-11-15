@@ -3233,9 +3233,19 @@ impl<'a> Interp<'a> {
                 let Expr::Call { callee, args, .. } = call else {
                     return Err(self.error("E0402", "compute expects a method call", *span));
                 };
+                let hints = if args.iter().any(expr_needs_context) {
+                    self.call_arg_hints(callee, args.len(), frame, me)
+                } else {
+                    Vec::new()
+                };
                 let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval(arg, frame, me)?);
+                for (position, arg) in args.iter().enumerate() {
+                    values.push(self.eval_with_hint(
+                        hints.get(position).cloned().unwrap_or(None),
+                        arg,
+                        frame,
+                        me,
+                    )?);
                 }
                 match callee.as_ref() {
                     Expr::Ident { name, .. } => {
@@ -9880,6 +9890,27 @@ impl<'a> Interp<'a> {
         self.pad_log();
         self.temporal_log[self.cycle as usize].record(path);
         self.wake_tcm_listeners(path);
+        // Emissions resolved to sys are visible under both e and sys.e
+        // (11.1, 12.2.5), including emits through me/an alias of sys.
+        // Record/wake those log spellings, but run actions and coverage
+        // exactly once below. Other instance events keep their existing
+        // path model; this is not general per-instance event resolution.
+        if owner.is_some()
+            && owner
+                == self
+                    .instances
+                    .iter()
+                    .position(|instance| instance.type_name == "sys")
+        {
+            let name = path.rsplit('.').next().unwrap_or(path);
+            for alias in [name.to_owned(), format!("sys.{name}")] {
+                if alias != path {
+                    self.emitted.insert(alias.clone());
+                    self.temporal_log[self.cycle as usize].record(&alias);
+                    self.wake_tcm_listeners(&alias);
+                }
+            }
+        }
         self.run_on_blocks(path, owner, span)?;
         self.sample_cover_groups(path, owner, frame, span);
         Ok(())
@@ -10072,12 +10103,24 @@ impl<'a> Interp<'a> {
         else {
             return;
         };
+        let root_event = (self
+            .instances
+            .iter()
+            .position(|instance| instance.type_name == "sys")
+            == Some(owner))
+        .then(|| path.rsplit('.').next().unwrap_or(path));
         let group_indices: Vec<usize> = self.coverage[entry_index]
             .groups
             .iter()
             .enumerate()
             .filter(|(_, group)| {
-                group.event_path.as_deref() == Some(path) && group.unit_owner.is_none()
+                group.unit_owner.is_none()
+                    && group.event_path.as_deref().is_some_and(|event| {
+                        event == path
+                            || root_event.is_some_and(|name| {
+                                event == name || event.strip_prefix("sys.") == Some(name)
+                            })
+                    })
             })
             .map(|(index, _)| index)
             .collect();
