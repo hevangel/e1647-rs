@@ -76,9 +76,16 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   Statement-position method calls and `compute` retain callee frames
   across suspension, including recursive helpers, composed method
   bodies and entry-event synchronization. Receivers and arguments
-  are retained across resumption. Calls embedded in value expressions
-  and receivers whose type cannot be resolved before evaluation still
-  use atomic dispatch. Compute arguments receive declared parameter hints,
+  are retained across resumption. Scheduled instance calls in statement
+  value expressions also suspend: assignments, conditions, arguments,
+  receivers, returns, print parts and loop headers retain completed values.
+  Lazy branches keep their chosen path; while conditions start fresh after
+  each body, and a suspended repeat-until condition resumes after its body.
+  Operator/formatting callbacks completed before a later suspension do not
+  replay. Runtime-resolved instance receivers use the same call engine.
+  Scoped evaluate/constructor actions, list callbacks, generation/coverage
+  observation, static methods, on blocks and check failure actions remain
+  atomic. Compute arguments receive declared parameter hints,
   including contextual constructors and evaluate expressions. Physical event
   keys distinguish owners and unify bare/dotted/alias references. Emission
   receivers evaluate once, including calls/indexes; on actions and coverage

@@ -506,9 +506,22 @@ browser sandbox API is not started.
   entry, retaining those identities through suspension; the pure core still
   accepts opaque string event keys. Static temporal paths use one
   type-qualified segment. Indexed temporal path syntax and active event
-  reference rebinding remain unsupported. Value-expression calls,
-  receivers whose types cannot be resolved before evaluation, `on`
-  blocks and check failure bodies remain atomic. Temporal waits
+  reference rebinding remain unsupported. Scheduled value calls attach a
+  `StatementEvaluation` tree to the statement path and descend through a
+  synthetic call level. Completed evaluation nodes retain values and ordered
+  child positions; replay traverses cached nodes until the pending call,
+  resumes its saved frame, then continues the original expression. Keeping
+  the original AST preserves operand precision and contextual type lookup.
+  Operator results and formatted print parts are evaluation nodes too, so
+  completed custom numeric callbacks do not replay. Each committed while
+  iteration resets its header tree; repeat-until records whether the body
+  completed before a suspended condition. Composed calls retain their last
+  return value. A private `ExecError` separates suspension/stop control from
+  public diagnostics; statement boundaries translate control into `Flow`.
+  Scoped evaluate/constructor actions, list callbacks, generation/coverage
+  observation, static methods, `on` blocks and check failure bodies remain
+  atomic. These scopes need separate continuations before their locals and
+  partially committed effects can survive suspension. Temporal waits
   (`@event`, sequences, propositions, event
   repeats, with 13.2.4's readability-only `until`) re-evaluate at
   every turn (12.3.2); propositions and repeat bounds retain sampled

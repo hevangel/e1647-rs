@@ -4876,3 +4876,51 @@ The output cap is checked after capture, not a streaming memory bound.
 Imported dependency staging, a licensed Specman adapter and live comparison
 of these candidates remain unfinished. No local all-feature, WASM runtime
 or commercial-simulator run was performed. No IEEE conformance is claimed.
+
+
+## 2026-11-15 — scheduled value-expression call continuations
+
+A new independent assignment fixture first reproduced the atomic-call gap:
+`prefix() + pending()` exhausted the temporal wait budget while its started
+producer could not run. Scheduled ordinary instance calls now use the saved
+call engine inside value expressions. A statement evaluation tree retains
+completed values and ordered child positions; the pending call resumes its
+callee frame through a synthetic path level. The original expression AST
+continues to supply precision and contextual type metadata. Private execution
+control distinguishes suspension and stop from user diagnostics.
+
+The call engine retains the last return value across composed blocks, while
+statement calls discard it as before. Loop header evaluation resets after
+committed bodies; repeat-until distinguishes a pending condition from a
+pending body. Completed operator and print-formatting results are retained,
+including side effects in custom numeric callbacks. Consumed synchronization
+clears the prior child's continuation before advancing to the next statement;
+the numeric-wait-header fixture exposed and verifies this repair. Atomic
+fallback dispatch also restores depth/static context on errors.
+
+Fifteen independently authored fixture sets under tests/fixtures/value-calls/
+cover the reproducer, nested and recursive value calls, arguments, typed and
+runtime-resolved receivers, composed returns, contextual returns, lazy
+branches, mutable fields/conditions retained across another coroutine's turn,
+while/repeat/for/foreach headers and suspended bodies, list/index assignment,
+print parts, TCM entry events, concurrent FIFO resource calls, compute/start
+arguments, numeric wait counts, precision, stop and errors after suspension.
+Thirteen pass frontend typing and the native CLI with exact output goldens;
+two pin exact native diagnostics (division by zero after sync and a blocked
+call without a producer). The existing E0421 test now places its blocking
+call inside an explicitly atomic evaluate scope, preserving that check.
+README/status/roadmap/architecture/CLI help state the implemented scope.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 495 passed, 0 failed (26 test binaries).
+- Focused value-call fixture test — passed for all fifteen fixture sets.
+- `git diff --check` — passed.
+
+Scoped evaluate/constructor actions, list callbacks, generation/coverage
+observation, static methods, on blocks and check failure actions remain
+atomic and need separate scope continuations. This change does not qualify
+those contexts or general simulator ordering. No local all-feature, WASM
+runtime or Specman run was performed. No IEEE conformance is claimed.

@@ -4,8 +4,8 @@ The IEEE 1647-2019 migration phases below are complete; the broader
 milestones remain partial. Recent work adds conservative type checking
 (including coverage options and nested expression/temporal traversal),
 bounded polynomial constraint solving and streaming temporal rule monitors. Remaining work includes full name
-resolution/type inference, general temporal sampling timelines, expression-value
-continuations for suspended calls, the remaining coverage options,
+resolution/type inference, general temporal sampling timelines, continuations for scoped
+action/list callbacks, the remaining coverage options,
 general constraint solving, differential qualification, HDL event
 ordering and a browser sandbox API. Completed migration checkboxes do
 not imply full language support or IEEE conformance.
@@ -207,9 +207,10 @@ not imply full language support or IEEE conformance.
       and resume through the statement-path cursor), while re-entry
       into statement-position method calls and `compute` preserves
       callee frames, arguments and composed-body positions, including
-      recursive helpers and blocking resource calls. Calls embedded
-      in value expressions remain atomic; receivers whose object type
-      cannot be resolved before evaluation use ordinary dispatch —
+      recursive helpers and blocking resource calls. Scheduled instance
+      calls in value expressions retain completed operands, receivers,
+      arguments and results across suspension, including runtime-resolved
+      receivers. Scoped action/list callbacks and observation remain atomic —
       `detach`/`delay`/`exec` TEs, select
       choice policies beyond the constant-expression subset (the
       full choice-expression grammar and soft-order interactions),
@@ -399,9 +400,12 @@ not imply full language support or IEEE conformance.
       Suspension re-enters compound
       statements, including `if`/`case`/`for`/`for each`/`repeat until`;
       statement-position calls and `compute` carry call-stack
-      continuations, including TCM entry-event waits. Calls embedded
-      in value expressions, unresolved receiver types and `on` blocks
-      remain atomic. Combined execution/typing fixtures verify saved parameter
+      continuations, including TCM entry-event waits. Scheduled value calls
+      also carry evaluation continuations through assignments, conditions,
+      arguments, receivers, returns, print parts and loop headers. Completed
+      operator/formatting results do not replay. Scoped evaluate/constructor
+      actions, list callbacks, generation/coverage observation, static methods,
+      `on` blocks and check failure actions remain atomic. Combined execution/typing fixtures verify saved parameter
       and return metadata through nested waits, resource calls, entry events
       and composed bodies. Compute arguments receive parameter hints. Physical
       event identities isolate owners across waits/entry clocks/edge sampling;

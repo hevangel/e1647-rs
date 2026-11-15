@@ -57,10 +57,13 @@ Scalar/list/reference aliases default through their declared representation.
 Defaulting more than 64 aliases reports a bounded diagnostic; cyclic default
 chains are rejected by that bound.
 
-Statement-position calls and `compute` preserve nested callee frames
-across waits and blocking resource calls. Calls inside value expressions
-and receivers whose types cannot be resolved before evaluation remain
-atomic. Compute arguments now receive the same declared parameter contexts
+Scheduled instance calls preserve nested callee frames across waits and
+blocking resource calls, including calls in assignments, conditions,
+arguments, receivers and return expressions. Completed expression values,
+operator results and formatted print parts survive resumption without replay.
+Scoped `evaluate`/constructor actions, list callbacks, generation/coverage
+observation, static methods, `on` blocks and check failure actions remain
+atomic; these scopes do not yet carry their own continuations. Compute arguments now receive the same declared parameter contexts
 as ordinary/started calls. Instance events use physical owner identities:
 bare, dotted and object-alias references resolve to the same event, while
 same-named events on different instances stay separate. Emission receivers
