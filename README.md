@@ -28,8 +28,9 @@
 > IEEE conformance is claimed.
 
 Temporal rules and waits retain sampled proposition and repeat-bound
-values, so later state matching uses the recorded values. Raw temporal
-`change`/`rise`/`fall` expressions remain unsupported.
+values, so later state matching uses the recorded values. Temporal
+`change`/`rise`/`fall` also sample Boolean, integer and enumeral
+expressions; general event-specific timelines remain incomplete.
 
 Type checking traverses nested value operands, `evaluate` and `new ... with`
 bodies, statement values, and temporal rule/wait values. Explicit evaluate,
