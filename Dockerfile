@@ -32,6 +32,7 @@ RUN apt-get update \
         g++ \
         libc6-dev \
         pkg-config \
+        python3 \
         git \
     && rm -rf /var/lib/apt/lists/* \
     && rustup component add rustfmt clippy
@@ -40,7 +41,7 @@ RUN apt-get update \
 COPY --from=xezim-build /opt/xezim /opt/xezim
 COPY --from=xezim-build /opt/xezim-src/include /opt/xezim-src/include
 COPY c/xezim_bridge.c /opt/xezim/src/xezim_bridge.c
-RUN cc -shared -fPIC -I/opt/xezim-src/include \
+RUN cc -Wall -Wextra -Werror -shared -fPIC -I/opt/xezim-src/include \
         -o /opt/xezim/bridge.so /opt/xezim/src/xezim_bridge.c \
     && rm /opt/xezim/src/xezim_bridge.c
 ENV PATH="/opt/xezim/bin:${PATH}" \

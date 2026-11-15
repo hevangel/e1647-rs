@@ -17,8 +17,9 @@
 //!   FINISH               -> BYE
 //!   ```
 //!
-//!   Lines the simulator prints on its own are ignored by the reader —
-//!   only the response prefixes are matched.
+//!   Ordinary log lines are ignored; reserved reply tokens match exactly.
+//!   Startup and complete commands have bounded deadlines. See
+//!   `docs/HDL_QUALIFICATION.md` for the concrete profile and limits.
 //!
 //! - [`NullSimulator`] — the no-op backend for where no simulator
 //!   exists. Every operation reports the honest "no simulator" error
@@ -52,9 +53,13 @@
 
 use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(not(target_arch = "wasm32"))]
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::{self, Receiver};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Duration, Instant};
 
 /// One HDL simulator backend: how a loaded session drives signal reads
 /// and writes, advances time and ends the run.
@@ -86,6 +91,13 @@ pub trait Simulator {
 
     /// End the simulation. A backend with nothing to end does nothing.
     fn finish(&mut self);
+
+    /// Checked cleanup when a backend can report a failed handshake/exit.
+    /// Existing backends retain their cleanup behavior by default.
+    fn finish_checked(&mut self) -> Result<(), String> {
+        self.finish();
+        Ok(())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -108,139 +120,322 @@ fn valid_location(value: &str, what: &str) -> Result<(), String> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+const MAX_RESPONSE_LINE: usize = 16 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub struct HdlSession {
     child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdin: Option<ChildStdin>,
+    responses: Option<Receiver<Result<String, String>>>,
+    timeout: Duration,
+    failed: Option<String>,
+    finished: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-/// Read response lines until one starts with one of the protocol
-/// prefixes; simulator-own output in between is skipped. Returns the
-/// matching line.
-fn next_protocol_line(
-    stdout: &mut BufReader<ChildStdout>,
-    prefixes: &[&str],
-) -> Result<String, String> {
-    loop {
-        let mut line = String::new();
-        match stdout.read_line(&mut line) {
-            Ok(0) => {
-                return Err("the simulator closed its output before answering (did \
-                     the design elaborate?)"
-                    .to_owned());
-            }
-            Ok(_) => {
-                let trimmed = line.trim_end().to_owned();
-                if prefixes
-                    .iter()
-                    .any(|prefix| trimmed == *prefix || trimmed.starts_with(prefix))
-                {
-                    return Ok(trimmed);
-                }
-            }
-            Err(err) => return Err(format!("could not read from the simulator: {err}")),
-        }
+fn session_timeout(setting: Option<&str>) -> Result<Duration, String> {
+    let millis = match setting {
+        None => 30_000,
+        Some(text) => text
+            .parse::<u64>()
+            .ok()
+            .filter(|n| (1..=300_000).contains(n))
+            .ok_or("E1647_XEZIM_TIMEOUT_MS must be an integer from 1 to 300000")?,
+    };
+    Ok(Duration::from_millis(millis))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn wave_enabled(setting: Option<&str>) -> Result<bool, String> {
+    match setting {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        _ => Err("E1647_XEZIM_WAVE must be 0 or 1".to_owned()),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn valid_signal_path(path: &str) -> Result<(), String> {
+    if path.is_empty() || path.len() > 511 || !path.bytes().all(|c| c.is_ascii_graphic()) {
+        Err(
+            "invalid signal path: expected 1..511 printable ASCII bytes without whitespace"
+                .to_owned(),
+        )
+    } else {
+        Ok(())
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl HdlSession {
-    /// Spawn the simulator with the VPI bridge and wait for it to finish
-    /// elaboration (the first `READY`). The bridge module location can be
-    /// overridden with `E1647_XEZIM_BRIDGE` (container default
-    /// `/opt/xezim/bridge.so`).
+    /// Load the native xezim VPI session. A complete startup/command handshake
+    /// has a 30-second deadline, configurable with E1647_XEZIM_TIMEOUT_MS
+    /// (1..300000). Source and bridge paths use an argv list without a shell.
     pub fn load(design_file: &str, top: &str) -> Result<Self, String> {
         let bridge = std::env::var("E1647_XEZIM_BRIDGE")
             .unwrap_or_else(|_| "/opt/xezim/bridge.so".to_owned());
         valid_location(&bridge, "VPI bridge (E1647_XEZIM_BRIDGE)")?;
         valid_location(design_file, "design file")?;
         valid_location(top, "top module name")?;
-        let mut child = Command::new("xezim")
-            .arg("--simulate")
-            .arg("--vpi-lib")
-            .arg(&bridge)
-            .arg("-s")
-            .arg(top)
-            .arg(design_file)
+        let setting =
+            std::env::var("E1647_XEZIM_TIMEOUT_MS")
+                .map(Some)
+                .or_else(|error| match error {
+                    std::env::VarError::NotPresent => Ok(None),
+                    _ => Err("E1647_XEZIM_TIMEOUT_MS is not valid Unicode".to_owned()),
+                })?;
+        let timeout = session_timeout(setting.as_deref())?;
+        let wave = std::env::var("E1647_XEZIM_WAVE")
+            .map(Some)
+            .or_else(|error| match error {
+                std::env::VarError::NotPresent => Ok(None),
+                _ => Err("E1647_XEZIM_WAVE is not valid Unicode".to_owned()),
+            })?;
+        let mut command = Command::new("xezim");
+        command.args(["--simulate", "--vpi-lib", &bridge, "-s", top, design_file]);
+        if wave_enabled(wave.as_deref())? {
+            command.arg("--wave");
+        }
+        Self::spawn(command, timeout)
+    }
+
+    fn spawn(mut command: Command, timeout: Duration) -> Result<Self, String> {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|err| {
-                "could not spawn 'xezim' (is it on PATH? the container \
-                 provides it): "
-                    .to_owned()
-                    + &err.to_string()
+            .map_err(|error| {
+                format!("could not spawn the simulator (is xezim on PATH?): {error}")
             })?;
-        let stdin = child.stdin.take().ok_or("no stdin for the simulator")?;
-        let stdout = child.stdout.take().ok_or("no stdout for the simulator")?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
         let mut session = Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            responses: None,
+            timeout,
+            failed: None,
+            finished: false,
         };
-        session.wait_ready()?;
+        let Some(stdout) = stdout else {
+            return Err("no stdout for the simulator".to_owned());
+        };
+        if session.stdin.is_none() {
+            return Err("no stdin for the simulator".to_owned());
+        }
+        // A bounded queue prevents an eager simulator from retaining unbounded
+        // log output. Dropping the receiver releases a blocked sender; killing
+        // the owned child closes its output. Descendant process trees are not
+        // managed by this session.
+        let (sender, receiver) = mpsc::sync_channel(8);
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut bytes = Vec::new();
+                let result = match reader
+                    .by_ref()
+                    .take((MAX_RESPONSE_LINE + 1) as u64)
+                    .read_until(b'\n', &mut bytes)
+                {
+                    Ok(0) => Err("the simulator closed its output before answering".to_owned()),
+                    Ok(_) if bytes.len() > MAX_RESPONSE_LINE => {
+                        Err("simulator output line exceeds 16384 bytes".to_owned())
+                    }
+                    Ok(_) => String::from_utf8(bytes)
+                        .map(|line| line.trim_end_matches(['\r', '\n']).to_owned())
+                        .map_err(|_| "simulator output is not UTF-8".to_owned()),
+                    Err(error) => Err(format!("could not read from the simulator: {error}")),
+                };
+                let terminal = result.is_err();
+                if sender.send(result).is_err() || terminal {
+                    break;
+                }
+            }
+        });
+        session.responses = Some(receiver);
+        let deadline = Instant::now() + timeout;
+        let result = session.expect(&["READY"], deadline, &mut 0).map(|_| ());
+        session.complete_exchange(result)?;
         Ok(session)
     }
 
-    fn wait_ready(&mut self) -> Result<(), String> {
-        next_protocol_line(&mut self.stdout, &["READY"]).map(|_| ())
+    fn available(&self) -> Result<(), String> {
+        if let Some(error) = &self.failed {
+            Err(format!("simulator session is closed after: {error}"))
+        } else if self.finished {
+            Err("simulator session is finished".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn terminate(&mut self) {
+        self.stdin.take();
+        self.responses.take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    fn complete_exchange<T>(&mut self, result: Result<T, String>) -> Result<T, String> {
+        if let Err(error) = &result {
+            self.failed = Some(error.clone());
+            self.terminate();
+        }
+        result
     }
 
     fn send(&mut self, command: &str) -> Result<(), String> {
+        self.available()?;
         self.stdin
-            .write_all(command.as_bytes())
-            .and_then(|_| self.stdin.write_all(b"\n"))
-            .and_then(|_| self.stdin.flush())
-            .map_err(|err| format!("could not write to the simulator: {err}"))
+            .as_mut()
+            .ok_or("simulator input is closed")?
+            .write_all(format!("{command}\n").as_bytes())
+            .and_then(|_| self.stdin.as_mut().unwrap().flush())
+            .map_err(|error| format!("could not write to the simulator: {error}"))
     }
 
-    fn expect(&mut self, prefixes: &[&str]) -> Result<String, String> {
-        next_protocol_line(&mut self.stdout, prefixes)
+    fn expect(
+        &self,
+        expected: &[&str],
+        deadline: Instant,
+        bytes: &mut usize,
+    ) -> Result<String, String> {
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or("timed out waiting for the simulator response")?;
+            let line = self
+                .responses
+                .as_ref()
+                .ok_or("simulator output is closed")?
+                .recv_timeout(remaining)
+                .map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => {
+                        "timed out waiting for the simulator response"
+                    }
+                    mpsc::RecvTimeoutError::Disconnected => "simulator output reader stopped",
+                })??;
+            *bytes += line.len() + 1;
+            if *bytes > MAX_RESPONSE_BYTES {
+                return Err("simulator response exceeds 1048576 bytes".to_owned());
+            }
+            let token = line
+                .split_once(' ')
+                .map_or(line.as_str(), |(token, _)| token);
+            if !matches!(token, "READY" | "OK" | "VAL" | "ERR" | "BYE") {
+                continue;
+            }
+            if token == "ERR" {
+                return Err(line);
+            }
+            if !expected.contains(&token)
+                || (matches!(token, "READY" | "OK" | "BYE") && line != token)
+            {
+                return Err(format!(
+                    "unexpected simulator response '{line}', expected {}",
+                    expected.join(" or ")
+                ));
+            }
+            return Ok(line);
+        }
     }
 
-    /// Assign an integer value to a signal.
+    /// Assign a signed 32-bit VPI integer. Wider transfers are not supported.
     pub fn set(&mut self, path: &str, value: i64) -> Result<(), String> {
-        self.send(&format!("SET {path} {value}"))?;
-        match self.expect(&["OK", "ERR"])?.as_str() {
-            "OK" => Ok(()),
-            err => Err(err.to_owned()),
-        }
+        self.available()?;
+        valid_signal_path(path)?;
+        i32::try_from(value).map_err(|_| "HDL bridge writes require a signed 32-bit value")?;
+        let deadline = Instant::now() + self.timeout;
+        let result = (|| {
+            self.send(&format!("SET {path} {value}"))?;
+            self.expect(&["OK"], deadline, &mut 0).map(|_| ())
+        })();
+        self.complete_exchange(result)
     }
 
-    /// Read an integer value from a signal.
+    /// Read a signed 32-bit VPI integer; the bridge rejects wider/MVL signals.
     pub fn get(&mut self, path: &str) -> Result<i128, String> {
-        self.send(&format!("GET {path}"))?;
-        match self.expect(&["VAL", "ERR"])?.strip_prefix("VAL ") {
-            Some(text) => text
-                .parse::<i128>()
-                .map_err(|err| format!("unreadable value '{text}': {err}")),
-            None => Err("signal read failed".to_owned()),
-        }
+        self.available()?;
+        valid_signal_path(path)?;
+        let deadline = Instant::now() + self.timeout;
+        let result = (|| {
+            self.send(&format!("GET {path}"))?;
+            let line = self.expect(&["VAL"], deadline, &mut 0)?;
+            let text = line
+                .strip_prefix("VAL ")
+                .ok_or("malformed simulator value response")?;
+            text.parse::<i32>()
+                .map(i128::from)
+                .map_err(|_| format!("unreadable signed 32-bit value '{text}'"))
+        })();
+        self.complete_exchange(result)
     }
 
-    /// Advance simulation time by the design's time units.
+    /// Advance time. ERR terminates the exchange immediately; OK and READY
+    /// share one deadline, rather than waiting forever after a rejected RUN.
     pub fn run(&mut self, delay: u64) -> Result<(), String> {
-        self.send(&format!("RUN {delay}"))?;
-        self.expect(&["OK", "ERR"])?;
-        self.wait_ready()
+        self.available()?;
+        let deadline = Instant::now() + self.timeout;
+        let result = (|| {
+            self.send(&format!("RUN {delay}"))?;
+            let mut bytes = 0;
+            self.expect(&["OK"], deadline, &mut bytes)?;
+            self.expect(&["READY"], deadline, &mut bytes).map(|_| ())
+        })();
+        self.complete_exchange(result)
     }
 
-    /// End the simulation and reap the child process.
-    pub fn finish(&mut self) {
-        if self.send("FINISH").is_ok() {
-            let _ = self.expect(&["BYE"]);
+    /// Request a clean finish, wait for BYE and a successful process exit,
+    /// then reap. Missing replies/exits are bounded by the same deadline.
+    pub fn finish_checked(&mut self) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
         }
-        let _ = self.child.wait();
+        self.available()?;
+        let deadline = Instant::now() + self.timeout;
+        let result = (|| {
+            self.send("FINISH")?;
+            self.expect(&["BYE"], deadline, &mut 0)?;
+            self.stdin.take();
+            loop {
+                if let Some(status) = self
+                    .child
+                    .try_wait()
+                    .map_err(|e| format!("could not reap the simulator: {e}"))?
+                {
+                    return if status.success() {
+                        Ok(())
+                    } else {
+                        Err(format!("simulator exited with {status}"))
+                    };
+                }
+                if Instant::now() >= deadline {
+                    return Err("timed out waiting for simulator exit".to_owned());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })();
+        let result = self.complete_exchange(result);
+        if result.is_ok() {
+            self.finished = true;
+            self.responses.take();
+        }
+        result
+    }
+
+    /// Compatibility cleanup entry point. Use finish_checked to observe errors.
+    pub fn finish(&mut self) {
+        let _ = self.finish_checked();
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for HdlSession {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.terminate();
     }
 }
 
@@ -286,6 +481,10 @@ impl Simulator for XezimSimulator {
 
     fn finish(&mut self) {
         self.session.finish();
+    }
+
+    fn finish_checked(&mut self) -> Result<(), String> {
+        self.session.finish_checked()
     }
 }
 
@@ -444,6 +643,14 @@ impl SignalSource {
         }
     }
 
+    /// End the session and observe backend handshake/exit errors.
+    pub fn finish_checked(&mut self) -> Result<(), String> {
+        match self {
+            SignalSource::Real(session) => session.finish_checked(),
+            SignalSource::Injected(_) => Ok(()),
+        }
+    }
+
     /// End the session. An injected source has nothing to end.
     pub fn finish(&mut self) {
         if let SignalSource::Real(session) = self {
@@ -499,6 +706,245 @@ impl InjectedSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These owned subprocesses test transport mechanics, not HDL semantics.
+    // The child is this same Rust test binary, selected with a per-process
+    // environment variable; no PATH mutation, shell or external simulator.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fixture_command(mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--quiet",
+                "--exact",
+                "hdl::tests::owned_protocol_fixture",
+                "--nocapture",
+            ])
+            .env("E1647_OWNED_HDL_FIXTURE", mode);
+        command
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fixture_session(mode: &str) -> HdlSession {
+        HdlSession::spawn(fixture_command(mode), Duration::from_secs(3)).unwrap()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn owned_protocol_fixture() {
+        let Ok(mode) = std::env::var("E1647_OWNED_HDL_FIXTURE") else {
+            return;
+        };
+        if mode == "startup-timeout" {
+            std::thread::sleep(Duration::from_secs(3));
+            return;
+        }
+        if mode == "startup-eof" {
+            return;
+        }
+        if mode == "startup-error" {
+            println!("ERR owned startup failure");
+            return;
+        }
+        if mode == "startup-malformed" {
+            println!("READY extra");
+            return;
+        }
+        println!("READYING is ordinary simulator output");
+        println!("READY");
+        std::io::stdout().flush().unwrap();
+        for line in std::io::stdin().lock().lines() {
+            let line = line.unwrap();
+            if line.starts_with("RUN ") {
+                match mode.as_str() {
+                    "run-error" => println!("ERR owned callback failure"),
+                    "run-timeout" => println!("OK"),
+                    "run-order" => println!("READY"),
+                    "run-malformed" => println!("OK extra"),
+                    "run-deadline" => {
+                        std::thread::sleep(Duration::from_millis(80));
+                        println!("OK");
+                        std::io::stdout().flush().unwrap();
+                        std::thread::sleep(Duration::from_millis(80));
+                        println!("READY");
+                    }
+                    _ => println!("OK\nREADY"),
+                }
+            } else if line.starts_with("SET ") {
+                println!("OK");
+            } else if line.starts_with("GET ") {
+                match mode.as_str() {
+                    "get-error" => println!("ERR owned missing signal"),
+                    "get-value" => println!("VAL not-an-integer"),
+                    "get-overflow" => println!("VAL 2147483648"),
+                    "get-order" => println!("READY"),
+                    "get-eof" => return,
+                    "get-long" => println!("{}", "x".repeat(MAX_RESPONSE_LINE + 1)),
+                    "get-noise" => {
+                        for _ in 0..140 {
+                            println!("{}", "x".repeat(8192));
+                        }
+                    }
+                    "get-utf8" => {
+                        std::io::stdout().write_all(&[255, b'\n']).unwrap();
+                    }
+                    _ => println!("VALUE is ordinary simulator output\nVAL -123"),
+                }
+            } else if line == "FINISH" {
+                match mode.as_str() {
+                    "finish-timeout" => {
+                        std::thread::sleep(Duration::from_secs(3));
+                        return;
+                    }
+                    "finish-exit-timeout" => {
+                        println!("BYE");
+                        std::io::stdout().flush().unwrap();
+                        std::thread::sleep(Duration::from_secs(3));
+                        return;
+                    }
+                    "finish-failed" => {
+                        println!("BYE");
+                        std::io::stdout().flush().unwrap();
+                        std::process::exit(7);
+                    }
+                    "finish-error" => {
+                        println!("ERR owned finish failure");
+                        return;
+                    }
+                    _ => {
+                        println!("BYE");
+                        return;
+                    }
+                }
+            }
+            std::io::stdout().flush().unwrap();
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn owned_session_handshakes_and_validation() {
+        let mut session = fixture_session("normal");
+        session.set("top.values[0]", i64::from(i32::MIN)).unwrap();
+        assert!(
+            session
+                .set("top.x", i64::from(i32::MAX) + 1)
+                .unwrap_err()
+                .contains("32-bit")
+        );
+        for path in ["", "top.x\nFINISH", "top .x", &"x".repeat(512)] {
+            assert!(
+                session
+                    .get(path)
+                    .unwrap_err()
+                    .contains("invalid signal path")
+            );
+        }
+        assert_eq!(session.get("top.values[0]").unwrap(), -123);
+        session.run(u64::MAX).unwrap();
+        session.finish_checked().unwrap();
+        session.finish_checked().unwrap();
+        assert!(session.child.try_wait().unwrap().unwrap().success());
+        assert!(session.get("top.x").unwrap_err().contains("finished"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn owned_run_error_does_not_wait_for_ready() {
+        let mut session = fixture_session("run-error");
+        let error = session.run(1).unwrap_err();
+        assert_eq!(error, "ERR owned callback failure");
+        assert!(session.child.try_wait().unwrap().is_some());
+        assert!(session.get("top.x").unwrap_err().contains(&error));
+        assert!(session.finish_checked().unwrap_err().contains(&error));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn owned_session_startup_failures_are_bounded() {
+        for (mode, message) in [
+            ("startup-timeout", "timed out"),
+            ("startup-eof", "closed its output"),
+            ("startup-error", "ERR owned startup failure"),
+            ("startup-malformed", "unexpected simulator response"),
+        ] {
+            let start = Instant::now();
+            let error = HdlSession::spawn(fixture_command(mode), Duration::from_millis(500))
+                .err()
+                .unwrap();
+            assert!(error.contains(message), "{mode}: {error}");
+            assert!(start.elapsed() < Duration::from_secs(5), "{mode}");
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn owned_response_failures_reap_the_child() {
+        for (mode, message) in [
+            ("get-error", "ERR owned missing signal"),
+            ("get-value", "unreadable"),
+            ("get-overflow", "32-bit"),
+            ("get-order", "unexpected"),
+            ("get-eof", "closed its output"),
+            ("get-long", "line exceeds"),
+            ("get-noise", "response exceeds"),
+            ("get-utf8", "not UTF-8"),
+            ("run-order", "unexpected"),
+            ("run-malformed", "unexpected"),
+            ("run-timeout", "timed out"),
+            ("run-deadline", "timed out"),
+        ] {
+            let mut session = fixture_session(mode);
+            session.timeout = Duration::from_millis(120);
+            let start = Instant::now();
+            let error = if mode.starts_with("run") {
+                session.run(1).unwrap_err()
+            } else {
+                session.get("top.x").unwrap_err()
+            };
+            assert!(error.contains(message), "{mode}: {error}");
+            assert!(session.child.try_wait().unwrap().is_some(), "{mode}");
+            assert!(start.elapsed() < Duration::from_secs(5), "{mode}");
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn owned_finish_failures_are_bounded_and_reaped() {
+        for (mode, message) in [
+            ("finish-timeout", "timed out"),
+            ("finish-exit-timeout", "timed out"),
+            ("finish-failed", "exited with"),
+            ("finish-error", "ERR owned finish failure"),
+        ] {
+            let mut session = fixture_session(mode);
+            session.timeout = Duration::from_millis(120);
+            let error = session.finish_checked().unwrap_err();
+            assert!(error.contains(message), "{mode}: {error}");
+            assert!(session.child.try_wait().unwrap().is_some(), "{mode}");
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn session_timeout_settings_are_explicit() {
+        assert_eq!(session_timeout(None).unwrap(), Duration::from_secs(30));
+        assert_eq!(
+            session_timeout(Some("1")).unwrap(),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            session_timeout(Some("300000")).unwrap(),
+            Duration::from_secs(300)
+        );
+        for setting in ["0", "300001", "no", "-1", ""] {
+            assert!(session_timeout(Some(setting)).is_err());
+        }
+        assert!(!wave_enabled(None).unwrap());
+        assert!(!wave_enabled(Some("0")).unwrap());
+        assert!(wave_enabled(Some("1")).unwrap());
+        assert!(wave_enabled(Some("yes")).is_err());
+    }
 
     /// The null backend is the trait-dispatch double: every drive
     /// operation reports the honest no-simulator error (the interpreter

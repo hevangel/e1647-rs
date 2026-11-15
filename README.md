@@ -158,6 +158,11 @@ Scope follows the field tree under `sys`; shared objects use their first
 visited path, with the existing bounded instance walk. A detached owner
 without the requested containing unit reports an error.
 
+The native HDL bridge has an [explicit xezim qualification profile](docs/HDL_QUALIFICATION.md)
+covering signed 32-bit transfers, counter edges, errors, VCD and HDL code
+coverage. Startup and command waits are bounded; wider/MVL transfers are
+rejected. This does not qualify general e/HDL event ordering.
+
 ## From Slopman to Rustman
 
 In keeping with this repository's policy of honest staged claims, the
@@ -209,6 +214,7 @@ docker compose build               # build the toolchain image
 docker compose run --rm verify     # fmt + clippy + tests, all features
 docker compose run --rm demo       # run and elaborate the example programs
 docker compose run --rm mixed      # mixed e + SystemVerilog testcase (xezim)
+docker compose run --rm qualify-hdl # assert the explicit xezim VPI profile
 docker compose run --rm toolchain  # interactive shell in the container
 ```
 

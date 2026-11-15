@@ -21,12 +21,38 @@
  *   cc -shared -fPIC -I<xezim>/include -o bridge.so xezim_bridge.c
  */
 
+#include <errno.h>
+#include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "vpi_user.h"
 
 static void control_loop(void);
+
+/* The vpiIntVal transfer is explicitly limited to at most 32 signal bits. */
+static int supported_signal(vpiHandle handle)
+{
+    PLI_INT32 width = vpi_get(vpiSize, handle);
+    if (width < 1 || width > 32) {
+        printf("ERR signal width must be from 1 to 32 bits\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int parse_delay(const char *text, uint64_t *delay)
+{
+    char *end;
+    unsigned long long value;
+    if (*text < '0' || *text > '9') return 0;
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (errno || *end != '\0' || value > UINT64_MAX) return 0;
+    *delay = (uint64_t)value;
+    return 1;
+}
 
 /* After a RUN the simulation advanced; re-enter the control loop and
  * tell the driver we can accept commands again. */
@@ -44,21 +70,41 @@ static void control_loop(void)
     char line[1024];
 
     while (fgets(line, sizeof line, stdin)) {
+        if (strchr(line, '\n') == NULL && !feof(stdin)) {
+            int c;
+            while ((c = getchar()) != '\n' && c != EOF) { }
+            printf("ERR command exceeds input buffer\n");
+            fflush(stdout);
+            continue;
+        }
         line[strcspn(line, "\r\n")] = '\0';
 
         if (strncmp(line, "SET ", 4) == 0) {
             char path[512];
-            long value;
+            char number[64], extra, *end;
+            long long value;
             vpiHandle handle;
             s_vpi_value value_data;
-            if (sscanf(line + 4, "%511s %ld", path, &value) != 2) {
+            if (sscanf(line + 4, "%511s %63s %c", path, number, &extra) != 2) {
                 printf("ERR usage: SET <path> <value>\n");
+                fflush(stdout);
+                continue;
+            }
+            errno = 0;
+            value = strtoll(number, &end, 10);
+            if (errno || *end != '\0' || value < INT32_MIN || value > INT32_MAX) {
+                printf("ERR SET requires a signed 32-bit integer\n");
                 fflush(stdout);
                 continue;
             }
             handle = vpi_handle_by_name(path, NULL);
             if (handle == NULL) {
                 printf("ERR no such signal '%s'\n", path);
+                fflush(stdout);
+                continue;
+            }
+            if (!supported_signal(handle)) {
+                vpi_release_handle(handle);
                 fflush(stdout);
                 continue;
             }
@@ -69,10 +115,10 @@ static void control_loop(void)
             printf("OK\n");
             fflush(stdout);
         } else if (strncmp(line, "GET ", 4) == 0) {
-            char path[512];
+            char path[512], extra;
             vpiHandle handle;
             s_vpi_value value_data;
-            if (sscanf(line + 4, "%511s", path) != 1) {
+            if (sscanf(line + 4, "%511s %c", path, &extra) != 1) {
                 printf("ERR usage: GET <path>\n");
                 fflush(stdout);
                 continue;
@@ -80,6 +126,20 @@ static void control_loop(void)
             handle = vpi_handle_by_name(path, NULL);
             if (handle == NULL) {
                 printf("ERR no such signal '%s'\n", path);
+                fflush(stdout);
+                continue;
+            }
+            if (!supported_signal(handle)) {
+                vpi_release_handle(handle);
+                fflush(stdout);
+                continue;
+            }
+            value_data.format = vpiBinStrVal;
+            vpi_get_value(handle, &value_data);
+            if (value_data.value.str == NULL ||
+                strspn(value_data.value.str, "01") != strlen(value_data.value.str)) {
+                vpi_release_handle(handle);
+                printf("ERR GET does not support X/Z signal values\n");
                 fflush(stdout);
                 continue;
             }
@@ -91,9 +151,14 @@ static void control_loop(void)
         } else if (strncmp(line, "RUN ", 4) == 0) {
             s_cb_data callback_data;
             s_vpi_time delay_time;
-            long delay = atol(line + 4);
+            uint64_t delay;
+            if (!parse_delay(line + 4, &delay)) {
+                printf("ERR RUN requires an unsigned 64-bit delay\n");
+                fflush(stdout);
+                continue;
+            }
             delay_time.type = vpiSimTime;
-            delay_time.high = 0;
+            delay_time.high = (PLI_UINT32)(delay >> 32);
             delay_time.low = (PLI_UINT32)delay;
             memset(&callback_data, 0, sizeof callback_data);
             callback_data.reason = cbAfterDelay;

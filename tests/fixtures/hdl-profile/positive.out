@@ -1,0 +1,6 @@
+min -2147483648
+max 2147483647
+edge 1 count 1
+edge 2 count 2
+edge 3 count 3
+finished

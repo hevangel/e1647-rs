@@ -12362,7 +12362,7 @@ impl<'a> Interp<'a> {
         values: Vec<Value>,
         span: crate::ast::Span,
     ) -> Result<Value, ExecError> {
-        // ExecErrors are built inline (no closure holds a borrow of
+        // Diagnostics are built inline (no closure holds a borrow of
         // `self` across the mutable session accesses).
         let not_loaded = || {
             ExecError::new(
@@ -12489,7 +12489,9 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 if let Some(mut session) = self.hdl.take() {
-                    session.finish();
+                    session
+                        .finish_checked()
+                        .map_err(|message| self.error("E0408", message, span))?;
                 }
                 Ok(Value::Void)
             }
@@ -17480,5 +17482,74 @@ impl<'a> Interp<'a> {
                 origin_span(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod simulator_cleanup_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct FailingFinish(Rc<Cell<bool>>);
+
+    impl crate::hdl::Simulator for FailingFinish {
+        fn load(_: &str, _: &str) -> Result<Self, String> {
+            Err("test-only backend".to_owned())
+        }
+        fn name(&self) -> &'static str {
+            "owned-finish-test"
+        }
+        fn set(&mut self, _: &str, _: i64) -> Result<(), String> {
+            unreachable!()
+        }
+        fn get(&mut self, _: &str) -> Result<i128, String> {
+            unreachable!()
+        }
+        fn run(&mut self, _: u64) -> Result<(), String> {
+            unreachable!()
+        }
+        fn finish(&mut self) {
+            unreachable!("checked finish must dispatch")
+        }
+        fn finish_checked(&mut self) -> Result<(), String> {
+            Err("owned finish failure".to_owned())
+        }
+    }
+
+    impl Drop for FailingFinish {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    #[test]
+    fn checked_finish_error_reaches_the_cli_diagnostic_contract() {
+        let source = include_str!("../tests/fixtures/hdl-session/finish-error.e");
+        let parsed = crate::parser::parse(source);
+        let elaborated = crate::elab::elaborate(&parsed.declarations);
+        assert!(parsed.diagnostics.is_empty());
+        assert!(elaborated.diagnostics.is_empty());
+        assert!(crate::typing::check_types(&elaborated).is_empty());
+        let dropped = Rc::new(Cell::new(false));
+        let result = run_inner(
+            &elaborated,
+            1,
+            Some(crate::hdl::SignalSource::Real(Box::new(FailingFinish(
+                Rc::clone(&dropped),
+            )))),
+        );
+        assert_eq!(
+            result.output,
+            include_str!("../tests/fixtures/hdl-session/finish-error.out")
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|d| format!("{}\n", d.render()))
+                .collect::<String>(),
+            include_str!("../tests/fixtures/hdl-session/finish-error.run.expected")
+        );
+        assert!(dropped.get());
     }
 }

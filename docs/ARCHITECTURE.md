@@ -629,6 +629,15 @@ browser sandbox API is not started.
   impl and one registry arm. Quoted HDL paths and the `hdl_*` routines
   read through `SignalSource`, which holds whichever backend loaded (or
   the injected per-cycle history).
+  Native sessions use a bounded reader queue, 16-KiB lines and one deadline
+  for a complete exchange (including RUN's OK/READY). Reserved response
+  tokens match exactly; ERR/malformed/out-of-order replies close and reap
+  the child. Checked finish observes BYE and process status; the CLI reports
+  failure as E0408. Signal transfers are explicitly signed 32-bit with
+  wider/MVL values rejected. E1647_XEZIM_WAVE controls optional --wave.
+  The concrete profile and its separate artifact-verifying runner are in
+  [HDL_QUALIFICATION.md](HDL_QUALIFICATION.md); they do not prove general
+  e/HDL event ordering.
 - `src/main.rs` — `e1647 tokens`, `e1647 parse`, `e1647 elab` and
   `e1647 run [--seed N]`. `import a.b` loads `a/b.e` or `a.b.e` next to
   the source and splices those declarations in front. `parse`, `elab` and
@@ -647,9 +656,9 @@ Remaining boundaries (the detailed behavior inventory is in STATUS.md):
 - General constraint solving: wide domains, division/modulo and temporal
   constraints exceed the bounded linear/polynomial solvers. Full connected
   field sets and select soft-order interactions remain incomplete.
-- Value-expression call continuations, receivers unresolved before evaluation,
-  and atomic on/check-failure bodies. Nested statement calls and compute now
-  suspend with saved frames. Temporal histories still share one global
+- Further scoped callback handling, preserving static/on/evaluate restrictions.
+  Scheduled instance value calls now retain expression/callee continuations,
+  including runtime-resolved receivers. Temporal histories still share one global
   timeline; per-instance/event-specific compound timelines, edge-width
   legality, real/MVL/custom-numeric edges and distinct same-cycle samples
   remain gaps. Dotted physical event identity is resolved; indexed temporal

@@ -53,3 +53,13 @@ services:
   mixed-port:
     <<: *toolchain
     command: ["cargo", "run", "--quiet", "--", "run", "--seed", "1", "examples/mixed_port.e"]
+
+
+  # Exact native/HDL outputs, error cases, VCD and HDL code coverage for the
+  # pinned xezim profile. Reports/artifacts remain under ignored local/.
+  qualify-hdl:
+    <<: *toolchain
+    command: >
+      bash -c "cargo build --locked --bin e1647
+      && python3 scripts/qualify_hdl.py --native /opt/target/debug/e1647
+      --report local/hdl-profile/report.json"

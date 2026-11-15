@@ -520,11 +520,18 @@ not imply full language support or IEEE conformance.
       (VHPI — not implemented) plugs in with one `Simulator` impl and one
       registry arm. Still one real simulator binding, and no backend
       selection knob yet (`hdl_load` resolves through the default
-      backend)
+      backend). Session startup/commands/finish now have bounded handshakes,
+      strict reply grammar and checked error/exit propagation. The bridge
+      explicitly transports signed 32-bit VPI values and rejects wide/MVL
+      transfers. Optional waveform instrumentation is available.
 - [~] SystemVerilog integration tests and event ordering — started: the
       compose `mixed` service runs `examples/mixed_counter.e` against
       `examples/mixed/counter.sv`. Event ordering between e and the HDL
-      simulator is not implemented
+      simulator is not implemented. The separate scripts/qualify_hdl.py
+      runner checks the pinned xezim profile's exact outputs/diagnostics,
+      VCD transitions and HDL code coverage, including both mixed examples;
+      see [HDL_QUALIFICATION.md](HDL_QUALIFICATION.md). This is explicit
+      hdl_run/READY qualification, not general scheduler integration
 - [~] WASM build and browser sandbox API — started: the core library
       (lexer/parser/elaborator/interpreter) compiles for
       `wasm32-unknown-unknown` (CI runs `cargo check --target
