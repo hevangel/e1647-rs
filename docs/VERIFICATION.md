@@ -4921,6 +4921,9 @@ Verification:
 
 Scoped evaluate/constructor actions, list callbacks, generation/coverage
 observation, static methods, on blocks and check failure actions remain
-atomic and need separate scope continuations. This change does not qualify
-those contexts or general simulator ordering. No local all-feature, WASM
+atomic. Any further legal callback suspension needs separate scope handling
+and qualification of the applicable restrictions: static methods are not TCMs,
+on actions prohibit time-consuming actions, and evaluate excludes wait/sync/
+return. This change does not qualify those contexts or general simulator
+ordering. No local all-feature, WASM
 runtime or Specman run was performed. No IEEE conformance is claimed.

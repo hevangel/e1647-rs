@@ -520,8 +520,11 @@ browser sandbox API is not started.
   public diagnostics; statement boundaries translate control into `Flow`.
   Scoped evaluate/constructor actions, list callbacks, generation/coverage
   observation, static methods, `on` blocks and check failure bodies remain
-  atomic. These scopes need separate continuations before their locals and
-  partially committed effects can survive suspension. Temporal waits
+  atomic. Any additional legal suspension in scoped callbacks requires
+  separate handling for their locals and partially committed effects.
+  Static methods are not TCMs (17.2.2); on actions prohibit time-consuming
+  actions (11.3), and evaluate actions exclude wait/sync/return (4.17.7).
+  Remaining callback work must preserve those restrictions. Temporal waits
   (`@event`, sequences, propositions, event
   repeats, with 13.2.4's readability-only `until`) re-evaluate at
   every turn (12.3.2); propositions and repeat bounds retain sampled

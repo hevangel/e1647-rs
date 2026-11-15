@@ -63,7 +63,8 @@ arguments, receivers and return expressions. Completed expression values,
 operator results and formatted print parts survive resumption without replay.
 Scoped `evaluate`/constructor actions, list callbacks, generation/coverage
 observation, static methods, `on` blocks and check failure actions remain
-atomic; these scopes do not yet carry their own continuations. Compute arguments now receive the same declared parameter contexts
+atomic and are outside this scheduled value-call support. Static methods are
+not TCMs, and on actions prohibit time-consuming actions. Compute arguments now receive the same declared parameter contexts
 as ordinary/started calls. Instance events use physical owner identities:
 bare, dotted and object-alias references resolve to the same event, while
 same-named events on different instances stay separate. Emission receivers
