@@ -16,10 +16,10 @@
 //! The 14.9 coverage configuration ([`CoverageConfig`]) carries the
 //! coverage mode (14.2's NOTE: "Unless coverage mode is turned on
 //! first (see 14.9), no coverage results are collected") and
-//! `max_int_buckets`. The setting routine the prose names,
-//! `set_config(<category>, <option>, <value>)` (14.9), is not wired
-//! into the interpreter yet, so the options are reachable through
-//! [`build_with_config`] only. The option entries whose semantics the
+//! `max_int_buckets`. The interpreter's `set_config(cover, ...)`
+//! (29.9) controls runtime collection, initially disabled, and default
+//! integer bucket counts. Builders construct schemas independently of
+//! runtime enablement. The option entries whose semantics the
 //! extractable prose defines apply from the recorded tokens:
 //! `no_collect`/`instance_no_collect` on the group (14.3.2) or the
 //! item (14.4.4) — when TRUE the group/item "shall not be presented" —
@@ -27,7 +27,7 @@
 //! group-level `at_least`/`weight` spellings (14.9.3/14.9.4: both "can
 //! be set in the coverage group or item definitions").
 //!
-//! Not modeled yet: the `set_config()` routine itself, the bool-exp
+//! Not modeled yet: other runtime configuration categories/options, the bool-exp
 //! option forms (including the implicit `inst` variable and the
 //! `per_unit_instance` scoping of 14.3.2/14.4.4),
 //! `instance_ignore`/`instance_illegal`, the `radix`/`when`/`never`
@@ -393,29 +393,18 @@ impl TypeCoverage {
     }
 }
 
-/// The coverage configuration options (14.9). The prose names the
-/// setting mechanism — the `set_config()` predefined routine, "sets
-/// the configuration options to the specified values" (the category,
-/// option, value shape of its syntax example; 7.6.1's `set_config_max`
-/// variant sets "the numeric options of a particular category to the
-/// specified maximum values") — and two coverage options by name: the
-/// coverage mode (14.2's NOTE) and `max_int_buckets` (14.3). The
-/// routine itself is not wired into the interpreter yet, so the
-/// options are reachable through [`build_with_config`] only.
+/// Coverage schema options: enablement (14.2) and default integer
+/// bucket count (14.3). The interpreter exposes the corresponding
+/// runtime options through `set_config(cover, ...)` (29.9).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverageConfig {
-    /// 14.2's NOTE: "Unless coverage mode is turned on first (see
-    /// 14.9), no coverage results are collected, even if cover groups
-    /// and cover items are defined." With the mode off nothing is
-    /// built, so the interpreter finds no groups to sample and the
-    /// report presents none. The default keeps collection on — a
-    /// documented deviation: the standard's mode starts off until
-    /// `set_config` turns it on, and the routine is not wired yet.
+    /// With this option disabled, the builder produces no groups.
+    /// The builder default constructs an enabled schema;
+    /// runtime execution separately starts with collection disabled
+    /// until `set_config(cover, mode, normal)` enables it.
     pub mode: bool,
-    /// 14.3: "If ranges is not specified, the default number of
-    /// buckets is 16 [set by the max_int_buckets coverage
-    /// configuration option (see 14.9)]." The integer items' default
-    /// bucket count; 0 leaves the item without default buckets
+    /// Default integer bucket count when no ranges are specified
+    /// (14.3); 0 leaves the item without default buckets
     /// (ungradeable).
     pub max_int_buckets: u64,
 }
@@ -442,12 +431,19 @@ pub fn build_with_config(
     elaborated: &crate::elab::Elaborated,
     config: &CoverageConfig,
 ) -> Vec<TypeCoverage> {
+    build_types(&elaborated.types, config)
+}
+
+pub(crate) fn build_types(
+    types: &[crate::elab::ElaboratedType],
+    config: &CoverageConfig,
+) -> Vec<TypeCoverage> {
     // 14.2's NOTE (see [`CoverageConfig::mode`]).
     if !config.mode {
         return Vec::new();
     }
     let mut result: Vec<TypeCoverage> = Vec::new();
-    for ty in &elaborated.types {
+    for ty in types {
         if ty.covers.is_empty() {
             continue;
         }

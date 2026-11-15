@@ -3797,9 +3797,24 @@ impl Parser {
             } else if self.at_punct("(") {
                 self.bump();
                 let mut args = Vec::new();
+                let config_call = matches!(&expr, Expr::Ident { name, .. } if name == "set_config");
                 if !self.at_punct(")") {
                     loop {
-                        args.push(self.parse_expr()?);
+                        if config_call && (args.is_empty() || args.len() % 2 == 1) {
+                            // Clause 29.9: category/option positions
+                            // are keyword names, not value expressions.
+                            let start = self.current_span().0;
+                            let Some(name) = self.take_word() else {
+                                self.error_here("E0108", "expected a configuration keyword");
+                                return None;
+                            };
+                            args.push(Expr::Ident {
+                                name,
+                                span: (start, self.last_end()),
+                            });
+                        } else {
+                            args.push(self.parse_expr()?);
+                        }
                         if !self.eat_punct(",") {
                             break;
                         }

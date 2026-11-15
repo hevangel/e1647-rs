@@ -1,0 +1,3 @@
+sys.cg samples=2
+n hits=[1,1] ungradeable=0
+flag hits=[0,2] ungradeable=0

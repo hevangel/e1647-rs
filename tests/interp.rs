@@ -26,6 +26,17 @@ fn run_source(source: &str, seed: u64) -> RunResult {
     run(&elaborated, seed)
 }
 
+/// Coverage tests explicitly enable collection during setup; ordinary
+/// execution tests retain the language's initially disabled mode.
+fn run_source_with_coverage(source: &str, seed: u64) -> RunResult {
+    run_source(
+        &format!(
+            "{source}\nextend sys {{ setup() is also {{ set_config(cover, mode, normal); }}; }};"
+        ),
+        seed,
+    )
+}
+
 /// Like [`run_source`], but the `hdl_*` routines and the `@sim`/event-port
 /// sampling read the injected per-cycle signal history instead of a
 /// spawned simulator (the `xezim` binary is not available in tests).
@@ -1899,7 +1910,7 @@ fn cover_group_samples_explicit_buckets_on_emit() {
     // 14.2/14.3: the group samples when its event fires; each item
     // value lands in the bucket whose range contains it, and values
     // outside every bucket are ungradeable.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
          item cur: uint using ranges = {\n            range([0..1], \"low\");\n            \
          range([2..3], \"high\");\n        };\n    };\n    run() is also {\n        \
@@ -1930,7 +1941,7 @@ fn cover_group_samples_explicit_buckets_on_emit() {
 fn cover_items_without_ranges_use_the_clause_defaults() {
     // 14.3: integers default to 16 buckets (0 through 15), booleans to
     // their two values; out-of-range values do not affect the grade.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    n: uint;\n    flag: bool;\n    cover cov_e is {\n        \
          item n: uint;\n        item flag: bool;\n    };\n    run() is also {\n        \
          n = 0; flag = TRUE; emit cov_e;\n        n = 15; flag = FALSE; emit cov_e;\n        \
@@ -1956,7 +1967,7 @@ fn cover_items_without_ranges_use_the_clause_defaults() {
 fn cover_is_also_merges_items_into_the_base_group() {
     // 14.6: `is also` extensions add items to the base group; an
     // `empty` placeholder receives them too.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    ok: bool;\n    cover cov_e is empty;\n    \
          cover cov_e is also {\n            item ok: bool;\n        };\n    run() is also {\n        \
          ok = TRUE; emit cov_e;\n    };\n};\n",
@@ -1974,7 +1985,7 @@ fn cover_is_also_merges_items_into_the_base_group() {
 fn untyped_unranged_cover_items_record_without_grading() {
     // An item with no ranges clause and no typed expression is
     // recorded but ungradeable (14.3: goals of 0).
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    tag: string;\n    cover cov_e is {\n        \
          item tag;\n        };\n    run() is also {\n        tag = \"a\"; emit cov_e;\n        \
      tag = \"b\"; emit cov_e;\n    };\n};\n",
@@ -2231,7 +2242,7 @@ fn transition_items_collect_value_pairs_from_the_base() {
     // 14.5: the transition derives previous-value/value samples from
     // the base item's consecutive samples; gradeable over the base's
     // bucket pairs.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
          item cur: uint using ranges = {\n            range([0..1], \"low\");\n            \
          range([2..3], \"high\");\n        };\n        transition cur;\n    };\n    \
@@ -2256,7 +2267,7 @@ fn transition_items_collect_value_pairs_from_the_base() {
 fn cross_items_collect_combinations_of_their_sources() {
     // 14.4: the cross shows every combination of the crossed items'
     // values; gradeable over the cross product of the bucket counts.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    a: uint;\n    b: bool;\n    cover cov_e is {\n        \
          item a: uint using ranges = {\n            range([0..1], \"low\");\n            \
          range([2..3], \"high\");\n        };\n        item b: bool;\n        cross a, b;\n    };\n    \
@@ -2279,7 +2290,7 @@ fn cross_items_collect_combinations_of_their_sources() {
 fn transitions_over_unbucketed_items_count_without_grading() {
     // An unbucketed base (no ranges) records pairs but yields no
     // grade — the honest v1 reading.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    tag: string;\n    cover cov_e is {\n        \
          item tag;\n        transition tag;\n    };\n    run() is also {\n            \
          tag = \"a\"; emit cov_e;\n            tag = \"b\"; emit cov_e;\n        };\n};\n",
@@ -2570,7 +2581,7 @@ fn per_instance_items_grade_per_bucket_with_holes() {
     // instance (`item==bucket`); unsampled instances are holes; the
     // group grade is the weighted grades of the instances plus the
     // per_type bucket.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
          item cur: uint using per_instance = TRUE, ranges = {\n            \
          range([0..1], \"low\");\n            range([2..3], \"high\");\n        };\n    };\n    \
@@ -2596,7 +2607,7 @@ fn per_instance_items_grade_per_bucket_with_holes() {
 fn unsampled_per_instance_buckets_are_holes() {
     // 14.4.2: "any instance that is not sampled is marked as a hole" —
     // a hole grades 0 and pulls the group grade down.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
          item cur: uint using per_instance = TRUE, ranges = {\n            \
          range([0..1], \"low\");\n            range([2..3], \"high\");\n            \
@@ -2621,7 +2632,7 @@ fn unsampled_per_instance_buckets_are_holes() {
 fn at_least_sets_the_bucket_goal_and_weight_scales_the_grade() {
     // Table 41's common readings: `at_least = N` is the per-bucket
     // goal, `weight = N` scales the item's grade contribution.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    a: uint;\n    b: bool;\n    cover cov_e is {\n        \
          item a: uint using at_least = 2, ranges = {\n            range([0..1], \"low\");\n        };\n        \
          item b: bool using weight = 3;\n    };\n    run() is also {\n            \
@@ -2645,7 +2656,7 @@ fn at_least_sets_the_bucket_goal_and_weight_scales_the_grade() {
 fn group_level_per_instance_marks_all_items() {
     // The group-level `per_instance = TRUE` spelling marks every item
     // of the group per-instance.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
          per_instance = TRUE;\n        item cur: uint using ranges = {\n            \
          range([0..1], \"low\");\n        };\n    };\n    run() is also {\n            \
@@ -2661,8 +2672,8 @@ fn group_level_per_instance_marks_all_items() {
 fn coverage_mode_off_collects_nothing() {
     // 14.2's NOTE: "Unless coverage mode is turned on first (see 14.9),
     // no coverage results are collected, even if cover groups and cover
-    // items are defined." With the mode off (14.9's set_config() is not
-    // wired, so the configuration is the builder API) nothing is built.
+    // items are defined." An explicitly disabled builder configuration
+    // produces no schema; the runtime starts disabled independently.
     let parsed = parse(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
          item cur: uint;\n        };\n};\n",
@@ -2679,9 +2690,8 @@ fn coverage_mode_off_collects_nothing() {
         ..e1647::coverage::CoverageConfig::default()
     };
     assert!(e1647::coverage::build_with_config(&elaborated, &config).is_empty());
-    // The default configuration keeps collection on (the documented v1
-    // deviation: the standard's mode starts off until set_config turns
-    // it on, and the routine is not wired yet).
+    // A builder's default constructs a schema. This does not enable
+    // runtime collection; set_config controls runtime enablement.
     assert!(
         !e1647::coverage::build_with_config(
             &elaborated,
@@ -2733,7 +2743,7 @@ fn no_collect_group_option_suppresses_the_group() {
     // options of the group are evaluated to TRUE, the group shall not
     // be presented under that instance." The constant TRUE spelling is
     // not presented at all — not sampled, not graded, not reported.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
          no_collect = TRUE;\n        item cur: uint using ranges = {\n            \
          range([0..1], \"low\");\n        };\n    };\n    run() is also {\n        \
@@ -2749,7 +2759,7 @@ fn no_collect_group_option_suppresses_the_group() {
 fn instance_no_collect_groups_are_not_presented_either() {
     // 14.3.2's OR relation: instance_no_collect = TRUE alone (no
     // no_collect on the group) suppresses presentation the same way.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
          instance_no_collect = TRUE;\n        item cur: uint;\n    };\n    run() is also {\n        \
          cur = 0; emit cov_e;\n    };\n};\n",
@@ -2765,7 +2775,7 @@ fn no_collect_item_option_suppresses_the_item() {
     // options of the item are evaluated to TRUE, the item shall not be
     // presented under that instance" — the item drops from the group;
     // its siblings still collect.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    a: uint;\n    b: bool;\n    cover cov_e is {\n        \
          item a: uint using no_collect = TRUE, ranges = {\n            range([0..1], \"low\");\n        };\n        \
          item b: bool;\n    };\n    run() is also {\n            a = 0; b = TRUE; emit cov_e;\n        };\n};\n",
@@ -2783,7 +2793,7 @@ fn name_option_renames_cross_and_transition_items() {
     // 14.4/14.5: a cross or transition "creates a new item with a name
     // specified using a name option" instead of the default
     // cross_a__b / transition__base names.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    op: uint;\n    carry: bool;\n    cover cov_e is {\n        \
          item op: uint using ranges = { range([0..1], \"low\"); };\n        \
          item carry: bool;\n        cross op, carry using name = \"op_by_carry\";\n        \
@@ -2811,7 +2821,7 @@ fn group_level_at_least_and_weight_apply_to_items_without_their_own() {
     // in the coverage group or item definitions" — the group option
     // applies to every item that does not set its own; the item-level
     // spelling wins where present.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    a: uint;\n    b: bool;\n    c: bool;\n    cover cov_e is {\n        \
          at_least = 2;\n        weight = 3;\n        item a: uint using ranges = {\n            \
          range([0..1], \"low\");\n        };\n        item b: bool using at_least = 4;\n        \
@@ -3777,7 +3787,7 @@ fn covers_sample_cg_samples_without_emitting_the_event() {
     // group procedurally — three calls after assigning 0, 1, 2, with
     // the sampling event never emitted, hit 3 of the 4 buckets of the
     // uint(bits: 2) item.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    \
          event cg;\n    x: uint(bits: 2);\n    \
          cover cg is {\n            item x: uint(bits: 2);\n    };\n    \
@@ -3843,7 +3853,7 @@ fn covers_compute_and_read_the_overall_grade() {
     // groups, 0.0-1.0); get_overall_grade() reads the last computed
     // value. get_ucd_path() (14.9.15-14.9.17) is the empty string — no
     // coverage database is written in this stage.
-    let result = run_source(
+    let result = run_source_with_coverage(
         "extend sys {\n    \
          event cg;\n    ok: bool;\n    cover cg is { item ok: bool; };\n    \
          run() is also {\n            \
@@ -4387,7 +4397,10 @@ fn table_from_csv_to_table_with_filter() {
     // T9.2's test: the rows come from tests/data/regs.csv's `regs`
     // table; the filter drops the `dummy` row, so `ctrl:8` and
     // `stat:4` print.
-    let path = format!("{}/tests/data/regs", env!("CARGO_MANIFEST_DIR"));
+    let path = format!(
+        "{}/tests/data/regs",
+        env!("CARGO_MANIFEST_DIR").replace('\\', "/")
+    );
     let source = format!(
         "extend sys {{\n    \
          run() is also {{\n        \
@@ -4404,7 +4417,10 @@ fn table_from_csv_to_table_with_unique() {
     // The unique option keeps the first row per distinct value,
     // applied after the filter — over the `dups` table whose widths
     // repeat (8, 4, 8, 4, 8), only the first 8 and the first 4 stay.
-    let path = format!("{}/tests/data/regs", env!("CARGO_MANIFEST_DIR"));
+    let path = format!(
+        "{}/tests/data/regs",
+        env!("CARGO_MANIFEST_DIR").replace('\\', "/")
+    );
     let source = format!(
         "extend sys {{\n    \
          run() is also {{\n        \
@@ -4467,7 +4483,7 @@ fn table_read_from_csv_is_cached_and_read_only() {
          run() is also {{\n        \
          var t := table_manager.read_table_from_csv(\"{}/tests/data/regs\", \"regs\");\n        \
          t.get_row(0).set_data(1, \"9\");\n    }};\n}};\n",
-        env!("CARGO_MANIFEST_DIR")
+        env!("CARGO_MANIFEST_DIR").replace('\\', "/")
     ));
     assert!(parsed.diagnostics.is_empty(), "parse failed");
     let elaborated = elaborate(&parsed.declarations);
@@ -4561,7 +4577,10 @@ fn gen_chosen_from_no_satisfying_element_reports_e0417() {
 fn table_copy_is_writable_and_read_helpers_work() {
     // copy() lifts the read-only flag; the csv readers report their
     // source, and the manager's line helpers answer per 32.3.3.
-    let path = format!("{}/tests/data/regs", env!("CARGO_MANIFEST_DIR"));
+    let path = format!(
+        "{}/tests/data/regs",
+        env!("CARGO_MANIFEST_DIR").replace('\\', "/")
+    );
     let output = clean_output(
         &format!(
             "extend sys {{\n    \
