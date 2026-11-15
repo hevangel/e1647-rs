@@ -4459,3 +4459,26 @@ remain unknown to the checker; qualified Type:: calls are supported. General
 name resolution, static initialization ordering/forward references, template
 static registration, signature equivalence, contextual inference and full
 constant/type resolution remain unfinished. No IEEE conformance is claimed.
+
+
+## 2026-11-14 — integrate reviewed coverage and typing stack
+
+PRs #68–#77 were merged into their parent feature branches after #67
+reached main. Those merges did not propagate the later implementation to
+main. This integration joins main at 29135b7 with the reviewed stack at
+5fcb153, retaining its history and independently authored fixture corpus.
+Before this log entry, the integration tree exactly matched 5fcb153
+(tree 0d8a4f011b5d7e25ac22b6e9ac77cd61a5adbeb7). No new language
+behavior is introduced by the merge; the preceding entries document the
+individual coverage and typing changes and their limits.
+
+Verification on the integration tree:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 476 passed, 0 failed (21 test binaries).
+
+No local all-feature, WASM runtime or Specman run was performed for this
+integration. Temporal edge execution and nested TCM statement-call
+continuations remain separate integration PRs (#66 and #65). Full language
+support and IEEE conformance remain unclaimed.
