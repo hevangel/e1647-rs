@@ -2,6 +2,48 @@ use std::fs;
 use std::path::Path;
 
 #[test]
+fn method_extension_contract_fixtures_match_expected() {
+    check_fixture_directory("fixtures/method-extension-contracts");
+}
+
+#[test]
+fn method_extension_contract_errors_are_rejected_and_omissions_execute() {
+    let root =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/method-extension-contracts");
+    for command in ["elab", "run"] {
+        for name in ["mismatch", "conditional", "template", "template-reversed"] {
+            let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+                .arg(command)
+                .arg(root.join(format!("{name}.e")))
+                .output()
+                .unwrap();
+            assert!(!result.status.success(), "{command} accepted {name}");
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains("E0225"),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+        .arg("run")
+        .arg(root.join("runtime.e"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        fs::read_to_string(root.join("runtime.out"))
+            .unwrap()
+            .trim_end()
+    );
+}
+
+#[test]
 fn interface_implementation_signature_fixtures_match_expected() {
     check_fixture_directory("fixtures/interface-signatures");
 }

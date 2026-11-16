@@ -1140,6 +1140,7 @@ Phase 12 — Docs/claims [Sonnet]
 | E0218 | check | illegal keyed-list key |
 | E0219 | check | conflicting inherited interface signatures |
 | E0224 | check/elab | coverage option/range/weight parameters, source-graph order/names/arity/size, scalar/derived effect-predicate scope or per-unit-instance scope (post-migration qualification) |
+| E0225 | elab | definite composed method-extension contract mismatch: arity, explicit annotations or static prefix; omitted annotations inherit (post-migration qualification) |
 | E0304 | elab | static member in `when` subtype |
 | E0305 | elab | static field physical/generated |
 | E0306 | elab | static field of unit-instance type |

@@ -3,8 +3,8 @@
 //! `struct`/`unit`, and `type` declarations pass through with their
 //! enumerals.
 //!
-//! This is **not** full elaboration: `when` subtypes are carried, not
-//! resolved; there is no type checking and no execution semantics.
+//! This is **not** full elaboration: when views and template instances are
+//! bounded, and there is no full typed IR or execution semantics here.
 //! Composition is order-independent on declarations (e allows an `extend`
 //! before its target) and deterministic: base-most `like` members first,
 //! then the declaring members, then each `extend` block in source order.
@@ -15,6 +15,8 @@
 //!
 //! - `E0224` invalid coverage option/range parameters or per-unit-instance scope
 //!   (clauses 14.2–14.3), checked after member composition
+//! - `E0225` definite method-extension signature mismatch after composition
+//!   and template substitution (17.2.4); omitted annotations inherit
 //! - `E0301` `like` inheritance cycle (reported once per type)
 //! - `E0302` the same field name is contributed by two different
 //!   declarations or extend blocks (duplicates inside one declaration are
@@ -1543,6 +1545,74 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         &result.defines,
     ));
     result
+        .diagnostics
+        .extend(check_method_extension_contracts(&result, declarations));
+    result
+}
+
+/// Extensions inherit omitted annotations by parameter position. Explicit
+/// annotations and arity must preserve their declaration's contract (17.2.4).
+/// Validate the final composed lists so when views and substituted template
+/// instances use their actual types. Source-identical inherited copies report
+/// once; distinct materialized type differences remain independently checked.
+fn check_method_extension_contracts(
+    elaborated: &Elaborated,
+    declarations: &[Declaration],
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut seen = BTreeSet::new();
+    for methods in elaborated
+        .types
+        .iter()
+        .map(|ty| &ty.methods)
+        .chain(elaborated.static_methods.values())
+    {
+        for extension in methods.iter().filter(|method| method.modifier.is_some()) {
+            let Some(prototype) = methods
+                .iter()
+                .find(|method| method.name == extension.name && method.modifier.is_none())
+            else {
+                continue;
+            };
+            let parameters_differ =
+                extension.params.len() != prototype.params.len()
+                    || extension.params.iter().zip(&prototype.params).any(
+                        |(extension, prototype)| match (&extension.ty, &prototype.ty) {
+                            (Some(a), Some(b)) => crate::check::signature_type_differs(
+                                a,
+                                b,
+                                declarations,
+                                &elaborated.defines,
+                                0,
+                            ),
+                            (Some(_), None) => true,
+                            (None, _) => false,
+                        },
+                    );
+            let result_differs = match (&extension.return_type, &prototype.return_type) {
+                (Some(a), Some(b)) => {
+                    crate::check::signature_type_differs(a, b, declarations, &elaborated.defines, 0)
+                }
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if !(parameters_differ || result_differs || extension.is_static != prototype.is_static)
+            {
+                continue;
+            }
+            let key = (
+                extension.name.clone(),
+                extension.name_span.0.byte,
+                extension.name_span.1.byte,
+                prototype.name_span.0.byte,
+                prototype.name_span.1.byte,
+            );
+            if seen.insert(key) {
+                diagnostics.push(Diagnostic::new("E0225", format!("extension of method '{}' has a different signature from its declaration (clause 17.2.4)", extension.name), extension.name_span.0, extension.name_span.1));
+            }
+        }
+    }
+    diagnostics
 }
 
 /// The clause 31 predefined numeric names (T7.2), synthesized as
@@ -1870,7 +1940,15 @@ fn compose_builtin_numeric_interfaces(types: &mut Vec<ElaboratedType>) {
 /// interpreter composes static `on` blocks and static method bodies in.
 fn static_registry<K: RegistryKind>(declarations: &[Declaration]) -> BTreeMap<String, Vec<K>> {
     let mut registry: BTreeMap<String, Vec<K>> = BTreeMap::new();
-    for declaration in declarations {
+    for declaration in declarations
+        .iter()
+        .filter(|d| d.kind != DeclarationKind::Extend)
+        .chain(
+            declarations
+                .iter()
+                .filter(|d| d.kind == DeclarationKind::Extend),
+        )
+    {
         // Only struct/unit declarations and the extend blocks that
         // target them contribute; a `type` declaration has no members of
         // these kinds, and a template extension applies per instance
