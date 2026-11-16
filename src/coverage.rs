@@ -42,6 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod constants;
 mod proof;
 pub(crate) use constants::resolve as resolve_constants;
+pub(crate) use constants::scalar_type as constant_scalar_type;
 pub(crate) use proof::{ScalarDomain, prove_predicate};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

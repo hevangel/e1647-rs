@@ -1,0 +1,11 @@
+sys.cg samples=4 grade=0.750
+n buckets=2 grade=1.000 samples=4
+0 [0..0] goal=2 hits=2
+1 [1..1] goal=2 hits=2
+aliased samples=4 combinations=2 total=Some(4) goal=1 weight=1 grade=Some(0.5)
+(0, FALSE) hits=2
+(1, FALSE) hits=2
+sys.ungraded samples=1 grade=none
+n buckets=2 grade=none samples=1
+FALSE [0..0] goal=0 hits=1
+TRUE [1..1] goal=0 hits=0

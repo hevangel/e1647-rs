@@ -489,8 +489,12 @@ not imply full language support or IEEE conformance.
       after composition, including inherited fields and qualified static consts,
       in names/ranges/goals/weights. Pure integer/string dependencies fold to
       literal initializers shared with runtime storage. Resolution is bounded;
-      aliases/explicit widths, enums, dynamic initializers and general constant
-      expressions remain incomplete.
+      alias chains resolve to the supported scalar representations. Known
+      int/uint widths 1–127 and star widths participate when initial values
+      already fit; no general storage narrowing is added. Runtime arithmetic
+      shares representation/width resolution for direct operands, including
+      static fields. Unresolved widths, enums, dynamic initializers and general
+      constant expressions remain incomplete.
       Integral range widths and per-range goals run with
       range/item/group/global precedence; zero-goal buckets are ungraded
       and do not show holes. Explicit construction is capped at 65536

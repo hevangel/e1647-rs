@@ -220,8 +220,12 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   inherited and qualified static consts. Their supported pure initializers
   fold to literals for runtime storage too. Arithmetic reuses direct-operand
   precision contexts; cycles, unsupported dependencies and overflowing
-  untyped arithmetic remain diagnostic cases. Explicit widths/aliases, enums,
-  dynamic initialization, real/enumeral ranges and item-domain width proofs
+  untyped arithmetic remain diagnostic cases. Aliases resolve through their scalar representation with a bounded walk;
+  known int/uint widths 1–127 and star widths participate when initializers
+  already fit. The runtime uses the same direct-operand representation/width
+  resolution, including qualified static fields. General storage narrowing,
+  unresolved widths, enums, dynamic initialization, real/enumeral ranges and
+  item-domain width proofs
   remain unfinished.
 
 ## What runs, by 2019 feature

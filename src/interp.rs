@@ -14204,10 +14204,18 @@ impl<'a> Interp<'a> {
     }
 
     fn static_type_of(&self, expr: &Expr, frame: &Frame, me: Option<usize>) -> Option<TypeExpr> {
+        let owner = me
+            .map(|index| self.instances[index].type_name.as_str())
+            .or(self.static_context.as_deref())
+            .unwrap_or("");
+        let resolve = |owner: &str, ty: &TypeExpr| {
+            crate::coverage::constant_scalar_type(self.types, owner, ty)
+                .unwrap_or_else(|| ty.clone())
+        };
         match expr {
             Expr::Ident { name, .. } => {
                 if let Some(ty) = frame.local_types.get(name) {
-                    return Some(ty.clone());
+                    return Some(resolve(owner, ty));
                 }
                 if let Some(index) = me {
                     let type_name = &self.instances[index].type_name;
@@ -14216,7 +14224,7 @@ impl<'a> Interp<'a> {
                         .iter()
                         .find(|t| t.name == *type_name)
                         .and_then(|t| t.fields.iter().find(|f| f.name == *name))
-                        .map(|f| f.ty.clone());
+                        .map(|f| resolve(type_name, &f.ty));
                 }
                 None
             }
@@ -14232,7 +14240,18 @@ impl<'a> Interp<'a> {
                     .iter()
                     .find(|t| t.name == type_name)
                     .and_then(|t| t.fields.iter().find(|f| f.name == *name))
-                    .map(|f| f.ty.clone())
+                    .map(|f| resolve(&type_name, &f.ty))
+            }
+            Expr::StaticAccess {
+                type_name, member, ..
+            } => {
+                let owner = self.static_field_owner_from(type_name, member)?;
+                let field = self
+                    .static_fields
+                    .get(&owner)?
+                    .iter()
+                    .find(|field| field.name == *member)?;
+                Some(resolve(&owner, &field.ty))
             }
             _ => None,
         }
