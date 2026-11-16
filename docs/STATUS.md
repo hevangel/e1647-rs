@@ -45,7 +45,11 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   and scalar/list element compatibility. A set kind represents declared sets,
   literals and set_of_values results, without tracking scalar domains. Unknown
   receivers/operands stay conservative. General bidirectional inference,
-  type-embedded expressions and full set-domain typing remain incomplete.
+  pre-elaboration type-expression checking and full set-domain typing remain
+  incomplete. Retained type annotations traverse width/key/template-value and
+  typeof expressions in their enclosing scopes, with an element-typed it for
+  keyed lists. Definite non-integer scalar widths report E0223. All parameters
+  bind before dependent annotations; type-position hints/bindings stay isolated.
   Explicit is-a bindings retain their matched kinds on proven Boolean paths:
   lazy and/or/implication operands, if branches, while bodies, check failure
   actions and ternary arms. Ambiguous joins and possible replacement bindings

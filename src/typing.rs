@@ -46,8 +46,11 @@
 //! return contexts type untyped evaluate/new bodies; calls and expression
 //! bodies establish their own scoped hints. Materialized templates retain
 //! object kinds and concatenation flattens list operands. Cast results,
-//! unresolved contexts/statics and type-embedded expressions remain
-//! conservative. Known list indexes require integer/enum kinds; membership
+//! unresolved contexts/statics remain conservative. Retained type-position
+//! widths, keys and value/typeof arguments are traversed in their scopes;
+//! definite non-integer widths report E0223. Expressions already eliminated
+//! by elaboration are not reconstructed. Known list indexes require
+//! integer/enum kinds; membership
 //! validates known containers and scalar/list element compatibility (4.11.6).
 //! Explicit is-a bindings retain kinds on proven Boolean guard paths,
 //! including lazy operands, branches and loops. Ambiguous joins/rebindings
@@ -469,6 +472,77 @@ impl<'a> TypeChecker<'a> {
         self.types.iter().find(|t| t.name == name)
     }
 
+    /// Walk retained type-position expressions without letting the surrounding
+    /// value's expected kind or compile-time bindings leak in/out. Named aliases
+    /// are checked at their declaration rather than expanded here.
+    fn check_type_expr(&mut self, ty: &TypeExpr) {
+        if matches!(
+            ty,
+            TypeExpr::Named { .. }
+                | TypeExpr::Formal { .. }
+                | TypeExpr::InlineEnum { .. }
+                | TypeExpr::Scalar { width: None, .. }
+        ) {
+            return;
+        }
+        let expected = self.expected_kind.take();
+        let locals = self.locals.clone();
+        let writes = self.binding_writes.len();
+        self.check_type_expr_inner(ty, 0);
+        self.binding_writes.truncate(writes);
+        self.locals = locals;
+        self.expected_kind = expected;
+    }
+
+    fn check_type_expr_inner(&mut self, ty: &TypeExpr, depth: usize) {
+        if depth >= 64 {
+            return;
+        }
+        match ty {
+            TypeExpr::Scalar { width, .. } => {
+                if let Some(width) = width {
+                    self.check_width(width);
+                }
+            }
+            TypeExpr::FormalWidth { width, .. } => self.check_width(width),
+            TypeExpr::List { element, key, .. } => {
+                self.check_type_expr_inner(element, depth + 1);
+                if let Some(key) = key {
+                    self.push_scope();
+                    self.bind_local("it", self.type_of(element));
+                    self.infer_with_hint(None, key);
+                    self.pop_scope();
+                }
+            }
+            TypeExpr::WhenQualified { base, .. } => self.check_type_expr_inner(base, depth + 1),
+            TypeExpr::TemplateRef { args, .. } => {
+                for arg in args {
+                    self.check_type_expr_inner(arg, depth + 1);
+                }
+            }
+            TypeExpr::Value { expr, .. }
+            | TypeExpr::TypeOf { expr, .. }
+            | TypeExpr::TypeOfItem { expr, .. } => {
+                self.infer_with_hint(None, expr);
+            }
+            TypeExpr::Named { .. } | TypeExpr::Formal { .. } | TypeExpr::InlineEnum { .. } => {}
+        }
+    }
+
+    fn check_width(&mut self, width: &Expr) {
+        let kind = self.infer_with_hint(Some(Ty::Int), width);
+        if has_opinion(&kind) && !matches!(kind, Ty::Int | Ty::Enum(_)) {
+            self.diagnostics.push(self.error(
+                "E0223",
+                format!(
+                    "scalar width has kind '{}' — an integer is required",
+                    kind.name()
+                ),
+                width.span(),
+            ));
+        }
+    }
+
     /// The conservative conversion of a declared type expression.
     fn type_of(&self, ty: &TypeExpr) -> Ty {
         self.type_of_at_depth(ty, 0)
@@ -561,6 +635,9 @@ impl<'a> TypeChecker<'a> {
     fn check_statement(&mut self, statement: &Stmt) {
         match statement {
             Stmt::VarDecl { name, ty, init, .. } => {
+                if let Some(ty) = ty {
+                    self.check_type_expr(ty);
+                }
                 let declared = ty.as_ref().map(|ty| self.type_of(ty));
                 let inferred = if let Some(init) = init {
                     let value = self.infer_with_hint(declared.clone(), init);
@@ -791,6 +868,9 @@ impl<'a> TypeChecker<'a> {
             Expr::Binary { op, lhs, rhs, span } => self.infer_binary(*op, lhs, rhs, *span),
             Expr::Unary { op, expr, span } => self.infer_unary(*op, expr, *span),
             Expr::New { ty, inits, .. } => {
+                if let Some(ty) = ty {
+                    self.check_type_expr(ty);
+                }
                 let candidate = ty
                     .as_ref()
                     .map(|ty| self.type_of(ty))
@@ -853,19 +933,22 @@ impl<'a> TypeChecker<'a> {
             }
             Expr::IsA {
                 expr,
+                ty,
                 binding,
                 negated,
                 ..
             } => {
                 self.infer(expr);
+                self.check_type_expr(ty);
                 if !*negated && let Some(name) = binding {
                     self.binding_writes.push(name.clone());
                     self.invalidate_binding(name);
                 }
                 Ty::Bool
             }
-            Expr::CastAs { expr, .. } => {
+            Expr::CastAs { expr, ty, .. } => {
                 self.infer(expr);
+                self.check_type_expr(ty);
                 // Several runtime casts preserve the input value. Do not
                 // assume that the spelled target determines its value kind.
                 Ty::Unknown
@@ -889,7 +972,7 @@ impl<'a> TypeChecker<'a> {
                                 self.infer(expr);
                             }
                             crate::ast::TableElem::Set(set) => self.check_set(set),
-                            crate::ast::TableElem::TypeSet { .. } => {}
+                            crate::ast::TableElem::TypeSet { ty, .. } => self.check_type_expr(ty),
                         }
                     }
                 }
@@ -912,6 +995,9 @@ impl<'a> TypeChecker<'a> {
                 Ty::Unknown
             }
             Expr::Evaluate { ty, var, body, .. } => {
+                if let Some(ty) = ty {
+                    self.check_type_expr(ty);
+                }
                 let result = ty
                     .as_ref()
                     .map(|ty| self.type_of(ty))
@@ -928,12 +1014,14 @@ impl<'a> TypeChecker<'a> {
             Expr::StaticAccess {
                 type_name, member, ..
             } => self.static_field(type_name, member).unwrap_or(Ty::Unknown),
-            // Leaves without ordinary expression children. Type-embedded
-            // expressions still need their own scopes.
+            // Leaves without ordinary expression children.
             Expr::Formal { .. } | Expr::HdlPath { .. } | Expr::AnnotationTypeRef { .. } => {
                 Ty::Unknown
             }
-            Expr::SetOfValues { .. } => Ty::Set,
+            Expr::SetOfValues { ty, .. } => {
+                self.check_type_expr(ty);
+                Ty::Set
+            }
         }
     }
 
@@ -1606,6 +1694,7 @@ fn registered_static_member<'a, T>(
 
 /// One field's init value against its declared type (6.9.1/6.9.4).
 fn check_field_init(checker: &mut TypeChecker, field: &crate::ast::Field) {
+    checker.check_type_expr(&field.ty);
     let Some(init) = &field.init else {
         return;
     };
@@ -1639,6 +1728,16 @@ fn check_method<'a>(
             .map(|ty| checker.type_of(ty))
             .unwrap_or(Ty::Unknown);
         checker.bind_local(&parameter.name, ty);
+    }
+    // Bind every parameter before checking dependent annotation expressions;
+    // even physically later parameters shadow owner fields.
+    for parameter in &method.params {
+        if let Some(ty) = &parameter.ty {
+            checker.check_type_expr(ty);
+        }
+    }
+    if let Some(ty) = &method.return_type {
+        checker.check_type_expr(ty);
     }
     checker.check_body(&method.body);
     checker.pop_scope();
@@ -1740,6 +1839,9 @@ pub fn check_types(elaborated: &Elaborated) -> Vec<Diagnostic> {
     for t in &elaborated.types {
         checker.me_type = Some(&t.name);
         checker.return_ty = None;
+        if let Some(ty) = &t.underlying {
+            checker.check_type_expr(ty);
+        }
         for field in &t.fields {
             if field.is_static {
                 // The registry owns these entries, including inherited copies.
@@ -1778,6 +1880,7 @@ pub fn check_types(elaborated: &Elaborated) -> Vec<Diagnostic> {
                     continue;
                 };
                 if let Some(ty) = &item.ty {
+                    checker.check_type_expr(ty);
                     let target = checker.type_of(ty);
                     checker.check_assignable(&value, &target, span, "coverage item");
                 }

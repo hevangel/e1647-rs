@@ -2,6 +2,51 @@ use std::fs;
 use std::path::Path;
 
 #[test]
+fn type_expression_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures/typing-type-expressions");
+}
+
+#[test]
+fn type_expression_errors_are_rejected_and_valid_scopes_execute() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typing-type-expressions");
+    for command in ["elab", "run"] {
+        for name in ["annotations", "values", "unresolved", "binding-isolation"] {
+            let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+                .arg(command)
+                .arg(root.join(format!("{name}.e")))
+                .output()
+                .unwrap();
+            assert!(!result.status.success(), "{command} accepted {name}");
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                stderr.contains(if name == "unresolved" {
+                    "E0208"
+                } else {
+                    "E022"
+                }),
+                "{command} {name}: {stderr}"
+            );
+        }
+    }
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+        .arg("run")
+        .arg(root.join("runtime.e"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        fs::read_to_string(root.join("runtime.out"))
+            .unwrap()
+            .trim_end()
+    );
+}
+
+#[test]
 fn conditional_binding_fixture_diagnostics_match_expected() {
     check_fixture_directory("fixtures/typing-bindings");
 }

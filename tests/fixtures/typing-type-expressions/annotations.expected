@@ -1,0 +1,9 @@
+1:30: error[E0223]: scalar width has kind 'bool' — an integer is required
+5:28: error[E0223]: scalar width has kind 'string' — an integer is required
+6:23: error[E0221]: 'node_s' has no field or method 'missing'
+7:33: error[E0221]: 'node_s' has no field or method 'missing'
+8:25: error[E0221]: 'node_s' has no field or method 'missing'
+8:68: error[E0221]: 'node_s' has no field or method 'other'
+9:31: error[E0221]: 'node_s' has no field or method 'absent'
+16:42: error[E0223]: scalar width has kind 'string' — an integer is required
+13:39: error[E0221]: 'node_s' has no field or method 'missing'

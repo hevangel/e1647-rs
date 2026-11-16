@@ -50,6 +50,10 @@ Boolean guard paths, including short-circuit operands and guarded branches.
 Ambiguous joins and possible rebinding remain conservative; general
 flow-sensitive narrowing is unfinished.
 
+Retained type annotations now check embedded widths, keyed-list keys and
+template/typeof arguments in scope. Definite non-integer widths report E0223;
+expressions already replaced during elaboration remain outside this pass.
+
 Known variable, assignment, field, parameter and return contexts now type
 untyped `evaluate` and `new` expressions. This includes qualified calls,
 indexed targets and result metadata retained across TCM suspension. Calls and

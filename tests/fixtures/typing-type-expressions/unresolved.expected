@@ -1,0 +1,6 @@
+6:20: error[E0208]: typeof(): cannot determine the static type of this expression
+7:19: error[E0208]: typeof_item(): cannot determine the static type of this expression
+8:20: error[E0313]: actual for value parameter 'n' is not a constant expression of type 'uint'
+6:27: error[E0221]: 'node_s' has no field or method 'missing'
+7:31: error[E0221]: 'node_s' has no field or method 'other'
+8:35: error[E0221]: 'node_s' has no field or method 'value_width'
