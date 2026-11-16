@@ -249,7 +249,13 @@ single-source browser sandbox API runs in disposable workers (see
   mismatches (4.11.6). Declared sets, literals and set_of_values have a Set kind;
   scalar domains and unsupported numeric conversions remain conservative.
   Operand traversal runs once without inheriting the Boolean result context.
-  Conditional `is a` bindings still require further work. Define and predefined constant precedence now
+  Explicit is-a bindings retain facts for true and false Boolean outcomes.
+  Lazy and/or/implication inference checks operands once under their entry
+  facts; joins retain identical kinds only. Possible binding writes invalidate
+  earlier facts, including shadowed frame locals. Branches, while bodies,
+  check failure actions and ternary arms install temporary proof scopes.
+  This does not narrow the tested operand or change interpreter binding
+  lifetimes. Define and predefined constant precedence now
   applies across every checked context, preventing same-named fields or
   locals from supplying the wrong kind; define values remain unknown.
   Registered `Type::field` accesses read kinds from the exact declaring

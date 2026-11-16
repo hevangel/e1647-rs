@@ -254,7 +254,11 @@ not imply full language support or IEEE conformance.
       Known list indexes and membership containers/element kinds now receive
       definite-kind checks; sets retain a kind without scalar-domain metadata.
       General bidirectional inference, full set-domain/numeric checks,
-      conditional bindings and type-embedded expressions remain incomplete. Registered
+      type-embedded expressions and general flow-sensitive narrowing remain incomplete.
+      Explicit is-a binding kinds propagate on proven true/false guard paths,
+      including lazy and/or/implication operands, branches, while bodies,
+      check failure actions and ternary arms. Joins retain only agreed kinds;
+      possible replacement bindings invalidate stale local kinds. Registered
       static fields and qualified call signatures now retain kinds. Static
       initializers/methods/handlers are checked once in their declaring
       scope, with omitted extension annotations inherited from the prototype.

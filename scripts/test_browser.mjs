@@ -64,6 +64,14 @@ try {
   const imported = await request(await fixture("import"), { operation: "run" });
   assert.equal(imported.error.code, "unsupported_import");
   checks.push("spanned syntax/type diagnostics, DUT failure and import rejection");
+  const guardSource = await readFile(resolve(root, "tests/fixtures/typing-bindings/guards.e"), "utf8");
+  const guards = await request(guardSource, { operation: "check" });
+  assert.equal(guards.ok, false); assert.equal(guards.diagnostics.length, 10);
+  const guardDiagnostics = guards.diagnostics.map(d => `${d.start.line}:${d.start.column}: error[${d.code}]: ${d.message}\n`).join("");
+  assert.equal(guardDiagnostics, await readFile(resolve(root, "tests/fixtures/typing-bindings/guards.expected"), "utf8"));
+  const guardRun = await request(await readFile(resolve(root, "tests/fixtures/typing-bindings/runtime.e"), "utf8"), { operation: "run" });
+  assert.equal(guardRun.ok, true); assert.equal(guardRun.output, "guarded bindings passed");
+  checks.push("conditional binding type diagnostics");
   const covered = await request(await fixture("coverage"), { operation: "run" });
   assert.equal(covered.ok, true);
   const group = covered.coverage.find(group => group.name === "cg");

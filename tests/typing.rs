@@ -1,6 +1,44 @@
 use std::fs;
 use std::path::Path;
 
+#[test]
+fn conditional_binding_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures/typing-bindings");
+}
+
+#[test]
+fn conditional_bindings_reject_known_errors_and_execute_valid_guards() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typing-bindings");
+    for command in ["elab", "run"] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+            .arg(command)
+            .arg(root.join("guards.e"))
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "{command} accepted guarded type errors"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("E0220"));
+    }
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+        .arg("run")
+        .arg(root.join("runtime.e"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        fs::read_to_string(root.join("runtime.out"))
+            .unwrap()
+            .trim_end()
+    );
+}
+
 /// Golden diagnostic fixtures for the conservative type check: every
 /// `tests/fixtures-type/*.e` must produce exactly the diagnostics
 /// listed in its `.expected` file (empty input expected is written as

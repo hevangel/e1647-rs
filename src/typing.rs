@@ -49,8 +49,11 @@
 //! unresolved contexts/statics and type-embedded expressions remain
 //! conservative. Known list indexes require integer/enum kinds; membership
 //! validates known containers and scalar/list element compatibility (4.11.6).
-//! The built-in set kind retains no scalar-domain information. Conditional
-//! is-a bindings and full set/numeric domain rules still need further work.
+//! Explicit is-a bindings retain kinds on proven Boolean guard paths,
+//! including lazy operands, branches and loops. Ambiguous joins/rebindings
+//! lose their kinds; arbitrary flow-sensitive narrowing is not performed.
+//! The built-in set kind retains no scalar-domain information; full
+//! set/numeric domain rules still need further work.
 //!
 //! ## Diagnostic codes
 //!
@@ -64,7 +67,40 @@
 use crate::ast::{DeclarationKind, Expr, MethodDecl, ScalarBase, Stmt, TypeExpr, UnaryOp};
 use crate::diagnostic::Diagnostic;
 use crate::elab::{Elaborated, ElaboratedType};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Explicit is-a bindings guaranteed on a Boolean outcome. Possible writes
+/// are retained separately: a later conditional binding can replace an earlier
+/// one even when its result does not guarantee a particular kind.
+#[derive(Default)]
+struct GuardFacts {
+    yes: BTreeMap<String, Ty>,
+    no: BTreeMap<String, Ty>,
+    writes: BTreeSet<String>,
+}
+
+fn after_guard(
+    earlier: &BTreeMap<String, Ty>,
+    later: &BTreeMap<String, Ty>,
+    writes: &BTreeSet<String>,
+) -> BTreeMap<String, Ty> {
+    earlier
+        .iter()
+        .filter(|(name, _)| !writes.contains(*name))
+        .chain(later.iter())
+        .map(|(name, kind)| (name.clone(), kind.clone()))
+        .collect()
+}
+
+fn common_bindings(
+    left: &BTreeMap<String, Ty>,
+    right: &BTreeMap<String, Ty>,
+) -> BTreeMap<String, Ty> {
+    left.iter()
+        .filter(|(name, kind)| right.get(*name) == Some(*kind))
+        .map(|(name, kind)| (name.clone(), kind.clone()))
+        .collect()
+}
 
 /// The conservative type lattice. `Unknown` carries no opinion and
 /// makes every rule about it silent.
@@ -248,6 +284,9 @@ struct TypeChecker<'a> {
     enumeral_table: BTreeMap<String, String>,
     /// The scoped local variables; the last scope is innermost.
     locals: Vec<BTreeMap<String, Ty>>,
+    /// Append-only during traversal so nested expressions can report all
+    /// possible binding writes, including repeated writes of the same name.
+    binding_writes: Vec<String>,
     /// The enclosing method's return type.
     return_ty: Option<&'a TypeExpr>,
     /// The enclosing composed type (the `me`/`self` receiver).
@@ -277,6 +316,7 @@ impl<'a> TypeChecker<'a> {
             types,
             enumeral_table,
             locals: vec![BTreeMap::new()],
+            binding_writes: Vec::new(),
             return_ty: None,
             me_type: None,
             diagnostics: Vec::new(),
@@ -304,6 +344,115 @@ impl<'a> TypeChecker<'a> {
 
     fn local(&self, name: &str) -> Option<&Ty> {
         self.locals.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    fn invalidate_binding(&mut self, name: &str) {
+        // Runtime bindings may replace a frame local. Outside a guaranteed
+        // guard path neither its old kind nor its matched kind is certain.
+        if let Some(scope) = self
+            .locals
+            .iter_mut()
+            .rev()
+            .find(|scope| scope.contains_key(name))
+        {
+            scope.insert(name.to_owned(), Ty::Unknown);
+        } else {
+            self.bind_local(name, Ty::Unknown);
+        }
+    }
+
+    fn with_bindings<R>(
+        &mut self,
+        bindings: &BTreeMap<String, Ty>,
+        check: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let start = self.binding_writes.len();
+        self.push_scope();
+        for (name, kind) in bindings {
+            self.bind_local(name, kind.clone());
+        }
+        let result = check(self);
+        self.pop_scope();
+        // Writes observed under the temporary proof must also invalidate the
+        // surrounding frame when the proof's scope is removed.
+        for index in start..self.binding_writes.len() {
+            let name = self.binding_writes[index].clone();
+            self.invalidate_binding(&name);
+        }
+        result
+    }
+
+    /// Infer each operand once and carry explicit binding proofs through the
+    /// runtime's lazy Boolean paths (4.11 and 5.4.4.4). No operand narrowing or
+    /// arbitrary Boolean algebra is inferred from an unknown expression.
+    fn infer_guard(&mut self, expr: &Expr) -> (Ty, GuardFacts) {
+        use crate::ast::BinaryOp;
+        match expr {
+            Expr::Paren { expr, .. } => self.infer_guard(expr),
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr,
+                span,
+            } => {
+                let (kind, facts) = self.infer_guard(expr);
+                self.check_not_kind(&kind, *span);
+                (
+                    Ty::Bool,
+                    GuardFacts {
+                        yes: facts.no,
+                        no: facts.yes,
+                        writes: facts.writes,
+                    },
+                )
+            }
+            Expr::Binary {
+                op: op @ (BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::Imply),
+                lhs,
+                rhs,
+                span,
+            } => {
+                let (left_kind, left) = self.infer_guard(lhs);
+                let entry = if *op == BinaryOp::LogicalOr {
+                    &left.no
+                } else {
+                    &left.yes
+                };
+                let (right_kind, right) = self.with_bindings(entry, |this| this.infer_guard(rhs));
+                if *op != BinaryOp::Imply {
+                    for kind in [&left_kind, &right_kind] {
+                        self.check_logical_kind(kind, *span);
+                    }
+                }
+                let rhs_yes = after_guard(entry, &right.yes, &right.writes);
+                let rhs_no = after_guard(entry, &right.no, &right.writes);
+                let (yes, no) = match op {
+                    BinaryOp::LogicalAnd => (rhs_yes, common_bindings(&left.no, &rhs_no)),
+                    BinaryOp::LogicalOr => (common_bindings(&left.yes, &rhs_yes), rhs_no),
+                    _ => (common_bindings(&left.no, &rhs_yes), rhs_no),
+                };
+                let writes = left.writes.union(&right.writes).cloned().collect();
+                (Ty::Bool, GuardFacts { yes, no, writes })
+            }
+            _ => {
+                let start = self.binding_writes.len();
+                let kind = self.infer(expr);
+                let writes = self.binding_writes[start..].iter().cloned().collect();
+                let mut facts = GuardFacts {
+                    writes,
+                    ..GuardFacts::default()
+                };
+                if let Expr::IsA {
+                    ty,
+                    binding: Some(name),
+                    negated: false,
+                    ..
+                } = expr
+                {
+                    facts.yes.insert(name.clone(), self.type_of(ty));
+                }
+                (kind, facts)
+            }
+        }
     }
 
     /// The declared kind of a `me` field.
@@ -465,15 +614,15 @@ impl<'a> TypeChecker<'a> {
                 else_body,
                 ..
             } => {
-                self.infer(cond);
-                self.check_body(then_body);
+                let (_, facts) = self.infer_guard(cond);
+                self.with_bindings(&facts.yes, |this| this.check_body(then_body));
                 if let Some(else_body) = else_body {
-                    self.check_body(else_body);
+                    self.with_bindings(&facts.no, |this| this.check_body(else_body));
                 }
             }
             Stmt::While { cond, body, .. } => {
-                self.infer(cond);
-                self.check_body(body);
+                let (_, facts) = self.infer_guard(cond);
+                self.with_bindings(&facts.yes, |this| this.check_body(body));
             }
             Stmt::RepeatUntil { body, cond, .. } => {
                 self.check_body(body);
@@ -484,8 +633,8 @@ impl<'a> TypeChecker<'a> {
                 else_body,
                 ..
             } => {
-                self.infer(condition);
-                self.check_body(else_body);
+                let (_, facts) = self.infer_guard(condition);
+                self.with_bindings(&facts.no, |this| this.check_body(else_body));
             }
             Stmt::ForEach {
                 var,
@@ -632,6 +781,13 @@ impl<'a> TypeChecker<'a> {
                     Ty::Unknown
                 }
             }
+            Expr::Binary {
+                op:
+                    crate::ast::BinaryOp::LogicalAnd
+                    | crate::ast::BinaryOp::LogicalOr
+                    | crate::ast::BinaryOp::Imply,
+                ..
+            } => self.infer_guard(expr).0,
             Expr::Binary { op, lhs, rhs, span } => self.infer_binary(*op, lhs, rhs, *span),
             Expr::Unary { op, expr, span } => self.infer_unary(*op, expr, *span),
             Expr::New { ty, inits, .. } => {
@@ -686,19 +842,26 @@ impl<'a> TypeChecker<'a> {
                 else_expr,
                 ..
             } => {
-                self.infer(cond);
-                let left = self.infer(then_expr);
-                let right = self.infer(else_expr);
+                let (_, facts) = self.infer_guard(cond);
+                let left = self.with_bindings(&facts.yes, |this| this.infer(then_expr));
+                let right = self.with_bindings(&facts.no, |this| this.infer(else_expr));
                 shared_kind(left, right)
             }
             Expr::InSet { element, set, span } => {
                 self.check_membership(element, set, *span);
                 Ty::Bool
             }
-            Expr::IsA { expr, .. } => {
+            Expr::IsA {
+                expr,
+                binding,
+                negated,
+                ..
+            } => {
                 self.infer(expr);
-                // Conditional name bindings still require flow-sensitive
-                // resolution; this traversal does not narrow the operand.
+                if !*negated && let Some(name) = binding {
+                    self.binding_writes.push(name.clone());
+                    self.invalidate_binding(name);
+                }
                 Ty::Bool
             }
             Expr::CastAs { expr, .. } => {
@@ -1342,16 +1505,7 @@ impl<'a> TypeChecker<'a> {
         let inner = self.infer(expr);
         match op {
             UnaryOp::Not => {
-                if has_opinion(&inner) && !matches!(inner, Ty::Bool | Ty::Int | Ty::Enum(_)) {
-                    self.diagnostics.push(self.error(
-                        "E0223",
-                        format!(
-                            "'not' applies to '{}' — a boolean is required",
-                            inner.name()
-                        ),
-                        span,
-                    ));
-                }
+                self.check_not_kind(&inner, span);
                 Ty::Bool
             }
             UnaryOp::Negate | UnaryOp::Plus => {
@@ -1387,6 +1541,29 @@ impl<'a> TypeChecker<'a> {
                     Ty::Int
                 }
             }
+        }
+    }
+
+    fn check_not_kind(&mut self, kind: &Ty, span: crate::ast::Span) {
+        if has_opinion(kind) && !matches!(kind, Ty::Bool | Ty::Int | Ty::Enum(_)) {
+            self.diagnostics.push(self.error(
+                "E0223",
+                format!("'not' applies to '{}' — a boolean is required", kind.name()),
+                span,
+            ));
+        }
+    }
+
+    fn check_logical_kind(&mut self, kind: &Ty, span: crate::ast::Span) {
+        if has_opinion(kind) && !matches!(kind, Ty::Bool | Ty::Int | Ty::Enum(_)) {
+            self.diagnostics.push(self.error(
+                "E0223",
+                format!(
+                    "the logical operator's operand is '{}' — a boolean is required",
+                    kind.name()
+                ),
+                span,
+            ));
         }
     }
 }

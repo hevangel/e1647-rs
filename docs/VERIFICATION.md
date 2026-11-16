@@ -5108,3 +5108,42 @@ for this increment. This closes the scoped experimental browser API
 milestone; it does not qualify other browser engines, derived coverage
 serialization, full language semantics or whole-process resource/security
 guarantees. See [BROWSER_SANDBOX.md](BROWSER_SANDBOX.md) for the API and limits.
+
+## 2026-11-15 — Conditional is-a binding types
+
+The conservative type pass now retains matched kinds for explicit
+`is a T(name)` bindings along proven Boolean paths. True/false facts compose
+through parentheses, not, lazy and/or and implication. Known bindings reach
+if/else bodies, while bodies, check failure actions and ternary arms. A join
+retains only kinds common to every incoming path; possible replacement
+bindings invalidate earlier facts and stale frame-local kinds. Operands are
+inferred once. This changes static diagnostics, not runtime binding lifetimes,
+the tested operand's type, or general flow-sensitive inference.
+
+Independently authored fixtures under tests/fixtures/typing-bindings assert
+ten exact E0220/E0221 diagnostics, conservative silence for ambiguous joins,
+nonbinding negated is-a, shadowed locals and replacement bindings. Both elab
+and run reject the error fixture. The valid native run exercises branch,
+lazy operand, negation, implication, loop and ternary bindings and reports
+`guarded bindings passed` with all DUT checks satisfied.
+
+Actual verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed after replacing a
+  Clippy-reported unnecessary temporary vector during invalidation.
+- `cargo test --all-targets` — 511 passed, 0 failed, 0 ignored, 28 binaries.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- With PLAYWRIGHT_BROWSERS_PATH selecting the ignored local cache,
+  `node scripts/test_browser.mjs` — all nine assertion groups passed in
+  Chromium 156.0.8078.4. The new group asserts the same ten guarded-binding
+  diagnostics byte-for-byte through the actual worker/WASM check API and
+  executes the valid fixture successfully through its run API.
+- `git diff --check` — passed.
+
+The preceding sandbox PR #87 also completed all eight push/PR CI jobs:
+default, all-feature solver, real WASM/browser and real HDL image/profile
+checks. New CI results for this increment are pending. No local all-feature,
+new HDL/container or Specman run was performed for these typing changes;
+no new language execution or IEEE conformance claim is made.

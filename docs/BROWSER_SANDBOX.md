@@ -121,6 +121,7 @@ CI installs Chromium with its OS dependencies. Local installation can use
 or `msedge` selects an installed channel. Tests start a loopback-only HTTP
 server and close it and the browser afterward. They assert parse/check/run,
 full-width seeds, spanned diagnostics, DUT checks, basic coverage, imports,
+conditional binding type diagnostics,
 UTF-8/ABI quotas/releases, zero host imports, memory cap, synchronous guest
 deadline, fetch deadline, cancellation/reuse, traps, client errors and demo
 text rendering. The timeout/trap probes are independently authored tiny WASM

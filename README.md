@@ -45,6 +45,11 @@ accesses and `Type::method(...)` signatures also retain kinds, and static
 bodies use their declaring namespace without an instance. Bare static method
 calls remain unsupported; use the qualified form.
 
+Explicit `is a T(name)` bindings retain their matched types along proven
+Boolean guard paths, including short-circuit operands and guarded branches.
+Ambiguous joins and possible rebinding remain conservative; general
+flow-sensitive narrowing is unfinished.
+
 Known variable, assignment, field, parameter and return contexts now type
 untyped `evaluate` and `new` expressions. This includes qualified calls,
 indexed targets and result metadata retained across TCM suspension. Calls and
