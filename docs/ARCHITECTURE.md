@@ -658,6 +658,19 @@ single-source browser sandbox API runs in disposable workers (see
   `run` print diagnostics to stderr
   (`path:line:col: error[code]: message`) and their results on success.
 
+Present concrete method prototypes now receive a separate E0311 interface
+contract check in the well-formedness pass (6.3/6.13). Effective interface
+requirements include transitive interface bases; prototype lookup follows
+the struct's like chain and extend blocks. It reports definite arity,
+annotation-presence, parameter/result shape/width and static mismatches, once
+per type/method. Plain representation aliases expand with a 64-step bound;
+constant expressions normalize widths and template value arguments. Bit,
+nibble and byte normalize to their unsigned widths; long bases retain their
+distinct arithmetic identity. Missing prototypes, symbolic/ranged types and
+unresolved/conditional/template-only cases stay conservative; missing actual
+implementations still report E0414 when called. General signature equivalence
+and extension-block contract validation remain gaps.
+
 Remaining boundaries (the detailed behavior inventory is in STATUS.md):
 
 - Full name resolution, signatures, flow-sensitive/bidirectional inference,

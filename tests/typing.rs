@@ -2,6 +2,54 @@ use std::fs;
 use std::path::Path;
 
 #[test]
+fn interface_implementation_signature_fixtures_match_expected() {
+    check_fixture_directory("fixtures/interface-signatures");
+}
+
+#[test]
+fn interface_contract_errors_are_static_but_missing_methods_remain_runtime() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/interface-signatures");
+    for command in ["parse", "elab", "run"] {
+        for name in ["mismatch", "composition", "widths"] {
+            let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+                .arg(command)
+                .arg(root.join(format!("{name}.e")))
+                .output()
+                .unwrap();
+            assert!(!result.status.success(), "{command} accepted {name}");
+            assert!(String::from_utf8_lossy(&result.stderr).contains("E0311"));
+        }
+    }
+    for name in ["runtime", "missing"] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+            .arg("run")
+            .arg(root.join(format!("{name}.e")))
+            .output()
+            .unwrap();
+        if name == "runtime" {
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(result.stdout).unwrap(),
+                fs::read_to_string(root.join("runtime.out"))
+                    .unwrap()
+                    .trim_end()
+            );
+        } else {
+            assert!(!result.status.success());
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains("E0414"),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+}
+
+#[test]
 fn type_expression_fixture_diagnostics_match_expected() {
     check_fixture_directory("fixtures/typing-type-expressions");
 }

@@ -5194,3 +5194,49 @@ PR #88's eight push/PR CI jobs completed successfully (default Rust,
 all-feature solver, real WASM/browser and real HDL image/profile jobs).
 CI for this increment is pending. No new local all-feature, HDL/container or
 Specman run was performed; no full type system or IEEE conformance is claimed.
+
+## 2026-11-15 — Present interface implementation contracts
+
+Added the missing comparison between a concrete present method prototype and
+its effective implemented interface requirements (6.3/6.13). Definite arity,
+annotation-presence, scalar/list/nominal parameter/result, known-width and
+static mismatches now report E0311 once per type/method. Interface inheritance,
+struct like chains and extend contributors participate. Missing prototypes
+remain accepted statically; calling a missing implementation still reports
+the existing runtime E0414.
+
+Plain aliases follow the repository's current representation model, bounded
+at 64 expansions; ranged aliases remain uncertain. Constant width/value
+expressions use the existing bounded evaluator. Default int/uint widths and
+bit/nibble/byte unsigned widths normalize; long bases retain their distinct
+arithmetic identities. Symbolic widths, ranged/custom types, conditional or
+template-only implementations, extension-only blocks and full extension/type
+equivalence remain conservative. This does not close full signature checking.
+
+Independently authored fixtures in tests/fixtures/interface-signatures cover
+16 exact E0311 diagnostics, inherited/extended contributors, renamed parameters,
+plain aliases, equal constant widths, byte versus uint(bits:8), conservative
+unknown cases and missing-method staging. Parse/elab/run all reject the
+contract errors. The valid native and browser runs execute interface calls
+and verify results before printing `interface signatures passed`. The missing
+case checks successfully and fails only when run, with E0414. Initial fixture
+runs failed while expected files were unfinished and the missing-method test
+incorrectly asserted E0407; the observed existing E0414 and exact expected
+files were recorded before final verification.
+
+Actual checks:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 515 passed, 0 failed, 0 ignored, 28 binaries.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all eleven groups passed in Chromium
+  156.0.8078.4, including byte-for-byte comparison of all 16 new contract
+  diagnostics and valid/missing-method run staging through actual workers/WASM.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for preceding PR #89 completed successfully.
+CI for this increment is pending; no new local all-feature, HDL/container or
+Specman run was performed. No full type system or IEEE conformance is claimed.

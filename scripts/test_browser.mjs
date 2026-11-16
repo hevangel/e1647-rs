@@ -82,6 +82,20 @@ try {
   const typedRun = await request(await readFile(resolve(root, "tests/fixtures/typing-type-expressions/runtime.e"), "utf8"), { operation: "run" });
   assert.equal(typedRun.ok, true); assert.equal(typedRun.output, "type expressions passed");
   checks.push("retained type expression diagnostics and execution");
+  for (const name of ["mismatch", "composition", "widths"]) {
+    const directory = resolve(root, "tests/fixtures/interface-signatures");
+    const result = await request(await readFile(resolve(directory, `${name}.e`), "utf8"), { operation: "check" });
+    assert.equal(result.ok, false);
+    assert.equal(result.diagnostics.map(d => `${d.start.line}:${d.start.column}: error[${d.code}]: ${d.message}\n`).join(""),
+      await readFile(resolve(directory, `${name}.expected`), "utf8"));
+  }
+  const interfaceDirectory = resolve(root, "tests/fixtures/interface-signatures");
+  const interfaceRun = await request(await readFile(resolve(interfaceDirectory, "runtime.e"), "utf8"), { operation: "run" });
+  assert.equal(interfaceRun.ok, true); assert.equal(interfaceRun.output, "interface signatures passed");
+  const missingSource = await readFile(resolve(interfaceDirectory, "missing.e"), "utf8");
+  assert.equal((await request(missingSource, { operation: "check" })).ok, true);
+  assert.equal((await request(missingSource, { operation: "run" })).diagnostics[0].code, "E0414");
+  checks.push("interface implementation contracts and missing-method runtime staging");
   const covered = await request(await fixture("coverage"), { operation: "run" });
   assert.equal(covered.ok, true);
   const group = covered.coverage.find(group => group.name === "cg");

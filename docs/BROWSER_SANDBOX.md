@@ -123,6 +123,7 @@ server and close it and the browser afterward. They assert parse/check/run,
 full-width seeds, spanned diagnostics, DUT checks, basic coverage, imports,
 conditional binding type diagnostics,
 retained type-expression diagnostics and execution,
+interface implementation contracts and missing-method runtime staging,
 UTF-8/ABI quotas/releases, zero host imports, memory cap, synchronous guest
 deadline, fetch deadline, cancellation/reuse, traps, client errors and demo
 text rendering. The timeout/trap probes are independently authored tiny WASM

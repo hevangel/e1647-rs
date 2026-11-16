@@ -54,6 +54,10 @@ Retained type annotations now check embedded widths, keyed-list keys and
 template/typeof arguments in scope. Definite non-integer widths report E0223;
 expressions already replaced during elaboration remain outside this pass.
 
+Present concrete methods now receive interface contract checks for definite
+parameter, result, arity and static mismatches (E0311). Missing implementations
+remain runtime errors; full signature equivalence remains unfinished.
+
 Known variable, assignment, field, parameter and return contexts now type
 untyped `evaluate` and `new` expressions. This includes qualified calls,
 indexed targets and result metadata retained across TCM suspension. Calls and

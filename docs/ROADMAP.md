@@ -268,7 +268,14 @@ not imply full language support or IEEE conformance.
       initializers/methods/handlers are checked once in their declaring
       scope, with omitted extension annotations inherited from the prototype.
       Bare static-field writes and alias defaulting are corrected; bare
-      static method calls and full signature-equivalence checks remain gaps
+      static method calls and full signature-equivalence checks remain gaps.
+      Present concrete implementation prototypes now receive E0311 for definite
+      interface contract mismatches (arity, annotation presence, scalar/list/
+      nominal kinds, known widths, return types and static implementations).
+      Lookup follows effective interfaces, like bases and extend blocks;
+      missing implementations remain runtime E0414. Symbolic/ranged types,
+      template/conditional-only implementations and extension equivalence
+      remain conservative
 - [~] Differential corpus against an authorized reference simulator where
       available — earlier Specman reference runs via EDA Playground are
       recorded in docs/VERIFICATION.md. The manifest-driven runner in

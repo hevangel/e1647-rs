@@ -41,8 +41,8 @@
 //!   6.13: the members are method signatures)
 //! - `E0219` an interface inheriting conflicting signatures for one
 //!   method from two of its `like` bases (clause 6.13)
-//! - `E0311` a struct implementing two interfaces that declare one
-//!   method with different signatures (clause 6.3, 31.4) — reported once
+//! - `E0311` conflicting implemented-interface signatures or a definite
+//!   mismatch in a present implementation prototype (6.3, 31.4) — once
 //!   per (type, method); the check runs here rather than in `elab.rs`
 //!   because the fixture contract observes the well-formedness pass
 //! - `E0312` a `new S` value assigned to an interface-typed target the
@@ -205,6 +205,14 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
         declarations,
         &interfaces,
         &struct_impls,
+        &mut reported_implement_conflicts,
+        &mut diagnostics,
+    );
+    check_implementation_signatures(
+        declarations,
+        &interfaces,
+        &struct_impls,
+        &templates.defines,
         &mut reported_implement_conflicts,
         &mut diagnostics,
     );
@@ -1150,6 +1158,239 @@ fn check_implement_conflicts(
                     declaration.name_span.0,
                     declaration.name_span.1,
                 ));
+            }
+        }
+    }
+}
+
+/// A type difference that can be proved without general type equivalence.
+/// Plain aliases expand with a bound; ranges, unresolved types and symbolic
+/// widths deliberately stay conservative.
+fn signature_type_differs(
+    left: &TypeExpr,
+    right: &TypeExpr,
+    declarations: &[Declaration],
+    defines: &BTreeMap<String, Expr>,
+    depth: usize,
+) -> bool {
+    if depth >= 64 {
+        return false;
+    }
+    let alias = |ty: &TypeExpr| match ty {
+        TypeExpr::Named { name, .. } => declarations
+            .iter()
+            .find(|d| {
+                d.name == *name && d.kind == DeclarationKind::Type && d.subtype_range.is_none()
+            })
+            .and_then(|d| d.underlying.as_ref()),
+        _ => None,
+    };
+    if let Some(underlying) = alias(left) {
+        return signature_type_differs(underlying, right, declarations, defines, depth + 1);
+    }
+    if let Some(underlying) = alias(right) {
+        return signature_type_differs(left, underlying, declarations, defines, depth + 1);
+    }
+    let constant = |expr: &Expr| crate::elab::eval_const_expr(expr, &BTreeMap::new(), defines, 0);
+    match (left, right) {
+        (
+            TypeExpr::Scalar {
+                base: a, width: aw, ..
+            },
+            TypeExpr::Scalar {
+                base: b, width: bw, ..
+            },
+        ) => {
+            // The short unsigned bases denote the corresponding uint width.
+            // Long bases keep their identities (their arithmetic mode differs
+            // from int/uint(bits:64)); symbolic widths remain unknown.
+            let scalar = |base: crate::ast::ScalarBase, width: &Option<Box<Expr>>| {
+                use crate::ast::ScalarBase;
+                match base {
+                    ScalarBase::Bit => (ScalarBase::Uint, Some(1)),
+                    ScalarBase::Nibble => (ScalarBase::Uint, Some(4)),
+                    ScalarBase::Byte => (ScalarBase::Uint, Some(8)),
+                    ScalarBase::Int | ScalarBase::Uint => (
+                        base,
+                        match width.as_deref() {
+                            None => Some(32),
+                            Some(expr) => match constant(expr) {
+                                Some(crate::elab::Const::Int(n)) => Some(n),
+                                _ => None,
+                            },
+                        },
+                    ),
+                    _ => (base, None),
+                }
+            };
+            let (a, aw) = scalar(*a, aw);
+            let (b, bw) = scalar(*b, bw);
+            a != b || matches!((aw, bw), (Some(a), Some(b)) if a != b)
+        }
+        (TypeExpr::List { element: a, .. }, TypeExpr::List { element: b, .. }) => {
+            signature_type_differs(a, b, declarations, defines, depth + 1)
+        }
+        (TypeExpr::Scalar { .. }, TypeExpr::List { .. })
+        | (TypeExpr::List { .. }, TypeExpr::Scalar { .. }) => true,
+        (TypeExpr::Named { name: a, .. }, TypeExpr::Named { name: b, .. }) => {
+            let nominal = |name: &str| {
+                declarations.iter().any(|d| {
+                    d.name == name
+                        && d.underlying.is_none()
+                        && matches!(
+                            d.kind,
+                            DeclarationKind::Struct
+                                | DeclarationKind::Unit
+                                | DeclarationKind::Interface
+                                | DeclarationKind::Type
+                        )
+                })
+            };
+            a != b && nominal(a) && nominal(b)
+        }
+        (
+            TypeExpr::TemplateRef {
+                name: a, args: aa, ..
+            },
+            TypeExpr::TemplateRef {
+                name: b, args: ba, ..
+            },
+        ) if a == b && aa.len() == ba.len() => aa
+            .iter()
+            .zip(ba)
+            .any(|(a, b)| signature_type_differs(a, b, declarations, defines, depth + 1)),
+        (TypeExpr::Value { expr: a, .. }, TypeExpr::Value { expr: b, .. }) => {
+            match (constant(a), constant(b)) {
+                (Some(a), Some(b)) => a != b,
+                _ => false,
+            }
+        }
+        (TypeExpr::InlineEnum { names: a, .. }, TypeExpr::InlineEnum { names: b, .. }) => a != b,
+        _ => {
+            let family = |ty: &TypeExpr| match ty {
+                TypeExpr::Scalar { .. } => Some("scalar"),
+                TypeExpr::List { .. } => Some("list"),
+                TypeExpr::InlineEnum { .. } => Some("enum"),
+                TypeExpr::Named { name, .. } => declarations
+                    .iter()
+                    .find(|d| d.name == *name && d.kind != DeclarationKind::Extend)
+                    .and_then(|d| {
+                        if d.underlying.is_some() {
+                            None
+                        } else {
+                            match d.kind {
+                                DeclarationKind::Struct
+                                | DeclarationKind::Unit
+                                | DeclarationKind::Interface => Some("object"),
+                                DeclarationKind::Type => Some("enum"),
+                                _ => None,
+                            }
+                        }
+                    }),
+                _ => None,
+            };
+            matches!((family(left), family(right)), (Some(a), Some(b)) if a != b)
+        }
+    }
+}
+
+fn interface_method_requirements<'a>(
+    name: &'a str,
+    interfaces: &BTreeMap<&'a str, &'a Declaration>,
+    seen: &mut BTreeSet<&'a str>,
+    out: &mut Vec<(&'a str, &'a MethodDecl)>,
+) {
+    if !seen.insert(name) {
+        return;
+    }
+    let Some(interface) = interfaces.get(name) else {
+        return;
+    };
+    for (base, _) in &interface.bases {
+        if let Some(name) = base.declared_name() {
+            interface_method_requirements(name, interfaces, seen, out);
+        }
+    }
+    for member in &interface.members {
+        if let Member::Method(method) = member {
+            out.push((name, method));
+        }
+    }
+}
+
+/// Existing implementations must obey the interface contract (6.3/6.13).
+/// Missing methods remain the runtime E0414 case; conditional/template-only
+/// implementations are not asserted to be definitely present here.
+fn check_implementation_signatures(
+    declarations: &[Declaration],
+    interfaces: &BTreeMap<&str, &Declaration>,
+    struct_impls: &BTreeMap<&str, Vec<String>>,
+    defines: &BTreeMap<String, Expr>,
+    reported: &mut BTreeSet<(String, String)>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (name, implemented) in struct_impls {
+        let Some(owner) = declarations.iter().find(|d| {
+            d.name == *name
+                && matches!(
+                    d.kind,
+                    DeclarationKind::Struct | DeclarationKind::Unit | DeclarationKind::Extend
+                )
+                && d.template_params.is_empty()
+                && d.template_extend.is_none()
+        }) else {
+            continue;
+        };
+        let chain = like_chain(declarations, name);
+        let methods: Vec<_> = chain
+            .iter()
+            .flat_map(|ty| {
+                declarations
+                    .iter()
+                    .filter(move |d| d.name == *ty && d.template_extend.is_none())
+            })
+            .flat_map(|d| &d.members)
+            .filter_map(|m| {
+                if let Member::Method(m) = m {
+                    Some(m)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut requirements = Vec::new();
+        let mut seen = BTreeSet::new();
+        for interface in implemented {
+            interface_method_requirements(interface, interfaces, &mut seen, &mut requirements);
+        }
+        for (interface, required) in requirements {
+            let method = methods
+                .iter()
+                .copied()
+                .find(|m| m.name == required.name && m.modifier.is_none());
+            let Some(method) = method else {
+                continue;
+            };
+            let params_differ =
+                method.params.len() != required.params.len()
+                    || method.params.iter().zip(&required.params).any(|(a, b)| {
+                        match (&a.ty, &b.ty) {
+                            (Some(a), Some(b)) => {
+                                signature_type_differs(a, b, declarations, defines, 0)
+                            }
+                            (None, None) => false,
+                            _ => true,
+                        }
+                    });
+            let returns_differ = match (&method.return_type, &required.return_type) {
+                (Some(a), Some(b)) => signature_type_differs(a, b, declarations, defines, 0),
+                (None, None) => false,
+                _ => true,
+            };
+            if (method.is_static || params_differ || returns_differ)
+                && reported.insert((owner.name.clone(), method.name.clone()))
+            {
+                diagnostics.push(Diagnostic::new("E0311", format!("implementation '{}.{}' has a different signature from interface '{interface}' (clause 6.3)", owner.name, method.name), method.name_span.0, method.name_span.1));
             }
         }
     }

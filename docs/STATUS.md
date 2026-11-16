@@ -10,6 +10,13 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## The pipeline, end to end
 
+- **Interface contracts.** Concrete present prototypes are checked against
+  effective implemented interfaces, including inherited/extended contributors.
+  Definite parameter/result/arity/static mismatches report E0311. Plain aliases
+  use the current representation model; constant widths and short unsigned
+  bases normalize. Missing methods remain runtime E0414. Symbolic/ranged types,
+  template/conditional-only implementations and full extension/signature
+  equivalence remain incomplete.
 - **Browser sandbox.** An experimental single-source parse/check/run API and
   local demo execute the default-feature WASM library in disposable workers.
   Structured diagnostics, output, DUT failure counts and basic coverage

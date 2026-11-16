@@ -1147,7 +1147,7 @@ Phase 12 — Docs/claims [Sonnet]
 | E0308 | elab | static member added to `global` |
 | E0309 | elab | static method extended outside its struct |
 | E0310 | elab | static event in `when` subtype |
-| E0311 | elab | struct implements interfaces with conflicting signatures |
+| E0311 | check/elab | conflicting implemented-interface signatures or definite mismatch in a present concrete implementation prototype (post-migration qualification) |
 | E0312 | elab | struct assigned to an interface it does not implement |
 | E0313 | elab | template value actual not a constant of the right type |
 | E0314 | elab | template instance violates `conditions` |
