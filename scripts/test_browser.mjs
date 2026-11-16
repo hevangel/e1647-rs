@@ -108,6 +108,14 @@ try {
   const extensionRun = await request(await readFile(resolve(extensionDirectory, "runtime.e"), "utf8"), { operation: "run" });
   assert.equal(extensionRun.ok, true); assert.equal(extensionRun.output, "method extension contracts passed");
   checks.push("composed method extension contracts and static ordering");
+  const tickDirectory = resolve(root, "tests/fixtures/tick-literals");
+  const tickErrors = await request(await readFile(resolve(tickDirectory, "errors.e"), "utf8"), { operation: "check" });
+  assert.equal(tickErrors.diagnostics.map(d => `${d.start.line}:${d.start.column}: error[${d.code}]: ${d.message}\n`).join(""),
+    await readFile(resolve(tickDirectory, "errors.expected"), "utf8"));
+  assert.equal((await request(await readFile(resolve(tickDirectory, "paths.e"), "utf8"), { operation: "parse" })).ok, true);
+  const tickRun = await request(await readFile(resolve(tickDirectory, "runtime.e"), "utf8"), { operation: "run" });
+  assert.equal(tickRun.ok, true); assert.equal(tickRun.output, "tick qualifiers passed");
+  checks.push("tick/numeral disambiguation and qualified execution");
   const covered = await request(await fixture("coverage"), { operation: "run" });
   assert.equal(covered.ok, true);
   const group = covered.coverage.find(group => group.name === "cg");

@@ -5290,3 +5290,46 @@ Actual verification:
 All eight push/PR CI jobs for preceding PR #90 completed successfully.
 CI for this increment is pending. No new local all-feature, HDL/container or
 Specman run was performed; no IEEE conformance is claimed.
+
+## 2026-11-15 — Tick/numeral lexical disambiguation
+
+Fixed the concrete `when active_state'flag` regression recorded in the
+preceding entry. A tick adjacent to an identifier now selects qualification,
+including suffixes whose complete spelling could be an unsized numeral, such
+as `p.active_state'hFF` or `p.active_state'bX`. Otherwise a standalone numeric
+candidate must end at an identifier boundary; a prefix such as `'fla` can no
+longer split the identifier flag. Simple closed quoted HDL paths also retain
+their quotes when the first name looks numeric. The previous identifier's
+byte end supplies adjacency; whitespace/comments break it, preserving complete
+separated radix spellings used as numeric operands or macro arguments.
+
+The original method-contract when fixture now uses flag without a workaround.
+New independently authored fixtures check qualified fields/method calls and
+real sized/unsized/prefixed numerals together in execution, ordinary downstream
+type diagnostics with exact spans, and numeric-looking dotted/single-name HDL
+path parsing. New lexer tests preserve MVL numeral tokens, partial-name
+boundaries, quote chains, comments and UTF-8 byte/line/column positions. MVL
+execution and escaped/indexed HDL path grammar are not added.
+
+Initial fixture attempts treated reserved hex as an ordinary identifier and
+included indexed HDL paths that the parser does not support. They were
+corrected to the existing keyword/grammar boundaries; indexed forms remain
+covered only as lexical tokens, not as parsed/executed HDL paths.
+
+Actual checks:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 521 passed, 0 failed, 0 ignored, 28 binaries.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all thirteen groups passed in actual
+  Chromium 156.0.8078.4. The new group checks both exact downstream E0220
+  diagnostics, numeric-looking path parsing and the valid qualified run's
+  `tick qualifiers passed` output through actual worker/WASM execution.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for preceding PR #91 completed successfully.
+CI for this increment is pending. No new local all-feature, HDL/container or
+Specman run was performed; no IEEE conformance is claimed.

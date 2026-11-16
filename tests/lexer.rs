@@ -453,6 +453,105 @@ fn subtype_modifier_quote_tokenizes_standalone() {
 }
 
 #[test]
+fn glued_tick_names_win_over_numeric_prefixes() {
+    for name in [
+        "flag", "data", "bus", "octal", "hex_name", "xFF", "hFF", "bX", "d123", "face", "hFF$",
+    ] {
+        assert_eq!(
+            kinds(&format!("active_state'{name}")),
+            vec![
+                TokenKind::Identifier("active_state".into()),
+                TokenKind::Punctuation("'".into()),
+                TokenKind::Identifier(name.into()),
+            ],
+            "{name}"
+        );
+    }
+    assert_eq!(
+        kinds("red'hFF'flag"),
+        vec![
+            TokenKind::Identifier("red".into()),
+            TokenKind::Punctuation("'".into()),
+            TokenKind::Identifier("hFF".into()),
+            TokenKind::Punctuation("'".into()),
+            TokenKind::Identifier("flag".into())
+        ]
+    );
+    // Separated tokens can still be macro arguments or numeric expression
+    // operands; punctuation and comments do not create adjacency.
+    assert_eq!(
+        kinds("macro 'hFF"),
+        vec![
+            TokenKind::Identifier("macro".into()),
+            TokenKind::Number("'hFF".into())
+        ]
+    );
+    assert_eq!(
+        kinds("name/* comment */'hFF"),
+        vec![
+            TokenKind::Identifier("name".into()),
+            TokenKind::Number("'hFF".into())
+        ]
+    );
+    let positioned = tokenize("// λ\nactive_state'flag").unwrap();
+    assert_eq!(
+        (
+            positioned[1].start.byte,
+            positioned[1].start.line,
+            positioned[1].start.column
+        ),
+        (18, 2, 13)
+    );
+    assert_eq!(
+        (
+            positioned[1].end.byte,
+            positioned[2].start.byte,
+            positioned[2].end.byte
+        ),
+        (19, 19, 23)
+    );
+}
+
+#[test]
+fn unsized_numeric_prefixes_do_not_split_identifiers_or_quoted_paths() {
+    for name in ["flag", "decimal", "hex_signal", "bus_address"] {
+        assert_eq!(
+            kinds(&format!("'{name}")),
+            vec![
+                TokenKind::Punctuation("'".into()),
+                TokenKind::Identifier(name.into())
+            ]
+        );
+    }
+    for name in ["hFF", "hex.path", "bus[3].data", "data[7:0]"] {
+        let tokens = kinds(&format!("'{name}'"));
+        assert_eq!(tokens.first(), Some(&TokenKind::Punctuation("'".into())));
+        assert_eq!(tokens.last(), Some(&TokenKind::Punctuation("'".into())));
+        assert!(
+            tokens
+                .iter()
+                .any(|kind| matches!(kind, TokenKind::Identifier(_)))
+        );
+    }
+    assert_eq!(
+        kinds("'hFF + 'hAA"),
+        vec![
+            TokenKind::Number("'hFF".into()),
+            TokenKind::Punctuation("+".into()),
+            TokenKind::Number("'hAA".into())
+        ]
+    );
+    assert_eq!(
+        kinds("8'hFF 'bX 0xFF"),
+        vec![
+            TokenKind::Number("8'hFF".into()),
+            TokenKind::Number("'bX".into()),
+            TokenKind::Number("0xFF".into())
+        ]
+    );
+}
+
+#[test]
 fn code_segment_markers_must_own_their_line() {
     // Clause 4.2.3: the marker is the whole line, at the first column.
     assert_eq!(

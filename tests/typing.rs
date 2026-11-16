@@ -2,6 +2,45 @@ use std::fs;
 use std::path::Path;
 
 #[test]
+fn tick_literal_language_fixtures_match_expected() {
+    check_fixture_directory("fixtures/tick-literals");
+}
+
+#[test]
+fn tick_qualifiers_and_based_literals_execute_together() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tick-literals");
+    for command in ["elab", "run"] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+            .arg(command)
+            .arg(root.join("errors.e"))
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("E0220"),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+        .arg("run")
+        .arg(root.join("runtime.e"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        fs::read_to_string(root.join("runtime.out"))
+            .unwrap()
+            .trim_end()
+    );
+}
+
+#[test]
 fn method_extension_contract_fixtures_match_expected() {
     check_fixture_directory("fixtures/method-extension-contracts");
 }

@@ -125,6 +125,7 @@ conditional binding type diagnostics,
 retained type-expression diagnostics and execution,
 interface implementation contracts and missing-method runtime staging,
 composed extension contracts and static declaration/extend ordering,
+tick/numeral disambiguation and qualified field/method execution,
 UTF-8/ABI quotas/releases, zero host imports, memory cap, synchronous guest
 deadline, fetch deadline, cancellation/reuse, traps, client errors and demo
 text rendering. The timeout/trap probes are independently authored tiny WASM

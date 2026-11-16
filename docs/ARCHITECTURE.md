@@ -33,8 +33,14 @@ single-source browser sandbox API runs in disposable workers (see
   prose outside those segments is skipped. A file with no begin marker
   is tokenized as code throughout. Decimal integers take a `K`/`M`
   multiplier, `0c"..."` is a character literal, and non-decimal based
-  literals accept MVL digits. A bare `'` is punctuation, so
-  `'path.to.signal'` can be parsed later. Reports the first lexical
+  literals accept MVL digits. An adjacent identifier/tick suffix takes
+  qualification precedence, including flag and fully numeric-looking suffixes
+  such as hFF. Otherwise an unsized numeric candidate must end at an identifier
+  boundary; separate complete radix spellings stay numbers. A closed simple
+  quoted path preserves its quotes even when its name looks numeric. The
+  cursor remembers the previous identifier's byte end; whitespace/comments
+  break adjacency, preserving separated numeric macro arguments. Escaped or
+  indexed path parsing is not added. Reports the first lexical
   error; later stages collect many. MVL literals are tokenized and not
   evaluated. Block comments (`/* */`) are standard (clause 4.2.4):
   they span lines and code segments and do not nest.

@@ -3,9 +3,11 @@
 //! Keyword recognition, multi-character operators and IEEE 1647-style
 //! numerals (sized/unsized based literals, `0x`/`0b` prefixes, reals) were
 //! cross-checked against the MIT-licensed grammars pinned under
-//! `external/` (see docs/REFERENCES.md). A bare `'` followed by an
-//! identifier is the subtype modifier quote (`read'kind`), tokenized as a
-//! standalone punctuation token like the reference grammar's `SNG_QUOTE`.
+//! `external/` (see docs/REFERENCES.md). A tick glued to a preceding
+//! identifier is the subtype modifier quote (`read'kind`), tokenized
+//! separately even when its suffix looks numeric. Separated complete radix
+//! spellings retain numeric tokens; partial identifier prefixes do not.
+//! Simple quoted HDL paths keep both quotes, including numeric-looking names.
 //! Code-segment markers `<'` and `'>` (clause 4.2.3) count only when they
 //! occupy the first column and the rest of that line is whitespace. A file
 //! that contains such a begin marker is a comment until the first one, and
@@ -299,6 +301,9 @@ struct Cursor<'a> {
     /// Whether the cursor is inside a code segment. Prose outside segments
     /// is skipped when [`Self::segments`] is set.
     in_code: bool,
+    /// Only an adjacent identifier can glue a subtype tick to its suffix.
+    /// Separated macro arguments must still be able to start with a numeral.
+    identifier_end: Option<usize>,
 }
 
 impl<'a> Cursor<'a> {
@@ -311,6 +316,7 @@ impl<'a> Cursor<'a> {
             column: 1,
             segments,
             in_code: !segments,
+            identifier_end: None,
         }
     }
 
@@ -457,10 +463,7 @@ impl<'a> Cursor<'a> {
     fn read_word(&mut self) -> String {
         let start_byte = self.byte;
         // `$` extends identifiers: `port$` is the simple_port value access.
-        while self
-            .peek()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-        {
+        while self.peek().is_some_and(identifier_continue) {
             self.bump();
         }
         self.source[start_byte..self.byte].to_owned()
@@ -737,43 +740,81 @@ impl<'a> Cursor<'a> {
             // qualifiers `p.red'good'x`), or the opening or closing
             // quote of a quoted hierarchical path
             // (`'memory_tb.address'`). A based literal commits only when
-            // a digit of its base follows the base letter — `'x` in a
+            // a complete digit run follows the base letter — `'x` in a
             // qualifier run (`red'x`) is the qualifier quote, not the
             // start of a hex literal. Non-literal quotes become
             // standalone punctuation tokens (like the reference grammar's
             // `SNG_QUOTE`); the parser decides what they delimit.
-            match self.peek_second() {
-                Some(base) if Self::based_base_letter(base) => {
-                    let third = {
-                        let mut chars = self.source[self.byte..].chars();
-                        chars.next();
-                        chars.next();
-                        chars.next()
-                    };
-                    if third.is_some_and(|c| based_digit_ok(base, c, true)) {
-                        self.bump();
-                        self.bump();
-                        self.read_based_digits(base, start, true)?;
-                        self.finish_number(start)
-                    } else {
+            if self.identifier_end == Some(start.byte) || self.quoted_path_ahead() {
+                self.bump();
+                TokenKind::Punctuation("'".to_owned())
+            } else {
+                match self.peek_second() {
+                    Some(base) if Self::based_base_letter(base) => {
+                        let third = {
+                            let mut chars = self.source[self.byte..].chars();
+                            chars.next();
+                            chars.next();
+                            chars.next()
+                        };
+                        let complete_digits = third.is_some_and(|c| based_digit_ok(base, c, true))
+                            && !self.source[self.byte + 2..]
+                                .chars()
+                                .find(|c| !based_digit_ok(base, *c, true))
+                                .is_some_and(identifier_continue);
+                        if complete_digits {
+                            self.bump();
+                            self.bump();
+                            self.read_based_digits(base, start, true)?;
+                            self.finish_number(start)
+                        } else {
+                            self.bump();
+                            TokenKind::Punctuation("'".to_owned())
+                        }
+                    }
+                    _ => {
                         self.bump();
                         TokenKind::Punctuation("'".to_owned())
                     }
-                }
-                _ => {
-                    self.bump();
-                    TokenKind::Punctuation("'".to_owned())
                 }
             }
         } else {
             self.read_operator()
         };
+        self.identifier_end = matches!(&kind, TokenKind::Identifier(_)).then_some(self.byte);
         Ok(Some(Token {
             kind,
             start,
             end: self.position(),
         }))
     }
+
+    /// A closing quote after a simple HDL path wins over a numeric-looking
+    /// prefix. Arithmetic/separator characters end the probe, so a later
+    /// literal cannot accidentally close this one. Escaped HDL names remain
+    /// outside this lightweight path recognition.
+    fn quoted_path_ahead(&self) -> bool {
+        let mut chars = self.source[self.byte + 1..].chars();
+        if !chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
+            return false;
+        }
+        for c in chars {
+            if c == '\'' {
+                return true;
+            }
+            if !(identifier_continue(c) || matches!(c, '.' | '[' | ']' | ':')) {
+                return false;
+            }
+        }
+        false
+    }
+}
+
+fn identifier_continue(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$'
 }
 
 /// Whether `c` is legal in a based literal of `base`. `mvl` allows the

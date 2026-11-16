@@ -219,9 +219,13 @@ not imply full language support or IEEE conformance.
       rules apply in one pass; the backtick Verilog-style names of
       4.1.5.4 and the cross-file include-order visibility of B.5 are
       not modeled)
-- [ ] Disambiguate tick-qualified determinant names from apostrophe numerals:
-      `when active_state'flag` currently tokenizes the suffix as a numeral;
-      the independently authored method-contract fixture uses `mode` instead
+- [x] Disambiguate adjacent tick-qualified names from apostrophe numerals:
+      `when active_state'flag` and numeric-looking suffixes such as
+      `p.active_state'hFF` retain separate tick/name tokens. Complete standalone
+      numeral spellings remain numeric; partial numeric prefixes no longer split
+      an identifier. Simple closed quoted HDL path tokens retain their quotes.
+      Whitespace-separated complete radix forms retain numeral interpretation;
+      escaped/indexed HDL path grammar is outside this lexical milestone
 - [~] Add symbol resolution, types, diagnostics — well-formedness
       checks (duplicate declaration/field names, duplicate
       parameters/local variables/enumerals, unknown named/`like`/`extend`

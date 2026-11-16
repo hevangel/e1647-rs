@@ -37,6 +37,10 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   file. Member composition folds `like` chains and `extend` blocks into
   per-type member lists. Failures produce spanned diagnostics with
   fixture-tested output (`tests/fixtures/`).
+  Glued tick suffixes remain identifiers even when numeric-looking; separate
+  complete apostrophe numerals remain numbers. Partial prefixes no longer split
+  names, and simple numeric-looking quoted HDL paths keep their quotes. This
+  does not extend escaped/indexed HDL path parsing or execute MVL numerals.
 - **Elaboration.** The composed types feed the interpreter: `when`
   subtypes synthesize subtype views whose members apply;
   `typeof()`/`typeof_item()` type positions resolve; template instances
