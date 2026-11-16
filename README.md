@@ -30,7 +30,7 @@
 > IEEE conformance is claimed.
 
 An experimental [browser sandbox](docs/BROWSER_SANDBOX.md) exposes
-single-source parse/check/run, diagnostics, output and basic coverage through
+single-source parse/check/run, diagnostics, output and basic/derived coverage through
 a local demo and versioned WASM API. Disposable workers provide cancellation
 and deadlines. Chromium runtime tests cover the shipped default-feature
 build; imports and native HDL are unavailable in the browser.

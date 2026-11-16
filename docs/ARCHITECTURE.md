@@ -751,8 +751,9 @@ Remaining boundaries (the detailed behavior inventory is in STATUS.md):
   set/list pseudo-methods already execute; their presence does not imply the
   rest of the library is implemented.
 - Simulator bindings beyond xezim (including VHPI/VHDL), backend selection,
-  derived coverage serialization in the browser and browser engines beyond
-  Chromium. The single-source WASM ABI and worker runtime have real browser
+  browser engines beyond Chromium. The browser serializes native basic and
+  derived coverage summaries, preserving duplicate combination labels and
+  decimal-string counts; detailed bucket identities are not exposed. The single-source WASM ABI and worker runtime have real browser
   tests; this is an experimental declared-subset API, not a security audit.
 
 ## Qualification runner

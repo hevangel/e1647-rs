@@ -42,9 +42,19 @@ finishes without a fatal diagnostic. `output` preserves the interpreter's
 console text; the demo renders all returned content as text.
 
 Coverage is a flat array of group summaries with type/name/unit owner,
-samples, grade and basic items/buckets. Derived cross/transition structures
-are not serialized. A group grade follows the native collector and can be
-null. Coverage starts disabled until source config enables it. Seeds,
+samples, grade, basic items/buckets and a derived array for cross/transition
+summaries. Each derived entry has name, kind (cross or transition), sources
+(in declaration order), samples, goal, weight, totalCombos, grade and a
+combinations array of label/hits objects. Transition sources contains one
+name; its labels describe previous/current observations. Nested derived sources
+are named, including sources hidden from the reported view. Hidden groups and
+items are omitted using the native report filtering. Combinations stay an
+array because different bucket identities can render the same label; duplicate
+labels are preserved as separate entries. Detailed bucket identities and
+unsampled combinations are not serialized. totalCombos is a decimal string,
+or null for an ungradeable/overflowing domain; zero remains the string "0".
+Grades follow the native collector and can be null (including zero goals or
+empty domains). The derived field is additive within response version 1. Coverage starts disabled until source config enables it. Seeds,
 coverage counters/goals and signed 128-bit bucket bounds are **decimal
 strings** to preserve precision; grades are JSON numbers or null. Positions,
 API version and DUT counts are JSON numbers. The seed accepts the full u64
@@ -127,6 +137,8 @@ interface implementation contracts and missing-method runtime staging,
 composed extension contracts and static declaration/extend ordering,
 tick/numeral disambiguation and qualified field/method execution,
 method wrapper ordering/replacement, results, suspension and type diagnostics,
+derived coverage summaries (nested/hidden sources, duplicate labels, masks,
+per-unit ownership, ungradeable domains and full-width goals/weights),
 UTF-8/ABI quotas/releases, zero host imports, memory cap, synchronous guest
 deadline, fetch deadline, cancellation/reuse, traps, client errors and demo
 text rendering. The timeout/trap probes are independently authored tiny WASM

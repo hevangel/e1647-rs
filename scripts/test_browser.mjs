@@ -134,6 +134,15 @@ try {
   assert.equal(group.samples, "2"); assert.equal(group.grade, 1);
   assert.deepEqual(group.items[0].buckets.map(bucket => bucket.hits), ["1", "1"]);
   checks.push("basic coverage summary");
+  for (const name of ["coverage-graphs/cross-transition", "coverage-graphs/duplicate-labels",
+    "coverage-graphs/empty-unbounded", "coverage-graphs/all-masked", "wasm-api/derived-unbucketed"]) {
+    const path = resolve(root, "tests/fixtures", name);
+    const result = await request(await readFile(`${path}.e`, "utf8"), { operation: "run" });
+    assert.equal(result.ok, true, name);
+    assert.deepEqual(result.coverage, JSON.parse(await readFile(`${path}.browser.json`, "utf8")), name);
+  }
+  assert.deepEqual(group.derived, []);
+  checks.push("derived coverage summaries, hidden sources, masks, duplicate labels and exact counters");
   const failures = await page.evaluate(async () => {
     const { Sandbox } = await import("/client.js");
     const code = promise => promise.then(() => "unexpected_success", error => error.code);

@@ -31,11 +31,12 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   language execution and reference-simulator qualification remain incomplete.
 - **Browser sandbox.** An experimental single-source parse/check/run API and
   local demo execute the default-feature WASM library in disposable workers.
-  Structured diagnostics, output, DUT failure counts and basic coverage
-  summaries are tested in Chromium. The shipped module has zero host imports,
+  Structured diagnostics, output, DUT failure counts and basic/derived coverage
+  summaries are tested in Chromium. Derived crosses/transitions retain source
+  names, goals/weights, domain totals, grades and observed combination arrays,
+  including duplicate labels and per-unit ownership. The shipped module has zero host imports,
   a 128 MiB linear-memory cap and host cancellation/deadlines. Imports and
-  native HDL are unavailable; derived coverage serialization and other browser
-  engines remain unqualified. See [BROWSER_SANDBOX.md](BROWSER_SANDBOX.md).
+  native HDL are unavailable; other browser engines remain unqualified. See [BROWSER_SANDBOX.md](BROWSER_SANDBOX.md).
 - **Front end.** A source tokenizer and a recursive-descent parser for a
   declared subset: struct/unit/extend/type/interface/annotation and
   template declarations, fields, scalar/list/named/enumeral types,

@@ -4,7 +4,14 @@ use std::{fs, path::Path};
 #[test]
 fn browser_sources_share_native_pipeline_results() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-api");
-    for name in ["run", "coverage", "type-error", "dut-error", "import"] {
+    for name in [
+        "run",
+        "coverage",
+        "derived-unbucketed",
+        "type-error",
+        "dut-error",
+        "import",
+    ] {
         let path = root.join(format!("{name}.e"));
         let result = evaluate(
             &fs::read_to_string(&path).unwrap(),
@@ -55,5 +62,31 @@ fn browser_sources_share_native_pipeline_results() {
                 [1, 1]
             );
         }
+    }
+}
+
+#[test]
+fn derived_coverage_json_preserves_native_report_data() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for name in [
+        "coverage-graphs/cross-transition",
+        "coverage-graphs/duplicate-labels",
+        "coverage-graphs/empty-unbounded",
+        "coverage-graphs/all-masked",
+        "wasm-api/derived-unbucketed",
+    ] {
+        let path = root.join(name);
+        let response = evaluate(
+            &fs::read_to_string(path.with_extension("e")).unwrap(),
+            Operation::Run,
+            u64::MAX,
+        );
+        assert!(response.ok(), "{name}: {:?}", response.diagnostics);
+        let coverage = fs::read_to_string(path.with_extension("browser.json")).unwrap();
+        let expected = format!(
+            "{{\"version\":1,\"operation\":\"run\",\"seed\":\"18446744073709551615\",\"ok\":true,\"output\":\"\",\"diagnostics\":[],\"dutErrors\":0,\"coverage\":{},\"error\":null}}",
+            coverage.trim()
+        );
+        assert_eq!(response.to_json(), expected, "{name}");
     }
 }

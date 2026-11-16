@@ -62,10 +62,26 @@ impl Response {
                 format!("{{\"name\":{},\"samples\":{},\"ungradeableHits\":{},\"buckets\":[{}]}}",
                     json_string(&item.name), json_string(&item.samples.to_string()), json_string(&item.ungradeable_hits.to_string()), buckets)
             }).collect::<Vec<_>>().join(",");
-            let grade = group.grade().filter(|value| value.is_finite()).map_or("null".to_owned(), |value| value.to_string());
-            format!("{{\"type\":{},\"name\":{},\"unit\":{},\"samples\":{},\"grade\":{},\"items\":[{}]}}",
+            let derived = group.derived.iter().map(|item| {
+                let kind = match item.kind {
+                    crate::ast::CoverItemKind::Cross => "cross",
+                    crate::ast::CoverItemKind::Transition => "transition",
+                    crate::ast::CoverItemKind::Item => unreachable!("derived coverage kind"),
+                };
+                let sources = item.sources.iter().map(|source| json_string(source)).collect::<Vec<_>>().join(",");
+                // Keep an array: distinct bucket identities can have the same
+                // rendered label, and a label-keyed object would lose data.
+                let combinations = item.combos.iter().map(|(label, hits)| format!(
+                    "{{\"label\":{},\"hits\":{}}}", json_string(label), json_string(&hits.to_string()),
+                )).collect::<Vec<_>>().join(",");
+                let total = item.total_combos.map_or("null".to_owned(), |total| json_string(&total.to_string()));
+                format!("{{\"name\":{},\"kind\":{},\"sources\":[{}],\"samples\":{},\"goal\":{},\"weight\":{},\"totalCombos\":{},\"grade\":{},\"combinations\":[{}]}}",
+                    json_string(&item.name), json_string(kind), sources, json_string(&item.samples.to_string()),
+                    json_string(&item.goal.to_string()), json_string(&item.weight.to_string()), total, json_grade(item.grade()), combinations)
+            }).collect::<Vec<_>>().join(",");
+            format!("{{\"type\":{},\"name\":{},\"unit\":{},\"samples\":{},\"grade\":{},\"items\":[{}],\"derived\":[{}]}}",
                 json_string(&ty.type_name), json_string(&group.name),
-                group.unit_instance.as_deref().map_or("null".to_owned(), json_string), json_string(&group.samples.to_string()), grade, items)
+                group.unit_instance.as_deref().map_or("null".to_owned(), json_string), json_string(&group.samples.to_string()), json_grade(group.grade()), items, derived)
         })).collect::<Vec<_>>().join(",");
         let error = self.error.map_or("null".to_owned(), |(code, message)| {
             format!(
@@ -94,6 +110,12 @@ impl Response {
             json
         }
     }
+}
+
+fn json_grade(grade: Option<f64>) -> String {
+    grade
+        .filter(|value| value.is_finite())
+        .map_or("null".to_owned(), |value| value.to_string())
 }
 
 fn json_string(value: &str) -> String {

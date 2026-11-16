@@ -570,12 +570,14 @@ not imply full language support or IEEE conformance.
       and retains owned artifact evidence
 - [x] Experimental single-source WASM build and browser sandbox API:
       versioned parse/check/run ABI, spanned diagnostics, console text,
-      DUT failure counts and basic coverage summaries. Disposable workers
+      DUT failure counts and basic/derived coverage summaries. Disposable workers
       provide cancellation/deadlines; the shipped default-feature module
       has zero host imports and a 128 MiB linear-memory maximum. Real
       Chromium tests cover the ABI, pipeline, worker lifetime and demo;
-      CI repeats those tests. Imports/native HDL are unavailable; derived
-      coverage serialization, other browser engines and a security audit
+      CI repeats those tests. Cross/transition summaries include sources,
+      goals/weights, totals, grades and observed combination arrays; hidden
+      sources and duplicate labels retain the native reporting semantics.
+      Imports/native HDL are unavailable; other browser engines and a security audit
       remain outside this scoped milestone. See
       [BROWSER_SANDBOX.md](BROWSER_SANDBOX.md)
 

@@ -5377,3 +5377,47 @@ verification ran through the same approval path with these actual results:
 All eight push/PR CI jobs for preceding PR #92 completed successfully.
 CI for this increment is pending. No new local all-feature or HDL/container
 run was performed; no IEEE conformance is claimed.
+
+
+## 2026-11-16 — Browser derived coverage summaries
+
+The version-1 browser response now adds a derived array to each reported
+coverage group. Cross/transition summaries include their kind, source names,
+samples, hit goal, weight, possible-combination total, native grade and an
+array of observed label/hit pairs. Counts, totals, goals and weights remain
+decimal strings; an ungradeable total/grade is null and an empty domain retains
+its zero total. Hidden groups/items remain filtered by the native reporting
+view. This serializes the existing collector; it adds no language semantics.
+
+Independent expected JSON fixtures cover a nested cross over a hidden
+transition; distinct observations with identical rendered labels; a fully
+masked per-unit graph; a zero domain with an unbucketed input; and unbucketed
+string crosses/transitions with maximum-u64 goals/weights, zero goals/weights
+and Unicode names. The same five expected responses are checked byte-for-byte
+in native tests and parsed/compared through actual worker/WASM execution in
+Chromium. Basic-only groups retain an empty derived array. Label arrays retain
+separate observations; detailed bucket identities and unsampled combinations
+are outside this summary API.
+
+An initial escape-heavy coverage-name fixture exposed existing raw-token name
+handling. The serialization fixture now uses an ordinary Unicode name; quoted
+string observation labels still exercise JSON escaping. General coverage-name
+constant decoding remains separate work, rather than redefining its expected
+language behavior here.
+
+Actual verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 524 passed, 0 failed, 0 ignored, 29 binaries.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all fifteen groups passed in actual
+  Chromium 156.0.8078.4.
+- `git diff --check` — passed.
+
+At the latest observation, preceding PR #93's six native/solver/WASM CI jobs
+passed and its two HDL-profile jobs were still running. CI for this increment
+is pending. No new Specman, local all-feature or HDL/container run was
+performed; no IEEE conformance is claimed.
