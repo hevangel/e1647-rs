@@ -730,7 +730,20 @@ Remaining boundaries (the detailed behavior inventory is in STATUS.md):
   range labels evaluate literal-string concatenation/grouping with the same
   escape decoder as runtime strings. Name validation consumes the whole option
   expression; computed names share collection and graph lookup, and invalid
-  values report E0224. Named constants remain unresolved in these expressions.
+  values report E0224. A post-composition pass in coverage/constants.rs
+  resolves supported initialized plain integer/string const fields in schema
+  options, preserving reference spans. It also folds their pure initializers
+  for instance/declaration-time storage, including forward/inherited fields
+  and qualified static consts. Only names, ranges, goals and weights have
+  option tokens rewritten; runtime filter expressions retain their scopes.
+  Successful field values are memoized. Cycles and an active dependency plus
+  expression-depth limit of 64 stop resolution; concatenated strings are
+  capped at 256 KiB. Checked untyped arithmetic and the shared direct-operand
+  precision helper avoid overflow/preserve supported 32/64-bit contexts.
+  Explicit widths/aliases, enumerals, dynamic initializers and wider constant
+  expressions remain gaps. Existing E0224 diagnostics reject unresolved
+  schema values; unsupported fields shadowing predefined constants report
+  E0224 explicitly rather than silently selecting the predefined value.
   Basic and derived
   scalar effects, source graphs, filters, goals and bounded domain proofs run
   as described above; the coverage subset of set_config is wired. Other

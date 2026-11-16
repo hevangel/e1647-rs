@@ -215,7 +215,13 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   (concatenation/grouping) with runtime escape decoding. Full option values are
   consumed; invalid derived names report E0224 rather than accepting a prefix
   or silently using a default. Computed names share graph lookup and duplicate
-  checks. Real/enumeral ranges, named constants and item-domain width proofs
+  checks. Initialized plain integer/string const fields resolve in names,
+  range bounds/widths/labels/goals and group/item goals/weights, including
+  inherited and qualified static consts. Their supported pure initializers
+  fold to literals for runtime storage too. Arithmetic reuses direct-operand
+  precision contexts; cycles, unsupported dependencies and overflowing
+  untyped arithmetic remain diagnostic cases. Explicit widths/aliases, enums,
+  dynamic initialization, real/enumeral ranges and item-domain width proofs
   remain unfinished.
 
 ## What runs, by 2019 feature

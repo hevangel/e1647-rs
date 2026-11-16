@@ -1,0 +1,4 @@
+sys.cg samples=1 grade=none
+n buckets=2 grade=none samples=1
+FALSE [0..0] goal=0 hits=1
+TRUE [1..1] goal=0 hits=0

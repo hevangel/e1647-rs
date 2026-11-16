@@ -35,7 +35,9 @@ a local demo and versioned WASM API. Disposable workers provide cancellation
 and deadlines. Chromium runtime tests cover the shipped default-feature
 build; imports and native HDL are unavailable in the browser. Coverage derived
 names and range labels support grouped/concatenated string literals with
-runtime escape decoding; named constants remain a gap.
+runtime escape decoding. Supported initialized integer/string const fields
+resolve in coverage schema options and fold to runtime initializers after
+composition; aliases/widths, enums and dynamic constant evaluation remain gaps.
 
 Temporal rules and waits retain sampled proposition and repeat-bound
 values, so later state matching uses the recorded values. Temporal

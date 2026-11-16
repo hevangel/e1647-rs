@@ -15723,7 +15723,7 @@ fn scalar_range(base: ScalarBase, width: &Option<Box<Expr>>) -> Option<(i128, i1
 /// values; the unbounded mode keeps exactly that behavior, so only the
 /// ≤32-bit and 64-bit modes change results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Precision {
+pub(crate) enum Precision {
     /// (a) every operand type is at most 32 bits: compute in 32 bits,
     /// unsigned when any operand is unsigned.
     Bits32 { unsigned: bool },
@@ -15750,7 +15750,7 @@ impl Precision {
 
     /// The width this context computes at (`None` for the unbounded and
     /// real modes, where values are not wrapped).
-    fn bits(self) -> Option<u32> {
+    pub(crate) fn bits(self) -> Option<u32> {
         match self {
             Precision::Bits32 { .. } => Some(32),
             Precision::Bits64 { .. } => Some(64),
@@ -15768,7 +15768,7 @@ impl Precision {
     /// Cast one operand into the context: truncate to the width and
     /// interpret it signed or unsigned (5.6.3's "operands are cast").
     /// The unbounded and real modes keep the value as is.
-    fn cast_operand(self, value: i128) -> i128 {
+    pub(crate) fn cast_operand(self, value: i128) -> i128 {
         match self.bits() {
             None => value,
             Some(bits) => wrap_to_width(value, bits, self.unsigned()),
@@ -15848,7 +15848,7 @@ fn is_star_width(width: &Option<Box<Expr>>) -> bool {
 
 /// The 5.6.3 context type set from the operands' static types — the
 /// four rules (a)–(d), tried in order.
-fn precision_context(lhs: Option<&TypeExpr>, rhs: Option<&TypeExpr>) -> Precision {
+pub(crate) fn precision_context(lhs: Option<&TypeExpr>, rhs: Option<&TypeExpr>) -> Precision {
     use OperandClass::*;
     let (l, r) = (operand_class(lhs), operand_class(rhs));
     // No operand carries a static type (two literals, call results,

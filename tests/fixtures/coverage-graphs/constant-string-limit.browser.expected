@@ -1,0 +1,4 @@
+22:87: error[E0224]: coverage derived name requires a supported constant string (14.4-14.5)
+21:25: error[E0223]: the left operand of the arithmetic operator is 'string' — a number is required
+21:25: error[E0223]: the right operand of the arithmetic operator is 'string' — a number is required
+21:25: error[E0220]: field init value: a value of kind 'int' cannot be stored into 'string'

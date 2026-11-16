@@ -157,6 +157,22 @@ try {
       await readFile(`${path}.expected`, "utf8"), name);
   }
   checks.push("constant coverage names, decoded range labels and exact name diagnostics");
+  const namedDirectory = resolve(root, "tests/fixtures/coverage-graphs");
+  const namedRun = await request(await readFile(resolve(namedDirectory, "named-constants.e"), "utf8"), { operation: "run" });
+  assert.equal(namedRun.ok, true, JSON.stringify(namedRun.diagnostics));
+  assert.deepEqual(namedRun.coverage, JSON.parse(await readFile(resolve(namedDirectory, "named-constants.browser.json"), "utf8")));
+  const constantArithmetic = await request(await readFile(resolve(namedDirectory, "constant-arithmetic.e"), "utf8"), { operation: "run" });
+  assert.equal(constantArithmetic.ok, true, JSON.stringify(constantArithmetic.diagnostics));
+  assert.equal(constantArithmetic.coverage[0].grade, null);
+  assert.deepEqual(constantArithmetic.coverage[0].items[0].buckets.map(bucket => bucket.goal), ["0", "0"]);
+  for (const name of ["named-constant-errors", "constant-depth-limit", "constant-string-limit"]) {
+    const result = await request(await readFile(resolve(namedDirectory, `${name}.e`), "utf8"), { operation: "check" });
+    assert.equal(result.ok, false, name);
+    const expectedSuffix = name === "constant-string-limit" ? "browser.expected" : "expected";
+    assert.equal(result.diagnostics.map(d => `${d.start.line}:${d.start.column}: error[${d.code}]: ${d.message}\n`).join(""),
+      await readFile(resolve(namedDirectory, `${name}.${expectedSuffix}`), "utf8"), name);
+  }
+  checks.push("named coverage constants, inherited/static initializers, precision and invalid dependencies");
   const failures = await page.evaluate(async () => {
     const { Sandbox } = await import("/client.js");
     const code = promise => promise.then(() => "unexpected_success", error => error.code);

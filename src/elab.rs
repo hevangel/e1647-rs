@@ -1532,6 +1532,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
     // monomorphization worklist; a file-declared name of the same kind
     // shadows the builtin (the synthesized entry is skipped).
     compose_builtin_numeric_interfaces(&mut types);
+    let coverage_constant_diagnostics = crate::coverage::resolve_constants(&mut types);
     let method_layers = composed_method_layers(&types, &any_unit.methods);
     let mut result = Elaborated {
         method_layers,
@@ -1546,6 +1547,20 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         static_events: static_registry(declarations),
         static_ons: static_registry(declarations),
     };
+    result.diagnostics.extend(coverage_constant_diagnostics);
+    // Keep declaration-time storage aligned with the same resolved const
+    // initializer used by instance fields and coverage schemas.
+    for (owner, fields) in &mut result.static_fields {
+        if let Some(ty) = result.types.iter().find(|ty| &ty.name == owner) {
+            for field in fields {
+                if let Some(composed) = ty.fields.iter().find(|candidate| {
+                    candidate.name == field.name && candidate.name_span == field.name_span
+                }) {
+                    field.init = composed.init.clone();
+                }
+            }
+        }
+    }
     result.diagnostics.extend(crate::coverage::validate_types(
         &result.types,
         &result.defines,

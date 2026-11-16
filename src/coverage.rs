@@ -39,7 +39,9 @@ use crate::ast::{CoverGroupDecl, CoverItemDecl, CoverItemKind, Expr, ScalarBase,
 use crate::lexer::{Token, TokenKind};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod constants;
 mod proof;
+pub(crate) use constants::resolve as resolve_constants;
 pub(crate) use proof::{ScalarDomain, prove_predicate};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1461,7 +1463,10 @@ fn constant_string(
 ) -> Result<String, crate::diagnostic::Diagnostic> {
     fn evaluate(expr: &Expr) -> Option<String> {
         match expr {
-            Expr::StringLiteral { value, .. } => Some(crate::interp::unescape(value)),
+            Expr::StringLiteral { value, .. } => {
+                let value = crate::interp::unescape(value);
+                (value.len() <= constants::MAX_STRING_BYTES).then_some(value)
+            }
             Expr::Paren { expr, .. } => evaluate(expr),
             Expr::Binary {
                 op: crate::ast::BinaryOp::Add,
@@ -1470,7 +1475,11 @@ fn constant_string(
                 ..
             } => {
                 let mut value = evaluate(lhs)?;
-                value.push_str(&evaluate(rhs)?);
+                let rhs = evaluate(rhs)?;
+                if value.len().checked_add(rhs.len())? > constants::MAX_STRING_BYTES {
+                    return None;
+                }
+                value.push_str(&rhs);
                 Some(value)
             }
             _ => None,

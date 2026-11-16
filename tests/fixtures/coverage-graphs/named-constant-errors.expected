@@ -1,0 +1,5 @@
+13:53: error[E0224]: coverage constant 'MAX_INT' is shadowed by an unsupported field (14.3-14.5)
+9:53: error[E0224]: coverage range parameters require supported constant integers without overflow (14.3)
+10:53: error[E0224]: coverage range parameters require supported constant integers without overflow (14.3)
+11:43: error[E0224]: coverage range parameters require supported constant integers without overflow (14.3)
+12:41: error[E0224]: coverage weights require nonnegative constant u64 values (14.3-14.5)

@@ -5462,3 +5462,63 @@ All eight push/PR CI jobs for PR #93 passed. At the latest observation, PR
 #94's six native/solver/WASM jobs passed and its two HDL-profile jobs remained
 running. CI for this increment is pending. No new Specman, local all-feature
 or HDL/container run was performed; no IEEE conformance is claimed.
+
+
+## 2026-11-16 — Initialized const fields in coverage schemas
+
+A post-composition pass resolves supported explicitly initialized plain
+integer/string const fields in coverage names, ranges, hit goals and weights.
+Inherited members and qualified static consts use the composed owning type.
+Supported pure field initializers fold to literal AST values for instance and
+static storage too: previously a dependent field initializer executed without
+an owner scope and could fail even when its schema had resolved successfully.
+Reference/initializer spans and option separators are retained. Runtime filter
+options retain their original expressions and scopes.
+
+The evaluator supports integer arithmetic, unary signs, parentheses, string
+concatenation and supported const field dependencies. It shares the existing
+direct-operand arithmetic precision context instead of introducing a separate
+32/64-bit wrapping model. Whole option/range-parameter expressions fold before
+references become literals, preserving typed operand precision. Successful
+field values are memoized; cycles, combined dependency/expression depth beyond
+64, untyped arithmetic overflow and division by zero stop resolution. String
+concatenation and schema names/labels have a 256 KiB value bound. Unsupported
+fields shadowing predefined constants report E0224 instead of silently using
+the predefined value. Explicit widths/aliases, enums, dynamic initializers,
+general defines and broader constant expressions remain incomplete.
+
+Five independent fixtures cover inherited per-unit schemas, forward static
+initialization, named range bounds/widths/goals, group/item weight precedence,
+computed nested source names, runtime/schema value agreement, 32/64-bit
+arithmetic boundaries, escape preservation, cyclic/mutable/sized/dividing
+initializers, predefined-name shadowing and dependency/string-size limits.
+Expected counts and grades are authored independently. The native JSON test
+and actual browser worker/WASM agree on the full inherited coverage payload.
+Browser tests also execute the arithmetic case and compare exact error spans.
+
+Initial compilation corrected AST variant/member-span names and a Clippy
+unnecessary mutable borrow. The first runtime fixture exposed the owner-less
+initializer gap described above; it was fixed rather than replacing dependent
+initializers with literals in the source. The reserved step field spelling was
+changed to bucket_width. The string-size limit's elaboration fixture expects
+E0224; the complete CLI/browser pipeline also reports three existing type
+checker errors for the unfurled unsupported string addition. A separate
+browser expected file records all four diagnostics, verified against the
+native CLI as well. General runtime string addition remains outside this pass.
+
+Actual verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 524 passed, 0 failed, 0 ignored, 29 binaries.
+  New sources extend existing fixture loops.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all seventeen groups passed in actual
+  Chromium 156.0.8078.4, including the dependency and size-limit probes.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for both PR #94 and PR #95 passed. CI for this
+increment is pending. No new Specman, local all-feature or HDL/container run
+was performed; no IEEE conformance is claimed.

@@ -485,7 +485,12 @@ not imply full language support or IEEE conformance.
       remain gaps. Derived name options and range labels evaluate supported
       literal-string concatenation/grouping and decode runtime string escapes.
       Invalid derived names report E0224; computed names participate in graph
-      lookup and duplicate checking. Named constants remain unresolved here.
+      lookup and duplicate checking. Supported initialized const fields resolve
+      after composition, including inherited fields and qualified static consts,
+      in names/ranges/goals/weights. Pure integer/string dependencies fold to
+      literal initializers shared with runtime storage. Resolution is bounded;
+      aliases/explicit widths, enums, dynamic initializers and general constant
+      expressions remain incomplete.
       Integral range widths and per-range goals run with
       range/item/group/global precedence; zero-goal buckets are ungraded
       and do not show holes. Explicit construction is capped at 65536
