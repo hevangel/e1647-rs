@@ -5333,3 +5333,47 @@ Actual checks:
 All eight push/PR CI jobs for preceding PR #91 completed successfully.
 CI for this increment is pending. No new local all-feature, HDL/container or
 Specman run was performed; no IEEE conformance is claimed.
+
+
+## 2026-11-16 — Composed method execution policies
+
+Replaced sequential body execution with a shared first/also/only execution
+plan. Independently authored fixtures exercise same-layer ordering and only
+replacement; inherited wrappers around subtype bodies, including when views
+and templates; scalar argument handoff and restoration; implicit typed result
+slots; normal and early returns; explicit NULL reference returns without hidden
+object construction; static methods; and suspension in inline/started TCMs and
+main run. Constructor init, setup/check/run hooks, injected any_unit wrappers
+and inline sequence MAIN use the same plan. A native stress case executes 1200
+first extensions using iterative plan compilation.
+
+The result slot shadows an owner field of the same name and receives the
+inherited return type in the conservative checker. Three independently
+expected E0220 diagnostics check invalid assignments in core, also and static
+bodies. Browser tests execute all seven positive fixtures and compare those
+three diagnostics byte-for-byte with the expected fixture.
+
+An existing lawful local historical 2016 PDF was consulted to study wrapper
+semantics. This is not new 2019 reference qualification. No standard text,
+examples, proprietary code or vendor output was copied into the repository.
+No new Specman run was performed. Constructor timing, inline sequence execution
+and the existing atomic regions retain their documented approximations.
+
+Initial Clippy verification rejected a single-range array initializer; the
+fallback now borrows a named range. An approval-service usage-limit failure
+prevented one subsequent verification attempt from executing. After recovery,
+verification ran through the same approval path with these actual results:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 523 passed, 0 failed, 0 ignored, 29 binaries.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all fourteen groups passed in actual
+  Chromium 156.0.8078.4.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for preceding PR #92 completed successfully.
+CI for this increment is pending. No new local all-feature or HDL/container
+run was performed; no IEEE conformance is claimed.

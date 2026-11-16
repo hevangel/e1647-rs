@@ -680,8 +680,27 @@ remains a gap. E0225 checks composed extension blocks against their prototype,
 including when views, substituted templates and the static registry. Omitted
 annotations inherit; source-identical inherited/registry copies report once.
 Static registries collect base declarations before extend contributions,
-independent of their physical order. Full is-first/is-only execution policies
-remain unfinished.
+independent of their physical order.
+
+`src/methods.rs` compiles first/also/only bodies into an arena-backed plan,
+using an explicit work stack to avoid recursion for deeply extended methods.
+Elaboration retains method-layer ranges for inheritance, synthesized when views
+and substituted templates, distinguishing actual injected any_unit hooks. A
+subtype replaces the virtual central body while ancestor wrappers remain.
+Within one layer, only replaces the older subtree; first wraps it before and
+also wraps it after. Return jumps skip only the current subtree, so outer also
+bodies still execute. An owned program counter, argument save stack and result
+slot survive TCM suspension alongside the retained frame and statement path.
+First parameter rebindings feed the older subtree; also restores its incoming
+arguments and receives the older result. Typed bodies get an implicit result
+local with their inherited return type. Reference results default to NULL,
+without allocating hidden objects. Normal completion returns the slot; bare
+return uses it, while explicit return NULL stays NULL.
+
+Atomic instance/static calls, inline value/compute calls, started TCMs, main
+run, lifecycle hooks, creation-time init and inline sequence MAIN share the
+plan. Existing atomic regions and constructor timing approximations remain;
+this does not qualify full execution semantics against a reference simulator.
 
 Remaining boundaries (the detailed behavior inventory is in STATUS.md):
 

@@ -1729,6 +1729,11 @@ fn check_method<'a>(
             .unwrap_or(Ty::Unknown);
         checker.bind_local(&parameter.name, ty);
     }
+    if let Some(ty) = checker.return_ty
+        && !method.params.iter().any(|p| p.name == "result")
+    {
+        checker.bind_local("result", checker.type_of(ty));
+    }
     // Bind every parameter before checking dependent annotation expressions;
     // even physically later parameters shadow owner fields.
     for parameter in &method.params {
