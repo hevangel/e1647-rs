@@ -10,7 +10,8 @@
 
 Still ahead of the code: a typed IR, and simulator bindings beyond the
 xezim bridge (VHPI among them). The library compiles for wasm32; a
-browser sandbox API is not started.
+single-source browser sandbox API runs in disposable workers (see
+[BROWSER_SANDBOX.md](BROWSER_SANDBOX.md)).
 
 ## Principles
 
@@ -691,8 +692,9 @@ Remaining boundaries (the detailed behavior inventory is in STATUS.md):
   set/list pseudo-methods already execute; their presence does not imply the
   rest of the library is implemented.
 - Simulator bindings beyond xezim (including VHPI/VHDL), backend selection,
-  browser sandbox API and WASM runtime qualification. WASM compilation alone
-  is verified by CI.
+  derived coverage serialization in the browser and browser engines beyond
+  Chromium. The single-source WASM ABI and worker runtime have real browser
+  tests; this is an experimental declared-subset API, not a security audit.
 
 ## Qualification runner
 

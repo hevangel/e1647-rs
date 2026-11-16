@@ -33,6 +33,7 @@ pub mod lexer;
 pub mod macros;
 pub mod parser;
 pub mod preproc;
+pub mod sandbox;
 pub mod solve;
 pub mod tables;
 pub mod temporal;

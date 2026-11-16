@@ -35,12 +35,8 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features
 
-  # The core library (lexer/parser/elaborator/interpreter) compiles for
-  # wasm32. The one backend that needs a child process (the xezim VPI
-  # bridge) is native-only — under target_arch = "wasm32" it is not
-  # compiled and the null simulator backend answers there (see
-  # src/hdl.rs). A compilation check only: there is no browser sandbox
-  # API and no wasm runtime test yet.
+  # Standalone WASM ABI plus real Chromium worker/API/demo tests. Native
+  # xezim process spawning is excluded; no host imports are permitted.
   check-wasm:
     runs-on: ubuntu-latest
     steps:
@@ -50,6 +46,21 @@ jobs:
           targets: wasm32-unknown-unknown
       - run: cargo check --target wasm32-unknown-unknown
       - run: cargo check --target wasm32-unknown-unknown --all-targets
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --prefix browser --ignore-scripts
+      - run: node scripts/build_browser.mjs
+      - run: node browser/node_modules/playwright/cli.js install --with-deps chromium
+      - run: node scripts/test_browser.mjs
+      - name: Retain browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-sandbox-evidence
+          path: local/browser-sandbox/
+          if-no-files-found: warn
+          retention-days: 7
 
 
   # Real native/VPI simulation in the image built from this checkout.

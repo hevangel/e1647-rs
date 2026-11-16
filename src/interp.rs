@@ -218,6 +218,8 @@ pub struct RunResult {
     pub output: String,
     pub diagnostics: Vec<Diagnostic>,
     pub coverage: Vec<crate::coverage::TypeCoverage>,
+    /// Failed DUT checks, independent of fatal interpreter diagnostics.
+    pub dut_errors: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1436,6 +1438,7 @@ fn run_inner(
         // No `sys`: a declarations-only program runs to completion with no
         // output.
         return RunResult {
+            dut_errors: interp.dut_errors,
             output: interp.output,
             diagnostics: interp
                 .pending_diagnostics
@@ -1689,6 +1692,7 @@ fn run_inner(
     // (clause 6.9.1/6.9.4) join the run's diagnostics.
     diagnostics.append(&mut interp.pending_diagnostics);
     RunResult {
+        dut_errors: interp.dut_errors,
         output: interp.output,
         diagnostics: diagnostics
             .into_iter()
