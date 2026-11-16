@@ -726,7 +726,12 @@ Remaining boundaries (the detailed behavior inventory is in STATUS.md):
   Precise e/HDL event ordering remains unfinished.
 - The remaining coverage semantics: composite-valued predicates, mixed
   composite classification, real/enumeral ranges, full option/domain typing,
-  general constant/type resolution and radix/never behavior. Basic and derived
+  general constant/type resolution and radix/never behavior. Derived names and
+  range labels evaluate literal-string concatenation/grouping with the same
+  escape decoder as runtime strings. Name validation consumes the whole option
+  expression; computed names share collection and graph lookup, and invalid
+  values report E0224. Named constants remain unresolved in these expressions.
+  Basic and derived
   scalar effects, source graphs, filters, goals and bounded domain proofs run
   as described above; the coverage subset of set_config is wired. Other
   configuration categories/options and set_config_max remain gaps.

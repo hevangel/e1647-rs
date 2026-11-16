@@ -482,7 +482,11 @@ not imply full language support or IEEE conformance.
       option/scope errors are E0224. Other runtime configuration
       categories/options, `set_config_max`, composite-valued predicates,
       real/enumeral ranges, general constant/type resolution, radix/filter semantics and full option type checking
-      remain gaps. Integral range widths and per-range goals run with
+      remain gaps. Derived name options and range labels evaluate supported
+      literal-string concatenation/grouping and decode runtime string escapes.
+      Invalid derived names report E0224; computed names participate in graph
+      lookup and duplicate checking. Named constants remain unresolved here.
+      Integral range widths and per-range goals run with
       range/item/group/global precedence; zero-goal buckets are ungraded
       and do not show holes. Explicit construction is capped at 65536
       buckets per item; checked i128 arithmetic diagnoses unsupported or

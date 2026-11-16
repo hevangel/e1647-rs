@@ -73,6 +73,8 @@ fn derived_coverage_json_preserves_native_report_data() {
         "coverage-graphs/duplicate-labels",
         "coverage-graphs/empty-unbounded",
         "coverage-graphs/all-masked",
+        "coverage-graphs/constant-names",
+        "coverage-graphs/escaped-range-label",
         "wasm-api/derived-unbucketed",
     ] {
         let path = root.join(name);

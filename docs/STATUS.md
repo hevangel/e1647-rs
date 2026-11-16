@@ -211,8 +211,12 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   source-dependent classification over mixed composite inputs reports E0402.
   Whole-node constant predicates support nested sources. Full option type
   checking remains unfinished.
-  Real/enumeral ranges, general constant-name resolution and item-domain
-  width proofs remain unfinished.
+  Derived name options and range labels evaluate literal string expressions
+  (concatenation/grouping) with runtime escape decoding. Full option values are
+  consumed; invalid derived names report E0224 rather than accepting a prefix
+  or silently using a default. Computed names share graph lookup and duplicate
+  checks. Real/enumeral ranges, named constants and item-domain width proofs
+  remain unfinished.
 
 ## What runs, by 2019 feature
 

@@ -945,21 +945,24 @@ pub(crate) fn build_types(
 /// Synthesize a group's derived items (14.4/14.5) from its recorded
 /// cross/transition entries; final graph totals are computed after merging.
 fn derived_name(entry: &CoverItemDecl) -> String {
-    scan_string_option(&entry.using, "name").unwrap_or_else(|| match entry.kind {
-        CoverItemKind::Transition => format!(
-            "transition__{}",
-            entry.names.first().map_or("", |(name, _)| name)
-        ),
-        _ => format!(
-            "cross_{}",
-            entry
-                .names
-                .iter()
-                .map(|(name, _)| name.as_str())
-                .collect::<Vec<_>>()
-                .join("__")
-        ),
-    })
+    derived_name_option(&entry.using)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| match entry.kind {
+            CoverItemKind::Transition => format!(
+                "transition__{}",
+                entry.names.first().map_or("", |(name, _)| name)
+            ),
+            _ => format!(
+                "cross_{}",
+                entry
+                    .names
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("__")
+            ),
+        })
 }
 
 fn build_derived(decl: &CoverGroupDecl, config: &CoverageConfig) -> Vec<CoverDerivedData> {
@@ -1122,18 +1125,24 @@ fn scan_bool_option(tokens: &[Token], name: &str) -> Option<bool> {
     }
 }
 
-/// Scan `name = "text"` in recorded option tokens; `None` when the
-/// option is absent or its value is not a string literal.
-fn scan_string_option(tokens: &[Token], name: &str) -> Option<String> {
-    for index in 0..tokens.len() {
-        if token_word(&tokens[index]) == Some(name) && token_kind_is(tokens.get(index + 1)?, "=") {
-            return match tokens.get(index + 2).map(|token| &token.kind) {
-                Some(TokenKind::StringLiteral(text)) => Some(text.clone()),
-                _ => None,
-            };
-        }
-    }
-    None
+/// Use the complete top-level option expression, never a matching word in
+/// another option's nested expression or a valid prefix of an invalid value.
+fn derived_name_option(tokens: &[Token]) -> Result<Option<String>, crate::diagnostic::Diagnostic> {
+    option_entry(tokens, "name")
+        .map(|entry| {
+            let value = option_expression(entry);
+            if value.is_empty() {
+                return Err(option_error(
+                    entry,
+                    "coverage derived name requires a supported constant string (14.4-14.5)",
+                ));
+            }
+            constant_string(
+                value,
+                "coverage derived name requires a supported constant string (14.4-14.5)",
+            )
+        })
+        .transpose()
 }
 
 fn bool_buckets() -> Vec<CoverBucket> {
@@ -1293,7 +1302,12 @@ fn parse_ranges(using: &[Token]) -> Result<Vec<CoverBucket>, crate::diagnostic::
         }
         let name = parameters
             .get(1)
-            .map(|tokens| constant_string(tokens))
+            .map(|tokens| {
+                constant_string(
+                    tokens,
+                    "coverage range name requires a supported constant string (14.3)",
+                )
+            })
             .transpose()?
             .unwrap_or_default();
         let width = match parameters.get(2) {
@@ -1441,10 +1455,13 @@ fn constant_integer(tokens: &[Token]) -> Result<i128, crate::diagnostic::Diagnos
         .ok_or_else(|| option_error(tokens, "coverage range parameters require supported constant integers without overflow (14.3)"))
 }
 
-fn constant_string(tokens: &[Token]) -> Result<String, crate::diagnostic::Diagnostic> {
+fn constant_string(
+    tokens: &[Token],
+    message: &str,
+) -> Result<String, crate::diagnostic::Diagnostic> {
     fn evaluate(expr: &Expr) -> Option<String> {
         match expr {
-            Expr::StringLiteral { value, .. } => Some(value.clone()),
+            Expr::StringLiteral { value, .. } => Some(crate::interp::unescape(value)),
             Expr::Paren { expr, .. } => evaluate(expr),
             Expr::Binary {
                 op: crate::ast::BinaryOp::Add,
@@ -1462,12 +1479,7 @@ fn constant_string(tokens: &[Token]) -> Result<String, crate::diagnostic::Diagno
     crate::parser::parse_expression_tokens(tokens)
         .ok()
         .and_then(|expr| evaluate(&expr))
-        .ok_or_else(|| {
-            option_error(
-                tokens,
-                "coverage range name requires a supported constant string (14.3)",
-            )
-        })
+        .ok_or_else(|| option_error(tokens, message))
 }
 
 fn unsigned_goal(tokens: &[Token]) -> Result<u64, crate::diagnostic::Diagnostic> {
@@ -1515,6 +1527,18 @@ fn token_kind_is(token: &Token, symbol: &str) -> bool {
 /// Split only top-level option separators; calls and range bodies keep
 /// their internal commas/semicolons and their original source spans.
 fn option_value<'a>(tokens: &'a [Token], name: &str) -> Option<&'a [Token]> {
+    option_entry(tokens, name).map(option_expression)
+}
+
+fn option_expression(entry: &[Token]) -> &[Token] {
+    if entry.get(1).is_some_and(|token| token_kind_is(token, "=")) {
+        &entry[2..]
+    } else {
+        &entry[1..]
+    }
+}
+
+fn option_entry<'a>(tokens: &'a [Token], name: &str) -> Option<&'a [Token]> {
     let mut start = 0;
     let mut depth = 0usize;
     let mut found = None;
@@ -1525,13 +1549,7 @@ fn option_value<'a>(tokens: &'a [Token], name: &str) -> Option<&'a [Token]> {
         if separator {
             let part = &tokens[start..end];
             if part.first().and_then(token_word) == Some(name) {
-                found = Some(
-                    if part.get(1).is_some_and(|token| token_kind_is(token, "=")) {
-                        &part[2..]
-                    } else {
-                        &part[1..]
-                    },
-                );
+                found = Some(part);
             }
             start = end + 1;
         } else if let TokenKind::Punctuation(symbol) = &tokens[end].kind {
@@ -1700,6 +1718,10 @@ fn validate_source_graph(
                 1,
             )
         } else {
+            if let Err(diagnostic) = derived_name_option(&item.using) {
+                diagnostics.push(diagnostic);
+                continue;
+            }
             if (item.kind == CoverItemKind::Cross && item.names.len() < 2)
                 || (item.kind == CoverItemKind::Transition && item.names.len() != 1)
             {

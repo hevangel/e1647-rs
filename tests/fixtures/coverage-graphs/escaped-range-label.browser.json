@@ -1,0 +1,1 @@
+[{"type":"sys","name":"cg","unit":null,"samples":"2","grade":1,"items":[{"name":"n","samples":"2","ungradeableHits":"0","buckets":[{"lo":"0","hi":"0","label":"quote\"\\Ω","hits":"1","goal":"1","excluded":false},{"lo":"1","hi":"1","label":"\\n","hits":"1","goal":"1","excluded":false}]}],"derived":[]}]
