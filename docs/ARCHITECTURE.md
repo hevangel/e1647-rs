@@ -275,8 +275,9 @@ single-source browser sandbox API runs in disposable workers (see
   have neither receiver nor a bare static namespace, matching current runtime
   initialization. A declaration is preferred over physically earlier
   extension blocks; omitted extension annotations inherit by parameter
-  position/result. Explicit annotations keep their own kinds; full extension
-  signature equivalence is not checked. Unregistered/template entries stay
+  position/result. Explicit extension annotations, arity and static prefixes
+  now receive E0225 contract checks after composition/template substitution;
+  general type equivalence stays conservative. Unregistered/template entries stay
   conservative. New initializers clear the caller's static context and restore
   it afterward. Bare static method calls remain unsupported in the runtime
   and unknown to this checker; qualified calls are the supported form.
@@ -669,7 +670,12 @@ nibble and byte normalize to their unsigned widths; long bases retain their
 distinct arithmetic identity. Missing prototypes, symbolic/ranged types and
 unresolved/conditional/template-only cases stay conservative; missing actual
 implementations still report E0414 when called. General signature equivalence
-and extension-block contract validation remain gaps.
+remains a gap. E0225 checks composed extension blocks against their prototype,
+including when views, substituted templates and the static registry. Omitted
+annotations inherit; source-identical inherited/registry copies report once.
+Static registries collect base declarations before extend contributions,
+independent of their physical order. Full is-first/is-only execution policies
+remain unfinished.
 
 Remaining boundaries (the detailed behavior inventory is in STATUS.md):
 

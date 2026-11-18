@@ -96,6 +96,18 @@ try {
   assert.equal((await request(missingSource, { operation: "check" })).ok, true);
   assert.equal((await request(missingSource, { operation: "run" })).diagnostics[0].code, "E0414");
   checks.push("interface implementation contracts and missing-method runtime staging");
+  const extensionDirectory = resolve(root, "tests/fixtures/method-extension-contracts");
+  for (const name of ["mismatch", "conditional", "template", "template-reversed"]) {
+    const source = await readFile(resolve(extensionDirectory, `${name}.e`), "utf8");
+    if (name === "mismatch") assert.equal((await request(source, { operation: "parse" })).ok, true);
+    const result = await request(source, { operation: "check" });
+    assert.equal(result.ok, false);
+    assert.equal(result.diagnostics.map(d => `${d.start.line}:${d.start.column}: error[${d.code}]: ${d.message}\n`).join(""),
+      await readFile(resolve(extensionDirectory, `${name}.expected`), "utf8"));
+  }
+  const extensionRun = await request(await readFile(resolve(extensionDirectory, "runtime.e"), "utf8"), { operation: "run" });
+  assert.equal(extensionRun.ok, true); assert.equal(extensionRun.output, "method extension contracts passed");
+  checks.push("composed method extension contracts and static ordering");
   const covered = await request(await fixture("coverage"), { operation: "run" });
   assert.equal(covered.ok, true);
   const group = covered.coverage.find(group => group.name === "cg");

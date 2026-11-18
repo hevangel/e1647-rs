@@ -17,6 +17,11 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   bases normalize. Missing methods remain runtime E0414. Symbolic/ranged types,
   template/conditional-only implementations and full extension/signature
   equivalence remain incomplete.
+  Composed method extensions report E0225 for definite contract changes,
+  including when views and substituted templates; omitted annotations inherit.
+  Static declarations now precede extend contributions even when the extend
+  appears first in source. Full is-first/is-only execution policies remain
+  unfinished.
 - **Browser sandbox.** An experimental single-source parse/check/run API and
   local demo execute the default-feature WASM library in disposable workers.
   Structured diagnostics, output, DUT failure counts and basic coverage

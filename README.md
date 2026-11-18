@@ -57,6 +57,8 @@ expressions already replaced during elaboration remain outside this pass.
 Present concrete methods now receive interface contract checks for definite
 parameter, result, arity and static mismatches (E0311). Missing implementations
 remain runtime errors; full signature equivalence remains unfinished.
+Composed extensions report E0225 for definite signature changes and inherit
+omitted annotations, including substituted templates and when views.
 
 Known variable, assignment, field, parameter and return contexts now type
 untyped `evaluate` and `new` expressions. This includes qualified calls,

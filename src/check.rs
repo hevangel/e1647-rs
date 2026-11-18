@@ -1166,7 +1166,7 @@ fn check_implement_conflicts(
 /// A type difference that can be proved without general type equivalence.
 /// Plain aliases expand with a bound; ranges, unresolved types and symbolic
 /// widths deliberately stay conservative.
-fn signature_type_differs(
+pub(crate) fn signature_type_differs(
     left: &TypeExpr,
     right: &TypeExpr,
     declarations: &[Declaration],

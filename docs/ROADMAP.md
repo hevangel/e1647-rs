@@ -219,6 +219,9 @@ not imply full language support or IEEE conformance.
       rules apply in one pass; the backtick Verilog-style names of
       4.1.5.4 and the cross-file include-order visibility of B.5 are
       not modeled)
+- [ ] Disambiguate tick-qualified determinant names from apostrophe numerals:
+      `when active_state'flag` currently tokenizes the suffix as a numeral;
+      the independently authored method-contract fixture uses `mode` instead
 - [~] Add symbol resolution, types, diagnostics — well-formedness
       checks (duplicate declaration/field names, duplicate
       parameters/local variables/enumerals, unknown named/`like`/`extend`
@@ -274,8 +277,12 @@ not imply full language support or IEEE conformance.
       nominal kinds, known widths, return types and static implementations).
       Lookup follows effective interfaces, like bases and extend blocks;
       missing implementations remain runtime E0414. Symbolic/ranged types,
-      template/conditional-only implementations and extension equivalence
-      remain conservative
+      template/conditional-only implementations and general equivalence
+      remain conservative. Composed extension blocks now report E0225 for
+      definite arity, explicit parameter/result type or static-prefix changes;
+      omitted annotations inherit. Checks include when views, static registries
+      and substituted templates. Static registries compose declarations before
+      extends even when the extend appears first in the file
 - [~] Differential corpus against an authorized reference simulator where
       available — earlier Specman reference runs via EDA Playground are
       recorded in docs/VERIFICATION.md. The manifest-driven runner in
@@ -348,7 +355,9 @@ not imply full language support or IEEE conformance.
       list lengths)
 
 ## M3 — Behavioral execution
-- [~] Interpreter and method calling conventions — started: the
+- [~] Interpreter and method calling conventions — partial. Full
+      execution ordering/replacement of `is first`/`is only` remains
+      unfinished; their headers now receive signature contract validation. The
       statement subset in `src/interp.rs` executes expressions, `var`,
       assignment, calls, `if`/`while`/`for`/`case`, `repeat until`
       (clause 20.2.3 — the body at least once), `break`/`continue`,

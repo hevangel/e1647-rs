@@ -5240,3 +5240,53 @@ Actual checks:
 All eight push/PR CI jobs for preceding PR #89 completed successfully.
 CI for this increment is pending; no new local all-feature, HDL/container or
 Specman run was performed. No full type system or IEEE conformance is claimed.
+
+## 2026-11-15 — Composed method-extension contracts and static order
+
+Added E0225 after composition/final type-position resolution for definite
+method-extension contract changes (17.2.4): arity, explicit parameter/result
+annotations and static prefix. Omitted annotations inherit by parameter
+position/result, as the runtime already does. The pass covers regular composed
+methods, when views, substituted template instances and static registries.
+It reuses the bounded signature comparison, leaving symbolic/ranged types and
+unresolved or extension-only declarations conservative. Repeated source pairs
+in inherited/registry copies report once; a compatible template instance does
+not hide an incompatible instance from the same source, in either encounter
+order. Full signature equivalence and is-first/is-only execution policies
+remain unfinished.
+
+Static registry collection also now matches its documented composition order:
+declarations precede extend contributions even when an extend appears earlier
+in the file. The independent valid fixture checks static method results and
+static handler ordering, compatible renamed/omitted annotations, inherited
+instance methods, equivalent byte widths and suspended TCM extension results.
+Its observed success text is `method extension contracts passed`.
+
+Fixture development exposed an existing lexer gap: the tick in
+`active_state'flag` starts an apostrophe numeral token. The when-view fixture
+uses `mode` to exercise composition; the unresolved disambiguation case is
+now an explicit roadmap item. An initial Boolean determinant fixture was
+also outside the current when parser's identifier form. These parser failures
+were corrected before verification; they were not counted as E0225 evidence.
+A CLI-help edit initially re-encoded existing comment punctuation using the
+Windows locale; the original UTF-8 bytes were restored before staging, leaving
+only the intended help change.
+
+Actual verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 517 passed, 0 failed, 0 ignored, 28 binaries.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all twelve groups passed in actual
+  Chromium 156.0.8078.4. Ten E0225 diagnostics across four fixtures match
+  expected files byte-for-byte. Parse accepts the contract-only error case;
+  check rejects it. The valid fixture executes through worker/WASM, including
+  static order and suspended instance calls.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for preceding PR #90 completed successfully.
+CI for this increment is pending. No new local all-feature, HDL/container or
+Specman run was performed; no IEEE conformance is claimed.

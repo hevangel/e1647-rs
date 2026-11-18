@@ -1,0 +1,1 @@
+5:5: error[E0225]: extension of method 'f' has a different signature from its declaration (clause 17.2.4)
