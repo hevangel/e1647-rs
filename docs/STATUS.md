@@ -73,6 +73,16 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   report their end-of-run verdicts when their windows close. The
   clause 33 blocking TCMs (`up()`/`down()`/`lock()`) yield at the call
   and park blocked calls on a per-object FIFO wake pass.
+  Statement-position method calls and `compute` retain callee frames
+  across suspension, including recursive helpers, composed method
+  bodies and entry-event synchronization. Receivers and arguments
+  are retained across resumption. Calls embedded in value expressions
+  and receivers whose type cannot be resolved before evaluation still
+  use atomic dispatch. Compute arguments receive declared parameter hints,
+  including contextual constructors and evaluate expressions. Emissions whose
+  owner resolves to sys share bare and sys-qualified log/wake spellings;
+  on actions and coverage sample once. Other instances retain the existing
+  path model; this does not provide general per-instance event identity.
 - **Membership.** Scalar/list membership (4.11.6) executes over lists and
   integer/Boolean/enumeral sets. List-to-list containment is order-independent
   and requires distinct matches for repeated left values. Iterative matching
@@ -211,13 +221,19 @@ reading, nothing else.
   ignore/illegal predicates report definite type mismatches with owner,
   sampled-source and selected-unit bindings. Define kinds, composite
   operands and full option type checking remain unfinished).
-- Temporal edge expressions (`change/rise/fall`) still lack raw sampled
-  value history. Propositions and repeat bounds now retain their sampled
-  values: rules sample before each global cycle closes and at quit;
+- General temporal sampling remains incomplete. Temporal
+  `change/rise/fall` now retain Boolean/integer/enumeral samples (numeric
+  rise/fall compare magnitude; the first value establishes a baseline).
+  Explicit event clocks gate edge sampling; active waits retain edges
+  arriving after their turn. Propositions and repeat bounds retain their
+  sampled values: rules sample before each global cycle closes and at quit;
   waits sample when checked, with a separate context for each suspended
   wait. Rescans use those recorded values, including through mutable
   list references. This is expression-result history, not an arbitrary
-  snapshot of every variable or an event-specific/per-instance timeline.
+  snapshot of every variable or a general event-specific/per-instance
+  timeline. Real/MVL/custom-numeric edges and static edge-width checks
+  remain unsupported. Multiple occurrences in one virtual cycle collapse
+  to the cycle's sample.
   Unbounded obligation windows exhaust when the run ends — that is the
   12.3.3 semantics, not a limitation.
 - Constraint solving beyond bounded shapes (`gen` handles the linear

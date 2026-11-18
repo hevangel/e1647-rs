@@ -4,8 +4,8 @@ The IEEE 1647-2019 migration phases below are complete; the broader
 milestones remain partial. Recent work adds conservative type checking
 (including coverage options and nested expression/temporal traversal),
 bounded polynomial constraint solving and streaming temporal rule monitors. Remaining work includes full name
-resolution/type inference, temporal edge expressions, call-stack
-continuations for suspended TCM calls, the remaining coverage options,
+resolution/type inference, general temporal sampling timelines, expression-value
+continuations for suspended calls, the remaining coverage options,
 general constraint solving, differential qualification, HDL event
 ordering and a browser sandbox API. Completed migration checkboxes do
 not imply full language support or IEEE conformance.
@@ -88,9 +88,9 @@ not imply full language support or IEEE conformance.
       methods and `on` blocks substitute the extension's formals with
       the instance's actuals and append. Typed `new
       <named-or-template-instance> [with { .. }]` instantiates and
-      runs the `with` assignments (clause 6.3); untyped `new` still
-      evaluates to an
-      explicit not-supported diagnostic. Coverage groups (clause 14.2)
+      runs the `with` assignments (clause 6.3); untyped `new` uses known
+      variable/assignment/field/parameter/return contexts and diagnoses
+      unavailable instance contexts. Coverage groups (clause 14.2)
       parse, are recorded, and collect: `cover <event> is [also]
       { item/cross/transition entries; option entries }` and `cover
       <event> is empty;` — item types and sampled expressions are
@@ -205,9 +205,11 @@ not imply full language support or IEEE conformance.
       suspension re-entry reaches every compound statement now (waits
       inside `if`/`case`/`for`/`for each`/`repeat until` bodies suspend
       and resume through the statement-path cursor), while re-entry
-      into inline method calls and `compute` (a per-coroutine
-      call-stack continuation behind 13.2.2's return-resumes-callee
-      boundary) is not wired —
+      into statement-position method calls and `compute` preserves
+      callee frames, arguments and composed-body positions, including
+      recursive helpers and blocking resource calls. Calls embedded
+      in value expressions remain atomic; receivers whose object type
+      cannot be resolved before evaluation use ordinary dispatch —
       `detach`/`delay`/`exec` TEs, select
       choice policies beyond the constant-expression subset (the
       full choice-expression grammar and soft-order interactions),
@@ -382,11 +384,23 @@ not imply full language support or IEEE conformance.
       state and evaluation context: rules sample before a global cycle
       closes and at quit, and waits sample at each check, preserving
       their local context. Later matching uses recorded values. Raw
-      `change`/`rise`/`fall` expressions and event-specific/per-instance
-      histories remain gaps. Suspension re-enters compound
+      `change`/`rise`/`fall` expressions now sample Boolean, integer and
+      enumeral values (12.2.18), including explicit event-clock gating
+      and late-arriving clock samples for suspended waits. Numeric
+      rise/fall compare magnitude; the first observation is a baseline.
+      Real/MVL/custom-numeric edges, static edge-width checks and general
+      event-specific/per-instance histories remain gaps; multiple
+      occurrences in one virtual cycle collapse to its sample.
+      Suspension re-enters compound
       statements, including `if`/`case`/`for`/`for each`/`repeat until`;
-      inline calls and `compute` still need call-stack continuations,
-      and `on` blocks remain atomic
+      statement-position calls and `compute` carry call-stack
+      continuations, including TCM entry-event waits. Calls embedded
+      in value expressions, unresolved receiver types and `on` blocks
+      remain atomic. Combined execution/typing fixtures verify saved parameter
+      and return metadata through nested waits, resource calls, entry events
+      and composed bodies. Compute arguments receive parameter hints; root
+      event emissions share bare/sys-qualified log spellings without duplicate
+      on/coverage processing. General per-instance event identity remains a gap
 - [~] Coverage data model and reports — started: `src/coverage.rs`
       builds buckets and grades from the recorded groups (14.3's
       ranges/defaults, 14.6 merging), the interpreter samples on the

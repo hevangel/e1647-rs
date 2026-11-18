@@ -3716,6 +3716,54 @@ implicit index bindings remain unsupported. Traversal snapshots the
 receiver before predicate evaluation, so mutation does not change the
 items visited. Other expression-taking list methods remain gaps.
 
+## 2026-11-12 — Integrate reviewed scalar temporal edges into main
+
+PR #64 was merged into `agent/temporal-sampled-history` after that
+branch's original main merge. This integration brings its scalar temporal
+edge work to a feature branch based on current main, retaining the current
+license and the later frontend/type-checking changes.
+
+Recorded `change`/`rise`/`fall` results cover Boolean, integer and
+enumeral expressions (12.2.18). Numeric rise/fall compare magnitude;
+the first sample establishes a baseline. Rule/wait contexts retain
+separate histories. Explicit event clocks gate sampling and inner clocks
+override enclosing clocks. Active waits retain late-arriving clocked
+samples and consume matches since the previous observation. Completed,
+failed and expired waits retire their sampling state.
+
+Seven independently authored runtime fixture sets cover transitions,
+initial baselines, numeric magnitude, enumerals, explicit clocks,
+concurrent locals, successive waits, late clocks and exact E0402 output
+for unsupported real samples. Three core regressions cover comparisons,
+cloned monitors/context isolation and nested clock selection.
+
+The inherited verification-log merge had placed the edge entry inside
+the keyed-extrema entry and its verification inside the predicate-query
+entry. Those entries are separated here. Four CSV tests now normalize
+Windows path separators before embedding paths in e string literals;
+a checkout path containing a backslash followed by t otherwise became
+a tab and caused unrelated file-read failures.
+
+Verification on `agent/integrate-temporal-edges`:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 454 passed, 0 failed.
+- `git diff --check` — passed.
+
+The initial all-target run failed four CSV path tests; the final result
+above includes their path fixes. No local all-feature, WASM or Specman
+run was performed. PR #64 records the original reference basis as the
+lawful local 2016 redline's shared behavior with the 2019 clause-number
+mapping; this integration adds no new standard-reading qualification.
+
+This is regression evidence, not differential qualification or conformance.
+Static edge-width legality, real/MVL/custom-numeric edge samples,
+multiple distinct samples within one virtual cycle, general event-specific
+compound timelines, per-instance rule timelines and precise HDL event
+ordering remain gaps. The TCM call-continuation increment is separate
+(PR #65) and is not included in this branch.
+
 ## 2026-11-12 — Runtime coverage configuration
 
 `set_config(cover, ...)` now controls runtime coverage enablement and
@@ -4598,3 +4646,105 @@ images or vendor output is committed; external pins are unchanged. No Specman
 comparison, local all-feature run or WASM runtime run was performed. Full name
 resolution, set-domain typing, type-embedded scopes and general inference
 remain unfinished. No IEEE conformance is claimed.
+
+## 2026-11-12 — Nested statement-call continuations
+
+Statement-position instance methods, including ordinary helper methods,
+now preserve their caller/callee frames across suspension (13.2.2).
+The existing call-path machinery retains evaluated arguments, receivers,
+local variables and composed-body positions for nested and recursive
+calls and `compute`. Dispatch checks declared methods before resource
+method interception, avoiding repeated receiver evaluation for user
+methods named `down` or `up`. Entry-event synchronization (17.1.2)
+parks on the scheduler event wake pass. Argument-count errors are checked
+before parking. A `stop_run()` expression statement propagates Stop
+through the saved caller chain.
+
+Seven independently authored fixture sets in `tests/fixtures/tcm-calls/`
+pin nested blocking calls, concurrent callers with distinct locals,
+recursive calls and composed bodies, receiver/argument side effects,
+TCM entry synchronization, arity diagnostics and stopping nested callers.
+The resource-context regression now tests a value-expression call, which
+remains atomic, rather than an ordinary statement call.
+
+Verification on `agent/complete-tcm-continuations`:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 451 passed, 0 failed.
+- `git diff --check` — passed.
+
+The initial fixture runs exposed a missed entry-event wake and failure
+to propagate `stop_run()` through expression statements; both are fixed
+and included in the final all-target result. No all-feature, WASM or
+Specman reference run was performed for this increment. This is regression
+evidence, not differential qualification or a conformance claim.
+
+Value-expression calls, receivers whose types cannot be resolved before
+evaluation, `on` blocks and check failure bodies still use atomic
+execution. General expression continuations, per-instance event identity,
+temporal edge expressions and precise HDL event ordering remain gaps.
+
+
+## 2026-11-14 — combined execution, coverage and typing integration
+
+This branch joins the pending statement-continuation work (#65,
+0be54b8) and temporal-edge work (#66, 3405510) with the coverage/typing
+stack through #80 (9d747d4). Main had only #67 at integration time;
+this remains a feature-branch review, not a claim that the combined work
+has reached main. Both source histories and their existing fixture files
+are preserved. The verification log retains #66's repaired historical
+entries followed by every later coverage/typing/TCM entry. Active docs and
+CLI claims are reconciled, including stale negative claims about contextual
+new, set literals and statement-call suspension.
+
+Four independently authored fixture sets under
+`tests/fixtures/execution-integration/` exercise the combined behavior:
+
+- Two concurrent nested callers preserve locals and typed parameters across
+  semaphore waits and explicitly clocked temporal edges. Omitted composed
+  method annotations retain prototype kinds; contextual new returns execute
+  after suspension. Constructor counters verify eight new instances beyond
+  the baseline; the original packet references remain unchanged.
+- Nested compute entry events, alias parameter/result types and a contextual
+  constructor on a member compute call retain their frames and arguments.
+  Four constructor invocations beyond the baseline prove arguments are not
+  replayed while parking/resuming the nested calls.
+- Concurrent helpers sample separate unit coverage groups after suspension.
+  Each owner has two samples, one hit in each Boolean bucket and grade 1.0.
+- Root event spellings wake started/temporal waits consistently. A same-named
+  child event does not wake a sys-qualified listener. Bare, sys-qualified,
+  me-qualified and alias-receiver root emissions invoke root on actions once
+  each and contribute exactly four coverage samples, without replay/duplication.
+
+The fixtures exposed two implementation gaps. Bare root emissions were not
+visible as sys-qualified clock/entry events, stranding nested waits until the
+shared cycle budget. Resolved sys emissions now record/wake both bare and
+sys-qualified keys; root coverage selects matching groups once. On actions
+remain single-shot. Other instances retain the existing path model: arbitrary
+instance/event alias resolution and per-instance timelines are not supplied
+by this repair. Compute argument evaluation also lacked parameter hints;
+it now uses the same guarded metadata-only lookup and scoped evaluation as
+ordinary/started calls, fixing E0402 for its contextual constructor argument.
+
+Verification on the combined implementation:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 491 passed, 0 failed (23 test binaries).
+- The integration test binary contains three tests, covering all four new
+  fixture sets through parse/elaboration/type checking/native CLI plus exact
+  unit-owner and root-alias coverage assertions.
+- Existing #65 and #66 fixture/test files compare byte-for-byte unchanged
+  against their submitted heads.
+- `git diff --check` — passed; no conflict markers remain in src/docs/tests.
+
+The initial combined baseline passed before the new integration fixtures;
+their first run then reproduced the root clock/entry-path failure and missing
+compute constructor context. Both are fixed in the final all-target result.
+The coverage assertion uses the API's fractional grade (1.0), not percent.
+No Specman comparison, local all-feature run or WASM runtime run was performed.
+General expression continuations, name resolution/types, general solving,
+remaining coverage/libraries, per-instance temporal/event identity, precise
+HDL ordering and browser runtime qualification remain unfinished. No IEEE
+conformance is claimed.

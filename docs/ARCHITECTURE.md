@@ -121,8 +121,8 @@ browser sandbox API is not started.
   original template's own categories stay unvalidated (8.7's NOTE 2),
   and an arity mismatch reports `E0304` once and skips the extension.
   Typed `new <named-or-template-instance> [with { .. }]` instantiates
-  and runs the `with` assignments (clause 6.3); untyped `new` parses
-  to an explicit not-supported runtime diagnostic.
+  and runs the `with` assignments (clause 6.3); untyped `new` uses a known
+  contextual instance type or reports E0402 when no such context resolves.
   Clause 14 coverage groups (`cover <event> is [also] { .. };`, `is
   empty;`) record their item/cross/transition entries structurally and
   every option clause verbatim; the derived entries synthesize
@@ -156,7 +156,7 @@ browser sandbox API is not started.
   `E01xx` syntax, `E02xx` well-formedness; see the module documentation)
   and the AST stays partial under errors.
 - `src/temporal.rs` — the clause 12 temporal-engine core, a pure
-  library the interpreter will drive: `sampled_normal_form` propagates
+  library driven by the interpreter: `sampled_normal_form` propagates
   a temporal expression's sampling event so every atom carries it
   (12.1.4; sub-sampled subtrees keep their own event, 12.2.6) and
   `holds_tightly`/`succeeds` evaluate tight satisfaction (12.1.1.2) and
@@ -168,8 +168,9 @@ browser sandbox API is not started.
   true-match repeats (12.2.10–12.2.11), first-match repeats as sequence
   items (12.2.12), `fail`/`not`/`eventually` (12.2.13/17/15).
   Propositions and repeat bounds are evaluated through caller-supplied
-  callbacks; `change/rise/fall(exp)` edge samples report
-  `EvalError::EdgeSample` (raw edge-value history is not modeled)
+  callbacks or recorded history; `change/rise/fall(exp)` read recorded
+  edge results (12.2.18). Missing or unsupported edge samples report
+  `EvalError::EdgeSample`
   and unresolvable constructs report `EvalError::Unsupported`. The
   same module hosts the run-loop monitoring helpers:
   `succeeded_somewhere` (12.3.2 at any point), `rule_failed` (the
@@ -488,13 +489,21 @@ browser sandbox API is not started.
   turns that run atomically from one synchronization action to the
   next, and when nothing is eligible one cycle passes (the 5,000-cycle
   shared budget guards runaway programs, `E0409`). Suspending
-  captures the locals frame and builds a skip-cursor over `while`
-  chains — resumption re-enters the mid-iteration loop without
-  re-checking its condition and re-executes the wait statement
-  against the grown log (13.2.2(b)); `compute` and inline calls are
-  atomic regions whose waits spin inline, as do waits inside
-  `if`/`case`/`for` bodies (the documented v1 limitation of the
-  cursor). Temporal waits (`@event`, sequences, propositions, event
+  captures locals and the full statement path through compounds and
+  statement-position calls. Each call boundary retains the receiver,
+  evaluated arguments, callee locals and composed-body index. Nested
+  helpers and `compute` suspend on the same coroutine; returning
+  restores the caller without replaying its prefix. Entry-event waits
+  park through the scheduler's event wake pass. Compute argument evaluation
+  uses the same pure parameter-context lookup as ordinary/started calls.
+  Parameter/return metadata survives nested suspension and composed-body
+  transitions. A resolved sys event records and wakes both bare and
+  sys-qualified spellings. On actions execute once, and coverage selects
+  matching root groups once; aliases do not duplicate samples. Arbitrary
+  instance/event-path equivalence remains incomplete. Value-expression calls,
+  receivers whose types cannot be resolved before evaluation, `on`
+  blocks and check failure bodies remain atomic. Temporal waits
+  (`@event`, sequences, propositions, event
   repeats, with 13.2.4's readability-only `until`) re-evaluate at
   every turn (12.3.2); propositions and repeat bounds retain sampled
   results in each state, scoped to the individual wait. Rules retain
@@ -504,9 +513,20 @@ browser sandbox API is not started.
   callbacks remain available for external caller-supplied paths. Missing
   history does not fall back to present-day values. This is expression
   result history, not arbitrary variable snapshots or event-specific
-  sampling timelines. A temporal wait
+  sampling timelines. Scalar edges retain their previous sampled value
+  per evaluation context and expression. Boolean/integer/enumeral values
+  are supported; numeric rise/fall compare magnitude, and the first
+  sample establishes a baseline. Explicit event clocks gate sampling;
+  suspended waits capture those clocks at cycle closure and consume
+  matches since their previous check, so a clock after the waiter's turn
+  is retained. No repeated whole-prefix scan is needed: only the prior
+  in-progress state and newly appended states can gain matches. Finished
+  or expired wait contexts retire their sampling state. Real/MVL/custom
+  numeric edges and static edge-width legality remain gaps, and multiple
+  occurrences in one virtual cycle collapse to that cycle's sample.
+  A temporal wait
   unsatisfied after 1,000 cycles reports `E0409`, and unevaluable TEs
-  (`change/rise/fall`, unresolvable bounds) report `E0402` honestly.
+  (unsupported edge values/clocks, unresolvable bounds) report `E0402` honestly.
   `sync` (13.2.3) parses in bare and TE forms — the bare form
   suspends one cycle, the TE form behaves like the temporal wait.
   `expect`/`assume` rules (elaborated per type, 11.4) stream through
@@ -589,61 +609,54 @@ browser sandbox API is not started.
   `run` print diagnostics to stderr
   (`path:line:col: error[code]: message`) and their results on success.
 
-Deliberately not implemented yet: dynamic subtype matching for
-base-typed instances (when views resolve through when-qualified field
-types; chained modifiers and nested when-in-when blocks compose,
-though a view's own when-of pairs are not re-verified against its
-base's fields), general constraint solving (bounded linear and
-polynomial shapes, including disjunctions, are supported; wide domains,
-division/modulo and temporal constraints remain gaps), per-instance
-temporal timelines (the run log stays one
-global timeline; the simulator-side `@sim`/event-port triggers fire
-per instance at the scheduler's cycle boundaries), and suspension
-re-entry into inline method calls and `compute` (waits inside
-compound statements — `if`/`case`/`for`/`for each`/`repeat until` —
-suspend and resume through the statement-path cursor, the
-generalization of the earlier while-chain skip-cursor; a called
-method keeps 13.2.2's return-delimited atomic region, which needs a
-per-coroutine call-stack continuation, and `on` bodies stay atomic —
-11.3 bans time-consuming actions in them anyway), the remaining
-clause 14 coverage model (basic and derived items collect and grade;
-per_instance items grade per bucket with holes and the weighted
-group grade; the group/item `no_collect`/`instance_no_collect`
-options, the cross/transition `name` option and the group-level
-`at_least`/`weight` apply; per-unit scoping, `instance_no_collect` with
-`inst` and group/basic-item `when` filters run. Full option type checking,
-derived-item ignore/illegal, real/enumeral ranges and general constant/type
-resolution, radix/never and
-derived-item filter semantics remain unmodeled.
-The coverage subset of `set_config()` is wired; other categories,
-options and `set_config_max()` remain gaps), integer width
-truncation, evaluation of MVL literals, `detach`/`delay`/`exec` TEs, select
-choice policies beyond the constant-expression subset (the full
-choice-expression grammar, soft-order interactions between multiple
-selects), event-port triggering beyond the `hdl_path()`-bound edge
-sampling (`on p$` members run on `emit p$` and on the bound object's
-edges per the `edge()` attribute — the MVL edge spellings and
-`bind()` connections are not modeled), the preprocessor's
-rescanned/repeated substitution
-and backtick preprocessor names (replacement rules apply in one
-pass, per file — B.5's include-order visibility through `import` is
-not modeled), clause 8.4's template when-subtype instances, extension
-members beyond fields/constraints/methods/`on` blocks and the 8.6
-subtype propagation of applied extensions (the 8.7 NOTE 2
-actual-category validation stays out with the original template's),
-computed macros beyond the evaluated body subset (method calls,
-`is a` checks, `else if` chains, list/number expressions — such
-bodies decline, clause 15.3) and the match-expression grammar's
-repetition and category validation (clause 15.4), the Part 2 routine
-library beyond the reflection set
-(`set_of_values`/`full_set_of_values` and the 28.5 set
-pseudo-methods work; set literals, range modifiers on declared
-types, and bare scalar keywords as type arguments do not), simulator
-bindings beyond the xezim bridge (the `Simulator` seam is registered;
-VHPI among the bindings that are not written), a backend selection knob
-(`hdl_load` resolves through the default backend), and a browser
-sandbox API (the wasm32 compilation check passes; there is no sandbox
-API and no wasm runtime test).
+Remaining boundaries (the detailed behavior inventory is in STATUS.md):
+
+- Full name resolution, signatures, flow-sensitive/bidirectional inference,
+  conditional bindings and type-embedded expression scopes. The conservative
+  checker leaves unknown/custom numeric kinds silent and set scalar domains
+  untracked.
+- Dynamic subtype matching for base-typed instances. When-qualified fields,
+  chained modifiers and nested views compose, but a view's determinant pairs
+  are not fully revalidated against base fields.
+- General constraint solving: wide domains, division/modulo and temporal
+  constraints exceed the bounded linear/polynomial solvers. Full connected
+  field sets and select soft-order interactions remain incomplete.
+- Value-expression call continuations, receivers unresolved before evaluation,
+  and atomic on/check-failure bodies. Nested statement calls and compute now
+  suspend with saved frames. Temporal histories still share one global
+  timeline; per-instance/event-specific compound timelines, edge-width
+  legality, real/MVL/custom-numeric edges and distinct same-cycle samples
+  remain gaps. Bare/sys root-event aliases do not resolve arbitrary instance
+  event identity. Precise e/HDL event ordering remains unfinished.
+- The remaining coverage semantics: composite-valued predicates, mixed
+  composite classification, real/enumeral ranges, full option/domain typing,
+  general constant/type resolution and radix/never behavior. Basic and derived
+  scalar effects, source graphs, filters, goals and bounded domain proofs run
+  as described above; the coverage subset of set_config is wired. Other
+  configuration categories/options and set_config_max remain gaps.
+- Numeric widths beyond the implemented static precision contexts, wider
+  storage than the i128 model and evaluation of MVL literals. Real-valued set
+  membership and full set-domain validation also remain unsupported.
+- detach/delay/exec temporal expressions; select choice grammar beyond the
+  evaluated constant-expression subset; inline sequence execution without
+  enforcing do-keeping blocks; event-port behavior beyond hdl_path-bound edge
+  sampling (MVL edge spellings and bind connections remain unmodeled).
+- Rescanned/repeated preprocessing substitution, backtick preprocessor names
+  and cross-import include-order visibility. Replacement rules currently apply
+  once per file. Computed macros cover only the documented body subset; method
+  calls, is-a, else-if chains and list/number bodies decline. Match repetition
+  and category validation remain incomplete.
+- Template when-subtype instances, extension members beyond the implemented
+  fields/constraints/methods/on subset and subtype propagation of applied
+  extensions. Original template actual-category validation remains excluded
+  under 8.7 NOTE 2.
+- The full Part 2 routine library/reflection model and declared-type range
+  modifiers. Set literals, set_of_values/full_set_of_values and the selected
+  set/list pseudo-methods already execute; their presence does not imply the
+  rest of the library is implemented.
+- Simulator bindings beyond xezim (including VHPI/VHDL), backend selection,
+  browser sandbox API and WASM runtime qualification. WASM compilation alone
+  is verified by CI.
 
 ## The 2019 migration stages (PRs #40–#49)
 

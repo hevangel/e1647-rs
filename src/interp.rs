@@ -520,12 +520,29 @@ struct Frame {
     return_type: Option<TypeExpr>,
 }
 
+struct TemporalEdgeHistory {
+    context: u64,
+    routine: crate::ast::EdgeRoutine,
+    expr: Expr,
+    cycle: u64,
+    previous: Option<i128>,
+    current: i128,
+}
+
+struct TemporalWaitSampling {
+    te: crate::ast::TemporalExpr,
+    frame: Frame,
+    me: Option<usize>,
+    observed: usize,
+}
+
 #[derive(Debug, Clone)]
 struct StatementCall {
     receiver: usize,
     name: String,
     args: Vec<Value>,
     block: usize,
+    entry_complete: bool,
     frame: Frame,
     span: crate::ast::Span,
 }
@@ -558,9 +575,9 @@ enum Flow {
 /// loop body is re-entered mid-iteration (the condition is re-checked
 /// only when the iteration completes, exactly like the `while` model
 /// this generalizes). The descent reaches every compound; only the
-/// atomic regions (inline method calls, `compute`, `on` blocks, and a
-/// `check` else body, which continue their enclosing fragment) keep
-/// the conservative run-to-completion model.
+/// value-expression calls, `on` blocks and `check` else bodies keep
+/// the conservative run-to-completion model. Whole statement calls
+/// and `compute` carry callee frames in the same path.
 #[derive(Debug, Clone)]
 enum Child {
     /// A statement-position call, with its own locals and once-evaluated
@@ -609,6 +626,7 @@ struct PendingSuspension {
     path: Vec<PathLevel>,
     frame: Frame,
     eligible_at_cycle: u64,
+    wake_event: Option<String>,
     temporal: bool,
     span: crate::ast::Span,
     wait_start: Option<usize>,
@@ -797,13 +815,15 @@ struct Interp<'a> {
     sampling_temporal: bool,
     temporal_wait_contexts: BTreeMap<(Option<u64>, usize, usize, Option<usize>), u64>,
     next_temporal_context: u64,
+    temporal_edges: Vec<TemporalEdgeHistory>,
+    temporal_wait_sampling: BTreeMap<u64, TemporalWaitSampling>,
     /// The scheduled coroutines (13.2.2): the main `run()` chain first,
     /// then every `start`ed TCM, run round-robin.
     coroutines: Vec<Coroutine<'a>>,
     /// Set while a coroutine turn executes: statement walks record
     /// their descent for the resume path.
     tracing: bool,
-    /// Atomic regions (inline method calls, `compute`, `on` blocks,
+    /// Atomic regions (value-expression calls, `on` blocks,
     /// `check` else bodies): waits inside keep the inline spin instead
     /// of suspending.
     atomic_depth: usize,
@@ -1233,6 +1253,8 @@ fn run_inner(
         sampling_temporal: false,
         temporal_wait_contexts: BTreeMap::new(),
         next_temporal_context: 1u64 << 32,
+        temporal_edges: Vec::new(),
+        temporal_wait_sampling: BTreeMap::new(),
         coroutines: Vec::new(),
         tracing: false,
         atomic_depth: 0,
@@ -1480,6 +1502,7 @@ fn run_inner(
             }
             for position in expired.into_iter().rev() {
                 let co = interp.coroutines.remove(position);
+                interp.retire_temporal_waits(co.id);
                 diagnostics.push(interp.error(
                     "E0409",
                     format!(
@@ -1508,12 +1531,13 @@ fn run_inner(
         interp.current_coroutine_id = None;
         interp.resume_wait_start = None;
         match outcome {
-            TurnOutcome::Complete => {}
+            TurnOutcome::Complete => interp.retire_temporal_waits(co.id),
             TurnOutcome::Suspended => {
                 co.temporal_waited = 0;
                 interp.coroutines.push(co);
             }
             TurnOutcome::Error(diagnostic) => {
+                interp.retire_temporal_waits(co.id);
                 if matches!(co.kind, CoroutineKind::Main { .. }) {
                     diagnostics.push(diagnostic);
                     break;
@@ -2806,14 +2830,18 @@ impl<'a> Interp<'a> {
                 // (31.2.5's non-preemptive model interrupts at TCM
                 // calls and release/lock requests). Any other spelling
                 // evaluates through the expression evaluator.
-                if let Some(flow) = self.sync_statement_call(expr, frame, me)? {
-                    return Ok(flow);
-                }
                 if let Some(flow) = self.declared_statement_call(expr, frame, me)? {
                     return Ok(flow);
                 }
+                if let Some(flow) = self.sync_statement_call(expr, frame, me)? {
+                    return Ok(flow);
+                }
                 self.eval(expr, frame, me)?;
-                Ok(Flow::Normal)
+                Ok(if self.stop_requested {
+                    Flow::Stop
+                } else {
+                    Flow::Normal
+                })
             }
             Stmt::Return { value, .. } => {
                 let value = match value {
@@ -3199,16 +3227,25 @@ impl<'a> Interp<'a> {
                 self.next_coroutine_id += 1;
                 Ok(Flow::Normal)
             }
-            // `compute <call>;` — without TCM suspension, the call runs
-            // inline exactly like `start` (clause 13's run-to-completion
-            // semantics needs the scheduler).
+            // `compute <call>;` keeps the caller parked while the
+            // callee suspends and resumes on the same coroutine.
             Stmt::Compute { call, span } => {
                 let Expr::Call { callee, args, .. } = call else {
                     return Err(self.error("E0402", "compute expects a method call", *span));
                 };
+                let hints = if args.iter().any(expr_needs_context) {
+                    self.call_arg_hints(callee, args.len(), frame, me)
+                } else {
+                    Vec::new()
+                };
                 let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval(arg, frame, me)?);
+                for (position, arg) in args.iter().enumerate() {
+                    values.push(self.eval_with_hint(
+                        hints.get(position).cloned().unwrap_or(None),
+                        arg,
+                        frame,
+                        me,
+                    )?);
                 }
                 match callee.as_ref() {
                     Expr::Ident { name, .. } => {
@@ -5414,6 +5451,9 @@ impl<'a> Interp<'a> {
         if !self.suspend_eligible() {
             return Ok(None);
         }
+        if let Expr::Paren { expr, .. } = expr {
+            return self.declared_statement_call(expr, frame, me);
+        }
         let Expr::Call { callee, args, span } = expr else {
             return Ok(None);
         };
@@ -5424,7 +5464,9 @@ impl<'a> Interp<'a> {
                 };
                 (self.instances[index].type_name.clone(), name)
             }
-            Expr::MemberAccess { object, name, .. } => {
+            Expr::MemberAccess { object, name, .. }
+                if !crate::builtins::is_builtin_routine(name) =>
+            {
                 let Some(type_name) = self.statement_receiver_type(object, frame, me) else {
                     return Ok(None);
                 };
@@ -5434,9 +5476,10 @@ impl<'a> Interp<'a> {
         };
         if !self.types.iter().any(|ty| {
             ty.name == type_name
-                && ty.methods.iter().any(|method| {
-                    method.name == *name && !method.is_static && method.tcm_event.is_some()
-                })
+                && ty
+                    .methods
+                    .iter()
+                    .any(|method| method.name == *name && !method.is_static)
         }) {
             return Ok(None);
         }
@@ -5529,6 +5572,7 @@ impl<'a> Interp<'a> {
                 name: name.to_owned(),
                 args,
                 block: 0,
+                entry_complete: false,
                 frame: Frame::default(),
                 span,
             },
@@ -5561,6 +5605,46 @@ impl<'a> Interp<'a> {
                     call.span,
                 )
             })?;
+            if !call.entry_complete {
+                if let Some(block) = blocks.first()
+                    && call.args.len() != block.params.len()
+                {
+                    return Err(self.error(
+                        "E0402",
+                        format!(
+                            "method '{}' expects {} argument(s), got {}",
+                            call.name,
+                            block.params.len(),
+                            call.args.len()
+                        ),
+                        call.span,
+                    ));
+                }
+                // Clause 17.1.2: an inline TCM also synchronizes on
+                // its declared event before its first body action.
+                if let Some(event) = blocks.first().and_then(|block| block.tcm_event.as_ref()) {
+                    let event = self.event_path(event)?;
+                    if !is_every_cycle_event(&event) && !self.event_occurred_this_cycle(&event) {
+                        self.exec_context[call_level].child =
+                            Some(Child::Call(Box::new(call.clone())));
+                        // A synthetic leaf keeps entry distinct from
+                        // the body's first statement on resumption.
+                        self.exec_context.push(PathLevel {
+                            index: 0,
+                            child: None,
+                        });
+                        let flow =
+                            self.suspend_here(caller, call.span, false, self.cycle + 1, true, None);
+                        self.exec_context.pop();
+                        if let Some(pending) = &mut self.pending_suspension {
+                            pending.wake_event = Some(event);
+                        }
+                        return flow;
+                    }
+                }
+                call.entry_complete = true;
+                resume = None;
+            }
             while call.block < blocks.len() {
                 let block = blocks[call.block];
                 if call.args.len() != block.params.len() {
@@ -5678,9 +5762,8 @@ impl<'a> Interp<'a> {
             return Err(self.error("E0406", "recursion too deep", span));
         }
         self.depth += 1;
-        // Inline calls are atomic regions (13.2.2: a called TCM runs to
-        // its return before the callee resumes): waits inside keep the
-        // inline spin.
+        // Calls reached through value expressions remain atomic.
+        // Statement calls use exec_statement_call's saved frames.
         self.atomic_depth += 1;
         let mut result = Value::Void;
         let prototype = method_prototype(&blocks).expect("resolved method has a block");
@@ -9636,6 +9719,7 @@ impl<'a> Interp<'a> {
     fn advance_temporal_cycles(&mut self, cycles: u64) {
         for _ in 0..cycles {
             self.sample_rule_values();
+            self.sample_wait_edge_values();
             self.cycle = self.cycle.saturating_add(1);
             self.pad_log();
         }
@@ -9680,6 +9764,112 @@ impl<'a> Interp<'a> {
         for (expr, value) in numerics {
             state.record_numeric(context, expr, value);
         }
+        self.sample_temporal_edges(te, frame, me, context, false);
+    }
+
+    fn sample_wait_edge_values(&mut self) {
+        if self.sampling_temporal {
+            return;
+        }
+        self.sampling_temporal = true;
+        let waits: Vec<_> = self
+            .temporal_wait_sampling
+            .iter()
+            .map(|(context, sampling)| {
+                (
+                    *context,
+                    sampling.te.clone(),
+                    sampling.frame.clone(),
+                    sampling.me,
+                )
+            })
+            .collect();
+        for (context, te, mut frame, me) in waits {
+            self.sample_temporal_edges(&te, &mut frame, me, context, true);
+        }
+        self.sampling_temporal = false;
+    }
+
+    fn sample_temporal_edges(
+        &mut self,
+        te: &crate::ast::TemporalExpr,
+        frame: &mut Frame,
+        me: Option<usize>,
+        context: u64,
+        event_clocks_only: bool,
+    ) {
+        let mut edges = Vec::new();
+        crate::temporal::collect_edges(te, None, &mut edges);
+        for (routine, expr, sampling) in edges {
+            if event_clocks_only && temporal_sampling_is_global(sampling) {
+                continue;
+            }
+            let active = self.temporal_sampling_occurs(sampling);
+            let value = match active {
+                Some(false) => Some(false),
+                Some(true) => self.sample_temporal_edge(context, routine, expr, frame, me),
+                None => None,
+            };
+            self.temporal_log[self.cycle as usize].record_edge(context, routine, expr, value);
+        }
+    }
+
+    fn temporal_sampling_occurs(
+        &self,
+        sampling: Option<&crate::ast::TemporalExpr>,
+    ) -> Option<bool> {
+        match sampling {
+            None | Some(crate::ast::TemporalExpr::Cycle) => Some(true),
+            Some(crate::ast::TemporalExpr::Group(te)) => self.temporal_sampling_occurs(Some(te)),
+            Some(crate::ast::TemporalExpr::EventRef { path }) => Some(
+                is_every_cycle_event(&path.join("."))
+                    || self.temporal_log[self.cycle as usize].occurs(path),
+            ),
+            _ => None,
+        }
+    }
+
+    fn sample_temporal_edge(
+        &mut self,
+        context: u64,
+        routine: crate::ast::EdgeRoutine,
+        expr: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Option<bool> {
+        // The executed subset samples Boolean/integer/enumeral values.
+        // It uses the existing i128 value model; static edge-width
+        // legality and MVL/custom-numeric transitions are not checked.
+        let value = self.eval(expr, frame, me).ok()?;
+        let current = match value {
+            Value::Int(value) => value,
+            Value::Bool(value) => i128::from(value),
+            Value::Enum { type_name, name } => self.enumeral_index(&type_name, &name)?,
+            _ => return None,
+        };
+        let previous = if let Some(history) = self.temporal_edges.iter_mut().find(|history| {
+            history.context == context && history.routine == routine && history.expr == *expr
+        }) {
+            // Rechecking in the same virtual cycle updates the current
+            // sample, without changing which prior sample it compares to.
+            if history.cycle != self.cycle {
+                history.previous = Some(history.current);
+                history.cycle = self.cycle;
+            }
+            history.current = current;
+            history.previous
+        } else {
+            self.temporal_edges.push(TemporalEdgeHistory {
+                context,
+                routine,
+                expr: expr.clone(),
+                cycle: self.cycle,
+                previous: None,
+                current,
+            });
+            None
+        };
+        Some(crate::temporal::sampled_edge(routine, previous, current))
     }
 
     /// Fire one event occurrence — the shared path of `emit` (11.2) and
@@ -9700,6 +9890,27 @@ impl<'a> Interp<'a> {
         self.pad_log();
         self.temporal_log[self.cycle as usize].record(path);
         self.wake_tcm_listeners(path);
+        // Emissions resolved to sys are visible under both e and sys.e
+        // (11.1, 12.2.5), including emits through me/an alias of sys.
+        // Record/wake those log spellings, but run actions and coverage
+        // exactly once below. Other instance events keep their existing
+        // path model; this is not general per-instance event resolution.
+        if owner.is_some()
+            && owner
+                == self
+                    .instances
+                    .iter()
+                    .position(|instance| instance.type_name == "sys")
+        {
+            let name = path.rsplit('.').next().unwrap_or(path);
+            for alias in [name.to_owned(), format!("sys.{name}")] {
+                if alias != path {
+                    self.emitted.insert(alias.clone());
+                    self.temporal_log[self.cycle as usize].record(&alias);
+                    self.wake_tcm_listeners(&alias);
+                }
+            }
+        }
         self.run_on_blocks(path, owner, span)?;
         self.sample_cover_groups(path, owner, frame, span);
         Ok(())
@@ -9892,12 +10103,24 @@ impl<'a> Interp<'a> {
         else {
             return;
         };
+        let root_event = (self
+            .instances
+            .iter()
+            .position(|instance| instance.type_name == "sys")
+            == Some(owner))
+        .then(|| path.rsplit('.').next().unwrap_or(path));
         let group_indices: Vec<usize> = self.coverage[entry_index]
             .groups
             .iter()
             .enumerate()
             .filter(|(_, group)| {
-                group.event_path.as_deref() == Some(path) && group.unit_owner.is_none()
+                group.unit_owner.is_none()
+                    && group.event_path.as_deref().is_some_and(|event| {
+                        event == path
+                            || root_event.is_some_and(|name| {
+                                event == name || event.strip_prefix("sys.") == Some(name)
+                            })
+                    })
             })
             .map(|(index, _)| index)
             .collect();
@@ -10894,8 +11117,8 @@ impl<'a> Interp<'a> {
     }
 
     /// Whether the running statement may suspend to the scheduler: a
-    /// coroutine turn, not inside an atomic region (inline method
-    /// calls, `compute`, `on` blocks, `check` else bodies — 13.2.2
+    /// coroutine turn, not inside an atomic region (value-expression
+    /// calls, `on` blocks, `check` else bodies — 13.2.2
     /// delimits atomic fragments at the synchronization actions, and
     /// these regions keep the conservative run-to-completion model of
     /// v1; `on` bodies may not contain time-consuming actions at all,
@@ -10929,6 +11152,7 @@ impl<'a> Interp<'a> {
             path,
             frame: frame.clone(),
             eligible_at_cycle,
+            wake_event: None,
             temporal,
             span,
             wait_start,
@@ -10961,11 +11185,68 @@ impl<'a> Interp<'a> {
             self.next_temporal_context += 1;
             context
         });
+        self.temporal_wait_sampling
+            .entry(context)
+            .and_modify(|sampling| {
+                sampling.frame = frame.clone();
+            })
+            .or_insert_with(|| TemporalWaitSampling {
+                te: te.clone(),
+                frame: frame.clone(),
+                me,
+                observed: 0,
+            });
         let result = self.temporal_wait_in_context(te, span, frame, me, (start, context));
         if !matches!(result, Ok(Flow::Suspend)) {
             self.temporal_wait_contexts.remove(&key);
+            self.temporal_wait_sampling.remove(&context);
+            self.temporal_edges
+                .retain(|history| history.context != context);
         }
         result
+    }
+
+    /// Only the previous in-progress state and newly appended states
+    /// can have gained a match since the last check. Preserve a match
+    /// that occurred after the waiter's turn, without rescanning every
+    /// old prefix on every scheduler turn.
+    fn temporal_wait_succeeded(
+        &mut self,
+        te: &crate::ast::TemporalExpr,
+        start: usize,
+        context: u64,
+    ) -> Result<bool, crate::temporal::EvalError> {
+        let observed = self
+            .temporal_wait_sampling
+            .get(&context)
+            .map_or(0, |sampling| sampling.observed);
+        let states = &self.temporal_log[start..];
+        let callbacks = historical_temporal_callbacks(context);
+        for end in observed.saturating_sub(1)..states.len() {
+            if crate::temporal::succeeds(te, &states[..=end], &callbacks)? {
+                return Ok(true);
+            }
+        }
+        if let Some(sampling) = self.temporal_wait_sampling.get_mut(&context) {
+            sampling.observed = states.len();
+        }
+        Ok(false)
+    }
+
+    fn retire_temporal_waits(&mut self, coroutine: u64) {
+        let contexts: Vec<_> = self
+            .temporal_wait_contexts
+            .iter()
+            .filter(|(key, _)| key.0 == Some(coroutine))
+            .map(|(_, context)| *context)
+            .collect();
+        self.temporal_wait_contexts
+            .retain(|key, _| key.0 != Some(coroutine));
+        for context in contexts {
+            self.temporal_wait_sampling.remove(&context);
+            self.temporal_edges
+                .retain(|history| history.context != context);
+        }
     }
 
     fn temporal_wait_in_context(
@@ -10980,9 +11261,7 @@ impl<'a> Interp<'a> {
         self.pad_log();
         if self.suspend_eligible() {
             self.sample_temporal_values(te, frame, me, context);
-            let callbacks = historical_temporal_callbacks(context);
-            let slice = &self.temporal_log[start..];
-            match crate::temporal::succeeds(te, slice, &callbacks) {
+            match self.temporal_wait_succeeded(te, start, context) {
                 Ok(true) => return Ok(Flow::Normal),
                 Ok(false) => {
                     return self.suspend_here(
@@ -11006,9 +11285,7 @@ impl<'a> Interp<'a> {
         let mut waited = 0u64;
         loop {
             self.sample_temporal_values(te, frame, me, context);
-            let callbacks = historical_temporal_callbacks(context);
-            let slice = &self.temporal_log[start..];
-            match crate::temporal::succeeds(te, slice, &callbacks) {
+            match self.temporal_wait_succeeded(te, start, context) {
                 Ok(true) => return Ok(Flow::Normal),
                 Ok(false) => {}
                 Err(err) => {
@@ -16129,6 +16406,15 @@ fn is_every_cycle_event(path: &str) -> bool {
     )
 }
 
+fn temporal_sampling_is_global(sampling: Option<&crate::ast::TemporalExpr>) -> bool {
+    match sampling {
+        None | Some(crate::ast::TemporalExpr::Cycle) => true,
+        Some(crate::ast::TemporalExpr::Group(te)) => temporal_sampling_is_global(Some(te)),
+        Some(crate::ast::TemporalExpr::EventRef { path }) => is_every_cycle_event(&path.join(".")),
+        _ => false,
+    }
+}
+
 /// The `keep <port>.edge() == <value>` attribute values (9.7.3) per
 /// (type name, port name), read structurally from the composed
 /// constraints (either orientation, call on either side). Values outside
@@ -16714,6 +17000,7 @@ impl<'a> Interp<'a> {
                 co.path = suspension.path;
                 co.frame = suspension.frame;
                 co.eligible_at_cycle = suspension.eligible_at_cycle;
+                co.wake_event = suspension.wake_event;
                 co.suspended_temporal = suspension.temporal;
                 co.span = suspension.span;
                 co.wait_start = suspension.wait_start;
