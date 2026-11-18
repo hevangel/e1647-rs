@@ -36,8 +36,14 @@ bodies, statement values, and temporal rule/wait values. Explicit evaluate,
 bit-slice and table-test results retain known kinds. Registered `Type::field`
 accesses and `Type::method(...)` signatures also retain kinds, and static
 bodies use their declaring namespace without an instance. Bare static method
-calls remain unsupported; use the qualified form. Contextual inference and
-complete name resolution remain unfinished.
+calls remain unsupported; use the qualified form.
+
+Known variable, assignment, field, parameter and return contexts now type
+untyped `evaluate` and `new` expressions. This includes qualified calls,
+indexed targets and result metadata retained across TCM suspension. Calls and
+expression bodies establish their own contexts. Unknown contexts still need
+an explicit type; general bidirectional inference and full name resolution
+remain unfinished.
 
 Scalar/list/reference aliases default through their declared representation.
 Defaulting more than 64 aliases reports a bounded diagnostic; cyclic default

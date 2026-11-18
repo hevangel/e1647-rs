@@ -34,8 +34,15 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   scoped `evaluate` and `new ... with` bodies, all statement value children,
   and temporal rule/wait proposition and repeat-bound expressions. Explicit
   `evaluate`, bit-slice and `in_table` results retain known kinds. Index
-  kinds, membership compatibility, context-inferred expression types,
+  kinds, membership compatibility, general bidirectional inference,
   conditional bindings and type-embedded expressions remain incomplete.
+  Known declaration/assignment/field/parameter/return kinds now contextually
+  type untyped evaluate/new bodies. Runtime contexts include indexed/static
+  targets, qualified calls, supported inferred-value shapes and return
+  metadata saved across TCM suspension. Calls, init actions and expression
+  bodies isolate their contexts; missing runtime contexts still report E0122
+  for evaluate and E0402 for new. Materialized template kinds propagate and
+  concatenation inference flattens list operands like the value model.
   Registered static field accesses and qualified call signatures retain
   kinds; static methods/handlers and initializers are checked once in their
   declaring contexts. Static extensions can inherit omitted annotations

@@ -159,6 +159,83 @@ fn alias_defaults_have_a_bounded_runtime_diagnostic() {
 }
 
 #[test]
+fn contextual_type_fixture_diagnostics_match_expected() {
+    check_fixture_directory("fixtures/typing-context");
+}
+
+#[test]
+fn contextual_errors_are_rejected_by_cli_and_valid_scopes_execute() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typing-context");
+    for command in ["elab", "run"] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+            .arg(command)
+            .arg(directory.join("evaluate-contexts.e"))
+            .output()
+            .expect("CLI starts");
+        assert!(
+            !result.status.success(),
+            "{command} accepted contextual mismatches"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("error[E0220]"));
+    }
+    for (file, expected) in [
+        ("runtime.e", "context scopes passed"),
+        ("tcm-runtime.e", "suspended contexts passed"),
+        ("field-runtime.e", "field contexts passed"),
+        ("extension-runtime.e", "extension contexts passed"),
+    ] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+            .arg("run")
+            .arg(directory.join(file))
+            .output()
+            .expect("CLI starts");
+        assert!(
+            result.status.success(),
+            "{file}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(String::from_utf8(result.stdout).unwrap(), expected);
+    }
+}
+
+#[test]
+fn missing_context_runtime_diagnostics_match_expected() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typing-context");
+    for name in [
+        "missing-context",
+        "body-boundary",
+        "builtin-boundary",
+        "cyclic-value-context",
+        "init-boundary",
+    ] {
+        let source = fs::read_to_string(directory.join(format!("{name}.e"))).unwrap();
+        let parsed = e1647::parser::parse(&source);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{name}: {:?}",
+            parsed.diagnostics
+        );
+        let elaborated = e1647::elab::elaborate(&parsed.declarations);
+        assert!(
+            elaborated.diagnostics.is_empty(),
+            "{name}: {:?}",
+            elaborated.diagnostics
+        );
+        let result = e1647::interp::run(&elaborated, 1);
+        let actual = result
+            .diagnostics
+            .iter()
+            .map(|d| format!("{}\n", d.render()))
+            .collect::<String>();
+        assert_eq!(
+            actual,
+            fs::read_to_string(directory.join(format!("{name}.run.expected"))).unwrap(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn inferred_local_fixture_diagnostics_match_expected() {
     check_fixture_directory("fixtures/typing-inference");
 }

@@ -41,8 +41,12 @@
 //! qualified static field/call signatures retain declared kinds. Static
 //! bodies have a declaring namespace without a me receiver and are checked
 //! once from their registries. Omitted extension annotations inherit from
-//! their declaration. Cast results, implicit contexts, unregistered statics
-//! and type-embedded expressions remain conservative. Index-kind/membership compatibility
+//! their declaration. Known declaration, assignment, field, parameter and
+//! return contexts type untyped evaluate/new bodies; calls and expression
+//! bodies establish their own scoped hints. Materialized templates retain
+//! object kinds and concatenation flattens list operands. Cast results,
+//! unresolved contexts/statics and type-embedded expressions remain
+//! conservative. Index-kind/membership compatibility
 //! and conditional is-a bindings still need separate typing rules.
 //!
 //! ## Diagnostic codes
@@ -230,6 +234,9 @@ struct TypeChecker<'a> {
     elaborated: &'a Elaborated,
     /// A static method/on block has an owner namespace but no me receiver.
     static_context: Option<&'a str>,
+    /// Scoped contextual result kind for evaluate/new. Calls and expression
+    /// bodies establish their own contexts instead of inheriting this hint.
+    expected_kind: Option<Ty>,
     types: &'a [ElaboratedType],
     /// Enumerand → its enumeral type name (composed `type` kinds).
     enumeral_table: BTreeMap<String, String>,
@@ -260,6 +267,7 @@ impl<'a> TypeChecker<'a> {
         Self {
             elaborated,
             static_context: None,
+            expected_kind: None,
             types,
             enumeral_table,
             locals: vec![BTreeMap::new()],
@@ -350,6 +358,13 @@ impl<'a> TypeChecker<'a> {
                 }
                 Ty::Object(name.clone())
             }
+            TypeExpr::TemplateRef { name, args, .. } => {
+                let name = crate::ast::template_instance_name(name, args);
+                match self.find_type(&name) {
+                    Some(ty) if ty.kind != DeclarationKind::NumericType => Ty::Object(name),
+                    _ => Ty::Unknown,
+                }
+            }
             TypeExpr::WhenQualified { base, .. } => self.type_of_at_depth(base, depth + 1),
             TypeExpr::InlineEnum { .. } => Ty::Enum("<inline enumeral list>".to_owned()),
             // Template/formal/typeof spellings stay unchecked (v1).
@@ -390,7 +405,7 @@ impl<'a> TypeChecker<'a> {
             Stmt::VarDecl { name, ty, init, .. } => {
                 let declared = ty.as_ref().map(|ty| self.type_of(ty));
                 let inferred = if let Some(init) = init {
-                    let value = self.infer(init);
+                    let value = self.infer_with_hint(declared.clone(), init);
                     if let Some(target) = &declared {
                         self.check_assignable(
                             &value,
@@ -412,8 +427,13 @@ impl<'a> TypeChecker<'a> {
                 self.bind_local(name, declared.unwrap_or(inferred));
             }
             Stmt::Assign { target, value, .. } | Stmt::RgfAssign { target, value, .. } => {
-                let value_ty = self.infer(value);
+                // Resolve the target once while preserving value-before-target
+                // diagnostic ordering. Static inference has no runtime effects.
+                let before = self.diagnostics.len();
                 let target_ty = self.infer(target);
+                let target_errors = self.diagnostics.split_off(before);
+                let value_ty = self.infer_with_hint(Some(target_ty.clone()), value);
+                self.diagnostics.extend(target_errors);
                 self.check_assignable(&value_ty, &target_ty, value.span(), "assignment");
             }
             Stmt::ExprStmt { expr, .. } => {
@@ -423,7 +443,8 @@ impl<'a> TypeChecker<'a> {
                 let Some(value) = value else {
                     return;
                 };
-                let value_ty = self.infer(value);
+                let hint = self.return_ty.map(|ty| self.type_of(ty));
+                let value_ty = self.infer_with_hint(hint, value);
                 if let Some(return_ty) = self.return_ty {
                     let target = self.type_of(return_ty);
                     self.check_assignable(&value_ty, &target, value.span(), "return value");
@@ -545,6 +566,13 @@ impl<'a> TypeChecker<'a> {
     // Expressions
     // ----------------------------------------------------------------
 
+    fn infer_with_hint(&mut self, hint: Option<Ty>, expr: &Expr) -> Ty {
+        let saved = std::mem::replace(&mut self.expected_kind, hint);
+        let result = self.infer(expr);
+        self.expected_kind = saved;
+        result
+    }
+
     /// Infer the conservative kind of an expression, reporting the
     /// member/index/operator rules along the way.
     fn infer(&mut self, expr: &Expr) -> Ty {
@@ -588,21 +616,23 @@ impl<'a> TypeChecker<'a> {
             Expr::Binary { op, lhs, rhs, span } => self.infer_binary(*op, lhs, rhs, *span),
             Expr::Unary { op, expr, span } => self.infer_unary(*op, expr, *span),
             Expr::New { ty, inits, .. } => {
-                let result = match ty {
-                    Some(TypeExpr::Named { name, .. }) if sync_type(name) => Ty::Sync,
-                    Some(TypeExpr::Named { name, .. }) if name == "instance_iterator" => {
-                        Ty::Iterator
-                    }
-                    Some(TypeExpr::Named { name, .. }) => Ty::Object(name.clone()),
-                    Some(TypeExpr::TemplateRef { name, args, .. }) => {
-                        Ty::Object(crate::ast::template_instance_name(name, args))
-                    }
+                let candidate = ty
+                    .as_ref()
+                    .map(|ty| self.type_of(ty))
+                    .or_else(|| self.expected_kind.clone());
+                let candidate = match candidate {
+                    Some(Ty::List(element)) if ty.is_none() => Some(*element),
+                    other => other,
+                };
+                let result = match candidate {
+                    Some(kind @ (Ty::Object(_) | Ty::Sync | Ty::Iterator)) => kind,
                     _ => Ty::Unknown,
                 };
                 // The runtime's with block has a fresh frame and the new
                 // object as me. Caller locals and return types do not apply.
                 let old_me = self.me_type;
                 let old_static = self.static_context.take();
+                let old_expected = self.expected_kind.take();
                 let old_return = self.return_ty.take();
                 let old_locals = std::mem::take(&mut self.locals);
                 self.me_type = match &result {
@@ -614,12 +644,16 @@ impl<'a> TypeChecker<'a> {
                 self.return_ty = old_return;
                 self.me_type = old_me;
                 self.static_context = old_static;
+                self.expected_kind = old_expected;
                 result
             }
             Expr::ListConcat { items, .. } => {
                 let mut element = None;
                 for item in items {
-                    let kind = self.infer(item);
+                    let kind = match self.infer(item) {
+                        Ty::List(element) => *element, // Concatenation flattens list operands.
+                        kind => kind,
+                    };
                     element = Some(match element {
                         None => kind,
                         Some(previous) => shared_kind(previous, kind),
@@ -700,11 +734,14 @@ impl<'a> TypeChecker<'a> {
                 let result = ty
                     .as_ref()
                     .map(|ty| self.type_of(ty))
+                    .or_else(|| self.expected_kind.clone())
                     .unwrap_or(Ty::Unknown);
+                let saved = self.expected_kind.take();
                 self.push_scope();
                 self.bind_local(var.as_deref().unwrap_or("value"), result.clone());
                 self.check_body(body);
                 self.pop_scope();
+                self.expected_kind = saved;
                 result
             }
             Expr::StaticAccess {
@@ -900,7 +937,27 @@ impl<'a> TypeChecker<'a> {
         Ty::Unknown
     }
 
-    fn infer_call(&mut self, callee: &Expr, args: &[Expr], _span: crate::ast::Span) -> Ty {
+    fn infer_call(&mut self, callee: &Expr, args: &[Expr], span: crate::ast::Span) -> Ty {
+        let saved = self.expected_kind.take();
+        let result = self.infer_call_inner(callee, args, span);
+        self.expected_kind = saved;
+        result
+    }
+
+    fn infer_arguments(&mut self, args: &[Expr], method: Option<&MethodDecl>) -> Vec<Ty> {
+        args.iter()
+            .enumerate()
+            .map(|(index, arg)| {
+                let hint = method
+                    .and_then(|method| method.params.get(index))
+                    .and_then(|parameter| parameter.ty.as_ref())
+                    .map(|ty| self.type_of(ty));
+                self.infer_with_hint(hint, arg)
+            })
+            .collect()
+    }
+
+    fn infer_call_inner(&mut self, callee: &Expr, args: &[Expr], _span: crate::ast::Span) -> Ty {
         // Builtin routines: `out`, `append`, `pack`, ... — the runtime
         // dispatches by name; the checker stays out of their argument
         // shapes (E0402 at run time is the authority there).
@@ -925,7 +982,12 @@ impl<'a> TypeChecker<'a> {
                 let method = me_name
                     .as_deref()
                     .and_then(|type_name| self.find_type(type_name))
-                    .and_then(|t| t.methods.iter().find(|m| m.name.as_str() == name));
+                    .and_then(|t| {
+                        t.methods
+                            .iter()
+                            .find(|m| m.name == *name && m.modifier.is_none())
+                            .or_else(|| t.methods.iter().find(|m| m.name == *name))
+                    });
                 let Some(method) = method else {
                     for arg in args {
                         self.infer(arg);
@@ -937,7 +999,7 @@ impl<'a> TypeChecker<'a> {
                     .as_ref()
                     .map(|rt| self.type_of(rt))
                     .unwrap_or(Ty::Void);
-                let argument_types: Vec<_> = args.iter().map(|arg| self.infer(arg)).collect();
+                let argument_types = self.infer_arguments(args, Some(method));
                 self.check_args(method, args, &argument_types);
                 return_ty
             }
@@ -964,8 +1026,10 @@ impl<'a> TypeChecker<'a> {
                     self.push_scope();
                     self.bind_local("it", element.as_ref().clone());
                     for arg in args {
-                        let argument_ty = self.infer(arg);
-                        if matches!(name.as_str(), "has" | "count" | "all" | "all_indices") {
+                        let predicate =
+                            matches!(name.as_str(), "has" | "count" | "all" | "all_indices");
+                        let argument_ty = self.infer_with_hint(predicate.then_some(Ty::Bool), arg);
+                        if predicate {
                             self.check_assignable(
                                 &argument_ty,
                                 &Ty::Bool,
@@ -983,18 +1047,25 @@ impl<'a> TypeChecker<'a> {
                         _ => element.as_ref().clone(),
                     };
                 }
-                let argument_types: Vec<_> = args.iter().map(|arg| self.infer(arg)).collect();
+                let method = self.find_type(type_name_of(&object_ty)).and_then(|ty| {
+                    ty.methods
+                        .iter()
+                        .find(|method| method.name == *name && method.modifier.is_none())
+                        .or_else(|| ty.methods.iter().find(|method| method.name == *name))
+                });
+                let argument_types = self.infer_arguments(args, method);
                 match &object_ty {
                     Ty::Object(_) => {
-                        // The receiver's method call: check the
-                        // arguments against the composed signature.
-                        let t = self.find_type(type_name_of(&object_ty));
-                        if let Some(method) =
-                            t.and_then(|t| t.methods.iter().find(|m| m.name.as_str() == name))
-                        {
+                        if let Some(method) = method {
                             self.check_args(method, args, &argument_types);
+                            method
+                                .return_type
+                                .as_ref()
+                                .map(|ty| self.type_of(ty))
+                                .unwrap_or(Ty::Void)
+                        } else {
+                            self.infer_member(&object_ty, name, *member_span)
                         }
-                        self.infer_member(&object_ty, name, *member_span)
                     }
                     Ty::List(_) => match name.as_str() {
                         "size" | "max_index" => Ty::Int,
@@ -1017,27 +1088,29 @@ impl<'a> TypeChecker<'a> {
             // resolution is the plain one (4.17.3).
             Expr::QualifiedField { base, field, .. } => {
                 let object_ty = self.infer(base);
-                let argument_types: Vec<_> = args.iter().map(|arg| self.infer(arg)).collect();
-                if let Ty::Object(_) = &object_ty {
-                    let t = self.find_type(type_name_of(&object_ty));
-                    if let Some(method) =
-                        t.and_then(|t| t.methods.iter().find(|m| m.name.as_str() == field))
-                    {
-                        self.check_args(method, args, &argument_types);
-                        return method
-                            .return_type
-                            .as_ref()
-                            .map(|rt| self.type_of(rt))
-                            .unwrap_or(Ty::Void);
-                    }
+                let method = self.find_type(type_name_of(&object_ty)).and_then(|ty| {
+                    ty.methods
+                        .iter()
+                        .find(|method| method.name == *field && method.modifier.is_none())
+                        .or_else(|| ty.methods.iter().find(|method| method.name == *field))
+                });
+                let argument_types = self.infer_arguments(args, method);
+                if let Some(method) = method {
+                    self.check_args(method, args, &argument_types);
+                    return method
+                        .return_type
+                        .as_ref()
+                        .map(|ty| self.type_of(ty))
+                        .unwrap_or(Ty::Void);
                 }
                 Ty::Unknown
             }
             Expr::StaticAccess {
                 type_name, member, ..
             } => {
-                let argument_types: Vec<_> = args.iter().map(|arg| self.infer(arg)).collect();
-                let Some(method) = self.static_method(type_name, member) else {
+                let method = self.static_method(type_name, member);
+                let argument_types = self.infer_arguments(args, method);
+                let Some(method) = method else {
                     return Ty::Unknown; // E0307 ownership checks belong to elaboration.
                 };
                 self.check_args(method, args, &argument_types);
@@ -1280,8 +1353,8 @@ fn check_field_init(checker: &mut TypeChecker, field: &crate::ast::Field) {
     let Some(init) = &field.init else {
         return;
     };
-    let value = checker.infer(init);
     let target = checker.type_of(&field.ty);
+    let value = checker.infer_with_hint(Some(target.clone()), init);
     checker.check_assignable(&value, &target, init.span(), "field init value");
 }
 
@@ -1500,7 +1573,12 @@ pub fn check_types(elaborated: &Elaborated) -> Vec<Diagnostic> {
                 check_method(&mut checker, method, method);
                 checker.me_type = Some(&t.name);
             } else {
-                check_method(&mut checker, method, method);
+                let prototype = t
+                    .methods
+                    .iter()
+                    .find(|entry| entry.name == method.name && entry.modifier.is_none())
+                    .unwrap_or(method);
+                check_method(&mut checker, method, prototype);
             }
         }
     }

@@ -1,0 +1,1 @@
+2:35: error[E0220]: variable initialization: a value of kind 'NULL' cannot be stored into 'int'

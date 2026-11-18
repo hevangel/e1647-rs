@@ -243,8 +243,13 @@ not imply full language support or IEEE conformance.
       evaluate locals shadow and restore caller bindings. Known result
       kinds propagate for explicit evaluate, slices and in_table. Call
       arguments are inferred once, preventing duplicate nested diagnostics.
-      Index-kind/membership checks, contextual inference, conditional
-      bindings and type-embedded expressions remain incomplete. Registered
+      Known declaration/assignment/field/parameter/return contexts now type
+      untyped evaluate/new bodies, including indexed/static targets and
+      qualified calls. Result metadata persists through TCM suspension;
+      expression bodies and calls isolate outer hints. Template-instance
+      kinds propagate and concatenation inference flattens list operands.
+      Index-kind/membership checks, general bidirectional inference,
+      conditional bindings and type-embedded expressions remain incomplete. Registered
       static fields and qualified call signatures now retain kinds. Static
       initializers/methods/handlers are checked once in their declaring
       scope, with omitted extension annotations inherited from the prototype.
