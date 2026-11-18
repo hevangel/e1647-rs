@@ -143,6 +143,20 @@ try {
   }
   assert.deepEqual(group.derived, []);
   checks.push("derived coverage summaries, hidden sources, masks, duplicate labels and exact counters");
+  for (const name of ["constant-names", "escaped-range-label"]) {
+    const path = resolve(root, "tests/fixtures/coverage-graphs", name);
+    const result = await request(await readFile(`${path}.e`, "utf8"), { operation: "run" });
+    assert.equal(result.ok, true, name);
+    assert.deepEqual(result.coverage, JSON.parse(await readFile(`${path}.browser.json`, "utf8")), name);
+  }
+  for (const name of ["constant-name-errors", "constant-name-duplicate"]) {
+    const path = resolve(root, "tests/fixtures/coverage-graphs", name);
+    const result = await request(await readFile(`${path}.e`, "utf8"), { operation: "check" });
+    assert.equal(result.ok, false, name);
+    assert.equal(result.diagnostics.map(d => `${d.start.line}:${d.start.column}: error[${d.code}]: ${d.message}\n`).join(""),
+      await readFile(`${path}.expected`, "utf8"), name);
+  }
+  checks.push("constant coverage names, decoded range labels and exact name diagnostics");
   const failures = await page.evaluate(async () => {
     const { Sandbox } = await import("/client.js");
     const code = promise => promise.then(() => "unexpected_success", error => error.code);

@@ -33,7 +33,9 @@ An experimental [browser sandbox](docs/BROWSER_SANDBOX.md) exposes
 single-source parse/check/run, diagnostics, output and basic/derived coverage through
 a local demo and versioned WASM API. Disposable workers provide cancellation
 and deadlines. Chromium runtime tests cover the shipped default-feature
-build; imports and native HDL are unavailable in the browser.
+build; imports and native HDL are unavailable in the browser. Coverage derived
+names and range labels support grouped/concatenated string literals with
+runtime escape decoding; named constants remain a gap.
 
 Temporal rules and waits retain sampled proposition and repeat-bound
 values, so later state matching uses the recorded values. Temporal

@@ -139,6 +139,7 @@ tick/numeral disambiguation and qualified field/method execution,
 method wrapper ordering/replacement, results, suspension and type diagnostics,
 derived coverage summaries (nested/hidden sources, duplicate labels, masks,
 per-unit ownership, ungradeable domains and full-width goals/weights),
+constant coverage names/range labels with decoded escapes and exact E0224 errors,
 UTF-8/ABI quotas/releases, zero host imports, memory cap, synchronous guest
 deadline, fetch deadline, cancellation/reuse, traps, client errors and demo
 text rendering. The timeout/trap probes are independently authored tiny WASM

@@ -5421,3 +5421,44 @@ At the latest observation, preceding PR #93's six native/solver/WASM CI jobs
 passed and its two HDL-profile jobs were still running. CI for this increment
 is pending. No new Specman, local all-feature or HDL/container run was
 performed; no IEEE conformance is claimed.
+
+
+## 2026-11-16 — Constant coverage names and decoded range labels
+
+Derived name options now consume the whole top-level expression and evaluate
+the supported literal-string concatenation/grouping subset. Each literal uses
+the same escape decoder as runtime strings, as do coverage range labels.
+Graph validation and schema construction use the same computed name, allowing
+later derived sources to reference a concatenated name and rejecting decoded
+name collisions. Invalid, missing, non-string or unsupported expressions
+report E0224 rather than truncating to a leading literal or falling back to
+a generated name. Missing values retain their option's source position.
+Named constants and arbitrary expressions remain outside this subset; this
+is not general constant resolution or full coverage option typing.
+
+Four independent fixture cases exercise a hidden concatenated cross name
+referenced by a later cross; grouped names and quote/backslash/Unicode
+escapes; range-label escapes and a concatenation boundary that must not be
+decoded twice; six exact invalid-name diagnostics (wrong kind, mixed addition,
+unresolved name, trailing tokens, incomplete addition and missing value); and
+a duplicate computed name. Two independently expected browser JSON reports
+match native serialization byte-for-byte and real worker/WASM results; the
+same seven E0224 diagnostics match expected files through browser check.
+
+Actual verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 524 passed, 0 failed, 0 ignored, 29 binaries.
+  New sources extend existing fixture loops rather than adding test functions.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all sixteen groups passed in actual
+  Chromium 156.0.8078.4.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for PR #93 passed. At the latest observation, PR
+#94's six native/solver/WASM jobs passed and its two HDL-profile jobs remained
+running. CI for this increment is pending. No new Specman, local all-feature
+or HDL/container run was performed; no IEEE conformance is claimed.
