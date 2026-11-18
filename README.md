@@ -11,6 +11,8 @@
 </p>
 
 > **Status: pre-alpha — full inventory in [docs/STATUS.md](docs/STATUS.md).**
+> Composed methods execute first/also/only wrappers with subtype replacement,
+> implicit result slots and retained suspension state in the tested subset.
 > The implementation target is **IEEE 1647-2019**. Today the tool
 > tokenizes, parses and elaborates a declared subset of the language and
 > executes it: `e1647 run` generates seeded-random data under `keep`

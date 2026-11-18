@@ -617,6 +617,10 @@ pub struct SequenceInfo {
 /// Outcome of elaborating one file's declarations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Elaborated {
+    /// Contiguous method ranges by inheritance layer, root first. Injected
+    /// any_unit hooks form their own outer layer. Indices address types' final
+    /// composed method vectors, so substitution/when views retain provenance.
+    pub method_layers: BTreeMap<String, Vec<std::ops::Range<usize>>>,
     /// In declaration order; `extend` blocks are folded into their targets
     /// and do not appear separately.
     pub types: Vec<ElaboratedType>,
@@ -1528,7 +1532,9 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
     // monomorphization worklist; a file-declared name of the same kind
     // shadows the builtin (the synthesized entry is skipped).
     compose_builtin_numeric_interfaces(&mut types);
+    let method_layers = composed_method_layers(&types, &any_unit.methods);
     let mut result = Elaborated {
+        method_layers,
         types,
         defines,
         sequences,
@@ -1548,6 +1554,73 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         .diagnostics
         .extend(check_method_extension_contracts(&result, declarations));
     result
+}
+
+fn composed_method_layers(
+    types: &[ElaboratedType],
+    any_unit_methods: &[(&MethodDecl, usize)],
+) -> BTreeMap<String, Vec<std::ops::Range<usize>>> {
+    let index: BTreeMap<_, _> = types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| (ty.name.as_str(), i))
+        .collect();
+    let mut layers: BTreeMap<String, Vec<std::ops::Range<usize>>> = BTreeMap::new();
+    for start in 0..types.len() {
+        let mut chain = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut cursor = start;
+        while !layers.contains_key(&types[cursor].name) && visited.insert(cursor) {
+            chain.push(cursor);
+            let Some(next) = types[cursor]
+                .base
+                .as_deref()
+                .and_then(|name| index.get(name))
+                .copied()
+            else {
+                break;
+            };
+            cursor = next;
+        }
+        for i in chain.into_iter().rev() {
+            let ty = &types[i];
+            let mut own_start = 0;
+            let mut inherited = Vec::new();
+            if let Some(base) = ty
+                .base
+                .as_deref()
+                .and_then(|name| index.get(name))
+                .map(|i| &types[*i])
+                && base.methods.len() <= ty.methods.len()
+                && base
+                    .methods
+                    .iter()
+                    .zip(&ty.methods)
+                    .all(|(a, b)| a.name == b.name && a.span == b.span)
+                && let Some(parent) = layers.get(&base.name)
+            {
+                own_start = base.methods.len();
+                inherited = parent.clone();
+            } else if ty.kind == DeclarationKind::Unit
+                && ty.base.is_none()
+                && any_unit_methods.len() <= ty.methods.len()
+                && any_unit_methods
+                    .iter()
+                    .zip(&ty.methods)
+                    .all(|((a, _), b)| a.name == b.name && a.span == b.span)
+            {
+                own_start = any_unit_methods.len();
+                if own_start > 0 {
+                    inherited.push(0..own_start);
+                }
+            }
+            if own_start < ty.methods.len() {
+                inherited.push(own_start..ty.methods.len());
+            }
+            layers.insert(ty.name.clone(), inherited);
+        }
+    }
+    layers
 }
 
 /// Extensions inherit omitted annotations by parameter position. Explicit

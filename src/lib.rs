@@ -31,6 +31,7 @@ pub mod hdl;
 pub mod interp;
 pub mod lexer;
 pub mod macros;
+mod methods;
 pub mod parser;
 pub mod preproc;
 pub mod sandbox;

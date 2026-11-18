@@ -20,8 +20,15 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   Composed method extensions report E0225 for definite contract changes,
   including when views and substituted templates; omitted annotations inherit.
   Static declarations now precede extend contributions even when the extend
-  appears first in source. Full is-first/is-only execution policies remain
-  unfinished.
+  appears first in source. Shared method execution plans implement first/also/only
+  ordering and replacement, preserving ancestor wrappers around subtype bodies.
+  First wrappers can update scalar arguments for their older subtree; also
+  wrappers receive their original arguments and the older result. Returns end
+  the current wrapper subtree while later outer also wrappers still run. Typed
+  methods have an implicit result slot (reference defaults are NULL), checked
+  conservatively for assignments. Atomic/static calls, suspended inline/started
+  calls, lifecycle hooks and inline sequence MAIN share these policies. Full
+  language execution and reference-simulator qualification remain incomplete.
 - **Browser sandbox.** An experimental single-source parse/check/run API and
   local demo execute the default-feature WASM library in disposable workers.
   Structured diagnostics, output, DUT failure counts and basic coverage

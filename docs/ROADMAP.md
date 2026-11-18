@@ -359,9 +359,13 @@ not imply full language support or IEEE conformance.
       list lengths)
 
 ## M3 — Behavioral execution
-- [~] Interpreter and method calling conventions — partial. Full
-      execution ordering/replacement of `is first`/`is only` remains
-      unfinished; their headers now receive signature contract validation. The
+- [~] Interpreter and method calling conventions — partial. Shared execution
+      plans implement `is first`/`is also`/`is only` ordering, replacement,
+      wrapper-local return, scalar parameter handoff and implicit result slots.
+      Ancestor wrappers surround subtype replacements, including tested when
+      views and templates. Atomic/static calls, suspended inline/started TCMs,
+      lifecycle hooks and inline sequence MAIN use the same policies; full
+      language execution and reference-simulator qualification remain gaps. The
       statement subset in `src/interp.rs` executes expressions, `var`,
       assignment, calls, `if`/`while`/`for`/`case`, `repeat until`
       (clause 20.2.3 — the body at least once), `break`/`continue`,

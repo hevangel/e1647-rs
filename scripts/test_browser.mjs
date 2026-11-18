@@ -116,6 +116,18 @@ try {
   const tickRun = await request(await readFile(resolve(tickDirectory, "runtime.e"), "utf8"), { operation: "run" });
   assert.equal(tickRun.ok, true); assert.equal(tickRun.output, "tick qualifiers passed");
   checks.push("tick/numeral disambiguation and qualified execution");
+  const executionDirectory = resolve(root, "tests/fixtures/method-execution");
+  for (const name of ["order", "arguments-results", "static", "tcm", "lifecycle", "sequence", "polymorphic"]) {
+    const result = await request(await readFile(resolve(executionDirectory, `${name}.e`), "utf8"), { operation: "run" });
+    assert.equal(result.ok, true, `${name}: ${JSON.stringify(result.diagnostics)}`);
+    assert.equal(result.dutErrors, 0, name);
+    assert.equal(result.output, await readFile(resolve(executionDirectory, `${name}.out`), "utf8"), name);
+  }
+  const resultErrors = await request(await readFile(resolve(executionDirectory, "result-errors.e"), "utf8"), { operation: "check" });
+  assert.equal(resultErrors.ok, false);
+  assert.equal(resultErrors.diagnostics.map(d => `${d.start.line}:${d.start.column}: error[${d.code}]: ${d.message}\n`).join(""),
+    await readFile(resolve(executionDirectory, "result-errors.expected"), "utf8"));
+  checks.push("method wrapper ordering, replacement, results and suspension");
   const covered = await request(await fixture("coverage"), { operation: "run" });
   assert.equal(covered.ok, true);
   const group = covered.coverage.find(group => group.name === "cg");

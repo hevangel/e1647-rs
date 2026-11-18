@@ -629,10 +629,8 @@ impl StatementEvaluation {
 struct StatementCall {
     receiver: usize,
     name: String,
-    args: Vec<Value>,
-    block: usize,
+    progress: crate::methods::Progress,
     entry_complete: bool,
-    result: Value,
     frame: Frame,
     span: crate::ast::Span,
 }
@@ -735,12 +733,12 @@ struct PendingSuspension {
 }
 
 /// One concurrently scheduled execution (clause 13.2.2): the main
-/// pseudo-coroutine (the `run()` bodies, in order) and every `start`ed
+/// pseudo-coroutine (the composed `run()` execution plan) and every `start`ed
 /// TCM. Suspension state is the statement path into the tree (the
 /// walk's position when the synchronization action suspended), the
 /// captured locals frame, and the cycle gate.
-struct Coroutine<'a> {
-    kind: CoroutineKind<'a>,
+struct Coroutine {
+    kind: CoroutineKind,
     /// The scheduler-wide identity of this coroutine — the locker's
     /// holder identity (clause 33: `lock()`/`release()` by the same
     /// entity).
@@ -768,19 +766,18 @@ struct Coroutine<'a> {
     wait_start: Option<usize>,
 }
 
-enum CoroutineKind<'a> {
-    /// The `run()` bodies, executed in order as one coroutine.
+enum CoroutineKind {
+    /// The composed `run()` plan, executed as one coroutine.
     Main {
-        blocks: Vec<&'a [Stmt]>,
-        next_block: usize,
+        instance: usize,
+        progress: crate::methods::Progress,
     },
     /// A started TCM: instance, method name (resolved per turn, so
     /// `is also` chains compose), evaluated arguments.
     Tcm {
         instance: usize,
         method: String,
-        args: Vec<Value>,
-        next_block: usize,
+        progress: crate::methods::Progress,
     },
 }
 
@@ -919,7 +916,8 @@ struct Interp<'a> {
     temporal_wait_sampling: BTreeMap<u64, TemporalWaitSampling>,
     /// The scheduled coroutines (13.2.2): the main `run()` chain first,
     /// then every `start`ed TCM, run round-robin.
-    coroutines: Vec<Coroutine<'a>>,
+    coroutines: Vec<Coroutine>,
+    method_layers: &'a BTreeMap<String, Vec<std::ops::Range<usize>>>,
     /// Set while a coroutine turn executes: statement walks record
     /// their descent for the resume path.
     tracing: bool,
@@ -1358,6 +1356,7 @@ fn run_inner(
         temporal_edges: Vec::new(),
         temporal_wait_sampling: BTreeMap::new(),
         coroutines: Vec::new(),
+        method_layers: &elaborated.method_layers,
         tracing: false,
         atomic_depth: 0,
         exec_context: Vec::new(),
@@ -1431,7 +1430,7 @@ fn run_inner(
             .insert(field.name, value);
     }
     let types: &[crate::elab::ElaboratedType] = interp.types;
-    let Some(sys) = types
+    let Some(_) = types
         .iter()
         .find(|t| t.name == "sys" && t.kind == DeclarationKind::Unit)
     else {
@@ -1452,11 +1451,6 @@ fn run_inner(
             },
         };
     };
-    let run_blocks: Vec<&MethodDecl> = sys
-        .methods
-        .iter()
-        .filter(|method| method.name == "run")
-        .collect();
     let sys_index = interp.instantiate("sys");
     let mut diagnostics = Vec::new();
     // Table 1's setup phase (28.3): `sys.setup()` runs before any
@@ -1500,18 +1494,23 @@ fn run_inner(
         let sequence_index = interp.instantiate(&sequence.name);
         interp.instances[sequence_index].set("driver", Value::Object(driver_index));
         let types: &[crate::elab::ElaboratedType] = interp.types;
-        let Some(body) = types
-            .iter()
-            .find(|t| t.name == sequence.name)
-            .and_then(|t| t.methods.iter().find(|m| m.name == "body").cloned())
-        else {
+        if resolve_method_blocks(types, &sequence.name, "body", origin_span()).is_err() {
             continue;
-        };
-        let mut frame = Frame::default();
-        frame
-            .locals
-            .insert("driver".to_owned(), Value::Object(driver_index));
-        if let Err(diagnostic) = interp.exec_block(&body.body, &mut frame, Some(sequence_index)) {
+        }
+        let program =
+            crate::methods::Program::instance(types, interp.method_layers, &sequence.name, "body");
+        let mut locals = BTreeMap::new();
+        locals.insert("driver".to_owned(), Value::Object(driver_index));
+        interp.atomic_depth += 1;
+        let outcome = interp.execute_atomic_method(
+            &program,
+            Vec::new(),
+            Some(sequence_index),
+            origin_span(),
+            Some(&locals),
+        );
+        interp.atomic_depth -= 1;
+        if let Err(diagnostic) = outcome {
             interp.output.push_str(&format!(
                 "sequence {}: {}\n",
                 sequence.name,
@@ -1528,8 +1527,8 @@ fn run_inner(
     // eligible, one cycle passes.
     interp.coroutines.push(Coroutine {
         kind: CoroutineKind::Main {
-            blocks: run_blocks.iter().map(|b| b.body.as_slice()).collect(),
-            next_block: 0,
+            instance: sys_index,
+            progress: crate::methods::Progress::new(Vec::new()),
         },
         id: interp.next_coroutine_id,
         path: Vec::new(),
@@ -2102,34 +2101,16 @@ impl<'a> Interp<'a> {
         // the instance can overwrite generated fields it set (a
         // documented approximation). The blocks run inline (an atomic
         // region: no suspension), with the fresh instance as `me`; a
-        // block's error is collected and instance creation still
+        // composed call's first error is collected and instance creation still
         // succeeds, like a field init failure.
-        if self.depth <= 100 {
-            let init_blocks: Vec<Vec<Stmt>> = types
-                .iter()
-                .find(|t| t.name == type_name)
-                .map(|ty| {
-                    ty.methods
-                        .iter()
-                        .filter(|method| method.name == "init")
-                        .map(|method| method.body.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            self.depth += 1;
-            self.atomic_depth += 1;
+        if self.depth <= 100
+            && resolve_method_blocks(types, type_name, "init", origin_span()).is_ok()
+        {
             let saved_hint = self.expected_type.take();
-            for body in &init_blocks {
-                let mut frame = Frame::default();
-                match self.exec_block(body, &mut frame, Some(index)) {
-                    Ok(Flow::Stop) => self.stop_requested = true,
-                    Ok(_) => {}
-                    Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
-                }
+            if let Err(diagnostic) = self.call_method(index, "init", Vec::new(), origin_span()) {
+                self.pending_diagnostics.push(diagnostic);
             }
             self.expected_type = saved_hint;
-            self.atomic_depth -= 1;
-            self.depth -= 1;
         }
         index
     }
@@ -2993,6 +2974,9 @@ impl<'a> Interp<'a> {
                     Some(expr) => {
                         self.eval_with_hint(frame.return_type.clone(), expr, frame, me)?
                     }
+                    None if frame.return_type.is_some() => {
+                        frame.locals.get("result").cloned().unwrap_or(Value::Void)
+                    }
                     None => Value::Void,
                 };
                 Ok(Flow::Return(value))
@@ -3353,8 +3337,7 @@ impl<'a> Interp<'a> {
                     kind: CoroutineKind::Tcm {
                         instance,
                         method: name,
-                        args: values,
-                        next_block: 0,
+                        progress: crate::methods::Progress::new(values),
                     },
                     id: self.next_coroutine_id,
                     path: Vec::new(),
@@ -5711,6 +5694,141 @@ impl<'a> Interp<'a> {
         Ok(frame)
     }
 
+    /// Reference results start NULL; scalar/list/value results use the existing
+    /// representation defaults. Creating a result slot must not instantiate a
+    /// reference object or run its init hook.
+    fn method_result_default(&mut self, ty: Option<&TypeExpr>) -> Value {
+        let Some(ty) = ty.and_then(|ty| self.resolved_hint_type(ty, 0)) else {
+            return Value::Void;
+        };
+        let value_type = match &ty {
+            TypeExpr::Scalar { .. } | TypeExpr::List { .. } | TypeExpr::InlineEnum { .. } => true,
+            TypeExpr::Named { name, .. } => {
+                name == "set"
+                    || self.types.iter().any(|entry| {
+                        entry.name == *name
+                            && matches!(
+                                entry.kind,
+                                crate::ast::DeclarationKind::Type
+                                    | crate::ast::DeclarationKind::NumericType
+                            )
+                    })
+            }
+            TypeExpr::TemplateRef { name, args, .. } => {
+                let canonical = crate::ast::template_instance_name(name, args);
+                self.types.iter().any(|entry| {
+                    entry.name == canonical
+                        && entry.kind == crate::ast::DeclarationKind::NumericType
+                })
+            }
+            _ => false,
+        };
+        if value_type {
+            self.default_for(&ty)
+        } else {
+            Value::Void
+        }
+    }
+
+    fn method_execution_frame(
+        &mut self,
+        block: &MethodDecl,
+        prototype: &MethodDecl,
+        progress: &crate::methods::Progress,
+        kind: crate::methods::BodyKind,
+        span: crate::ast::Span,
+    ) -> Result<Frame, ExecError> {
+        let mut frame = self.method_frame(block, prototype, &progress.args, span)?;
+        if let Some(ty) = frame.return_type.clone()
+            && !block.params.iter().any(|p| p.name == "result")
+        {
+            let value = if kind == crate::methods::BodyKind::After {
+                self.bind_slot_value(progress.result.clone(), Some(&ty), span)?
+            } else {
+                self.method_result_default(Some(&ty))
+            };
+            frame.locals.insert("result".to_owned(), value);
+            frame.local_types.insert("result".to_owned(), ty);
+        }
+        Ok(frame)
+    }
+
+    fn complete_method_body(
+        progress: &mut crate::methods::Progress,
+        block: &MethodDecl,
+        kind: crate::methods::BodyKind,
+        on_return: usize,
+        frame: &Frame,
+        flow: Flow,
+    ) {
+        let returned = matches!(&flow, Flow::Return(_));
+        progress.result = match flow {
+            Flow::Return(value) => value,
+            _ if frame.return_type.is_some() => {
+                frame.locals.get("result").cloned().unwrap_or(Value::Void)
+            }
+            _ => Value::Void,
+        };
+        if kind == crate::methods::BodyKind::Before && !returned {
+            progress.args = block
+                .params
+                .iter()
+                .map(|p| {
+                    frame
+                        .locals
+                        .get(&p.name)
+                        .expect("bound method parameter")
+                        .clone()
+                })
+                .collect();
+        }
+        progress.pc = if returned { on_return } else { progress.pc + 1 };
+    }
+
+    fn execute_atomic_method(
+        &mut self,
+        program: &crate::methods::Program<'a>,
+        args: Vec<Value>,
+        me: Option<usize>,
+        span: crate::ast::Span,
+        locals: Option<&BTreeMap<String, Value>>,
+    ) -> Result<Value, ExecError> {
+        let mut progress = crate::methods::Progress::new(args);
+        while let Some(step) = program.steps.get(progress.pc).copied() {
+            if progress.control(step) {
+                continue;
+            }
+            let crate::methods::Step::Body {
+                method,
+                kind,
+                on_return,
+            } = step
+            else {
+                progress.result =
+                    self.method_result_default(program.prototype.return_type.as_ref());
+                progress.pc += 1;
+                continue;
+            };
+            let mut frame =
+                self.method_execution_frame(method, program.prototype, &progress, kind, span)?;
+            if let Some(locals) = locals {
+                for (name, value) in locals {
+                    frame
+                        .locals
+                        .entry(name.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+            let flow = self.exec_block(&method.body, &mut frame, me)?;
+            if matches!(flow, Flow::Stop) {
+                self.stop_requested = true;
+                break;
+            }
+            Self::complete_method_body(&mut progress, method, kind, on_return, &frame, flow);
+        }
+        Ok(progress.result)
+    }
+
     fn begin_statement_call(
         &mut self,
         receiver: usize,
@@ -5730,10 +5848,8 @@ impl<'a> Interp<'a> {
             StatementCall {
                 receiver,
                 name: name.to_owned(),
-                args,
-                block: 0,
+                progress: crate::methods::Progress::new(args),
                 entry_complete: false,
-                result: Value::Void,
                 frame: Frame::default(),
                 span,
             },
@@ -5763,6 +5879,12 @@ impl<'a> Interp<'a> {
             let types = self.types;
             let type_name = self.instances[call.receiver].type_name.clone();
             let blocks = resolve_method_blocks(types, &type_name, &call.name, call.span)?;
+            let program = crate::methods::Program::instance(
+                types,
+                self.method_layers,
+                &type_name,
+                &call.name,
+            );
             let call_level = self.exec_context.len().checked_sub(1).ok_or_else(|| {
                 self.error(
                     "E0402",
@@ -5771,29 +5893,24 @@ impl<'a> Interp<'a> {
                 )
             })?;
             if !call.entry_complete {
-                if let Some(block) = blocks.first()
-                    && call.args.len() != block.params.len()
-                {
+                if call.progress.args.len() != program.prototype.params.len() {
                     return Err(self.error(
                         "E0402",
                         format!(
                             "method '{}' expects {} argument(s), got {}",
                             call.name,
-                            block.params.len(),
-                            call.args.len()
+                            program.prototype.params.len(),
+                            call.progress.args.len()
                         ),
                         call.span,
                     ));
                 }
-                // Clause 17.1.2: an inline TCM also synchronizes on
-                // its declared event before its first body action.
-                if let Some(event) = self.entry_event_key(&blocks, &call.args, call.receiver)?
+                if let Some(event) =
+                    self.entry_event_key(&blocks, &call.progress.args, call.receiver)?
                     && !is_every_cycle_event(&event)
                     && !self.event_occurred_this_cycle(&event)
                 {
                     self.exec_context[call_level].child = Some(Child::Call(Box::new(call.clone())));
-                    // A synthetic leaf keeps entry distinct from
-                    // the body's first statement on resumption.
                     self.exec_context.push(PathLevel {
                         index: 0,
                         child: None,
@@ -5809,27 +5926,29 @@ impl<'a> Interp<'a> {
                 call.entry_complete = true;
                 resume = None;
             }
-            while call.block < blocks.len() {
-                let block = blocks[call.block];
-                if call.args.len() != block.params.len() {
-                    return Err(self.error(
-                        "E0402",
-                        format!(
-                            "method '{}' expects {} argument(s), got {}",
-                            call.name,
-                            block.params.len(),
-                            call.args.len()
-                        ),
-                        call.span,
-                    ));
+            while let Some(step) = program.steps.get(call.progress.pc).copied() {
+                if call.progress.control(step) {
+                    continue;
                 }
+                let crate::methods::Step::Body {
+                    method,
+                    kind,
+                    on_return,
+                } = step
+                else {
+                    call.progress.result =
+                        self.method_result_default(program.prototype.return_type.as_ref());
+                    call.progress.pc += 1;
+                    continue;
+                };
                 let mut frame = if resume.is_some() {
                     call.frame.clone()
                 } else {
-                    self.method_frame(
-                        block,
-                        method_prototype(&blocks).unwrap_or(block),
-                        &call.args,
+                    self.method_execution_frame(
+                        method,
+                        program.prototype,
+                        &call.progress,
+                        kind,
                         call.span,
                     )?
                 };
@@ -5837,12 +5956,12 @@ impl<'a> Interp<'a> {
                 self.exec_context[call_level].child = Some(Child::Call(Box::new(call.clone())));
                 let flow = match resume.take() {
                     Some(path) => self.exec_block_resumable(
-                        &block.body,
+                        &method.body,
                         &mut frame,
                         Some(call.receiver),
                         path,
                     )?,
-                    None => self.exec_block(&block.body, &mut frame, Some(call.receiver))?,
+                    None => self.exec_block(&method.body, &mut frame, Some(call.receiver))?,
                 };
                 match flow {
                     Flow::Suspend => {
@@ -5862,16 +5981,17 @@ impl<'a> Interp<'a> {
                         self.stop_requested = true;
                         return Ok(Flow::Stop);
                     }
-                    Flow::Return(value) => {
-                        call.result = value;
-                        call.block += 1;
-                    }
-                    Flow::Normal | Flow::Break | Flow::Continue => {
-                        call.block += 1;
-                    }
+                    flow => Self::complete_method_body(
+                        &mut call.progress,
+                        method,
+                        kind,
+                        on_return,
+                        &frame,
+                        flow,
+                    ),
                 }
             }
-            Ok(Flow::Return(call.result))
+            Ok(Flow::Return(call.progress.result))
         })();
         self.depth -= 1;
         result
@@ -5933,36 +6053,9 @@ impl<'a> Interp<'a> {
         // Atomic callback/fallback dispatch. Scheduled instance calls use
         // exec_statement_call, including calls in ordinary expressions.
         self.atomic_depth += 1;
-        let outcome = (|| {
-            let mut result = Value::Void;
-            let prototype = method_prototype(&blocks).expect("resolved method has a block");
-            for block in blocks {
-                if args.len() != block.params.len() {
-                    return Err(self.error(
-                        "E0402",
-                        format!(
-                            "method '{name}' expects {} argument(s), got {}",
-                            block.params.len(),
-                            args.len()
-                        ),
-                        span,
-                    ));
-                }
-                let mut frame = self.method_frame(block, prototype, &args, span)?;
-                match self.exec_block(&block.body, &mut frame, Some(object_index))? {
-                    Flow::Return(value) => result = value,
-                    Flow::Normal | Flow::Break | Flow::Continue => {}
-                    // stop_run() inside a TCM unwinds the whole run; the flag
-                    // is checked by the run loop and the calling scheduler.
-                    Flow::Stop => {
-                        self.stop_requested = true;
-                    }
-                    // Suspension is disabled in atomic regions.
-                    Flow::Suspend => {}
-                }
-            }
-            Ok(result)
-        })();
+        let program =
+            crate::methods::Program::instance(types, self.method_layers, &type_name, name);
+        let outcome = self.execute_atomic_method(&program, args, Some(object_index), span, None);
         self.atomic_depth -= 1;
         self.depth -= 1;
         outcome
@@ -6005,34 +6098,8 @@ impl<'a> Interp<'a> {
         self.atomic_depth += 1;
         let previous_context = self.static_context.take();
         self.static_context = Some(type_name.to_owned());
-        let outcome = (|| {
-            let mut result = Value::Void;
-            let prototype = method_prototype(&blocks).expect("resolved method has a block");
-            for block in &blocks {
-                if args.len() != block.params.len() {
-                    return Err(self.error(
-                        "E0402",
-                        format!(
-                            "static method '{name}' expects {} argument(s), got {}",
-                            block.params.len(),
-                            args.len()
-                        ),
-                        span,
-                    ));
-                }
-                let mut frame = self.method_frame(block, prototype, &args, span)?;
-                match self.exec_block(&block.body, &mut frame, None)? {
-                    Flow::Return(value) => result = value,
-                    Flow::Normal | Flow::Break | Flow::Continue => {}
-                    Flow::Stop => {
-                        self.stop_requested = true;
-                    }
-                    // Suspension is disabled in atomic regions.
-                    Flow::Suspend => {}
-                }
-            }
-            Ok(result)
-        })();
+        let program = crate::methods::Program::static_method(&blocks);
+        let outcome = self.execute_atomic_method(&program, args, None, span, None);
         self.static_context = previous_context;
         self.atomic_depth -= 1;
         self.depth -= 1;
@@ -12613,10 +12680,8 @@ impl<'a> Interp<'a> {
                 StatementCall {
                     receiver,
                     name: name.to_owned(),
-                    args,
-                    block: 0,
+                    progress: crate::methods::Progress::new(args),
                     entry_complete: false,
-                    result: Value::Void,
                     frame: Frame::default(),
                     span,
                 },
@@ -17337,128 +17402,103 @@ impl<'a> Interp<'a> {
     /// One scheduler turn (13.2.2): execute the coroutine atomically
     /// from its resume point until it completes, suspends at a
     /// synchronization action, or errors.
-    fn run_coroutine_turn(&mut self, co: &mut Coroutine<'a>) -> TurnOutcome {
-        // The kind's payload is copied out so the turn's &mut self
-        // calls never hold a borrow of `co`.
-        enum Plan<'a> {
-            Main {
-                blocks: Vec<&'a [Stmt]>,
-                next: usize,
-            },
-            Tcm {
-                instance: usize,
-                name: String,
-                args: Vec<Value>,
-                next: usize,
-            },
-        }
-        let plan = match &co.kind {
-            CoroutineKind::Main { blocks, next_block } => Plan::Main {
-                blocks: blocks.clone(),
-                next: *next_block,
-            },
+    fn run_coroutine_turn(&mut self, co: &mut Coroutine) -> TurnOutcome {
+        let (instance, name, mut progress, main) = match &co.kind {
+            CoroutineKind::Main { instance, progress } => {
+                (*instance, "run".to_owned(), progress.clone(), true)
+            }
             CoroutineKind::Tcm {
                 instance,
                 method,
-                args,
-                next_block,
-            } => Plan::Tcm {
-                instance: *instance,
-                name: method.clone(),
-                args: args.clone(),
-                next: *next_block,
-            },
+                progress,
+            } => (*instance, method.clone(), progress.clone(), false),
         };
-        match plan {
-            Plan::Main { blocks, mut next } => {
-                let block_count = blocks.len();
-                while next < block_count {
-                    let body = blocks[next];
-                    match self.run_body(body, co) {
-                        Ok(Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_)) => {
-                            next += 1;
-                            co.path.clear();
-                            co.frame = Frame::default();
-                        }
-                        Ok(Flow::Stop) => {
-                            self.stop_requested = true;
-                            if let CoroutineKind::Main { next_block, .. } = &mut co.kind {
-                                *next_block = next;
-                            }
-                            return TurnOutcome::Complete;
-                        }
-                        Ok(Flow::Suspend) => {
-                            if let CoroutineKind::Main { next_block, .. } = &mut co.kind {
-                                *next_block = next;
-                            }
-                            return self.take_suspension(co);
-                        }
-                        Err(diagnostic) => return TurnOutcome::Error(diagnostic),
-                    }
-                }
+        let type_name = self.instances[instance].type_name.clone();
+        if resolve_method_blocks(self.types, &type_name, &name, co.span).is_err() {
+            return if main {
                 TurnOutcome::Complete
+            } else {
+                TurnOutcome::Error(self.error(
+                    "E0401",
+                    format!("method '{name}' not found for the started TCM"),
+                    co.span,
+                ))
+            };
+        }
+        let program =
+            crate::methods::Program::instance(self.types, self.method_layers, &type_name, &name);
+        while let Some(step) = program.steps.get(progress.pc).copied() {
+            if progress.control(step) {
+                continue;
             }
-            Plan::Tcm {
-                instance,
-                name,
-                args,
-                mut next,
-            } => {
-                let types: &[crate::elab::ElaboratedType] = self.types;
-                let type_name = self.instances[instance].type_name.clone();
-                let Ok(blocks) = resolve_method_blocks(types, &type_name, &name, co.span) else {
-                    return TurnOutcome::Error(ExecError::new(
-                        "E0401",
-                        format!("method '{name}' not found for the started TCM"),
-                        co.span.0,
-                        co.span.1,
-                    ));
+            let crate::methods::Step::Body {
+                method,
+                kind,
+                on_return,
+            } = step
+            else {
+                progress.result =
+                    self.method_result_default(program.prototype.return_type.as_ref());
+                progress.pc += 1;
+                continue;
+            };
+            if co.path.is_empty() {
+                co.frame = match self.method_execution_frame(
+                    method,
+                    program.prototype,
+                    &progress,
+                    kind,
+                    co.span,
+                ) {
+                    Ok(frame) => frame,
+                    Err(error) => return TurnOutcome::Error(error),
                 };
-                let block_count = blocks.len();
-                while next < block_count {
-                    let block = blocks[next];
-                    if co.path.is_empty() {
-                        // A fresh `is also` block binds its parameters
-                        // from the start-time arguments.
-                        co.frame = match self.method_frame(
-                            block,
-                            method_prototype(&blocks).unwrap_or(block),
-                            &args,
-                            co.span,
-                        ) {
-                            Ok(frame) => frame,
-                            Err(diagnostic) => return TurnOutcome::Error(diagnostic),
-                        };
+            }
+            match self.run_body(&method.body, co) {
+                Ok(Flow::Suspend) => {
+                    match &mut co.kind {
+                        CoroutineKind::Main {
+                            progress: saved, ..
+                        }
+                        | CoroutineKind::Tcm {
+                            progress: saved, ..
+                        } => *saved = progress,
                     }
-                    match self.run_body(&block.body, co) {
-                        Ok(Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_)) => {
-                            next += 1;
-                            co.path.clear();
-                        }
-                        Ok(Flow::Stop) => {
-                            self.stop_requested = true;
-                            break;
-                        }
-                        Ok(Flow::Suspend) => {
-                            if let CoroutineKind::Tcm { next_block, .. } = &mut co.kind {
-                                *next_block = next;
-                            }
-                            return self.take_suspension(co);
-                        }
-                        Err(diagnostic) => return TurnOutcome::Error(diagnostic),
-                    }
+                    return self.take_suspension(co);
                 }
-                if let CoroutineKind::Tcm { next_block, .. } = &mut co.kind {
-                    *next_block = next;
+                Ok(Flow::Stop) => {
+                    self.stop_requested = true;
+                    break;
                 }
-                TurnOutcome::Complete
+                Ok(flow) => {
+                    Self::complete_method_body(
+                        &mut progress,
+                        method,
+                        kind,
+                        on_return,
+                        &co.frame,
+                        flow,
+                    );
+                    co.path.clear();
+                    co.frame = Frame::default();
+                }
+                Err(error) => return TurnOutcome::Error(error),
             }
         }
+        match &mut co.kind {
+            CoroutineKind::Main {
+                progress: saved, ..
+            }
+            | CoroutineKind::Tcm {
+                progress: saved, ..
+            } => *saved = progress,
+        }
+        TurnOutcome::Complete
     }
 
     /// Execute one body, resuming through the statement path when
     /// suspended.
-    fn run_body(&mut self, body: &'a [Stmt], co: &mut Coroutine<'a>) -> Result<Flow, ExecError> {
+    fn run_body(&mut self, body: &'a [Stmt], co: &mut Coroutine) -> Result<Flow, ExecError> {
         if co.path.is_empty() {
             self.exec_block(body, &mut co.frame, co.me)
         } else {
@@ -17467,7 +17507,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Collect the suspension the turn raised.
-    fn take_suspension(&mut self, co: &mut Coroutine<'a>) -> TurnOutcome {
+    fn take_suspension(&mut self, co: &mut Coroutine) -> TurnOutcome {
         match self.pending_suspension.take() {
             Some(suspension) => {
                 co.path = suspension.path;
