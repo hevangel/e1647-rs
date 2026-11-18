@@ -1,0 +1,142 @@
+// Real browser execution, including worker lifetime and the standalone ABI.
+import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { readFile, mkdir, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const { chromium } = createRequire(new URL("../browser/package.json", import.meta.url))("playwright");
+const files = new Map(["index.html", "style.css", "main.js", "client.js", "worker.js", "e1647.wasm"].map(name => [`/${name}`, name]));
+const mime = { html: "text/html", css: "text/css", js: "text/javascript", wasm: "application/wasm" };
+// Tiny independently authored modules isolate synchronous WASM timeout/trap
+// handling from the interpreter. They have no host imports.
+const testModule = body => {
+  const name = [...Buffer.from("e1647_api_version")];
+  const exports = [1, name.length, ...name, 0, 0];
+  const code = [1, body.length + 1, 0, ...body];
+  return Buffer.from([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 127,
+    3, 2, 1, 0, 7, exports.length, ...exports, 10, code.length, ...code]);
+};
+const loopModule = testModule([3, 64, 12, 0, 11, 0, 11]);
+const trapModule = testModule([0, 11]);
+assert(WebAssembly.validate(loopModule)); assert(WebAssembly.validate(trapModule));
+const server = createServer(async (req, res) => {
+  if (req.url === "/slow.wasm") { req.on("close", () => res.destroy()); return; }
+  if (req.url === "/loop.wasm" || req.url === "/trap.wasm") {
+    res.writeHead(200, { "Content-Type": "application/wasm" }).end(req.url === "/loop.wasm" ? loopModule : trapModule); return;
+  }
+  const name = files.get(req.url === "/" ? "/index.html" : req.url);
+  if (!name) { res.writeHead(404).end(); return; }
+  try { res.writeHead(200, { "Content-Type": mime[name.split(".").at(-1)], "Cache-Control": "no-store" }); res.end(await readFile(resolve(root, "browser", name))); }
+  catch { res.writeHead(500).end(); }
+});
+await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+let browser;
+const checks = [];
+try {
+  browser = await chromium.launch({ headless: true, ...(process.env.E1647_BROWSER_CHANNEL ? { channel: process.env.E1647_BROWSER_CHANNEL } : {}) });
+  const page = await browser.newPage();
+  const errors = [];
+  page.on("pageerror", error => errors.push(error.message));
+  await page.goto(`http://127.0.0.1:${server.address().port}/`);
+  const fixture = async name => readFile(resolve(root, "tests/fixtures/wasm-api", `${name}.e`), "utf8");
+  const request = async (source, options = {}) => page.evaluate(async ({ source, options }) => {
+    const { Sandbox } = await import("/client.js");
+    return new Sandbox().request(source, options);
+  }, { source, options });
+  const good = await fixture("run");
+  for (const operation of ["parse", "check", "run"]) {
+    const result = await request(good, { operation, seed: "18446744073709551615" });
+    assert.equal(result.ok, true); assert.equal(result.version, 1); assert.equal(result.operation, operation);
+    assert.equal(result.seed, "18446744073709551615");
+    assert.equal(result.output, operation === "run" ? "10\n" : "");
+    checks.push(`${operation} pipeline and full-width seed`);
+  }
+  const typed = await request(await fixture("type-error"), { operation: "run" });
+  assert.equal(typed.ok, false); assert.equal(typed.output, "");
+  assert.equal(typed.diagnostics[0].code, "E0220"); assert.equal(typed.diagnostics[0].start.line, 3);
+  assert(typed.diagnostics[0].end.byte > typed.diagnostics[0].start.byte);
+  const syntax = await request("extend sys {", { operation: "parse" });
+  assert.equal(syntax.ok, false); assert(syntax.diagnostics.length > 0);
+  const dut = await request(await fixture("dut-error"), { operation: "run" });
+  assert.equal(dut.ok, false); assert.equal(dut.dutErrors, 1);
+  const imported = await request(await fixture("import"), { operation: "run" });
+  assert.equal(imported.error.code, "unsupported_import");
+  checks.push("spanned syntax/type diagnostics, DUT failure and import rejection");
+  const covered = await request(await fixture("coverage"), { operation: "run" });
+  assert.equal(covered.ok, true);
+  const group = covered.coverage.find(group => group.name === "cg");
+  assert.equal(group.samples, "2"); assert.equal(group.grade, 1);
+  assert.deepEqual(group.items[0].buckets.map(bucket => bucket.hits), ["1", "1"]);
+  checks.push("basic coverage summary");
+  const failures = await page.evaluate(async () => {
+    const { Sandbox } = await import("/client.js");
+    const code = promise => promise.then(() => "unexpected_success", error => error.code);
+    const sandbox = new Sandbox({ wasmUrl: "/slow.wasm", timeoutMs: 1000 });
+    const pending = code(sandbox.request(""));
+    const busy = await code(sandbox.request("")); sandbox.cancel();
+    const cancelled = await pending;
+    sandbox.wasmUrl = new URL("/e1647.wasm", location.href).href;
+    const recovered = await sandbox.request("");
+    return { busy, cancelled, recovered: recovered.ok, idle: !sandbox.busy,
+      timeout: await code(new Sandbox({ wasmUrl: "/slow.wasm", timeoutMs: 50 }).request("")),
+      cpuTimeout: await code(new Sandbox({ wasmUrl: "/loop.wasm", timeoutMs: 300 }).request("")),
+      trap: await code(new Sandbox({ wasmUrl: "/trap.wasm" }).request("")),
+      seed: await code(new Sandbox().request("", { seed: "18446744073709551616" })),
+      operation: await code(new Sandbox().request("", { operation: "unknown" })),
+      input: await code(new Sandbox().request("λ".repeat(131073))),
+      load: await code(new Sandbox({ wasmUrl: "/missing.wasm" }).request("")) };
+  });
+  assert.deepEqual(failures, { busy: "busy", cancelled: "cancelled", recovered: true, idle: true,
+    timeout: "timeout", cpuTimeout: "timeout", trap: "wasm_error", seed: "invalid_seed", operation: "invalid_operation", input: "input_limit", load: "load_error" });
+  checks.push("deadline, cancellation, recovery, concurrency and client errors");
+  const abi = await page.evaluate(async () => {
+    const module = await WebAssembly.compile(await (await fetch("/e1647.wasm")).arrayBuffer());
+    const { exports: api } = await WebAssembly.instantiate(module, {});
+    const read = handle => JSON.parse(new TextDecoder().decode(new Uint8Array(api.memory.buffer, api.e1647_result_ptr(handle), api.e1647_result_len(handle))));
+    const execute = (p, n, op = 0) => { const h = api.e1647_execute(p, n, op, 0xffffffff, 0xffffffff); const r = read(h); api.e1647_result_free(h); return r; };
+    const invalid = execute(1, 5).error.code;
+    const pointer = api.e1647_alloc(1); new Uint8Array(api.memory.buffer)[pointer] = 255;
+    const utf8 = execute(pointer, 1).error.code;
+    const length = execute(pointer, 0).error.code;
+    new Uint8Array(api.memory.buffer)[pointer] = 32;
+    const operation = execute(pointer, 1, 99).error.code;
+    api.e1647_free(pointer);
+    const freed = execute(pointer, 1).error.code;
+    const inputs = Array.from({ length: 8 }, () => api.e1647_alloc(0));
+    const inputLimit = api.e1647_alloc(0); const oversize = api.e1647_alloc(262145);
+    const results = Array.from({ length: 8 }, () => api.e1647_execute(inputs[0], 0, 0, 1, 0));
+    const resultLimit = api.e1647_execute(inputs[0], 0, 0, 1, 0);
+    const validResults = results.every(h => h && read(h).ok);
+    for (const h of results) api.e1647_result_free(h);
+    const invalidResult = api.e1647_result_ptr(results[0]) | api.e1647_result_len(results[0]) | api.e1647_result_free(results[0]);
+    inputs.forEach(p => api.e1647_free(p));
+    const reused = api.e1647_alloc(0) !== 0;
+    api.memory.grow(2048 - api.memory.buffer.byteLength / 65536);
+    let capped = false; try { api.memory.grow(1); } catch (error) { capped = error instanceof RangeError; }
+    return { imports: WebAssembly.Module.imports(module), version: api.e1647_api_version(),
+      invalid, utf8, length, operation, freed, inputLimit, oversize, resultLimit, validResults, invalidResult, reused, capped };
+  });
+  assert.deepEqual(abi, { imports: [], version: 1, invalid: "invalid_buffer", utf8: "invalid_utf8", length: "invalid_buffer",
+    operation: "invalid_operation", freed: "invalid_buffer", inputLimit: 0, oversize: 0, resultLimit: 0, validResults: true, invalidResult: 0, reused: true, capped: true });
+  checks.push("zero host imports, ABI validation/quotas/releases and 128 MiB memory cap");
+  await page.locator('#source').fill(good);
+  await page.locator('[data-operation="run"]').click();
+  await page.waitForFunction(() => document.querySelector('#status').textContent === "Completed");
+  assert.equal(await page.locator('#output').textContent(), "10\n");
+  await page.locator('#source').fill('extend sys { run() is also { out("<img src=x onerror=alert(1)>"); }; };');
+  await page.locator('[data-operation="run"]').click();
+  await page.waitForFunction(() => document.querySelector('#status').textContent === "Completed");
+  assert.equal(await page.locator('#output img').count(), 0);
+  assert.equal(await page.locator('#output').textContent(), '<img src=x onerror=alert(1)>');
+  checks.push("demo controls and text-only rendering");
+  assert.deepEqual(errors, []);
+  const evidence = resolve(root, "local/browser-sandbox"); await mkdir(evidence, { recursive: true });
+  await page.screenshot({ path: resolve(evidence, "demo.png"), fullPage: true });
+  await writeFile(resolve(evidence, "report.json"), JSON.stringify({ browser: browser.version(), channel: process.env.E1647_BROWSER_CHANNEL ?? "chromium", checks }, null, 2) + "\n");
+  console.log(`PASS: ${checks.length} browser check groups (${browser.version()})`);
+} finally {
+  await browser?.close();
+  server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+}

@@ -5056,3 +5056,55 @@ Compose path; historical entries correctly describe their earlier scope.
 Floating base/transitive resolutions can change image bytes, so each new image
 must run qualification. No byte-reproducible-build, general e/HDL ordering,
 VHDL, browser-runtime or Specman qualification is claimed.
+
+## 2026-11-15 — Single-source browser sandbox API
+
+Added a version-1 standalone default-feature WASM ABI and a local browser
+demo. The shared native pipeline parses/checks/runs one source; imports are
+rejected. Results include spanned diagnostics, console output, independent
+DUT failure counts and basic coverage summaries. Decimal seed/counter/bound
+strings preserve wide integers. The client creates and terminates a fresh
+module worker/instance for each request, with cancellation and a default
+three-second deadline. The build fixes linear memory at 16 MiB initially
+and 128 MiB maximum; the module has no host imports.
+
+Actual checks on Windows with the native GNU toolchain:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 509 passed, 0 failed, 0 ignored,
+  across 28 test binaries. This includes four serialization/pipeline unit
+  tests and one fixture integration test sharing five browser input cases.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed; release WASM copied to the
+  ignored browser artifact with the explicit memory linker limits.
+- `npm.cmd install --prefix browser --ignore-scripts` — passed, two packages
+  installed, zero audit vulnerabilities reported; Playwright pinned at 1.64.1.
+  `npm.cmd ci --prefix browser --ignore-scripts` also passed with the lockfile.
+- With `PLAYWRIGHT_BROWSERS_PATH=B:/e1647-rs/local/playwright-browsers`,
+  `node browser/node_modules/playwright/cli.js install chromium` — passed.
+- With that same cache variable, `node scripts/test_browser.mjs` — passed:
+  eight browser assertion groups in Chromium headless 156.0.8078.4.
+  Parse/check/run and u64-max seeds, type/syntax spans, failed DUT checks,
+  import rejection, basic coverage, input limits, busy/cancel/recovery,
+  fetch and synchronous WASM deadlines, WASM traps, load/seed/operation
+  errors, invalid buffers/UTF-8, allocation/result quotas, release/reuse,
+  zero host imports and the actual 128 MiB memory maximum were asserted.
+  Demo run controls and HTML-shaped output rendered as text were asserted;
+  the retained demo screenshot was also inspected visually.
+- `git diff --check` — passed.
+
+An initial installed-Chrome launch exited before opening a page; it was
+not counted as runtime evidence. The pinned Playwright Chromium download
+and subsequent real-browser runs succeeded. An initial diagnostic lookup
+used the nonexistent CLI `check` command; `elab` provided the expected
+fixture diagnostic and the shared API tests passed. Owned report/screenshot
+and native test log live under ignored local evidence paths.
+
+CI now builds this artifact and runs the same real Chromium suite, retaining
+owned browser evidence for seven days. CI results are pending until the PR
+runs. Native all-feature, new container/HDL and Specman runs were not repeated
+for this increment. This closes the scoped experimental browser API
+milestone; it does not qualify other browser engines, derived coverage
+serialization, full language semantics or whole-process resource/security
+guarantees. See [BROWSER_SANDBOX.md](BROWSER_SANDBOX.md) for the API and limits.

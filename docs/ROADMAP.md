@@ -7,7 +7,7 @@ bounded polynomial constraint solving and streaming temporal rule monitors. Rema
 resolution/type inference, general temporal sampling timelines, continuations for scoped
 action/list callbacks, the remaining coverage options,
 general constraint solving, differential qualification, HDL event
-ordering and a browser sandbox API. Completed migration checkboxes do
+ordering and broader browser qualification. Completed migration checkboxes do
 not imply full language support or IEEE conformance.
 
 ## M0 — Repository and infrastructure
@@ -535,14 +535,16 @@ not imply full language support or IEEE conformance.
       The Dockerfile build and actual qualify-hdl/verify services passed
       locally; a separate CI job builds the image, runs the real profile
       and retains owned artifact evidence
-- [~] WASM build and browser sandbox API — started: the core library
-      (lexer/parser/elaborator/interpreter) compiles for
-      `wasm32-unknown-unknown` (CI runs `cargo check --target
-      wasm32-unknown-unknown`); nothing had to be excluded from the
-      build, and the process-spawning xezim backend is native-only by
-      cfg there (`hdl_load` under wasm32 fails with the honest
-      no-simulator error). No browser sandbox API and no wasm runtime
-      test yet
+- [x] Experimental single-source WASM build and browser sandbox API:
+      versioned parse/check/run ABI, spanned diagnostics, console text,
+      DUT failure counts and basic coverage summaries. Disposable workers
+      provide cancellation/deadlines; the shipped default-feature module
+      has zero host imports and a 128 MiB linear-memory maximum. Real
+      Chromium tests cover the ABI, pipeline, worker lifetime and demo;
+      CI repeats those tests. Imports/native HDL are unavailable; derived
+      coverage serialization, other browser engines and a security audit
+      remain outside this scoped milestone. See
+      [BROWSER_SANDBOX.md](BROWSER_SANDBOX.md)
 
 ## Migration to IEEE 1647-2019
 
