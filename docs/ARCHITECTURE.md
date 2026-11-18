@@ -740,7 +740,13 @@ Remaining boundaries (the detailed behavior inventory is in STATUS.md):
   expression-depth limit of 64 stop resolution; concatenated strings are
   capped at 256 KiB. Checked untyped arithmetic and the shared direct-operand
   precision helper avoid overflow/preserve supported 32/64-bit contexts.
-  Explicit widths/aliases, enumerals, dynamic initializers and wider constant
+  A shared scalar-representation resolver follows alias chains and evaluates
+  supported width expressions in the owner scope. Explicit int/uint widths
+  1–127 and star widths participate; sized initializers must already fit.
+  The runtime precision lookup uses the same resolver for direct locals,
+  fields and qualified static fields, keeping aliased/sized 32/64-bit and
+  wide contexts aligned with schema evaluation. General storage narrowing,
+  unresolved widths, enumerals, dynamic initializers and wider constant
   expressions remain gaps. Existing E0224 diagnostics reject unresolved
   schema values; unsupported fields shadowing predefined constants report
   E0224 explicitly rather than silently selecting the predefined value.

@@ -173,6 +173,15 @@ try {
       await readFile(resolve(namedDirectory, `${name}.${expectedSuffix}`), "utf8"), name);
   }
   checks.push("named coverage constants, inherited/static initializers, precision and invalid dependencies");
+  const representationRun = await request(await readFile(resolve(namedDirectory, "constant-representations.e"), "utf8"), { operation: "run" });
+  assert.equal(representationRun.ok, true, JSON.stringify(representationRun.diagnostics));
+  assert.equal(representationRun.output, await readFile(resolve(namedDirectory, "constant-representations.out"), "utf8"));
+  assert.deepEqual(representationRun.coverage, JSON.parse(await readFile(resolve(namedDirectory, "constant-representations.browser.json"), "utf8")));
+  const representationErrors = await request(await readFile(resolve(namedDirectory, "constant-representation-errors.e"), "utf8"), { operation: "check" });
+  assert.equal(representationErrors.ok, false);
+  assert.equal(representationErrors.diagnostics.map(d => `${d.start.line}:${d.start.column}: error[${d.code}]: ${d.message}\n`).join(""),
+    await readFile(resolve(namedDirectory, "constant-representation-errors.expected"), "utf8"));
+  checks.push("alias and sized constants with shared runtime precision and exact diagnostics");
   const failures = await page.evaluate(async () => {
     const { Sandbox } = await import("/client.js");
     const code = promise => promise.then(() => "unexpected_success", error => error.code);

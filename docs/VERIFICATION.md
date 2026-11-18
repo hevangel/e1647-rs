@@ -5522,3 +5522,51 @@ Actual verification:
 All eight push/PR CI jobs for both PR #94 and PR #95 passed. CI for this
 increment is pending. No new Specman, local all-feature or HDL/container run
 was performed; no IEEE conformance is claimed.
+
+
+## 2026-11-16 — Constant alias and sized representations
+
+The initialized-const pass now follows aliases to its supported integer/string
+scalar representations. Known int/uint widths from 1 through 127 and star
+widths participate, including supported constant width expressions. Explicitly
+sized initializers must already fit; this does not add general storage
+narrowing or change the i128 storage model. Cyclic aliases, unresolved widths,
+widths outside the supported range and out-of-range sized values stay
+unresolved and report E0224 when used in a coverage schema.
+
+Runtime direct-operand precision uses the same representation resolver for
+locals/parameters, instance fields and qualified static fields. This fixes
+alias operands that previously selected an untyped arithmetic context and
+static operands that previously supplied no precision context. Coverage
+expression folding and ordinary method arithmetic therefore agree on tested
+32/64-bit wrapping and wide/star-width contexts. Runtime filter execution,
+other expression shapes, enum constants and dynamic initialization retain
+their documented limits.
+
+Two independently authored fixtures exercise chained numeric/string aliases,
+constant width expressions, a signed 8-bit lower bound and unsigned 127-bit
+upper bound, alias method parameters, wide/star-width arithmetic, qualified
+static constants, named ranges/crosses and zero-goal reports. Exact console
+values verify arithmetic without allowing comparison-context casts to mask
+an incorrect stored value. An independent browser JSON expectation checks the
+full coverage payload. Five exact E0224 cases cover cyclic aliases, width 128,
+unsigned overflow/negative initialization and a computed zero width. The
+preceding unsupported-sized fixture now uses a mutable width, since a literal
+8-bit representation has become supported.
+
+Actual verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 524 passed, 0 failed, 0 ignored, 29 binaries.
+  New sources extend existing fixture loops.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all eighteen groups passed in actual
+  Chromium 156.0.8078.4, including the exact output, report and error checks.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for preceding PR #96 passed. CI for this increment
+is pending. No new Specman, local all-feature or HDL/container run was
+performed; no IEEE conformance is claimed.

@@ -44,6 +44,82 @@ struct Resolver<'a> {
 }
 
 impl Resolver<'_> {
+    fn scalar_type(&mut self, owner: &str, ty: &TypeExpr, depth: usize) -> Option<TypeExpr> {
+        if depth + self.active.len() > 64 {
+            return None;
+        }
+        match ty {
+            TypeExpr::Named { name, .. } => {
+                let underlying = self
+                    .types
+                    .iter()
+                    .find(|ty| ty.name == *name && ty.kind == crate::ast::DeclarationKind::Type)?
+                    .underlying
+                    .as_ref()?
+                    .clone();
+                self.scalar_type(owner, &underlying, depth + 1)
+            }
+            TypeExpr::Scalar { base, width, span }
+                if matches!(
+                    base,
+                    ScalarBase::Int
+                        | ScalarBase::Uint
+                        | ScalarBase::Longint
+                        | ScalarBase::Longuint
+                        | ScalarBase::String
+                ) =>
+            {
+                let width = match width.as_deref() {
+                    None => None,
+                    Some(Expr::Ident { name, .. })
+                        if name == "*" && matches!(base, ScalarBase::Int | ScalarBase::Uint) =>
+                    {
+                        width.clone()
+                    }
+                    Some(expr) if matches!(base, ScalarBase::Int | ScalarBase::Uint) => {
+                        let Value::Int(bits) = self.evaluate(owner, expr, 0)? else {
+                            return None;
+                        };
+                        if !(1..=127).contains(&bits) {
+                            return None;
+                        }
+                        Some(Box::new(Expr::IntLiteral {
+                            text: bits.to_string(),
+                            span: expr.span(),
+                        }))
+                    }
+                    _ => return None,
+                };
+                Some(TypeExpr::Scalar {
+                    base: *base,
+                    width,
+                    span: *span,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn operand_type(&mut self, owner: &str, expr: &Expr) -> Option<TypeExpr> {
+        let (owner, name) = match expr {
+            Expr::Ident { name, .. } => (owner, name.as_str()),
+            Expr::StaticAccess {
+                type_name, member, ..
+            } => (type_name.as_str(), member.as_str()),
+            _ => return None,
+        };
+        let ty = self
+            .types
+            .iter()
+            .find(|ty| ty.name == owner)?
+            .fields
+            .iter()
+            .find(|field| field.name == name)?
+            .ty
+            .clone();
+        self.scalar_type(owner, &ty, 0)
+    }
+
     fn field(&mut self, owner: &str, name: &str) -> Option<Value> {
         let key = (owner.to_owned(), name.to_owned());
         if let Some(value) = self.memo.get(&key) {
@@ -58,24 +134,35 @@ impl Resolver<'_> {
             .find(|ty| ty.name == owner)
             .and_then(|ty| ty.fields.iter().find(|field| field.name == name))
             .filter(|field| field.is_const)
-            // Width/alias/custom representation semantics are not inferred.
-            .filter(|field| {
-                matches!(
-                    &field.ty,
-                    TypeExpr::Scalar {
-                        width: None,
-                        base: ScalarBase::Int
-                            | ScalarBase::Uint
-                            | ScalarBase::Longint
-                            | ScalarBase::Longuint
-                            | ScalarBase::String,
-                        ..
-                    }
-                )
-            })
-            .and_then(|field| field.init.as_ref())
             .cloned()
-            .and_then(|expr| self.evaluate(owner, &expr, 0));
+            .and_then(|field| {
+                let ty = self.scalar_type(owner, &field.ty, 0)?;
+                let value = self.evaluate(owner, field.init.as_ref()?, 0)?;
+                // Storage narrowing is not inferred. Only resolve explicitly
+                // sized initializers when they already fit that representation.
+                if let (
+                    TypeExpr::Scalar {
+                        base,
+                        width: Some(width),
+                        ..
+                    },
+                    Value::Int(value),
+                ) = (&ty, &value)
+                    && let Expr::IntLiteral { text, .. } = width.as_ref()
+                {
+                    let bits: u32 = text.parse().ok()?;
+                    let fits = if *base == ScalarBase::Uint {
+                        *value >= 0 && *value <= (i128::MAX >> (127 - bits))
+                    } else {
+                        let half = 1i128.checked_shl(bits - 1)?;
+                        *value >= -half && *value < half
+                    };
+                    if !fits {
+                        return None;
+                    }
+                }
+                Some(value)
+            });
         self.active.remove(&key);
         if value.is_some() {
             self.memo.insert(key, value.clone());
@@ -141,19 +228,10 @@ impl Resolver<'_> {
                 }
             }
             Expr::Binary { op, lhs, rhs, .. } => {
-                let operand_type = |expr: &Expr| match expr {
-                    Expr::Ident { name, .. } => self
-                        .types
-                        .iter()
-                        .find(|ty| ty.name == owner)
-                        .and_then(|ty| ty.fields.iter().find(|field| field.name == *name))
-                        .map(|field| field.ty.clone()),
-                    _ => None,
-                };
-                let precision = crate::interp::precision_context(
-                    operand_type(lhs).as_ref(),
-                    operand_type(rhs).as_ref(),
-                );
+                let lhs_type = self.operand_type(owner, lhs);
+                let rhs_type = self.operand_type(owner, rhs);
+                let precision =
+                    crate::interp::precision_context(lhs_type.as_ref(), rhs_type.as_ref());
                 let lhs = self.evaluate(owner, lhs, depth + 1)?;
                 let rhs = self.evaluate(owner, rhs, depth + 1)?;
                 use crate::ast::BinaryOp;
@@ -377,6 +455,20 @@ impl Resolver<'_> {
         }
         result
     }
+}
+
+pub(crate) fn scalar_type(
+    types: &[ElaboratedType],
+    owner: &str,
+    ty: &TypeExpr,
+) -> Option<TypeExpr> {
+    Resolver {
+        types,
+        memo: BTreeMap::new(),
+        active: BTreeSet::new(),
+        diagnostics: Vec::new(),
+    }
+    .scalar_type(owner, ty, 0)
 }
 
 pub(crate) fn resolve(types: &mut [ElaboratedType]) -> Vec<crate::diagnostic::Diagnostic> {

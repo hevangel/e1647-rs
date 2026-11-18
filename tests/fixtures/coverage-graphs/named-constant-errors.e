@@ -2,7 +2,7 @@ extend sys {
     const cycle_a: int = cycle_b;
     const cycle_b: int = cycle_a;
     !mutable_bound: int = 1;
-    const sized: uint(bits: 8) = 1;
+    !runtime_width: int = 8; const sized: uint(bits: runtime_width) = 1;
     const divided: int = 1 / 0;
     !MAX_INT: int = 2;
     cover cg is {

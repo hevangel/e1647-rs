@@ -141,6 +141,7 @@ derived coverage summaries (nested/hidden sources, duplicate labels, masks,
 per-unit ownership, ungradeable domains and full-width goals/weights),
 constant coverage names/range labels with decoded escapes and exact E0224 errors,
 named constant dependencies, inherited/static initializers and arithmetic precision,
+alias/sized representations, width boundaries and exact unsupported-width diagnostics,
 UTF-8/ABI quotas/releases, zero host imports, memory cap, synchronous guest
 deadline, fetch deadline, cancellation/reuse, traps, client errors and demo
 text rendering. The timeout/trap probes are independently authored tiny WASM
