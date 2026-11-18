@@ -215,6 +215,17 @@ Specman adapter or actual reference comparison of these candidates is qualified
 yet; native-only reports explicitly record reference-not-run. See
 [qualification/README.md](../qualification/README.md).
 
+## Native HDL profile
+
+The [explicit xezim 0.11.3 profile](HDL_QUALIFICATION.md) runs real VPI
+simulation, checking signed 32-bit transfers, both mixed counter examples,
+error diagnostics, VCD transitions and HDL code coverage. The native session
+has bounded startup/command/finish handshakes and reaps its owned child on
+failure. Wider/MVL transfers are rejected; E1647_XEZIM_WAVE enables optional
+wave instrumentation. This qualifies explicit hdl_run/READY observations,
+not general e/HDL event ordering. Default cargo/CI tests cover transport and
+frontend mechanics; the real profile is a separate command.
+
 ## Tests and the two revisions
 
 The suite targets **2019 only** — there is no 2016 mode and no

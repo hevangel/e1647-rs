@@ -4927,3 +4927,82 @@ on actions prohibit time-consuming actions, and evaluate excludes wait/sync/
 return. This change does not qualify those contexts or general simulator
 ordering. No local all-feature, WASM
 runtime or Specman run was performed. No IEEE conformance is claimed.
+
+
+## 2026-11-15 — bounded HDL sessions and real xezim profile
+
+The available extended EDA image supplied xezim 0.11.3, revision 058f2bba,
+matching Dockerfile's full source pin. Its image ID was
+sha256:2c2d7265c7d157ac99201232025af5faf975221693a7ebdc4aba80df8c031f54
+and its compiler was rustc 1.99.0. The older local e1647-rs-toolchain tag did
+not expose xezim on PATH; that tag alone was not accepted as qualification.
+The current source was mounted read-only into the extended image, the owned
+bridge compiled against /opt/xezim/include, and generated data written only
+under the host's ignored local/hdl-qualification directory.
+
+A code review found that RUN accepted an ERR reply and then waited for READY,
+which never follows a rejected command. Native sessions now fail immediately
+on ERR and use a bounded response reader with one deadline for each complete
+startup/command/finish exchange. Replies match reserved tokens exactly;
+malformed/out-of-order responses, EOF, invalid UTF-8, overlong output and
+missing replies close/reap the owned child. Subsequent calls preserve the
+failure. Local invalid paths/values send no command. Checked finish observes
+BYE and a successful child exit; CLI failures report E0408. Legacy finish()
+cleanup remains available without returning errors.
+
+The owned C bridge now parses complete numeric/argument forms, rejects command
+truncation, retains both halves of a 64-bit delay and explicitly limits
+vpiIntVal transfers to signed 32-bit values over signals of 1..32 bits.
+X/Z reads and wide signals fail instead of being silently narrowed/coerced.
+E1647_XEZIM_WAVE=1 enables optional --wave instrumentation; startup/command
+limits use E1647_XEZIM_TIMEOUT_MS (default30000, accepted1..300000).
+
+New owned Rust subprocess tests cover success, lookalike log prefixes, invalid
+local requests, startup/command/finish timeouts, shared RUN deadlines, ERR,
+out-of-order/malformed/overflow replies, EOF, output bounds and failed exit.
+A separate injected backend fixture verifies checked-finish E0408 propagation,
+that later statements do not run, and that the backend is dropped. These are
+transport/interpreter mechanics, not reference simulation evidence.
+
+scripts/qualify_hdl.py performs actual Linux/xezim qualification. Six owned
+fixture programs plus both existing mixed counter examples pass exact output,
+diagnostic and exit-code oracles. The real bridge also rejects malformed raw
+commands without applying a rejected SET. For the positive fixture, the VCD
+has a 1ps timescale, three rising edges at ticks3/5/7, counter values0/1/2/3,
+the two signed-word bit patterns, and final tick9. HDL code coverage records
+nine covered statements, three always-block executions and three clock
+rises/falls. This is HDL code coverage, separate from e cover-group coverage.
+The script verifies these contents, rejects an unqualified simulator revision,
+checks input/binary stability and records hashes without raw stdout/stderr.
+Artifacts and reports remain ignored local data. Three Python oracle tests
+reject corrupted values/times/widths and incorrect coverage counts.
+
+Exact checks and observed results:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 504 passed, 0 failed, 0 ignored (27 binaries).
+- `py -m unittest discover -s tests -p hdl_qualification_test.py` — 3 passed.
+  Python private-temp ACLs required normal user access on Windows; no ACL or
+  security policy was changed. Linux CI runs the same mechanical tests.
+- `docker compose config --quiet` — passed.
+- In the extended image, `cc -Wall -Wextra -Werror -shared -fPIC
+  -I/opt/xezim/include -o /artifacts/bridge.so c/xezim_bridge.c` — passed.
+- In that image, `cargo build --locked --target-dir /artifacts/target
+  --bin e1647` — passed.
+- In that image, `E1647_XEZIM_BRIDGE=/artifacts/bridge.so python3
+  scripts/qualify_hdl.py --native /artifacts/target/debug/e1647
+  --report /artifacts/qualification.json` — passed:8 cases plus raw bridge
+  assertions, VCD and HDL coverage contents verified.
+- `git diff --check` — passed.
+
+README/status/roadmap/architecture/CLI help and HDL_QUALIFICATION.md describe
+the contract and scope. Dockerfile adds Python3 and strict bridge compilation;
+compose adds qualify-hdl. The full Dockerfile image was not rebuilt locally;
+the actual qualification used the fingerprinted existing extended image.
+Default CI exercises portable mechanics, not a real simulator. No local
+all-feature, WASM-runtime or Specman run was performed. The untagged response
+protocol reserves exact token lines; standalone sessions do not manage child
+process trees (the Linux runner adds process-group cleanup). Arbitrary signal
+types, large-delay/max-time behavior, general e/HDL scheduling, VHDL/VHPI and
+browser execution remain unqualified. No IEEE conformance is claimed.

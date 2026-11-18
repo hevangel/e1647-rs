@@ -16,6 +16,8 @@ jobs:
       - run: cargo test --all-targets
       - name: Qualification runner protocol tests
         run: python3 -m unittest discover -s tests -p qualification_runner_test.py
+      - name: HDL artifact oracle tests (not simulation)
+        run: python3 -m unittest discover -s tests -p hdl_qualification_test.py
       - run: cargo build --bin e1647
       - name: Native candidate cases (no reference run)
         run: python3 scripts/qualify.py --native-only
