@@ -16,3 +16,6 @@ local/
 
 # Local Mimosa security-scanner state
 .mimosa/
+
+# Python qualification-runner bytecode caches
+__pycache__/
