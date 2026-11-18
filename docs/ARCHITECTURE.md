@@ -217,8 +217,15 @@ single-source browser sandbox API runs in disposable workers (see
   Expression traversal is exhaustive over the AST's ordinary value children:
   membership elements and sets, casts, bit slices, table tuples/rows, set
   literals, select weights, chosen-from targets/lists and unknown callees.
-  Type-embedded expressions and raw select choice tokens retain their own
-  unresolved scope/grammar. Cast result kinds stay unknown because the
+  Retained type expressions now traverse scalar/formal widths, nested list
+  elements/keys, template arguments and unresolved typeof placeholders.
+  Keys bind it to the list element kind; all parameters are bound before
+  checking dependent method annotations. Definite non-integer widths report
+  E0223. The visitor clears value hints, restores local kinds and discards
+  type-position binding effects afterward. It visits alias/field/method/local,
+  coverage and expression type sites, with a recursion bound of 64. Expressions
+  already replaced by elaboration cannot be recovered by this pass; raw select
+  choice tokens still need their grammar. Cast result kinds stay unknown because the
   evaluator's fallback preserves its input. Explicit `evaluate` results,
   slices and `in_table` results have known kinds. An evaluate body gets a
   scoped result local and keeps the owner/caller context; a new initializer
@@ -654,7 +661,9 @@ single-source browser sandbox API runs in disposable workers (see
 Remaining boundaries (the detailed behavior inventory is in STATUS.md):
 
 - Full name resolution, signatures, flow-sensitive/bidirectional inference,
-  conditional bindings and type-embedded expression scopes. The conservative
+  operand narrowing and pre-elaboration type-expression checking. Explicit
+  guard binding facts and retained type-expression scopes are implemented.
+  The conservative
   checker leaves unknown/custom numeric kinds silent and set scalar domains
   untracked.
 - Dynamic subtype matching for base-typed instances. When-qualified fields,

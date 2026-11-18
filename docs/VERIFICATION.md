@@ -5147,3 +5147,50 @@ default, all-feature solver, real WASM/browser and real HDL image/profile
 checks. New CI results for this increment are pending. No local all-feature,
 new HDL/container or Specman run was performed for these typing changes;
 no new language execution or IEEE conformance claim is made.
+
+## 2026-11-15 — Expressions retained in type positions
+
+The conservative post-composition pass now traverses expressions retained in
+type annotations: scalar/formal widths, nested list keys/elements, when bases,
+template type/value arguments and unresolved typeof/typeof_item placeholders.
+Entry sites cover alias underlying types, fields (including statics), method
+parameters/results, locals, coverage items, casts, is-a, constructors,
+evaluate, set_of_values/full_set_of_values and in_table type sets. Known
+non-integer scalar-width kinds produce E0223; enum/integer/unknown kinds
+remain conservative. This does not add general width evaluation or prove
+numeric width bounds.
+
+Key expressions bind it to the element kind. All method parameters shadow
+owner fields before dependent annotations are checked. Type-position checks
+isolate expected value hints and restore local/binding state; a dedicated
+fixture proves that a binding inside a width cannot erase the enclosing
+frame's known integer kind. Alias expansion is not repeated at use sites;
+the type visitor has a depth bound of 64. Expressions already replaced during
+elaboration are not reconstructed and remain a pre-elaboration checking gap.
+
+Independently authored fixtures under tests/fixtures/typing-type-expressions
+cover exact diagnostic spans, parameter/static/key scopes, template values,
+retained placeholders, conservative unknown widths and valid native execution.
+The unresolved fixture also retains the existing E0208/E0313 diagnostics;
+run stops at those earlier-stage errors, while the complete fixture pipeline
+additionally checks its nested E0221 diagnostics. Initial fixture attempts
+used ambiguous template argument syntax and assumed a different diagnostic
+order; these were corrected to the parser's existing syntax and stage order.
+
+Actual checks:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 513 passed, 0 failed, 0 ignored, 28 binaries.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all ten groups passed in Chromium
+  156.0.8078.4. Seventeen new annotation/value diagnostics match native
+  expected files byte-for-byte, and the valid fixture also runs in WASM.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `git diff --check` — passed.
+
+PR #88's eight push/PR CI jobs completed successfully (default Rust,
+all-feature solver, real WASM/browser and real HDL image/profile jobs).
+CI for this increment is pending. No new local all-feature, HDL/container or
+Specman run was performed; no full type system or IEEE conformance is claimed.

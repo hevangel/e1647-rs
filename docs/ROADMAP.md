@@ -254,7 +254,12 @@ not imply full language support or IEEE conformance.
       Known list indexes and membership containers/element kinds now receive
       definite-kind checks; sets retain a kind without scalar-domain metadata.
       General bidirectional inference, full set-domain/numeric checks,
-      type-embedded expressions and general flow-sensitive narrowing remain incomplete.
+      pre-elaboration type-expression checking and general flow-sensitive narrowing
+      remain incomplete. Retained type annotations now traverse widths, keyed-list
+      keys (with an element-typed it), template value arguments and unresolved
+      typeof/typeof_item expressions. Known non-integer width kinds report E0223;
+      parameters bind before dependent annotations are checked. Type-position
+      hints and conditional binding effects stay isolated from surrounding values.
       Explicit is-a binding kinds propagate on proven true/false guard paths,
       including lazy and/or/implication operands, branches, while bodies,
       check failure actions and ternary arms. Joins retain only agreed kinds;
