@@ -13,5 +13,7 @@ extend sys {
         var it: string = "outer";
         xs.has(it > outer);
         var still_string: string = it;
+        xs.and_all(it);
+        xs.or_all(it);
     };
 };

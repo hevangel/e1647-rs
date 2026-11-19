@@ -33,10 +33,8 @@
 //! A third backend (VHPI, say) plugs in beside them: implement
 //! [`Simulator`], give it a registry name, and add one constructor arm
 //! to [`load_backend`] — the interpreter and the signal sources do not
-//! change. There is no VHPI today, and no configuration knob selects a
-//! backend yet: `hdl_load` resolves through [`load`] (the default
-//! backend), while [`load_backend`] is the explicit form tests and
-//! future configuration can name a backend through.
+//! change. The two-argument `hdl_load` uses [`load`]. An optional third
+//! argument selects a registered backend through [`load_backend`].
 //!
 //! Values can also come from an injected per-cycle history
 //! ([`SignalSource::Injected`]) without any backend: the interpreter's

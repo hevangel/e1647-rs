@@ -625,7 +625,9 @@ single-source browser sandbox API runs in disposable workers (see
   elements, and `all_indices` returns matching zero-based indices.
   Empty lists return FALSE, zero or a fresh empty list. Arity and
   non-boolean predicate errors report E0402. The type pass scopes `it`
-  to the element kind and infers the query result kind.
+  to the element kind and infers the query result kind. The expression
+  forms of `and_all` and `or_all` share this traversal and return Boolean
+  results. With an empty receiver they return TRUE and FALSE, respectively.
 - `src/solve.rs` — constraint IR and the pluggable solver seam: the
   top-level `keep` constraints of one type translate (conservatively) into
   bounded-integer variables plus a boolean tree of comparisons;
@@ -774,7 +776,7 @@ Remaining boundaries (the detailed behavior inventory is in STATUS.md):
   modifiers. Set literals, set_of_values/full_set_of_values and the selected
   set/list pseudo-methods already execute; their presence does not imply the
   rest of the library is implemented.
-- Simulator bindings beyond xezim (including VHPI/VHDL), backend selection,
+- Simulator bindings beyond xezim (including VHPI/VHDL) and
   browser engines beyond Chromium. The browser serializes native basic and
   derived coverage summaries, preserving duplicate combination labels and
   decimal-string counts; detailed bucket identities are not exposed. The single-source WASM ABI and worker runtime have real browser

@@ -5570,3 +5570,40 @@ Actual verification:
 All eight push/PR CI jobs for preceding PR #96 passed. CI for this increment
 is pending. No new Specman, local all-feature or HDL/container run was
 performed; no IEEE conformance is claimed.
+
+## 2026-11-19 — Explicit HDL backend selection
+
+`hdl_load(file, top)` uses the platform default. A third string
+argument selects a registered backend. Unknown names report E0408 and
+list the available names. Invalid argument types and counts report E0402.
+
+- Formatting and Clippy passed for the native defaults and all features.
+- All-target tests passed with 525 default-feature tests and 534
+  all-feature tests. The wasm32 all-target compilation check passed.
+- A CLI smoke test used a stand-in for xezim. Both load forms completed
+  the bridge handshake, read a signal value, and finished the session.
+  The real mixed-language demo and HDL event ordering were outside this check.
+
+## 2026-11-19 — Boolean list aggregate expressions
+
+`and_all(expr)` and `or_all(expr)` evaluate a Boolean expression with
+`it` bound to each element (27.5.1/2). They traverse a snapshot in list
+order and restore the caller's binding. Empty lists return TRUE for
+`and_all` and FALSE for `or_all`. The runtime regression checks both
+identities and counts predicate calls. The typing fixture checks
+diagnostics for non-Boolean expressions.
+
+Formatting, default and all-feature Clippy, and wasm32 all-target
+compilation passed. All-target test runs passed with 526 default-feature
+tests and 535 all-feature tests. The checks use local regression tests.
+
+## 2026-11-19 — Bounds checks for wide runtime indexes
+
+List `exists()`, table `copy_with_rows()`, and integer-to-enumeral
+casts validate indexes before converting to a host-sized index.
+Regression tests cover wide positive and negative values, normal row
+copying, and the E0404 diagnostic for an out-of-range table index.
+
+Formatting, default and all-feature Clippy, and the wasm32 all-target
+compilation check passed. All-target tests passed with 528 default-feature
+tests and 537 all-feature tests.

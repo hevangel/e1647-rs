@@ -113,6 +113,8 @@ original item or its index; the latest item wins a tie.
 List queries `has`, `count`, `all` and `all_indices` accept one boolean
 expression with `it` bound to each item. Filtering preserves order and
 returns a fresh list; implicit index bindings remain unsupported.
+`and_all` and `or_all` also accept an expression and reduce its Boolean
+results across the list.
 
 Coverage starts disabled. Enable it in a `sys.setup()` extension:
 
@@ -247,6 +249,11 @@ docker compose run --rm mixed      # mixed e + SystemVerilog testcase (xezim)
 docker compose run --rm qualify-hdl # assert the explicit xezim VPI profile
 docker compose run --rm toolchain  # interactive shell in the container
 ```
+
+`hdl_load(file, top)` uses the platform default simulator. Supply a third
+string argument to select a registered backend, for example
+`hdl_load("counter.sv", "top", "xezim")` on native builds. Unknown names
+report the available backends.
 
 `run` executes the built-in `sys` unit's `run()` methods. Every run takes
 an explicit `--seed` and is fully deterministic per backend. By default

@@ -155,9 +155,8 @@
 //! `E0405` "list method ... is not supported": `apply` (27.4.2),
 //! `sort`/`sort_by_field` (27.4.23/27.4.24), `first`/`last`
 //! (27.4.6/27.4.13), `first_index`/`last_index` (27.4.7/27.4.14),
-//! `all_different` (27.4.1), `unique` (27.4.28), `split` (27.4.25), the
-//! expression forms of the boolean 27.5 aggregates
-//! `and_all`/`or_all`. The 27.4.17/27.4.20/27.5.4-27.5.6 aggregates
+//! `all_different` (27.4.1), `unique` (27.4.28), and `split` (27.4.25).
+//! The 27.4.17/27.4.20/27.5.4-27.5.6 aggregates
 //! (`max_value`, `min_value`, `product`, `sum`, `average`) DO take a
 //! per-item expression — they intercept before the argument evaluation
 //! ([`Interp::call_list_aggregate`]); their empty-list `average` and
@@ -172,6 +171,8 @@
 //! a scoped `it` binding (27.4.10/4/29/30). `has` stops at the first
 //! match; the others preserve order. Their receiver is snapshotted before
 //! evaluation, so mutation during a predicate does not change traversal.
+//! `and_all` and `or_all` (27.5.1/2) also accept an item expression
+//! and reduce all of its Boolean results.
 //! Implicit index bindings are not modeled. Also not
 //! modeled: `resize` (27.3.16 — the
 //! `filler`/`keep_old` parameters are expressions and new items need the
@@ -8491,7 +8492,7 @@ impl<'a> Interp<'a> {
                 // The copy restricted to the given rows (0-based row
                 // indexes, or table_row handles selected by identity).
                 let items = list.items.borrow().clone();
-                let mut selection: Vec<Option<usize>> = Vec::with_capacity(items.len());
+                let mut selection = Vec::with_capacity(items.len());
                 for item in &items {
                     match item {
                         Value::Int(index) => {
@@ -8502,10 +8503,11 @@ impl<'a> Interp<'a> {
                                     span,
                                 ));
                             }
-                            selection.push(Some(*index as usize));
+                            selection.push(Some(*index));
                         }
                         Value::TableRow { row, .. } => {
-                            selection.push(table.borrow().row_index(row));
+                            selection
+                                .push(table.borrow().row_index(row).map(|index| index as i128));
                         }
                         _ => {
                             return Err(self.error(
@@ -8528,14 +8530,14 @@ impl<'a> Interp<'a> {
                         ));
                     };
                     let rows_len = borrowed.rows.len();
-                    if index >= rows_len {
+                    if index >= rows_len as i128 {
                         return Err(self.error(
                             "E0404",
                             format!("table row index {index} out of range (size {rows_len})"),
                             span,
                         ));
                     }
-                    let row = Rc::new(RefCell::new(borrowed.rows[index].borrow().clone()));
+                    let row = Rc::new(RefCell::new(borrowed.rows[index as usize].borrow().clone()));
                     copy.rows.push(row);
                 }
                 drop(borrowed);
@@ -9465,7 +9467,7 @@ impl<'a> Interp<'a> {
         })
     }
 
-    /// Predicate list queries (27.4.4/10/29/30), with receiver snapshot.
+    /// Predicate list queries and Boolean aggregates, with receiver snapshot.
     fn call_list_query(
         &mut self,
         list: &ListValue,
@@ -9483,6 +9485,7 @@ impl<'a> Interp<'a> {
             ));
         };
         let items = list.items.borrow().clone();
+        let item_count = items.len() as i128;
         let mut matches = Vec::new();
         let mut count = 0;
         for (index, item) in items.into_iter().enumerate() {
@@ -9515,6 +9518,8 @@ impl<'a> Interp<'a> {
         Ok(match name {
             "has" => Value::Bool(false),
             "count" => Value::Int(count),
+            "and_all" => Value::Bool(count == item_count),
+            "or_all" => Value::Bool(count != 0),
             _ => Value::List(ListValue {
                 items: Rc::new(RefCell::new(matches)),
                 element: if name == "all_indices" {
@@ -11844,7 +11849,7 @@ impl<'a> Interp<'a> {
             // 27.4.5 exists(): TRUE when an item with the given index
             // number exists in the list, FALSE when the index does not.
             ("exists", [Value::Int(index)]) => {
-                Ok(Value::Bool(*index >= 0 && (*index as usize) < items.len()))
+                Ok(Value::Bool((0..items.len() as i128).contains(index)))
             }
             ("exists", _) => Err(self.error("E0402", "exists() expects an integer index", span)),
             // 27.4.3 copy(): a copy of the list — the list case of
@@ -12001,9 +12006,8 @@ impl<'a> Interp<'a> {
                 return Some(self.store_list(list, Vec::new(), Value::Void));
             }
             // 27.5.1 and_all(): TRUE when every item is TRUE; empty is
-            // TRUE (the prose's stated empty result). The exp-parameter
-            // form is a documented gap; the no-argument form reads the
-            // items themselves.
+            // TRUE (the prose's stated empty result). With no argument,
+            // read the items themselves.
             ("and_all", []) => {
                 let mut all = true;
                 for item in items {
@@ -12445,15 +12449,16 @@ impl<'a> Interp<'a> {
         };
         match name {
             "hdl_load" => {
-                if values.len() != 2 {
-                    return Err(self.error(
-                        "E0402",
-                        format!("'hdl_load' expects 2 arguments, got {}", values.len()),
-                        span,
-                    ));
-                }
-                let [file, top] = values.as_slice() else {
-                    unreachable!("checked the count");
+                let (file, top, backend) = match values.as_slice() {
+                    [file, top] => (file, top, None),
+                    [file, top, backend] => (file, top, Some(backend)),
+                    _ => {
+                        return Err(self.error(
+                            "E0402",
+                            format!("'hdl_load' expects 2 or 3 arguments, got {}", values.len()),
+                            span,
+                        ));
+                    }
                 };
                 let Value::Str(file) = file else {
                     return Err(self.error("E0402", "hdl_load expects a design file string", span));
@@ -12465,7 +12470,18 @@ impl<'a> Interp<'a> {
                         span,
                     ));
                 };
-                match crate::hdl::load(file, top) {
+                let session = match backend {
+                    None => crate::hdl::load(file, top),
+                    Some(Value::Str(backend)) => crate::hdl::load_backend(backend, file, top),
+                    Some(_) => {
+                        return Err(self.error(
+                            "E0402",
+                            "hdl_load expects a simulator backend name string",
+                            span,
+                        ));
+                    }
+                };
+                match session {
                     Ok(session) => {
                         self.hdl = Some(crate::hdl::SignalSource::Real(session));
                         Ok(Value::Void)
@@ -12968,7 +12984,8 @@ impl<'a> Interp<'a> {
                 // non-list receiver for same-named struct methods.
                 let mut extreme_receiver = None;
                 if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
-                    && matches!(name.as_str(), "has" | "count" | "all" | "all_indices")
+                    && (matches!(name.as_str(), "has" | "count" | "all" | "all_indices")
+                        || (!args.is_empty() && matches!(name.as_str(), "and_all" | "or_all")))
                 {
                     let receiver = self.eval(object, frame, me)?;
                     if let Value::List(list) = receiver {
@@ -13378,22 +13395,23 @@ impl<'a> Interp<'a> {
                 }
                 if let (Value::Int(index), TypeExpr::Named { name, .. }) = (&value, ty) {
                     let types: &[crate::elab::ElaboratedType] = self.types;
-                    if let Some(declared) = types.iter().find(|t| t.name == *name)
-                        && !declared.enumerals.is_empty()
-                        && (0..declared.enumerals.len()).contains(&(*index as usize))
+                    if let Ok(index) = usize::try_from(*index)
+                        && let Some(declared) = types.iter().find(|t| t.name == *name)
+                        && let Some(enumeral) = declared.enumerals.get(index)
                     {
                         return Ok(Value::Enum {
                             type_name: name.clone(),
-                            name: declared.enumerals[*index as usize].name.clone(),
+                            name: enumeral.name.clone(),
                         });
                     }
                 }
                 if let (Value::Int(index), TypeExpr::InlineEnum { names, .. }) = (&value, ty)
-                    && (0..names.len()).contains(&(*index as usize))
+                    && let Ok(index) = usize::try_from(*index)
+                    && let Some(name) = names.get(index)
                 {
                     return Ok(Value::Enum {
                         type_name: inline_enum_key(names),
-                        name: names[*index as usize].clone(),
+                        name: name.clone(),
                     });
                 }
                 // Interface casts (5.10.2.4): no object is of an

@@ -543,7 +543,9 @@ not imply full language support or IEEE conformance.
       remain unsupported. `has`/`count`/`all`/`all_indices` accept one
       boolean expression bound to `it`, preserve order and return fresh
       filtered/index lists; implicit index bindings are not modeled.
-      Other expression-taking forms, `resize`, the 27.6 CRC family and
+      `and_all` and `or_all` accept a Boolean item expression and
+      evaluate it for each item (27.5.1/2). Other expression-taking
+      forms, `resize`, the 27.6 CRC family and
       27.7 keyed lists are documented gaps in `src/interp.rs`). Set literals
       in expressions, range
       modifiers on declared types (so `full_set_of_values` can
@@ -564,9 +566,9 @@ not imply full language support or IEEE conformance.
       simulator exists (its operations report the honest no-simulator
       error, and it is the tests' dispatch double), and a third backend
       (VHPI — not implemented) plugs in with one `Simulator` impl and one
-      registry arm. Still one real simulator binding, and no backend
-      selection knob yet (`hdl_load` resolves through the default
-      backend). Session startup/commands/finish now have bounded handshakes,
+      registry arm. The two-argument `hdl_load` uses the platform default.
+      An optional third argument selects a registered backend by name.
+      Session startup/commands/finish now have bounded handshakes,
       strict reply grammar and checked error/exit propagation. The bridge
       explicitly transports signed 32-bit VPI values and rejects wide/MVL
       transfers. Optional waveform instrumentation is available.

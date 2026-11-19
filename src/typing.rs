@@ -1351,13 +1351,17 @@ impl<'a> TypeChecker<'a> {
                             | "count"
                             | "all"
                             | "all_indices"
+                            | "and_all"
+                            | "or_all"
                     )
                 {
                     self.push_scope();
                     self.bind_local("it", element.as_ref().clone());
                     for arg in args {
-                        let predicate =
-                            matches!(name.as_str(), "has" | "count" | "all" | "all_indices");
+                        let predicate = matches!(
+                            name.as_str(),
+                            "has" | "count" | "all" | "all_indices" | "and_all" | "or_all"
+                        );
                         let argument_ty = self.infer_with_hint(predicate.then_some(Ty::Bool), arg);
                         if predicate {
                             self.check_assignable(
@@ -1371,7 +1375,7 @@ impl<'a> TypeChecker<'a> {
                     self.pop_scope();
                     return match name.as_str() {
                         "min_index" | "max_index" | "count" => Ty::Int,
-                        "has" => Ty::Bool,
+                        "has" | "and_all" | "or_all" => Ty::Bool,
                         "all_indices" => Ty::List(Box::new(Ty::Int)),
                         "all" => object_ty,
                         _ => element.as_ref().clone(),

@@ -279,10 +279,43 @@ fn list_reverse_copy_and_exists() {
          print xs.reverse();\n        print xs;\n        \
          var ys: list of int = xs.copy();\n        ys.delete(0);\n        \
          print xs.size(), ys.size();\n        \
-         print xs.exists(0), xs.exists(2), xs.exists(3);\n    };\n};\n",
+         print xs.exists(0), xs.exists(2), xs.exists(3);\n        \
+         print xs.exists(-1), xs.exists(4294967296), xs.exists(18446744073709551616);\n    };\n};\n",
         1,
     );
-    assert_eq!(output, "[3, 2, 1]\nxs = [1, 2, 3]\n3 2\nTRUE TRUE FALSE\n");
+    assert_eq!(
+        output,
+        "[3, 2, 1]\nxs = [1, 2, 3]\n3 2\nTRUE TRUE FALSE\nFALSE FALSE FALSE\n"
+    );
+}
+
+#[test]
+fn copying_table_rows_rejects_a_wide_index() {
+    let result = run_source(
+        r#"
+extend sys {
+    run() is also {
+        var source: table = table_manager.create_table_without_column_names(1);
+        source.add_row();
+        var indexes: list of longuint;
+        indexes.push(0);
+        print source.copy_with_rows(indexes).get_rows_num();
+        indexes.push(18446744073709551616);
+        source.copy_with_rows(indexes);
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(result.output, "1\n");
+    let [diagnostic] = result.diagnostics.as_slice() else {
+        panic!(
+            "expected one row index diagnostic: {:?}",
+            result.diagnostics
+        );
+    };
+    assert_eq!(diagnostic.code, "E0404");
+    assert!(diagnostic.message.contains("18446744073709551616"));
 }
 
 #[test]
@@ -309,7 +342,7 @@ fn list_sum_product_and_all_or_all_with_empty_results() {
     // 27.5.5 sum(): the integer sum, 0 when empty. 27.5.4 product(): the
     // integer product, 1 when empty. 27.5.1 and_all(): TRUE when empty.
     // 27.5.2 or_all(): FALSE when empty. The no-argument forms read the
-    // items themselves; the exp-parameter forms are a documented gap.
+    // items themselves.
     let output = clean_output(
         "extend sys {\n    run() is also {\n        var xs: list of int;\n        \
          xs.push(2); xs.push(3); xs.push(4);\n        \
@@ -321,6 +354,33 @@ fn list_sum_product_and_all_or_all_with_empty_results() {
         1,
     );
     assert_eq!(output, "9 24\n0 1\nFALSE TRUE\nTRUE FALSE\n");
+}
+
+#[test]
+fn boolean_list_aggregates_evaluate_each_item_expression() {
+    let output = clean_output(
+        r#"
+extend sys {
+    visits: int;
+    positive(item: int): bool is {
+        visits = visits + 1;
+        return item > 0;
+    };
+    run() is also {
+        var xs: list of int;
+        var it: int = 99;
+        visits = 0;
+        print xs.and_all(positive(it)), xs.or_all(positive(it)), visits + 0;
+        xs.push(0); xs.push(2); xs.push(3);
+        print xs.and_all(positive(it)), visits + 0;
+        print xs.or_all(positive(it)), visits + 0;
+        print xs.and_all(it >= 0), xs.or_all(it < 0), it + 0;
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(output, "TRUE FALSE 0\nFALSE 3\nTRUE 6\nTRUE FALSE 99\n");
 }
 
 #[test]
@@ -718,6 +778,44 @@ fn hdl_path_access_without_a_session_is_e0408() {
             .collect::<Vec<_>>(),
         vec!["E0408"]
     );
+}
+
+#[test]
+fn hdl_load_selects_registered_backends_and_validates_arguments() {
+    for (arguments, code, message) in [
+        (
+            r#""counter.sv", "top", "unknown""#,
+            "E0408",
+            "unknown simulator backend 'unknown' (registered:",
+        ),
+        (
+            r#""counter.sv", "top", "null""#,
+            "E0408",
+            "the null backend",
+        ),
+        (
+            r#""counter.sv", "top", 42"#,
+            "E0402",
+            "expects a simulator backend name string",
+        ),
+        (
+            r#""counter.sv", "top", "null", "extra""#,
+            "E0402",
+            "expects 2 or 3 arguments, got 4",
+        ),
+    ] {
+        let source = format!("extend sys {{ run() is also {{ hdl_load({arguments}); }}; }};");
+        let result = run_source(&source, 1);
+        let [diagnostic] = result.diagnostics.as_slice() else {
+            panic!("expected one diagnostic for hdl_load({arguments})");
+        };
+        assert_eq!(diagnostic.code, code);
+        assert!(
+            diagnostic.render().contains(message),
+            "{}",
+            diagnostic.render()
+        );
+    }
 }
 
 #[test]
@@ -2536,6 +2634,23 @@ fn cast_of_int_to_enumeral_maps_the_index() {
         1,
     );
     assert!(output.contains("RED"), "output: {output}");
+}
+
+#[test]
+fn cast_of_wide_int_does_not_wrap_to_an_enumeral() {
+    let output = clean_output(
+        r#"
+type color_t : [WHITE, BLACK];
+extend sys {
+    run() is also {
+        print (18446744073709551616).as_a(color_t);
+        print (-18446744073709551616).as_a(color_t);
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(output, "18446744073709551616\n-18446744073709551616\n");
 }
 
 #[test]
