@@ -25,12 +25,31 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   and `template extend` blocks apply to the instances whose actuals
   match; static members register per type. After composition, the
   conservative type check ([`typing`]) walks every method body, field
-  init value, `keep` constraint, `on` body, coverage item and synthesized
+  init value, `keep` constraint, `on` body, coverage item/Boolean option and synthesized
   `when` view, and reports definite mismatches only: a value that cannot be
   the target it is stored into (E0220), a member a known when-less
   receiver does not have (E0221), indexing a non-list (E0222), an
   operator on incompatible operand kinds (E0223) — anything uncertain
-  stays silent.
+  stays silent. Traversal includes nested membership/casts/slices/tables,
+  scoped `evaluate` and `new ... with` bodies, all statement value children,
+  and temporal rule/wait proposition and repeat-bound expressions. Explicit
+  `evaluate`, bit-slice and `in_table` results retain known kinds. Index
+  kinds, membership compatibility, general bidirectional inference,
+  conditional bindings and type-embedded expressions remain incomplete.
+  Known declaration/assignment/field/parameter/return kinds now contextually
+  type untyped evaluate/new bodies. Runtime contexts include indexed/static
+  targets, qualified calls, supported inferred-value shapes and return
+  metadata saved across TCM suspension. Calls, init actions and expression
+  bodies isolate their contexts; missing runtime contexts still report E0122
+  for evaluate and E0402 for new. Materialized template kinds propagate and
+  concatenation inference flattens list operands like the value model.
+  Registered static field accesses and qualified call signatures retain
+  kinds; static methods/handlers and initializers are checked once in their
+  declaring contexts. Static extensions can inherit omitted annotations
+  from their declaration. Bare field writes work without an instance in
+  static methods/handlers, including inherited fields; unqualified static
+  method calls remain unsupported. Scalar/list/reference alias defaults
+  follow their representation with a 64-alias bound (E0402 on excess).
   Declared method parameters bind within their method, and type-inferring
   local declarations retain known initializer kinds (clause 18),
   including homogeneous list literals and equal-kind ternary branches.
@@ -74,6 +93,60 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   ranges and Boolean buckets retain their declared/default shapes.
   `run --coverage` reports collected groups; `print`/`out` and the
   message hooks produce the run log.
+  `per_unit_instance [= unit_type]` collects separate groups for the
+  nearest containing unit of that type, including unsampled units.
+  Group/basic-item `when` expressions gate sampling in their owning
+  struct context. `instance_no_collect` uses `inst` to suppress a unit's
+  group or item in reports. Hidden items remain available to crosses and
+  transitions; filtered-out sources do not reuse stale cross values.
+  Integral range widths subdivide inclusive bounds and preserve short
+  final buckets. Hit goals resolve range → item → group → global;
+  zero-goal buckets retain counts without contributing to bucket grades.
+  `set_config(cover, at_least, N)` configures the default before sampling.
+  Explicit range construction is capped at 65536 buckets per item.
+  Basic-item `ignore`/`illegal` expressions use their item and constants;
+  `instance_ignore`/`instance_illegal` additionally allow `inst` fields in
+  per-unit groups (14.3/14.3.4). Ignored/illegal values add neither hits nor
+  derived samples; wholly excluded buckets leave grade denominators and
+  hole lists. Illegal values produce DUT errors after check hooks, or at
+  observation when `check_illegal_immediately` is TRUE (29.9). Ignore wins
+  overlapping matches; that policy and exact reporting phase are unqualified.
+  Integral/Boolean bucket masks classify comparisons/membership/Boolean
+  compositions symbolically, or enumerate at most 65536 candidate visits
+  per item refresh for other pure expressions. Wider arithmetic reports
+  E0402. Real/string unbucketed items only filter observed values.
+  Cross/transition `when`, `no_collect`, `instance_no_collect`, `at_least`
+  and `weight` options run over basic or derived sources (14.4/14.5). Transition
+  history advances through legal source samples even when the derived item
+  is filtered. Goals inherit item → group → runtime precedence. Zero goals
+  are ungraded; zero weights contribute nothing. Hidden derived items keep
+  collection data but leave report/grade views. Derived grades participate
+  in the weighted per-type aggregate of mixed per-instance groups.
+  Named crosses/transitions may source earlier basic or derived items in
+  the same group. Stable observation references preserve nested histories,
+  duplicate bucket labels, masks and per-unit collections. Parent filters
+  cannot leak stale values into child crosses. Source order, names and
+  cardinality are validated with E0224, including across group extensions.
+  Expanded tuples are capped at 65536 scalar components. Unbucketed source
+  histories retain real/string labels but remain ungraded. Cross/transition
+  ignore/illegal predicates bind participating basic scalar values; transition
+  predicates also bind prev_<source> snapshots. Instance variants bind inst.
+  Integral/Boolean masks use conservative interval proofs and iterative range
+  splitting to find legal tuple witnesses, considering basic filters and
+  removing wholly excluded combinations. Supported proofs include comparisons,
+  Boolean logic, membership and checked arithmetic bounds. Unknown shapes
+  retain ordinary evaluation. The budget is 65536 scalar-domain work units
+  per derived item refresh, charging proofs and concrete checks; excess work
+  reports E0402. Storage-boundary wrapping and short-circuit errors are
+  preserved. Basic metadata lookup selects item declarations even when an
+  extension's transition physically precedes its aliased source. Unbucketed real/string/enumeral values only filter actual observations.
+  Masks commit atomically across basic and derived items and propagate to
+  descendants. Composite predicate operands remain unsupported (E0224), and
+  source-dependent classification over mixed composite inputs reports E0402.
+  Whole-node constant predicates support nested sources. Full option type
+  checking remains unfinished.
+  Real/enumeral ranges, general constant-name resolution and item-domain
+  width proofs remain unfinished.
 
 ## What runs, by 2019 feature
 
@@ -129,8 +202,11 @@ reading, nothing else.
   constraints, `on` bodies, coverage items and the synthesized `when`
   views; local declarations propagate known initializer kinds, but
   ambiguous kinds stay unknown and there is no interprocedural type
-  inference or full name-resolution pass. Coverage options recorded as raw
-  tokens are not checked).
+  inference or full name-resolution pass. Supported coverage option
+  syntax and unit scopes are checked. Boolean filters/visibility and
+  ignore/illegal predicates report definite type mismatches with owner,
+  sampled-source and selected-unit bindings. Define kinds, composite
+  operands and full option type checking remain unfinished).
 - Temporal edge expressions (`change/rise/fall`) still lack raw sampled
   value history. Propositions and repeat bounds now retain their sampled
   values: rules sample before each global cycle closes and at quit;

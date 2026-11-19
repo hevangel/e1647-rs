@@ -1,0 +1,4 @@
+node_u.cg@sys.a samples=1 grade=0.500
+n samples=1 hits=[0,1]
+node_u.cg@sys.b samples=0 grade=0.000
+n samples=0 hits=[0,0]

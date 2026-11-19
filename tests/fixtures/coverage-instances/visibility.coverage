@@ -1,0 +1,3 @@
+sample_u.cg@sys.a samples=1 grade=0.375
+other samples=1 hits=[0,1]
+cross_n__other samples=1 combinations=1

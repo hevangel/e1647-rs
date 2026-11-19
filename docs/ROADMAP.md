@@ -2,7 +2,10 @@
 
 The IEEE 1647-2019 migration phases below are complete; the broader
 milestones remain partial. Recent work adds conservative type checking
-(now including coverage items), bounded polynomial constraint solving
+(including coverage options and nested expression/temporal traversal),
+bounded polynomial constraint solving and streaming temporal rule monitors. Remaining work includes full name
+resolution/type inference, temporal edge expressions, call-stack
+continuations for suspended TCM calls, the remaining coverage options, (now including coverage items), bounded polynomial constraint solving
 and streaming temporal rule monitors. Remaining work includes full name
 resolution/type inference, temporal edge expressions, expression-value
 continuations for suspended calls, the remaining coverage options,
@@ -110,12 +113,14 @@ not imply full language support or IEEE conformance.
       grading. Per-instance coverage grades per bucket with holes
       (14.3.2), the option entries the prose defines apply
       (`at_least`/`weight`/`per_instance` at item and group level,
-      `no_collect`/`instance_no_collect` dropping the un-presented
+      `no_collect`/`instance_no_collect` hiding the un-presented
       group/item per 14.2.2/14.3.4, the cross/transition `name`
       option per 14.4/14.5), and the 14.9 configuration is honored
       through the builder API (`max_int_buckets`, the coverage mode);
-      the bool-exp option forms, the per-unit-instance scoping and
-      the option-table-image semantics remain not collected.
+      runtime configuration enables collection. Per-unit-instance
+      groups and group/basic-item `when` filters run; full option type
+      checking, real/enumeral ranges, derived-item ignore/illegal filters and radix
+      remain unfinished.
       Predefined non-scalar types `file` and `event` are accepted in
       type positions; `for each <type> (v) in list` records the element
       type filter. Simple macros expand (clause 15): `define <name'
@@ -188,12 +193,11 @@ not imply full language support or IEEE conformance.
       category validation — computed macros evaluate their restricted
       body subset, see M1), the remaining clause 14
       coverage model —
-      the bool-exp option forms (`no_collect`/`instance_no_collect`
-      with the implicit `inst` variable, `instance_ignore`/
-      `instance_illegal`), the per-unit-instance scoping (14.2.2), the
-      `radix`/`when`/`never` option semantics (the option tables are
-      not previously inspected); runtime configuration categories/options
-      beyond coverage mode and `max_int_buckets`, and `set_config_max()` —
+      real/enumeral ranges and general constant/type resolution,
+      `radix`/`never` and derived-item filters; full option type checking;
+      runtime configuration categories/options
+      beyond coverage mode, `max_int_buckets`, `at_least` and
+      `check_illegal_immediately`, and `set_config_max()` —
       the clause 12/13 temporal
       engine's remaining simulation integration — the scheduler runs
       started TCMs concurrently and waits/sync suspend, `@`-triggered
@@ -234,8 +238,28 @@ not imply full language support or IEEE conformance.
       Scalar/list aliases resolve with bounded recursion. Unknown or
       ambiguous kinds and custom numeric dispatch remain conservative;
       there is no flow-sensitive or interprocedural inference. Coverage
-      options remain unchecked raw tokens and full name resolution is
-      still missing
+      Boolean options now report definite mismatches in their owner,
+      sampled-source and selected-unit contexts. Define kinds, composite
+      predicate operands, other option types and full name resolution
+      remain unfinished. All statement value children and nested expression
+      operands now traverse, including membership, casts, bit slices,
+      tables, typed/untyped `evaluate` bodies, `new ... with` initializers
+      and temporal rule/wait values. New initializers use a fresh frame;
+      evaluate locals shadow and restore caller bindings. Known result
+      kinds propagate for explicit evaluate, slices and in_table. Call
+      arguments are inferred once, preventing duplicate nested diagnostics.
+      Known declaration/assignment/field/parameter/return contexts now type
+      untyped evaluate/new bodies, including indexed/static targets and
+      qualified calls. Result metadata persists through TCM suspension;
+      expression bodies and calls isolate outer hints. Template-instance
+      kinds propagate and concatenation inference flattens list operands.
+      Index-kind/membership checks, general bidirectional inference,
+      conditional bindings and type-embedded expressions remain incomplete. Registered
+      static fields and qualified call signatures now retain kinds. Static
+      initializers/methods/handlers are checked once in their declaring
+      scope, with omitted extension annotations inherited from the prototype.
+      Bare static-field writes and alias defaulting are corrected; bare
+      static method calls and full signature-equivalence checks remain gaps
 - [ ] Differential corpus against an authorized reference simulator where
       available (started: Specman reference runs via EDA Playground are
       recorded in docs/VERIFICATION.md; no automated differential harness yet)
@@ -375,15 +399,18 @@ not imply full language support or IEEE conformance.
       (14.3.2 — the group grade is the weighted instance grades plus
       the per_type bucket), `at_least`/`weight` apply from the option
       tokens (the group-level spellings included, 14.9.3/14.9.4), the
-      constant-TRUE `no_collect`/`instance_no_collect` options drop
-      the group/item from the collected model (14.2.2/14.3.4), the
+      `no_collect`/`instance_no_collect` options hide the group/item
+      from reports while retaining sampling storage (14.2.2/14.3.4), the
       cross/transition `name` option renames the derived item
       (14.4/14.5), and `run --coverage` reports instances; the 14.9
       configuration is honored through the builder API
       (`max_int_buckets`, the coverage mode) and runtime `set_config(cover, ...)`.
       Runtime collection starts disabled until enabled explicitly.
-      Bool-exp forms, per-unit-instance scoping (14.2.2) and the remaining
-      option semantics are not collected
+      Per-unit scoping follows the nearest requested unit in the field
+      tree, including inherited units, flattened lists and unsampled
+      instances. Group/basic-item `when` filters run in the owner context;
+      hidden sources remain available to derived items. Full option type
+      checking and remaining option semantics are unfinished
 - [~] Coverage configuration options (14.9) and per-unit-instance options (14.2.2) —
       started: the configuration record (`CoverageConfig`: the
       coverage mode per 14.2's NOTE, `max_int_buckets` per 14.3's
@@ -392,8 +419,41 @@ not imply full language support or IEEE conformance.
       `count_only` collect; `off` pauses without clearing counts;
       Boolean values also control enablement. `max_int_buckets` accepts
       0–65536 before sampling; after sampling, changes report E0402.
-      Other runtime configuration categories/options, `set_config_max`,
-      bool-exp option forms and `per_unit_instance` scoping remain gaps
+      `per_unit_instance [= unit_type]` and `instance_no_collect` with
+      `inst` collect and present per-unit data (14.2.2/14.3.4); structural
+      option/scope errors are E0224. Other runtime configuration
+      categories/options, `set_config_max`, composite-valued predicates,
+      real/enumeral ranges, general constant/type resolution, radix/filter semantics and full option type checking
+      remain gaps. Integral range widths and per-range goals run with
+      range/item/group/global precedence; zero-goal buckets are ungraded
+      and do not show holes. Explicit construction is capped at 65536
+      buckets per item; checked i128 arithmetic diagnoses unsupported or
+      overflowing parameters (E0224). Global at_least changes are allowed
+      before sampling and report E0402 afterwards. Basic-item ignore/illegal
+      and per-unit instance variants exclude observations and whole buckets;
+      illegal values produce immediate or deferred DUT errors. Interval masks
+      and bounded arithmetic classification preserve derived bucket identity.
+      Cross/transition when, visibility, hit-goal and weight options run over
+      basic and previously declared derived sources. Derived grades enter the
+      weighted per-type aggregate in
+      mixed per-instance groups; filtered transitions retain source history.
+      Derived source graphs preserve nested key identities, current-round
+      freshness, masks and per-unit histories. Source order/name/arity errors
+      are E0224; expanded tuples are capped at 65536 scalar components.
+      Scalar cross/transition ignore/illegal predicates and instance variants
+      filter observations and classify finite integral/Boolean combinations.
+      Transitions bind prev_<source> snapshots. Basic and derived masks commit
+      together. Conservative interval proofs handle supported relations, logic,
+      membership and safe arithmetic; unknown regions split iteratively and
+      retain concrete evaluation. The per-item budget is 65536 scalar-domain
+      work units. Full signed-domain splitting avoids midpoint overflow;
+      checked negation diagnoses the storage limit rather than panicking.
+      Unbucketed real/string/enumeral sources filter points without grades.
+      Composite-valued predicates and general wide-domain classification remain
+      gaps; constant predicates work over nested sources. Unit scope freezes
+      after all instance-dependent coverage options. Source-kind-aware metadata
+      lookup resolves aliased items despite physically earlier extensions.
+      Exact overlap/phase/filter-side-effect behavior needs qualification
 - [~] Part 2 predefined routine library — started with the reflection
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`
       (5.10.5/5.10.6 — the argument parses as a type) build the

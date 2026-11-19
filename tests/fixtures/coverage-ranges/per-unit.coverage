@@ -1,0 +1,6 @@
+node_u.cg@sys.a samples=2 grade=1.000
+n buckets=1 grade=1.000
+pair [0..1] goal=2 hits=2
+node_u.cg@sys.b samples=1 grade=0.000
+n buckets=1 grade=0.000
+pair [0..1] goal=2 hits=1

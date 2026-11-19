@@ -1,0 +1,5 @@
+proof_u.cg@sys.a samples=2 grade=1.000
+cross_n__m samples=1 combinations=1 total=Some(1) goal=1 weight=1 grade=Some(1.0)
+(0..1000000000, 0..1000000000) hits=1
+proof_u.cg@sys.b samples=2 grade=none
+cross_n__m samples=0 combinations=0 total=Some(0) goal=1 weight=1 grade=None

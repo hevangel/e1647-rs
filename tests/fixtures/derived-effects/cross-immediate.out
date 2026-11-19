@@ -1,0 +1,6 @@
+dut_error: illegal derived coverage value (n=0, m=0) in 'sys.cg.cross_n__m'
+dut_error: illegal derived coverage value (n=1, m=1) in 'sys.cg.cross_n__m'
+done
+check
+end
+Checking is complete - 2 DUT error(s).

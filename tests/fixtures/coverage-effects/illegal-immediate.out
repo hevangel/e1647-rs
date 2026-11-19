@@ -1,0 +1,5 @@
+dut_error: illegal coverage value 0 in 'sys.cg.n'
+after
+check
+final
+Checking is complete - 1 DUT error(s).

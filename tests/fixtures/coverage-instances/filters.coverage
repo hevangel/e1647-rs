@@ -1,0 +1,5 @@
+sys.cg@type samples=3 grade=0.688
+a samples=2 hits=[1,1]
+b samples=3 hits=[1,2]
+cross_a__b samples=2 combinations=2
+transition__a samples=1 combinations=1

@@ -1,0 +1,1 @@
+5:50: error[E0220]: variable initialization: a value of kind 'int' cannot be stored into 'bool'

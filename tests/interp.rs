@@ -1520,14 +1520,13 @@ fn compute_calls_inline_and_untyped_params_accept_anything() {
 
 #[test]
 fn new_reports_a_clean_runtime_diagnostic() {
-    // An untyped `new` without a declared type to infer from (here: an
-    // assignment target's field has no type known to `new`) stays
-    // unsupported.
+    // An untyped new in a type-inferring declaration has no context.
+    // Typed assignment targets now supply their declared constructor type.
     let result = run(
         &elaborate(
             &parse(
                 "struct s {\n    v: int;\n};\n\
-             extend sys {\n    p: s;\n    run() is also {\n        p = new;\n    };\n};\n",
+             extend sys {\n    p: s;\n    run() is also {\n        var p := new;\n    };\n};\n",
             )
             .declarations,
         ),
@@ -2742,7 +2741,7 @@ fn no_collect_group_option_suppresses_the_group() {
     // 14.3.2: "if one or both of no_collect and instance_no_collect
     // options of the group are evaluated to TRUE, the group shall not
     // be presented under that instance." The constant TRUE spelling is
-    // not presented at all — not sampled, not graded, not reported.
+    // omitted from the reported view and its grade.
     let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
          no_collect = TRUE;\n        item cur: uint using ranges = {\n            \
@@ -2761,7 +2760,7 @@ fn instance_no_collect_groups_are_not_presented_either() {
     // no_collect on the group) suppresses presentation the same way.
     let result = run_source_with_coverage(
         "extend sys {\n    event cov_e;\n    cur: uint;\n    cover cov_e is {\n        \
-         instance_no_collect = TRUE;\n        item cur: uint;\n    };\n    run() is also {\n        \
+         per_unit_instance;\n        instance_no_collect = TRUE;\n        item cur: uint;\n    };\n    run() is also {\n        \
          cur = 0; emit cov_e;\n    };\n};\n",
         1,
     );

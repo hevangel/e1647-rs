@@ -1,0 +1,2 @@
+8:32: error[E0220]: argument: a value of kind 'string' cannot be stored into 'int'
+2:43: error[E0220]: return value: a value of kind 'string' cannot be stored into 'int'

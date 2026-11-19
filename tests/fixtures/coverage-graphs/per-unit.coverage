@@ -1,0 +1,6 @@
+graph_u.cg@sys.a samples=2 grade=0.062
+transition__p samples=1 combinations=1 total=Some(16) goal=1 weight=1 grade=Some(0.0625)
+(0, FALSE)→(1, FALSE) hits=1
+graph_u.cg@sys.b samples=2 grade=0.062
+transition__p samples=1 combinations=1 total=Some(16) goal=1 weight=1 grade=Some(0.0625)
+(1, FALSE)→(0, FALSE) hits=1
