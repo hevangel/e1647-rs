@@ -48,6 +48,10 @@ remain unfinished.
 Scalar/list/reference aliases default through their declared representation.
 Defaulting more than 64 aliases reports a bounded diagnostic; cyclic default
 chains are rejected by that bound.
+Statement-position calls and `compute` preserve nested callee frames
+across waits and blocking resource calls. Calls inside value expressions
+and receivers whose types cannot be resolved before evaluation remain
+atomic.
 
 List extrema `min`, `max`, `min_index` and `max_index` accept an optional
 per-item key expression such as `it.score`. They return the selected
