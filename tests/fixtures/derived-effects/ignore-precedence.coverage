@@ -1,0 +1,4 @@
+sys.cg samples=4 grade=1.000
+cross_n__m samples=2 combinations=2 total=Some(2) goal=1 weight=1 grade=Some(1.0)
+(1, 0) hits=1
+(1, 1) hits=1

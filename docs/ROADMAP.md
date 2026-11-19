@@ -2,12 +2,12 @@
 
 The IEEE 1647-2019 migration phases below are complete; the broader
 milestones remain partial. Recent work adds conservative type checking
-(now including coverage items), bounded polynomial constraint solving
-and streaming temporal rule monitors. Remaining work includes full name
-resolution/type inference, temporal edge expressions, expression-value
-continuations for suspended calls, the remaining coverage options,
+(including coverage options and nested expression/temporal traversal),
+bounded polynomial constraint solving and streaming temporal rule monitors. Remaining work includes full name
+resolution/type inference, general temporal sampling timelines, continuations for scoped
+action/list callbacks, the remaining coverage options,
 general constraint solving, differential qualification, HDL event
-ordering and a browser sandbox API. Completed migration checkboxes do
+ordering and broader browser qualification. Completed migration checkboxes do
 not imply full language support or IEEE conformance.
 
 ## M0 — Repository and infrastructure
@@ -88,9 +88,9 @@ not imply full language support or IEEE conformance.
       methods and `on` blocks substitute the extension's formals with
       the instance's actuals and append. Typed `new
       <named-or-template-instance> [with { .. }]` instantiates and
-      runs the `with` assignments (clause 6.3); untyped `new` still
-      evaluates to an
-      explicit not-supported diagnostic. Coverage groups (clause 14.2)
+      runs the `with` assignments (clause 6.3); untyped `new` uses known
+      variable/assignment/field/parameter/return contexts and diagnoses
+      unavailable instance contexts. Coverage groups (clause 14.2)
       parse, are recorded, and collect: `cover <event> is [also]
       { item/cross/transition entries; option entries }` and `cover
       <event> is empty;` — item types and sampled expressions are
@@ -110,12 +110,14 @@ not imply full language support or IEEE conformance.
       grading. Per-instance coverage grades per bucket with holes
       (14.3.2), the option entries the prose defines apply
       (`at_least`/`weight`/`per_instance` at item and group level,
-      `no_collect`/`instance_no_collect` dropping the un-presented
+      `no_collect`/`instance_no_collect` hiding the un-presented
       group/item per 14.2.2/14.3.4, the cross/transition `name`
       option per 14.4/14.5), and the 14.9 configuration is honored
       through the builder API (`max_int_buckets`, the coverage mode);
-      the bool-exp option forms, the per-unit-instance scoping and
-      the option-table-image semantics remain not collected.
+      runtime configuration enables collection. Per-unit-instance
+      groups and group/basic-item `when` filters run; full option type
+      checking, real/enumeral ranges, derived-item ignore/illegal filters and radix
+      remain unfinished.
       Predefined non-scalar types `file` and `event` are accepted in
       type positions; `for each <type> (v) in list` records the element
       type filter. Simple macros expand (clause 15): `define <name'
@@ -188,12 +190,11 @@ not imply full language support or IEEE conformance.
       category validation — computed macros evaluate their restricted
       body subset, see M1), the remaining clause 14
       coverage model —
-      the bool-exp option forms (`no_collect`/`instance_no_collect`
-      with the implicit `inst` variable, `instance_ignore`/
-      `instance_illegal`), the per-unit-instance scoping (14.2.2), the
-      `radix`/`when`/`never` option semantics (the option tables are
-      not previously inspected); runtime configuration categories/options
-      beyond coverage mode and `max_int_buckets`, and `set_config_max()` —
+      real/enumeral ranges and general constant/type resolution,
+      `radix`/`never` and derived-item filters; full option type checking;
+      runtime configuration categories/options
+      beyond coverage mode, `max_int_buckets`, `at_least` and
+      `check_illegal_immediately`, and `set_config_max()` —
       the clause 12/13 temporal
       engine's remaining simulation integration — the scheduler runs
       started TCMs concurrently and waits/sync suspend, `@`-triggered
@@ -206,9 +207,10 @@ not imply full language support or IEEE conformance.
       and resume through the statement-path cursor), while re-entry
       into statement-position method calls and `compute` preserves
       callee frames, arguments and composed-body positions, including
-      recursive helpers and blocking resource calls. Calls embedded
-      in value expressions remain atomic; receivers whose object type
-      cannot be resolved before evaluation use ordinary dispatch —
+      recursive helpers and blocking resource calls. Scheduled instance
+      calls in value expressions retain completed operands, receivers,
+      arguments and results across suspension, including runtime-resolved
+      receivers. Scoped action/list callbacks and observation remain atomic —
       `detach`/`delay`/`exec` TEs, select
       choice policies beyond the constant-expression subset (the
       full choice-expression grammar and soft-order interactions),
@@ -217,6 +219,13 @@ not imply full language support or IEEE conformance.
       rules apply in one pass; the backtick Verilog-style names of
       4.1.5.4 and the cross-file include-order visibility of B.5 are
       not modeled)
+- [x] Disambiguate adjacent tick-qualified names from apostrophe numerals:
+      `when active_state'flag` and numeric-looking suffixes such as
+      `p.active_state'hFF` retain separate tick/name tokens. Complete standalone
+      numeral spellings remain numeric; partial numeric prefixes no longer split
+      an identifier. Simple closed quoted HDL path tokens retain their quotes.
+      Whitespace-separated complete radix forms retain numeral interpretation;
+      escaped/indexed HDL path grammar is outside this lexical milestone
 - [~] Add symbol resolution, types, diagnostics — well-formedness
       checks (duplicate declaration/field names, duplicate
       parameters/local variables/enumerals, unknown named/`like`/`extend`
@@ -234,11 +243,58 @@ not imply full language support or IEEE conformance.
       Scalar/list aliases resolve with bounded recursion. Unknown or
       ambiguous kinds and custom numeric dispatch remain conservative;
       there is no flow-sensitive or interprocedural inference. Coverage
-      options remain unchecked raw tokens and full name resolution is
-      still missing
-- [ ] Differential corpus against an authorized reference simulator where
-      available (started: Specman reference runs via EDA Playground are
-      recorded in docs/VERIFICATION.md; no automated differential harness yet)
+      Boolean options now report definite mismatches in their owner,
+      sampled-source and selected-unit contexts. Define kinds, composite
+      predicate operands, other option types and full name resolution
+      remain unfinished. All statement value children and nested expression
+      operands now traverse, including membership, casts, bit slices,
+      tables, typed/untyped `evaluate` bodies, `new ... with` initializers
+      and temporal rule/wait values. New initializers use a fresh frame;
+      evaluate locals shadow and restore caller bindings. Known result
+      kinds propagate for explicit evaluate, slices and in_table. Call
+      arguments are inferred once, preventing duplicate nested diagnostics.
+      Known declaration/assignment/field/parameter/return contexts now type
+      untyped evaluate/new bodies, including indexed/static targets and
+      qualified calls. Result metadata persists through TCM suspension;
+      expression bodies and calls isolate outer hints. Template-instance
+      kinds propagate and concatenation inference flattens list operands.
+      Known list indexes and membership containers/element kinds now receive
+      definite-kind checks; sets retain a kind without scalar-domain metadata.
+      General bidirectional inference, full set-domain/numeric checks,
+      pre-elaboration type-expression checking and general flow-sensitive narrowing
+      remain incomplete. Retained type annotations now traverse widths, keyed-list
+      keys (with an element-typed it), template value arguments and unresolved
+      typeof/typeof_item expressions. Known non-integer width kinds report E0223;
+      parameters bind before dependent annotations are checked. Type-position
+      hints and conditional binding effects stay isolated from surrounding values.
+      Explicit is-a binding kinds propagate on proven true/false guard paths,
+      including lazy and/or/implication operands, branches, while bodies,
+      check failure actions and ternary arms. Joins retain only agreed kinds;
+      possible replacement bindings invalidate stale local kinds. Registered
+      static fields and qualified call signatures now retain kinds. Static
+      initializers/methods/handlers are checked once in their declaring
+      scope, with omitted extension annotations inherited from the prototype.
+      Bare static-field writes and alias defaulting are corrected; bare
+      static method calls and full signature-equivalence checks remain gaps.
+      Present concrete implementation prototypes now receive E0311 for definite
+      interface contract mismatches (arity, annotation presence, scalar/list/
+      nominal kinds, known widths, return types and static implementations).
+      Lookup follows effective interfaces, like bases and extend blocks;
+      missing implementations remain runtime E0414. Symbolic/ranged types,
+      template/conditional-only implementations and general equivalence
+      remain conservative. Composed extension blocks now report E0225 for
+      definite arity, explicit parameter/result type or static-prefix changes;
+      omitted annotations inherit. Checks include when views, static registries
+      and substituted templates. Static registries compose declarations before
+      extends even when the extend appears first in the file
+- [~] Differential corpus against an authorized reference simulator where
+      available — earlier Specman reference runs via EDA Playground are
+      recorded in docs/VERIFICATION.md. The manifest-driven runner in
+      scripts/qualify.py checks native outputs and explicit reference-adapter
+      envelopes against independent expected values; CI runs native-only
+      candidates and protocol tests. A licensed Specman adapter and actual
+      differential qualification of the new cases remain unfinished; see
+      qualification/README.md
 
 ## M2 — Elaboration and randomization
 - [~] `extend`, `when`, units, structs and inheritance — elaboration
@@ -303,7 +359,13 @@ not imply full language support or IEEE conformance.
       list lengths)
 
 ## M3 — Behavioral execution
-- [~] Interpreter and method calling conventions — started: the
+- [~] Interpreter and method calling conventions — partial. Shared execution
+      plans implement `is first`/`is also`/`is only` ordering, replacement,
+      wrapper-local return, scalar parameter handoff and implicit result slots.
+      Ancestor wrappers surround subtype replacements, including tested when
+      views and templates. Atomic/static calls, suspended inline/started TCMs,
+      lifecycle hooks and inline sequence MAIN use the same policies; full
+      language execution and reference-simulator qualification remain gaps. The
       statement subset in `src/interp.rs` executes expressions, `var`,
       assignment, calls, `if`/`while`/`for`/`case`, `repeat until`
       (clause 20.2.3 — the body at least once), `break`/`continue`,
@@ -320,6 +382,8 @@ not imply full language support or IEEE conformance.
       numeric expression aggregates and the predicate queries `has`,
       `count`, `all` and `all_indices`; other expression-taking forms
       remain documented gaps reporting `E0405`),
+      list containment with duplicate counts (4.11.6), scalar/list membership
+      in integer/Boolean/enumeral sets, and
       struct instances, sequence `do` (generates the item in place; the
       `keeping` block is not enforced), and `gen`. The optional `do`
       sugar on `if`/`while` — including the one-statement
@@ -359,13 +423,31 @@ not imply full language support or IEEE conformance.
       state and evaluation context: rules sample before a global cycle
       closes and at quit, and waits sample at each check, preserving
       their local context. Later matching uses recorded values. Raw
-      `change`/`rise`/`fall` expressions and event-specific/per-instance
-      histories remain gaps. Suspension re-enters compound
+      `change`/`rise`/`fall` expressions now sample Boolean, integer and
+      enumeral values (12.2.18), including explicit event-clock gating
+      and late-arriving clock samples for suspended waits. Numeric
+      rise/fall compare magnitude; the first observation is a baseline.
+      Real/MVL/custom-numeric edges, static edge-width checks and general
+      event-specific/per-instance histories remain gaps; multiple
+      occurrences in one virtual cycle collapse to its sample.
+      Suspension re-enters compound
       statements, including `if`/`case`/`for`/`for each`/`repeat until`;
       statement-position calls and `compute` carry call-stack
-      continuations, including TCM entry-event waits. Calls embedded
-      in value expressions, unresolved receiver types and `on` blocks
-      remain atomic
+      continuations, including TCM entry-event waits. Scheduled value calls
+      also carry evaluation continuations through assignments, conditions,
+      arguments, receivers, returns, print parts and loop headers. Completed
+      operator/formatting results do not replay. Scoped evaluate/constructor
+      actions, list callbacks, generation/coverage observation, static methods,
+      `on` blocks and check failure actions remain atomic. Combined execution/typing fixtures verify saved parameter
+      and return metadata through nested waits, resource calls, entry events
+      and composed bodies. Compute arguments receive parameter hints. Physical
+      event identities isolate owners across waits/entry clocks/edge sampling;
+      bare/dotted/alias spellings agree without duplicate on/coverage work.
+      Callee parameter scopes bind entry events. Each created instance owns
+      rule monitors and failure/sample contexts; new instances join monitoring.
+      Static temporal event paths parse. Rechecked waits preserve age and new
+      waits reset it. Active event-reference rebinding, indexed temporal path
+      syntax and complete event-specific timelines remain gaps
 - [~] Coverage data model and reports — started: `src/coverage.rs`
       builds buckets and grades from the recorded groups (14.3's
       ranges/defaults, 14.6 merging), the interpreter samples on the
@@ -375,15 +457,18 @@ not imply full language support or IEEE conformance.
       (14.3.2 — the group grade is the weighted instance grades plus
       the per_type bucket), `at_least`/`weight` apply from the option
       tokens (the group-level spellings included, 14.9.3/14.9.4), the
-      constant-TRUE `no_collect`/`instance_no_collect` options drop
-      the group/item from the collected model (14.2.2/14.3.4), the
+      `no_collect`/`instance_no_collect` options hide the group/item
+      from reports while retaining sampling storage (14.2.2/14.3.4), the
       cross/transition `name` option renames the derived item
       (14.4/14.5), and `run --coverage` reports instances; the 14.9
       configuration is honored through the builder API
       (`max_int_buckets`, the coverage mode) and runtime `set_config(cover, ...)`.
       Runtime collection starts disabled until enabled explicitly.
-      Bool-exp forms, per-unit-instance scoping (14.2.2) and the remaining
-      option semantics are not collected
+      Per-unit scoping follows the nearest requested unit in the field
+      tree, including inherited units, flattened lists and unsampled
+      instances. Group/basic-item `when` filters run in the owner context;
+      hidden sources remain available to derived items. Full option type
+      checking and remaining option semantics are unfinished
 - [~] Coverage configuration options (14.9) and per-unit-instance options (14.2.2) —
       started: the configuration record (`CoverageConfig`: the
       coverage mode per 14.2's NOTE, `max_int_buckets` per 14.3's
@@ -392,8 +477,54 @@ not imply full language support or IEEE conformance.
       `count_only` collect; `off` pauses without clearing counts;
       Boolean values also control enablement. `max_int_buckets` accepts
       0–65536 before sampling; after sampling, changes report E0402.
-      Other runtime configuration categories/options, `set_config_max`,
-      bool-exp option forms and `per_unit_instance` scoping remain gaps
+      `per_unit_instance [= unit_type]` and `instance_no_collect` with
+      `inst` collect and present per-unit data (14.2.2/14.3.4); structural
+      option/scope errors are E0224. Other runtime configuration
+      categories/options, `set_config_max`, composite-valued predicates,
+      real/enumeral ranges, general constant/type resolution, radix/filter semantics and full option type checking
+      remain gaps. Derived name options and range labels evaluate supported
+      literal-string concatenation/grouping and decode runtime string escapes.
+      Invalid derived names report E0224; computed names participate in graph
+      lookup and duplicate checking. Supported initialized const fields resolve
+      after composition, including inherited fields and qualified static consts,
+      in names/ranges/goals/weights. Pure integer/string dependencies fold to
+      literal initializers shared with runtime storage. Resolution is bounded;
+      alias chains resolve to the supported scalar representations. Known
+      int/uint widths 1–127 and star widths participate when initial values
+      already fit; no general storage narrowing is added. Runtime arithmetic
+      shares representation/width resolution for direct operands, including
+      static fields. Unresolved widths, enums, dynamic initializers and general
+      constant expressions remain incomplete.
+      Integral range widths and per-range goals run with
+      range/item/group/global precedence; zero-goal buckets are ungraded
+      and do not show holes. Explicit construction is capped at 65536
+      buckets per item; checked i128 arithmetic diagnoses unsupported or
+      overflowing parameters (E0224). Global at_least changes are allowed
+      before sampling and report E0402 afterwards. Basic-item ignore/illegal
+      and per-unit instance variants exclude observations and whole buckets;
+      illegal values produce immediate or deferred DUT errors. Interval masks
+      and bounded arithmetic classification preserve derived bucket identity.
+      Cross/transition when, visibility, hit-goal and weight options run over
+      basic and previously declared derived sources. Derived grades enter the
+      weighted per-type aggregate in
+      mixed per-instance groups; filtered transitions retain source history.
+      Derived source graphs preserve nested key identities, current-round
+      freshness, masks and per-unit histories. Source order/name/arity errors
+      are E0224; expanded tuples are capped at 65536 scalar components.
+      Scalar cross/transition ignore/illegal predicates and instance variants
+      filter observations and classify finite integral/Boolean combinations.
+      Transitions bind prev_<source> snapshots. Basic and derived masks commit
+      together. Conservative interval proofs handle supported relations, logic,
+      membership and safe arithmetic; unknown regions split iteratively and
+      retain concrete evaluation. The per-item budget is 65536 scalar-domain
+      work units. Full signed-domain splitting avoids midpoint overflow;
+      checked negation diagnoses the storage limit rather than panicking.
+      Unbucketed real/string/enumeral sources filter points without grades.
+      Composite-valued predicates and general wide-domain classification remain
+      gaps; constant predicates work over nested sources. Unit scope freezes
+      after all instance-dependent coverage options. Source-kind-aware metadata
+      lookup resolves aliased items despite physically earlier extensions.
+      Exact overlap/phase/filter-side-effect behavior needs qualification
 - [~] Part 2 predefined routine library — started with the reflection
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`
       (5.10.5/5.10.6 — the argument parses as a type) build the
@@ -435,19 +566,33 @@ not imply full language support or IEEE conformance.
       (VHPI — not implemented) plugs in with one `Simulator` impl and one
       registry arm. Still one real simulator binding, and no backend
       selection knob yet (`hdl_load` resolves through the default
-      backend)
+      backend). Session startup/commands/finish now have bounded handshakes,
+      strict reply grammar and checked error/exit propagation. The bridge
+      explicitly transports signed 32-bit VPI values and rejects wide/MVL
+      transfers. Optional waveform instrumentation is available.
 - [~] SystemVerilog integration tests and event ordering — started: the
       compose `mixed` service runs `examples/mixed_counter.e` against
       `examples/mixed/counter.sv`. Event ordering between e and the HDL
-      simulator is not implemented
-- [~] WASM build and browser sandbox API — started: the core library
-      (lexer/parser/elaborator/interpreter) compiles for
-      `wasm32-unknown-unknown` (CI runs `cargo check --target
-      wasm32-unknown-unknown`); nothing had to be excluded from the
-      build, and the process-spawning xezim backend is native-only by
-      cfg there (`hdl_load` under wasm32 fails with the honest
-      no-simulator error). No browser sandbox API and no wasm runtime
-      test yet
+      simulator is not implemented. The separate scripts/qualify_hdl.py
+      runner checks the pinned xezim profile's exact outputs/diagnostics,
+      VCD transitions and HDL code coverage, including both mixed examples;
+      see [HDL_QUALIFICATION.md](HDL_QUALIFICATION.md). This is explicit
+      hdl_run/READY qualification, not general scheduler integration.
+      The Dockerfile build and actual qualify-hdl/verify services passed
+      locally; a separate CI job builds the image, runs the real profile
+      and retains owned artifact evidence
+- [x] Experimental single-source WASM build and browser sandbox API:
+      versioned parse/check/run ABI, spanned diagnostics, console text,
+      DUT failure counts and basic/derived coverage summaries. Disposable workers
+      provide cancellation/deadlines; the shipped default-feature module
+      has zero host imports and a 128 MiB linear-memory maximum. Real
+      Chromium tests cover the ABI, pipeline, worker lifetime and demo;
+      CI repeats those tests. Cross/transition summaries include sources,
+      goals/weights, totals, grades and observed combination arrays; hidden
+      sources and duplicate labels retain the native reporting semantics.
+      Imports/native HDL are unavailable; other browser engines and a security audit
+      remain outside this scoped milestone. See
+      [BROWSER_SANDBOX.md](BROWSER_SANDBOX.md)
 
 ## Migration to IEEE 1647-2019
 

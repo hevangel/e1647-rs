@@ -1,0 +1,4 @@
+8:5: error[E0311]: implementation 'widths_s.defaulted' has a different signature from interface 'widths_i' (clause 6.3)
+9:5: error[E0311]: implementation 'widths_s.long_mode' has a different signature from interface 'widths_i' (clause 6.3)
+10:5: error[E0311]: implementation 'widths_s.short_mode' has a different signature from interface 'widths_i' (clause 6.3)
+11:5: error[E0311]: implementation 'widths_s.result' has a different signature from interface 'widths_i' (clause 6.3)

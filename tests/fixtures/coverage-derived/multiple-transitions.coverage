@@ -1,0 +1,4 @@
+sys.cg samples=2 grade=0.125
+enabled samples=1 combinations=1 total=Some(4) goal=1 weight=1 grade=Some(0.25)
+disabled samples=0 combinations=0 total=Some(4) goal=1 weight=1 grade=Some(0.0)
+FALSE→TRUE hits=1

@@ -2475,9 +2475,9 @@ impl Parser {
     /// `cover <event> is { [items, crosses, transitions, option
     /// entries] };` (clause 14.2) or `cover <event> is empty;`. Items
     /// parse structurally (`item name [: type] [= expr] [using …];`);
-    /// every `using` option clause and non-item body entry is recorded
-    /// as raw tokens — the option semantics belong to the coverage data
-    /// model, a later milestone. Nothing is collected at run time yet.
+    /// header/body options retain raw tokens with source spans. The
+    /// coverage model validates supported option expressions and scopes;
+    /// runtime collection belongs to the interpreter.
     fn parse_cover_group(&mut self) -> Option<crate::ast::CoverGroupDecl> {
         let start = self.current_span().0;
         self.bump(); // 'cover'
@@ -2485,6 +2485,33 @@ impl Parser {
         // The group identifies by its sampling event's path.
         let name = render_expr_path(&event).unwrap_or_default();
         let name_span = event.span();
+        let mut options = Vec::new();
+        if self.eat_keyword("using") {
+            let mut entry = Vec::new();
+            let mut depth = 0usize;
+            while self.peek().is_some() {
+                if depth == 0
+                    && self.peek_word_is("is")
+                    && match self.peek_second_kind() {
+                        Some(TokenKind::Punctuation(p)) => p == "{",
+                        Some(TokenKind::Keyword(k)) => k == "also" || k == "empty",
+                        _ => false,
+                    }
+                {
+                    break;
+                }
+                let token = self.bump();
+                if let TokenKind::Punctuation(p) = &token.kind {
+                    match p.as_str() {
+                        "(" | "[" | "{" => depth += 1,
+                        ")" | "]" | "}" => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                entry.push(token);
+            }
+            options.push(entry);
+        }
         self.expect_keyword_word("is")?;
         // `cover ... is also { .. }` extends the group (clause 14.6).
         let is_also = self.eat_keyword("also");
@@ -2499,13 +2526,12 @@ impl Parser {
                 is_also,
                 items: Vec::new(),
                 annotations: Vec::new(),
-                options: Vec::new(),
+                options,
                 span: (start, end),
             });
         }
         self.expect_punct("{", "E0106", "expected '{' to open the cover group body")?;
         let mut items = Vec::new();
-        let mut options = Vec::new();
         while !self.at_punct("}") && self.peek().is_some() {
             if self.at_punct(";") {
                 // A stray empty statement (`;;`) is tolerated.
@@ -2514,6 +2540,7 @@ impl Parser {
             }
             if self.at_keyword("item") || self.at_keyword("cross") || self.at_keyword("transition")
             {
+                let item_start = self.peek().expect("coverage item token exists").start;
                 let kind = if self.at_keyword("item") {
                     crate::ast::CoverItemKind::Item
                 } else if self.at_keyword("cross") {
@@ -2570,7 +2597,7 @@ impl Parser {
                     ty,
                     expr,
                     using,
-                    span: (start, end),
+                    span: (item_start, end),
                 });
             } else {
                 // A group-level option entry (`per_instance = TRUE;`,
@@ -2845,6 +2872,12 @@ impl Parser {
         let (start, _) = self.current_span();
         let (first, _) = self.expect_word("E0102", "expected the event name after '@'")?;
         let mut first = first;
+        if self.eat_punct("::") {
+            let (event, _) =
+                self.expect_word("E0102", "expected a static event name after '::'")?;
+            first.push_str("::");
+            first.push_str(&event);
+        }
         while self.at_punct("$") {
             self.bump();
             first.push('$');
@@ -6006,4 +6039,31 @@ pub fn parse_temporal_expression(source: &str) -> Result<crate::ast::TemporalExp
             .unwrap_or_default());
     }
     Ok(te)
+}
+
+/// Parse a recorded expression without discarding its source spans.
+pub(crate) fn parse_expression_tokens(
+    tokens: &[Token],
+) -> Result<Expr, crate::diagnostic::Diagnostic> {
+    let eof = tokens.last().map(|token| token.end).unwrap_or(Position {
+        byte: 0,
+        line: 1,
+        column: 1,
+    });
+    let mut parser = Parser::new(tokens.to_vec(), eof);
+    let expr = parser.parse_expr();
+    if parser.peek().is_some() {
+        parser.error_here("E0224", "unexpected token in coverage option expression");
+    }
+    if let Some(diagnostic) = parser.diagnostics.into_iter().next() {
+        return Err(diagnostic);
+    }
+    expr.ok_or_else(|| {
+        crate::diagnostic::Diagnostic::new(
+            "E0224",
+            "expected a coverage option expression",
+            eof,
+            eof,
+        )
+    })
 }

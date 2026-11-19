@@ -1,0 +1,40 @@
+unit child_u {
+    event ready;
+    worker() @sys.any is { emit ready; };
+};
+extend sys {
+    child: child_u is instance;
+    event ready;
+    !flag: bool = FALSE;
+    !hooks: uint = 0;
+    !hits: uint = 0;
+    cover ready is { item flag: bool; };
+    on ready { hooks = hooks + 1; };
+    qualified() @sys.ready is { hits = hits + 1; };
+    bare() @ready is { hits = hits + 1; };
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also {
+        start qualified();
+        start child.worker();
+        wait [2]*cycle;
+        check that hits == 0;
+        check that hooks == 0;
+        start bare();
+        sync;
+        emit ready;
+        sync;
+        check that hits == 2;
+        check that hooks == 1;
+        emit sys.ready;
+        wait @ready;
+        sync;
+        emit me.ready;
+        wait @sys.ready;
+        sync;
+        var root_ref := me;
+        emit root_ref.ready;
+        wait @sys.ready;
+        check that hooks == 4;
+        out("root event aliases passed");
+    };
+};

@@ -10,7 +10,8 @@
 
 Still ahead of the code: a typed IR, and simulator bindings beyond the
 xezim bridge (VHPI among them). The library compiles for wasm32; a
-browser sandbox API is not started.
+single-source browser sandbox API runs in disposable workers (see
+[BROWSER_SANDBOX.md](BROWSER_SANDBOX.md)).
 
 ## Principles
 
@@ -32,8 +33,14 @@ browser sandbox API is not started.
   prose outside those segments is skipped. A file with no begin marker
   is tokenized as code throughout. Decimal integers take a `K`/`M`
   multiplier, `0c"..."` is a character literal, and non-decimal based
-  literals accept MVL digits. A bare `'` is punctuation, so
-  `'path.to.signal'` can be parsed later. Reports the first lexical
+  literals accept MVL digits. An adjacent identifier/tick suffix takes
+  qualification precedence, including flag and fully numeric-looking suffixes
+  such as hFF. Otherwise an unsized numeric candidate must end at an identifier
+  boundary; separate complete radix spellings stay numbers. A closed simple
+  quoted path preserves its quotes even when its name looks numeric. The
+  cursor remembers the previous identifier's byte end; whitespace/comments
+  break adjacency, preserving separated numeric macro arguments. Escaped or
+  indexed path parsing is not added. Reports the first lexical
   error; later stages collect many. MVL literals are tokenized and not
   evaluated. Block comments (`/* */`) are standard (clause 4.2.4):
   they span lines and code segments and do not nest.
@@ -121,8 +128,8 @@ browser sandbox API is not started.
   original template's own categories stay unvalidated (8.7's NOTE 2),
   and an arity mismatch reports `E0304` once and skips the extension.
   Typed `new <named-or-template-instance> [with { .. }]` instantiates
-  and runs the `with` assignments (clause 6.3); untyped `new` parses
-  to an explicit not-supported runtime diagnostic.
+  and runs the `with` assignments (clause 6.3); untyped `new` uses a known
+  contextual instance type or reports E0402 when no such context resolves.
   Clause 14 coverage groups (`cover <event> is [also] { .. };`, `is
   empty;`) record their item/cross/transition entries structurally and
   every option clause verbatim; the derived entries synthesize
@@ -156,7 +163,7 @@ browser sandbox API is not started.
   `E01xx` syntax, `E02xx` well-formedness; see the module documentation)
   and the AST stays partial under errors.
 - `src/temporal.rs` — the clause 12 temporal-engine core, a pure
-  library the interpreter will drive: `sampled_normal_form` propagates
+  library driven by the interpreter: `sampled_normal_form` propagates
   a temporal expression's sampling event so every atom carries it
   (12.1.4; sub-sampled subtrees keep their own event, 12.2.6) and
   `holds_tightly`/`succeeds` evaluate tight satisfaction (12.1.1.2) and
@@ -168,8 +175,9 @@ browser sandbox API is not started.
   true-match repeats (12.2.10–12.2.11), first-match repeats as sequence
   items (12.2.12), `fail`/`not`/`eventually` (12.2.13/17/15).
   Propositions and repeat bounds are evaluated through caller-supplied
-  callbacks; `change/rise/fall(exp)` edge samples report
-  `EvalError::EdgeSample` (raw edge-value history is not modeled)
+  callbacks or recorded history; `change/rise/fall(exp)` read recorded
+  edge results (12.2.18). Missing or unsupported edge samples report
+  `EvalError::EdgeSample`
   and unresolvable constructs report `EvalError::Unsupported`. The
   same module hosts the run-loop monitoring helpers:
   `succeeded_somewhere` (12.3.2 at any point), `rule_failed` (the
@@ -191,8 +199,19 @@ browser sandbox API is not started.
   same-named field. An explicit item type checks compatibility (E0220),
   and expression traversal checks missing members, indexing and operand
   kinds (E0221–E0223). Unknown kinds stay silent. Cross/transition names
-  refer to items rather than owner fields; raw coverage options remain
-  unchecked. Typed method parameters bind within their method scope.
+  refer to items rather than owner fields. Effective Boolean options are
+  checked using the shared coverage option parser: `when` uses the owner,
+  instance visibility also binds the selected unit as `inst`, and
+  ignore/illegal predicates bind sampled basic sources without an owner
+  receiver, including `prev_<source>` for transitions. Instance effects
+  also bind `inst`; it takes precedence over a same-named source. Each
+  expression must be compatible with bool (E0220); ordinary conservative
+  traversal also reports E0221-E0223. Unknown kinds, define constants and
+  composite-valued sources remain conservative. Group extensions use the
+  final effective options. Scopes are discarded before checking methods
+  and other types. This does not add complete name resolution or type
+  checking for every option/expression form. Supported option syntax and
+  unit scopes are checked during elaboration. Typed method parameters bind within their method scope.
   Local `var x := e` declarations retain known initializer kinds,
   including homogeneous list literals and equal-kind ternary branches
   (clause 18). Scalar/list aliases resolve with a depth bound; recursive
@@ -201,6 +220,95 @@ browser sandbox API is not started.
   also remains unknown. This is declaration inference, with no
   flow-sensitive narrowing or interprocedural inference; full name
   resolution remains a gap.
+  Expression traversal is exhaustive over the AST's ordinary value children:
+  membership elements and sets, casts, bit slices, table tuples/rows, set
+  literals, select weights, chosen-from targets/lists and unknown callees.
+  Retained type expressions now traverse scalar/formal widths, nested list
+  elements/keys, template arguments and unresolved typeof placeholders.
+  Keys bind it to the list element kind; all parameters are bound before
+  checking dependent method annotations. Definite non-integer widths report
+  E0223. The visitor clears value hints, restores local kinds and discards
+  type-position binding effects afterward. It visits alias/field/method/local,
+  coverage and expression type sites, with a recursion bound of 64. Expressions
+  already replaced by elaboration cannot be recovered by this pass; raw select
+  choice tokens still need their grammar. Cast result kinds stay unknown because the
+  evaluator's fallback preserves its input. Explicit `evaluate` results,
+  slices and `in_table` results have known kinds. An evaluate body gets a
+  scoped result local and keeps the owner/caller context; a new initializer
+  gets a fresh locals frame, no enclosing return type, and the known new
+  object as its receiver. Scoped expected kinds now reach evaluate/new
+  from known variables, assignment targets, field initializers, method
+  parameters and returns. Explicit expression annotations take precedence.
+  Calls clear the enclosing hint and bind each argument's parameter hint;
+  list predicates supply Bool. Expression bodies clear the enclosing hint
+  before walking actions; their own declarations/assignments supply hints.
+  Constructor elements can use a surrounding list's element context, and
+  concatenation type inference flattens list operands to match evaluation.
+  Materialized templates retain object kinds. Unknown contexts remain
+  conservative; this is not general bidirectional or flow-sensitive inference.
+  All statement value children now traverse, including loop bounds, print,
+  gen, emit, rgf assignment, wait, start and compute. The recorded foreach
+  index-name path is structural, not treated as an evaluated expression.
+  Temporal rule/wait propositions, edge operands and repeat bounds traverse
+  recursively, as do rule else actions; event reference paths remain
+  structural. A cloned exact-count repeat bound is checked once. This adds
+  no temporal execution support or new temporal operand typing rule.
+  Events/ports have unknown value kinds rather than false missing-member
+  errors. Known method arguments are inferred once, then validated against
+  their signatures without re-traversing them. Known list indexes require
+  integer/enum kinds (E0223); their integer context is independent of the
+  result's context. Membership unwraps a contained list's item kind before
+  comparison, checks known list/set containers and rejects definite element
+  mismatches (4.11.6). Declared sets, literals and set_of_values have a Set kind;
+  scalar domains and unsupported numeric conversions remain conservative.
+  Operand traversal runs once without inheriting the Boolean result context.
+  Explicit is-a bindings retain facts for true and false Boolean outcomes.
+  Lazy and/or/implication inference checks operands once under their entry
+  facts; joins retain identical kinds only. Possible binding writes invalidate
+  earlier facts, including shadowed frame locals. Branches, while bodies,
+  check failure actions and ternary arms install temporary proof scopes.
+  This does not narrow the tested operand or change interpreter binding
+  lifetimes. Define and predefined constant precedence now
+  applies across every checked context, preventing same-named fields or
+  locals from supplying the wrong kind; define values remain unknown.
+  Registered `Type::field` accesses read kinds from the exact declaring
+  registry; qualified calls check arguments once against that owner's
+  prototype and retain the declared result kind. E0307 still owns invalid
+  static-member shape/ownership checks. Static entries are checked once
+  from their registries, skipping inherited/synthesized copies. A static
+  method/handler has its declaring namespace but no `me`; bare static fields
+  follow the bounded base-chain lookup after locals. Static initializers
+  have neither receiver nor a bare static namespace, matching current runtime
+  initialization. A declaration is preferred over physically earlier
+  extension blocks; omitted extension annotations inherit by parameter
+  position/result. Explicit extension annotations, arity and static prefixes
+  now receive E0225 contract checks after composition/template substitution;
+  general type equivalence stays conservative. Unregistered/template entries stay
+  conservative. New initializers clear the caller's static context and restore
+  it afterward. Bare static method calls remain unsupported in the runtime
+  and unknown to this checker; qualified calls are the supported form.
+  The runtime carries contextual TypeExpr hints separately from its existing
+  arithmetic-precision lookup. Context lookup inspects metadata without
+  evaluating receivers or indexes: it follows known members, static fields,
+  list elements, declared method results, equal-shaped branches/literals and
+  supported inferred-value shapes. Alias lookup is bounded; inferred list
+  shape recovery is depth-capped and memoizes identities to reject cycles and
+  avoid repeated DAG traversal. Call argument lookup runs only for expressions
+  that can use a hint. Field initializers receive their declaration type.
+  One method-frame builder binds prototype metadata and return types for
+  inline/static/statement calls and started TCMs, preserving it in suspension
+  snapshots. New/init/evaluate bodies isolate caller hints; failure paths
+  restore expected types. E0122/E0402 remain the runtime diagnostics when a
+  required evaluate/new context is unavailable. No numeric-width inference,
+  full subtype inference or type-embedded resolution is added here.
+  Native membership compares list items through ordinary equality, with
+  input snapshots and distinct candidate matches for list-to-list containment.
+  Iterative augmenting paths avoid a greedy mismatch when mixed numeric
+  equality gives overlapping candidates; no recursive search is used. Set
+  membership checks each scalar or left list item against canonical intervals,
+  converting Boolean/enumeral values to their indices. Set multiplicity is
+  irrelevant. Real-valued set membership and full domain qualification remain
+  gaps. Inferred native set values also supply a contextual set hint.
 - `src/elab.rs` — member composition: `like` chains and `extend` blocks fold
   into one composed member list per `struct`/`unit` (inheritance-cycle,
   cross-declaration duplicate-field and unmodified-method-redefinition
@@ -237,7 +345,7 @@ browser sandbox API is not started.
   take the 14.3 defaults (16 buckets for integers — "0 through 15" —
   two for booleans; anything else is ungradeable with a note). The
   interpreter samples a group when its event fires: each item's
-  recorded expression evaluates in the emitting frame (or the named
+  recorded expression evaluates in its owning struct (or the named
   field is read) and the value lands in the containing bucket;
   out-of-range values are ungradeable (14.3: "goals of 0"). Grades
   are covered-buckets-per-item, averaged over gradeable items; cross/
@@ -250,9 +358,73 @@ browser sandbox API is not started.
   per_type bucket), `weight = N` scales the grade contribution, the
   group-level `at_least`/`weight` spellings apply to items without
   their own (14.9.3/14.9.4), `no_collect`/`instance_no_collect`
-  (group, 14.2.2; item, 14.3.4) drop the group/item from the
-  collected model when TRUE, and the cross/transition `name` option
-  renames the derived item (14.4/14.5). The 14.9 coverage
+  (group, 14.2.2; item, 14.3.4) suppress presentation while retaining
+  sampling storage, and the cross/transition `name` option
+  renames the derived item (14.4/14.5). Derived `when` filters run with fresh
+  owner frames: transitions at the source observation, crosses after basic
+  sources for the round. Filtering a transition does not rewind the last
+  legal source observation. Derived visibility options keep collected data
+  but remove presentation and grade contributions, including per-unit
+  visibility changes. Goals count combinations reaching their required
+  hits, with item > group > runtime defaults; zero goals are ungraded.
+  Weights scale derived contributions within the same per-type aggregate
+  used by ordinary and mixed per-instance groups. Zero weights contribute
+  nothing, and floating-point weight totals avoid u64 sum overflow.
+  Checked u64 products keep large combination domains ungradeable rather
+  than overflowing; transition totals avoid host-pointer-width arithmetic.
+  Derived nodes can reference earlier basic/derived names in their group.
+  Observation keys reference stable basic bucket indices or parent key
+  indices, independently of display labels. Each source retains its previous
+  observation and current-round freshness. Transition descendants run from
+  a declaration-ordered work set as their source is produced; crosses run
+  in declaration order after basic sampling and produce further transitions.
+  Filtering a parent produces no child source; filtering a transition still
+  advances its parent history. Hidden nodes remain sampling sources.
+  A linear pass recomputes nested validity and combination counts against
+  current basic masks, preserving original keys for mask restoration. Empty
+  source domains dominate unknown/unrepresentable products. Unbucketed
+  strings/reals retain value labels while grades remain unavailable.
+  E0224 validates source arity, unique names and earlier declarations in the
+  merged base-then-extension order. A 65536 expanded scalar-component cap
+  bounds tuple expansion separately from bucket cardinality. Cycles are
+  rejected as invalid forward/self references; iterative processing avoids
+  recursive source-graph walks. The library round API requires begin_sample,
+  sample for each basic source, then record_crosses to finalize derived stats;
+  completing the same round twice does not add duplicate derived samples.
+  Scalar basic observations additionally retain owned value snapshots, separate
+  from labels/identities. Cross predicates bind their participating basic items;
+  transition predicates bind the source and prev_<source>. Instance variants
+  also bind the unit as inst. Pure-expression validation rejects owner/local
+  access, calls and direct composite-valued operands (E0224). Runtime Boolean
+  checks are E0402. Ignore short circuits illegal, using the existing overlap
+  policy and immediate/deferred DUT reporting. Suppressed derived observations
+  do not become child sources; basic source history still advances.
+  Derived integral/Boolean classification first proves uniform outcomes over
+  the remaining source envelope. `coverage/proof.rs` propagates conservative
+  integer intervals and total Boolean domains, respecting short-circuit logic,
+  conditionals and membership evaluation order. Arithmetic bounds require
+  checked endpoints; possible storage overflow stays unknown. Singleton inputs
+  use the real evaluator. Constant/name lookup respects define/predefined
+  precedence and the implicit inst binding. The current predicate-frame numeric
+  semantics are preserved; this adds no field-width precision support.
+  Uniform results retain the full source domain or exclude the node without
+  Cartesian enumeration. Otherwise bucket tuples use an iterative box work
+  list, exact proofs and concrete lower-end witnesses. Unknown boxes split the
+  first referenced varying axis; a sign-biased u128 midpoint handles the full
+  i128 domain without overflow. Basic ignore/illegal predicates participate in
+  every proof/check. A shared 65536 scalar-domain work budget charges each
+  interval proof and concrete check by its axis count. Excess work diagnoses
+  E0402 instead of inventing a mask. No recursive box search is used.
+  Basic source declaration/prototype lookup is shared with the basic classifier
+  and filters by Item kind, preventing earlier extension transitions from
+  shadowing aliased source types. Integer-minimum negation reports E0402 rather
+  than panicking. Constant prefixes can still exclude nodes before domain work.
+  All basic and derived masks commit together after successful classification.
+  Unbucketed real/string/enumeral sources filter points only and remain ungraded.
+  Constant predicates work over nested sources; source-dependent classification
+  over mixed composite inputs remains E0402. Composite-valued predicates,
+  general wide-domain classification, typed-domain/precision proofs and exact
+  side-effectful filter ordering still need implementation/qualification. The 14.9 coverage
   configuration (`CoverageConfig`: the coverage mode per 14.2's NOTE
   and `max_int_buckets` per 14.3's bracket) is honored through the
   `build_with_config` builder API and `set_config(cover, ...)` (29.9).
@@ -260,11 +432,49 @@ browser sandbox API is not started.
   which starts disabled. It validates category/option keyword positions
   before evaluating values and commits option changes together. Mode
   changes gate emit-driven and procedural sampling without clearing data.
-  Before sampling, `max_int_buckets` changes rebuild the schema from the
+  Before sampling, `max_int_buckets`/`at_least` changes rebuild the schema from the
   composed type declarations; after sampling they report E0402. The
   runtime resource bound is 65536 buckets per default integer item.
-  `range(...)`'s numeric parameters beyond
-  bounds/label are recorded, not applied.
+  Per-unit groups keep a schema plus one collection per containing unit,
+  labelled by `CoverGroupData::unit_instance`. The bounded, visited-set
+  instance walk resolves the nearest requested unit through inheritance,
+  flattened lists and cycles; aliases use the first visited path.
+  Unsampled units keep zero-hit groups. Structural option/scope errors
+  report E0224 after composition. `when` expressions use a fresh owner
+  frame; per-unit presentation expressions bind `inst` to the associated
+  unit. Crosses require current-round source values, and transitions keep
+  previous sampled values separately. The returned report view removes
+  hidden items/groups and per-unit schema placeholders. Full option type
+  checking, derived-item ignore/illegal filters and radix remain unfinished.
+  Basic-item ignore/illegal predicates run in fresh frames with only their
+  item, constants, and (for instance variants) the associated `inst`. Calls
+  and owner/local access are rejected with E0224. Non-Boolean results and
+  unsupported wide classification report E0402. Comparisons, membership
+  and logical compositions classify integral/Boolean intervals exactly;
+  other pure shapes enumerate with a shared 65536-candidate budget per item
+  refresh. Short circuit domains prevent evaluating guarded arithmetic on
+  excluded values. Masks commit atomically per group and refresh at sampling,
+  grade computation and final reporting. Partial buckets remain gradeable;
+  fully ignored/illegal buckets leave the denominator and report view.
+  Legal observations retain their original counts; ignored/illegal observations
+  are never recorded. Derived keys retain bucket indices separately from
+  display names, enabling current masks to filter historical combinations
+  and recompute possible-combination totals. Restoring masks reveals earlier
+  legal history. Unbucketed real/string items filter actual observations only.
+  Illegal observations queue DUT errors until after check hooks, with a final
+  flush after finalize/stop; check_illegal_immediately reports at observation.
+  Ignore takes precedence over illegal on overlap. This precedence, mutable
+  masks and exact reporting-phase placement are not reference-qualified.
+  Predicate arithmetic uses the interpreter's current scalar model; complete
+  typed-domain and precision proofs remain future work.
+  Integral `range(...)` construction parses positional name/width/goal
+  parameters, subdivides inclusive bounds and uses stable automatic bucket
+  labels. Range-local goal metadata preserves precedence over item/group/
+  global defaults. Zero-goal buckets retain counts but leave the bucket-grade
+  denominator; they do not report holes. Checked i128 constant arithmetic
+  rejects overflow/division errors, and construction is capped at 65536
+  buckets per item. General constant-name/type resolution, real/enumeral
+  bounds and item-domain width proofs remain unfinished.
 - `src/interp.rs` — interpreter for the statement subset (codes
   `E0401`–`E0413`). List values (clause 4.11.4's `list_ptr==`) carry
   reference identity: a `Value::List` holds its items behind a shared
@@ -305,22 +515,65 @@ browser sandbox API is not started.
   evaluated arguments, callee locals and composed-body index. Nested
   helpers and `compute` suspend on the same coroutine; returning
   restores the caller without replaying its prefix. Entry-event waits
-  park through the scheduler's event wake pass. Value-expression calls,
-  receivers whose types cannot be resolved before evaluation, `on`
-  blocks and check failure bodies remain atomic. Temporal waits
+  park through the scheduler's event wake pass. Compute argument evaluation
+  uses the same pure parameter-context lookup as ordinary/started calls.
+  Parameter/return metadata survives nested suspension and composed-body
+  transitions. Instance event keys encode physical owner plus event/port
+  name. Static event keys retain Type::event; bare/dotted/me/self/alias paths
+  bind in the owning frame. Emission receiver expressions evaluate once and
+  on/coverage processing occurs once for the physical owner. TCM entry paths
+  bind to the callee and already evaluated parameter values, not its caller.
+  Temporal expressions bind dotted event paths at rule registration or wait
+  entry, retaining those identities through suspension; the pure core still
+  accepts opaque string event keys. Static temporal paths use one
+  type-qualified segment. Indexed temporal path syntax and active event
+  reference rebinding remain unsupported. Scheduled value calls attach a
+  `StatementEvaluation` tree to the statement path and descend through a
+  synthetic call level. Completed evaluation nodes retain values and ordered
+  child positions; replay traverses cached nodes until the pending call,
+  resumes its saved frame, then continues the original expression. Keeping
+  the original AST preserves operand precision and contextual type lookup.
+  Operator results and formatted print parts are evaluation nodes too, so
+  completed custom numeric callbacks do not replay. Each committed while
+  iteration resets its header tree; repeat-until records whether the body
+  completed before a suspended condition. Composed calls retain their last
+  return value. A private `ExecError` separates suspension/stop control from
+  public diagnostics; statement boundaries translate control into `Flow`.
+  Scoped evaluate/constructor actions, list callbacks, generation/coverage
+  observation, static methods, `on` blocks and check failure bodies remain
+  atomic. Any additional legal suspension in scoped callbacks requires
+  separate handling for their locals and partially committed effects.
+  Static methods are not TCMs (17.2.2); on actions prohibit time-consuming
+  actions (11.3), and evaluate actions exclude wait/sync/return (4.17.7).
+  Remaining callback work must preserve those restrictions. Temporal waits
   (`@event`, sequences, propositions, event
   repeats, with 13.2.4's readability-only `until`) re-evaluate at
   every turn (12.3.2); propositions and repeat bounds retain sampled
   results in each state, scoped to the individual wait. Rules retain
   their own samples before global cycles close (including inline time
-  advances) and at quit. The pure core reads these historical values,
+  advances) and at quit. Runtime rules are materialized once per physical
+  created instance, including later allocations, with independent monitor,
+  sample context and registration-cycle log window. Uninstantiated types create no
+  monitors. Failure actions execute on the declaring instance. A wait's
+  age survives repeated checks, while the next span/start gets a fresh budget. The pure core reads these historical values,
   and numeric repeats read their bound at the path's starting state;
   callbacks remain available for external caller-supplied paths. Missing
   history does not fall back to present-day values. This is expression
   result history, not arbitrary variable snapshots or event-specific
-  sampling timelines. A temporal wait
+  sampling timelines. Scalar edges retain their previous sampled value
+  per evaluation context and expression. Boolean/integer/enumeral values
+  are supported; numeric rise/fall compare magnitude, and the first
+  sample establishes a baseline. Explicit event clocks gate sampling;
+  suspended waits capture those clocks at cycle closure and consume
+  matches since their previous check, so a clock after the waiter's turn
+  is retained. No repeated whole-prefix scan is needed: only the prior
+  in-progress state and newly appended states can gain matches. Finished
+  or expired wait contexts retire their sampling state. Real/MVL/custom
+  numeric edges and static edge-width legality remain gaps, and multiple
+  occurrences in one virtual cycle collapse to that cycle's sample.
+  A temporal wait
   unsatisfied after 1,000 cycles reports `E0409`, and unevaluable TEs
-  (`change/rise/fall`, unresolvable bounds) report `E0402` honestly.
+  (unsupported edge values/clocks, unresolvable bounds) report `E0402` honestly.
   `sync` (13.2.3) parses in bare and TE forms — the bare form
   suspends one cycle, the TE form behaves like the temporal wait.
   `expect`/`assume` rules (elaborated per type, 11.4) stream through
@@ -397,66 +650,155 @@ browser sandbox API is not started.
   impl and one registry arm. Quoted HDL paths and the `hdl_*` routines
   read through `SignalSource`, which holds whichever backend loaded (or
   the injected per-cycle history).
+  Native sessions use a bounded reader queue, 16-KiB lines and one deadline
+  for a complete exchange (including RUN's OK/READY). Reserved response
+  tokens match exactly; ERR/malformed/out-of-order replies close and reap
+  the child. Checked finish observes BYE and process status; the CLI reports
+  failure as E0408. Signal transfers are explicitly signed 32-bit with
+  wider/MVL values rejected. E1647_XEZIM_WAVE controls optional --wave.
+  The concrete profile and its separate artifact-verifying runner are in
+  [HDL_QUALIFICATION.md](HDL_QUALIFICATION.md); they do not prove general
+  e/HDL event ordering.
 - `src/main.rs` — `e1647 tokens`, `e1647 parse`, `e1647 elab` and
   `e1647 run [--seed N]`. `import a.b` loads `a/b.e` or `a.b.e` next to
   the source and splices those declarations in front. `parse`, `elab` and
   `run` print diagnostics to stderr
   (`path:line:col: error[code]: message`) and their results on success.
 
-Deliberately not implemented yet: dynamic subtype matching for
-base-typed instances (when views resolve through when-qualified field
-types; chained modifiers and nested when-in-when blocks compose,
-though a view's own when-of pairs are not re-verified against its
-base's fields), general constraint solving (bounded linear and
-polynomial shapes, including disjunctions, are supported; wide domains,
-division/modulo and temporal constraints remain gaps), per-instance
-temporal timelines (the run log stays one
-global timeline; the simulator-side `@sim`/event-port triggers fire
-per instance at the scheduler's cycle boundaries), and suspension
-re-entry into inline method calls and `compute` (waits inside
-compound statements — `if`/`case`/`for`/`for each`/`repeat until` —
-suspend and resume through the statement-path cursor, the
-generalization of the earlier while-chain skip-cursor; a called
-method keeps 13.2.2's return-delimited atomic region, which needs a
-per-coroutine call-stack continuation, and `on` bodies stay atomic —
-11.3 bans time-consuming actions in them anyway), the remaining
-clause 14 coverage model (basic and derived items collect and grade;
-per_instance items grade per bucket with holes and the weighted
-group grade; the group/item `no_collect`/`instance_no_collect`
-options, the cross/transition `name` option and the group-level
-`at_least`/`weight` apply; the bool-exp option forms with the
-implicit `inst` variable, the per-unit-instance scoping
-(14.2.2/14.3.4), the `radix`/`when`/`never` option semantics (the
-option tables were not previously inspected) remain unmodeled.
-The coverage subset of `set_config()` is wired; other categories,
-options and `set_config_max()` remain gaps), integer width
-truncation, evaluation of MVL literals, `detach`/`delay`/`exec` TEs, select
-choice policies beyond the constant-expression subset (the full
-choice-expression grammar, soft-order interactions between multiple
-selects), event-port triggering beyond the `hdl_path()`-bound edge
-sampling (`on p$` members run on `emit p$` and on the bound object's
-edges per the `edge()` attribute — the MVL edge spellings and
-`bind()` connections are not modeled), the preprocessor's
-rescanned/repeated substitution
-and backtick preprocessor names (replacement rules apply in one
-pass, per file — B.5's include-order visibility through `import` is
-not modeled), clause 8.4's template when-subtype instances, extension
-members beyond fields/constraints/methods/`on` blocks and the 8.6
-subtype propagation of applied extensions (the 8.7 NOTE 2
-actual-category validation stays out with the original template's),
-computed macros beyond the evaluated body subset (method calls,
-`is a` checks, `else if` chains, list/number expressions — such
-bodies decline, clause 15.3) and the match-expression grammar's
-repetition and category validation (clause 15.4), the Part 2 routine
-library beyond the reflection set
-(`set_of_values`/`full_set_of_values` and the 28.5 set
-pseudo-methods work; set literals, range modifiers on declared
-types, and bare scalar keywords as type arguments do not), simulator
-bindings beyond the xezim bridge (the `Simulator` seam is registered;
-VHPI among the bindings that are not written), a backend selection knob
-(`hdl_load` resolves through the default backend), and a browser
-sandbox API (the wasm32 compilation check passes; there is no sandbox
-API and no wasm runtime test).
+Present concrete method prototypes now receive a separate E0311 interface
+contract check in the well-formedness pass (6.3/6.13). Effective interface
+requirements include transitive interface bases; prototype lookup follows
+the struct's like chain and extend blocks. It reports definite arity,
+annotation-presence, parameter/result shape/width and static mismatches, once
+per type/method. Plain representation aliases expand with a 64-step bound;
+constant expressions normalize widths and template value arguments. Bit,
+nibble and byte normalize to their unsigned widths; long bases retain their
+distinct arithmetic identity. Missing prototypes, symbolic/ranged types and
+unresolved/conditional/template-only cases stay conservative; missing actual
+implementations still report E0414 when called. General signature equivalence
+remains a gap. E0225 checks composed extension blocks against their prototype,
+including when views, substituted templates and the static registry. Omitted
+annotations inherit; source-identical inherited/registry copies report once.
+Static registries collect base declarations before extend contributions,
+independent of their physical order.
+
+`src/methods.rs` compiles first/also/only bodies into an arena-backed plan,
+using an explicit work stack to avoid recursion for deeply extended methods.
+Elaboration retains method-layer ranges for inheritance, synthesized when views
+and substituted templates, distinguishing actual injected any_unit hooks. A
+subtype replaces the virtual central body while ancestor wrappers remain.
+Within one layer, only replaces the older subtree; first wraps it before and
+also wraps it after. Return jumps skip only the current subtree, so outer also
+bodies still execute. An owned program counter, argument save stack and result
+slot survive TCM suspension alongside the retained frame and statement path.
+First parameter rebindings feed the older subtree; also restores its incoming
+arguments and receives the older result. Typed bodies get an implicit result
+local with their inherited return type. Reference results default to NULL,
+without allocating hidden objects. Normal completion returns the slot; bare
+return uses it, while explicit return NULL stays NULL.
+
+Atomic instance/static calls, inline value/compute calls, started TCMs, main
+run, lifecycle hooks, creation-time init and inline sequence MAIN share the
+plan. Existing atomic regions and constructor timing approximations remain;
+this does not qualify full execution semantics against a reference simulator.
+
+Remaining boundaries (the detailed behavior inventory is in STATUS.md):
+
+- Full name resolution, signatures, flow-sensitive/bidirectional inference,
+  operand narrowing and pre-elaboration type-expression checking. Explicit
+  guard binding facts and retained type-expression scopes are implemented.
+  The conservative
+  checker leaves unknown/custom numeric kinds silent and set scalar domains
+  untracked.
+- Dynamic subtype matching for base-typed instances. When-qualified fields,
+  chained modifiers and nested views compose, but a view's determinant pairs
+  are not fully revalidated against base fields.
+- General constraint solving: wide domains, division/modulo and temporal
+  constraints exceed the bounded linear/polynomial solvers. Full connected
+  field sets and select soft-order interactions remain incomplete.
+- Further scoped callback handling, preserving static/on/evaluate restrictions.
+  Scheduled instance value calls now retain expression/callee continuations,
+  including runtime-resolved receivers. Temporal histories still share one global
+  timeline; per-instance/event-specific compound timelines, edge-width
+  legality, real/MVL/custom-numeric edges and distinct same-cycle samples
+  remain gaps. Dotted physical event identity is resolved; indexed temporal
+  paths and rebinding event references during active attempts remain gaps.
+  Precise e/HDL event ordering remains unfinished.
+- The remaining coverage semantics: composite-valued predicates, mixed
+  composite classification, real/enumeral ranges, full option/domain typing,
+  general constant/type resolution and radix/never behavior. Derived names and
+  range labels evaluate literal-string concatenation/grouping with the same
+  escape decoder as runtime strings. Name validation consumes the whole option
+  expression; computed names share collection and graph lookup, and invalid
+  values report E0224. A post-composition pass in coverage/constants.rs
+  resolves supported initialized plain integer/string const fields in schema
+  options, preserving reference spans. It also folds their pure initializers
+  for instance/declaration-time storage, including forward/inherited fields
+  and qualified static consts. Only names, ranges, goals and weights have
+  option tokens rewritten; runtime filter expressions retain their scopes.
+  Successful field values are memoized. Cycles and an active dependency plus
+  expression-depth limit of 64 stop resolution; concatenated strings are
+  capped at 256 KiB. Checked untyped arithmetic and the shared direct-operand
+  precision helper avoid overflow/preserve supported 32/64-bit contexts.
+  A shared scalar-representation resolver follows alias chains and evaluates
+  supported width expressions in the owner scope. Explicit int/uint widths
+  1–127 and star widths participate; sized initializers must already fit.
+  The runtime precision lookup uses the same resolver for direct locals,
+  fields and qualified static fields, keeping aliased/sized 32/64-bit and
+  wide contexts aligned with schema evaluation. General storage narrowing,
+  unresolved widths, enumerals, dynamic initializers and wider constant
+  expressions remain gaps. Existing E0224 diagnostics reject unresolved
+  schema values; unsupported fields shadowing predefined constants report
+  E0224 explicitly rather than silently selecting the predefined value.
+  Basic and derived
+  scalar effects, source graphs, filters, goals and bounded domain proofs run
+  as described above; the coverage subset of set_config is wired. Other
+  configuration categories/options and set_config_max remain gaps.
+- Numeric widths beyond the implemented static precision contexts, wider
+  storage than the i128 model and evaluation of MVL literals. Real-valued set
+  membership and full set-domain validation also remain unsupported.
+- detach/delay/exec temporal expressions; select choice grammar beyond the
+  evaluated constant-expression subset; inline sequence execution without
+  enforcing do-keeping blocks; event-port behavior beyond hdl_path-bound edge
+  sampling (MVL edge spellings and bind connections remain unmodeled).
+- Rescanned/repeated preprocessing substitution, backtick preprocessor names
+  and cross-import include-order visibility. Replacement rules currently apply
+  once per file. Computed macros cover only the documented body subset; method
+  calls, is-a, else-if chains and list/number bodies decline. Match repetition
+  and category validation remain incomplete.
+- Template when-subtype instances, extension members beyond the implemented
+  fields/constraints/methods/on subset and subtype propagation of applied
+  extensions. Original template actual-category validation remains excluded
+  under 8.7 NOTE 2.
+- The full Part 2 routine library/reflection model and declared-type range
+  modifiers. Set literals, set_of_values/full_set_of_values and the selected
+  set/list pseudo-methods already execute; their presence does not imply the
+  rest of the library is implemented.
+- Simulator bindings beyond xezim (including VHPI/VHDL), backend selection,
+  browser engines beyond Chromium. The browser serializes native basic and
+  derived coverage summaries, preserving duplicate combination labels and
+  decimal-string counts; detailed bucket identities are not exposed. The single-source WASM ABI and worker runtime have real browser
+  tests; this is an experimental declared-subset API, not a security audit.
+
+## Qualification runner
+
+`scripts/qualify.py` is a Python standard-library process boundary around the
+native CLI and an explicitly configured local reference adapter. A manifest
+identifies self-contained source cases, seeds, clause references and independent
+expected values. Both backends use the same staged source snapshot; source
+mutation and mismatched adapter case/hash/seed identities fail the comparison.
+Native markers require a completion sentinel and an exact result map. A
+reference adapter must report execution success plus tool/version/host-profile
+metadata, which remain operator-supplied assertions rather than attestation.
+
+Reports contain owned case values, fingerprints and status categories, not
+raw process output or command arguments. Native-only mode explicitly records
+reference-not-run and has a separate scope. Protocol fixture processes in the
+Python unit tests exercise failure handling; CI separately builds the real
+native executable and checks the three candidate programs. No qualified
+Specman adapter, imported dependency bundle or actual differential result for
+this new corpus is provided yet. See qualification/README.md for the adapter
+contract, timeout/cleanup boundaries and qualification limits.
 
 ## The 2019 migration stages (PRs #40–#49)
 
@@ -467,8 +809,12 @@ limits live in the PR bodies and the module headers.
   `BTreeMap<TypeName, BTreeMap<FieldName, Value>>` created at program
   start; keys come from elaboration's static-member registries (the
   declaring base or `extend` target). `Type::member` validates the
-  declared-in-exactly-T rule (E0307); `when` subtypes never own store
-  keys; static `on` blocks compose per type and run with no `me`.
+  declared-in-exactly-T rule (E0307). Bare field writes use the same owner
+  walk as reads even without an instance receiver; locals and actual
+  instance fields take precedence. Alias defaults recursively use their
+  declared representation; more than 64 aliases produce E0402 rather than
+  a fictitious alias object or unbounded recursion. `when` subtypes never
+  own store keys; static `on` blocks compose per type and run with no `me`.
 - **Interface attachment (6.13)** — an `interface` composes to its own
   ElaboratedType whose methods are the transitive signatures; a
   struct's `implementing` set composes through the same walk as like

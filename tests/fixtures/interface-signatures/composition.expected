@@ -1,0 +1,3 @@
+6:18: error[E0311]: implementation 'added_s.f' has a different signature from interface 'simple_i' (clause 6.3)
+3:17: error[E0311]: implementation 'child_s.f' has a different signature from interface 'simple_i' (clause 6.3)
+7:44: error[E0311]: implementation 'extension_s.f' has a different signature from interface 'simple_i' (clause 6.3)

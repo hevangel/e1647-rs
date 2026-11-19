@@ -1,0 +1,5 @@
+sys.cg samples=4 grade=0.023
+cross_t__m samples=3 combinations=3 total=Some(128) goal=1 weight=1 grade=Some(0.0234375)
+((((FALSE, FALSE), FALSE)→((TRUE, FALSE), TRUE)), FALSE) hits=1
+((((TRUE, FALSE), TRUE)→((FALSE, TRUE), FALSE)), TRUE) hits=1
+((((FALSE, TRUE), FALSE)→((TRUE, TRUE), TRUE)), TRUE) hits=1

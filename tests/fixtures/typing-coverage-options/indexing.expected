@@ -1,0 +1,3 @@
+5:61: error[E0220]: coverage instance_no_collect: a value of kind 'string' cannot be stored into 'bool'
+6:39: error[E0222]: indexing a value of kind 'int' — only a list is indexable
+6:67: error[E0220]: coverage instance_ignore: a value of kind 'string' cannot be stored into 'bool'

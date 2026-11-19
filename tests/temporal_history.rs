@@ -2,7 +2,18 @@ use std::{fs, path::Path};
 
 #[test]
 fn temporal_history_fixtures() {
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/temporal-history");
+    check_fixture_directory("temporal-history");
+}
+
+#[test]
+fn temporal_edge_fixtures() {
+    check_fixture_directory("temporal-edges");
+}
+
+fn check_fixture_directory(name: &str) {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
     let mut paths: Vec<_> = fs::read_dir(directory)
         .unwrap()
         .map(|entry| entry.unwrap().path())

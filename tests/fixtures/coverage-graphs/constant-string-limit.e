@@ -1,0 +1,23 @@
+extend sys {
+    const c0: string = "x";
+    const c1: string = c0 + c0;
+    const c2: string = c1 + c1;
+    const c3: string = c2 + c2;
+    const c4: string = c3 + c3;
+    const c5: string = c4 + c4;
+    const c6: string = c5 + c5;
+    const c7: string = c6 + c6;
+    const c8: string = c7 + c7;
+    const c9: string = c8 + c8;
+    const c10: string = c9 + c9;
+    const c11: string = c10 + c10;
+    const c12: string = c11 + c11;
+    const c13: string = c12 + c12;
+    const c14: string = c13 + c13;
+    const c15: string = c14 + c14;
+    const c16: string = c15 + c15;
+    const c17: string = c16 + c16;
+    const c18: string = c17 + c17;
+    const c19: string = c18 + c18;
+    cover cg is { item n: bool = FALSE; item m: bool = FALSE; cross n, m using name = c19; };
+};

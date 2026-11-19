@@ -3,8 +3,8 @@
 //! `struct`/`unit`, and `type` declarations pass through with their
 //! enumerals.
 //!
-//! This is **not** full elaboration: `when` subtypes are carried, not
-//! resolved; there is no type checking and no execution semantics.
+//! This is **not** full elaboration: when views and template instances are
+//! bounded, and there is no full typed IR or execution semantics here.
 //! Composition is order-independent on declarations (e allows an `extend`
 //! before its target) and deterministic: base-most `like` members first,
 //! then the declaring members, then each `extend` block in source order.
@@ -13,6 +13,10 @@
 //!
 //! ## Diagnostics (on top of the parser's)
 //!
+//! - `E0224` invalid coverage option/range parameters or per-unit-instance scope
+//!   (clauses 14.2–14.3), checked after member composition
+//! - `E0225` definite method-extension signature mismatch after composition
+//!   and template substitution (17.2.4); omitted annotations inherit
 //! - `E0301` `like` inheritance cycle (reported once per type)
 //! - `E0302` the same field name is contributed by two different
 //!   declarations or extend blocks (duplicates inside one declaration are
@@ -613,6 +617,10 @@ pub struct SequenceInfo {
 /// Outcome of elaborating one file's declarations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Elaborated {
+    /// Contiguous method ranges by inheritance layer, root first. Injected
+    /// any_unit hooks form their own outer layer. Indices address types' final
+    /// composed method vectors, so substitution/when views retain provenance.
+    pub method_layers: BTreeMap<String, Vec<std::ops::Range<usize>>>,
     /// In declaration order; `extend` blocks are folded into their targets
     /// and do not appear separately.
     pub types: Vec<ElaboratedType>,
@@ -1524,7 +1532,10 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
     // monomorphization worklist; a file-declared name of the same kind
     // shadows the builtin (the synthesized entry is skipped).
     compose_builtin_numeric_interfaces(&mut types);
-    Elaborated {
+    let coverage_constant_diagnostics = crate::coverage::resolve_constants(&mut types);
+    let method_layers = composed_method_layers(&types, &any_unit.methods);
+    let mut result = Elaborated {
+        method_layers,
         types,
         defines,
         sequences,
@@ -1535,7 +1546,161 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
         static_methods: static_registry(declarations),
         static_events: static_registry(declarations),
         static_ons: static_registry(declarations),
+    };
+    result.diagnostics.extend(coverage_constant_diagnostics);
+    // Keep declaration-time storage aligned with the same resolved const
+    // initializer used by instance fields and coverage schemas.
+    for (owner, fields) in &mut result.static_fields {
+        if let Some(ty) = result.types.iter().find(|ty| &ty.name == owner) {
+            for field in fields {
+                if let Some(composed) = ty.fields.iter().find(|candidate| {
+                    candidate.name == field.name && candidate.name_span == field.name_span
+                }) {
+                    field.init = composed.init.clone();
+                }
+            }
+        }
     }
+    result.diagnostics.extend(crate::coverage::validate_types(
+        &result.types,
+        &result.defines,
+    ));
+    result
+        .diagnostics
+        .extend(check_method_extension_contracts(&result, declarations));
+    result
+}
+
+fn composed_method_layers(
+    types: &[ElaboratedType],
+    any_unit_methods: &[(&MethodDecl, usize)],
+) -> BTreeMap<String, Vec<std::ops::Range<usize>>> {
+    let index: BTreeMap<_, _> = types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| (ty.name.as_str(), i))
+        .collect();
+    let mut layers: BTreeMap<String, Vec<std::ops::Range<usize>>> = BTreeMap::new();
+    for start in 0..types.len() {
+        let mut chain = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut cursor = start;
+        while !layers.contains_key(&types[cursor].name) && visited.insert(cursor) {
+            chain.push(cursor);
+            let Some(next) = types[cursor]
+                .base
+                .as_deref()
+                .and_then(|name| index.get(name))
+                .copied()
+            else {
+                break;
+            };
+            cursor = next;
+        }
+        for i in chain.into_iter().rev() {
+            let ty = &types[i];
+            let mut own_start = 0;
+            let mut inherited = Vec::new();
+            if let Some(base) = ty
+                .base
+                .as_deref()
+                .and_then(|name| index.get(name))
+                .map(|i| &types[*i])
+                && base.methods.len() <= ty.methods.len()
+                && base
+                    .methods
+                    .iter()
+                    .zip(&ty.methods)
+                    .all(|(a, b)| a.name == b.name && a.span == b.span)
+                && let Some(parent) = layers.get(&base.name)
+            {
+                own_start = base.methods.len();
+                inherited = parent.clone();
+            } else if ty.kind == DeclarationKind::Unit
+                && ty.base.is_none()
+                && any_unit_methods.len() <= ty.methods.len()
+                && any_unit_methods
+                    .iter()
+                    .zip(&ty.methods)
+                    .all(|((a, _), b)| a.name == b.name && a.span == b.span)
+            {
+                own_start = any_unit_methods.len();
+                if own_start > 0 {
+                    inherited.push(0..own_start);
+                }
+            }
+            if own_start < ty.methods.len() {
+                inherited.push(own_start..ty.methods.len());
+            }
+            layers.insert(ty.name.clone(), inherited);
+        }
+    }
+    layers
+}
+
+/// Extensions inherit omitted annotations by parameter position. Explicit
+/// annotations and arity must preserve their declaration's contract (17.2.4).
+/// Validate the final composed lists so when views and substituted template
+/// instances use their actual types. Source-identical inherited copies report
+/// once; distinct materialized type differences remain independently checked.
+fn check_method_extension_contracts(
+    elaborated: &Elaborated,
+    declarations: &[Declaration],
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut seen = BTreeSet::new();
+    for methods in elaborated
+        .types
+        .iter()
+        .map(|ty| &ty.methods)
+        .chain(elaborated.static_methods.values())
+    {
+        for extension in methods.iter().filter(|method| method.modifier.is_some()) {
+            let Some(prototype) = methods
+                .iter()
+                .find(|method| method.name == extension.name && method.modifier.is_none())
+            else {
+                continue;
+            };
+            let parameters_differ =
+                extension.params.len() != prototype.params.len()
+                    || extension.params.iter().zip(&prototype.params).any(
+                        |(extension, prototype)| match (&extension.ty, &prototype.ty) {
+                            (Some(a), Some(b)) => crate::check::signature_type_differs(
+                                a,
+                                b,
+                                declarations,
+                                &elaborated.defines,
+                                0,
+                            ),
+                            (Some(_), None) => true,
+                            (None, _) => false,
+                        },
+                    );
+            let result_differs = match (&extension.return_type, &prototype.return_type) {
+                (Some(a), Some(b)) => {
+                    crate::check::signature_type_differs(a, b, declarations, &elaborated.defines, 0)
+                }
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if !(parameters_differ || result_differs || extension.is_static != prototype.is_static)
+            {
+                continue;
+            }
+            let key = (
+                extension.name.clone(),
+                extension.name_span.0.byte,
+                extension.name_span.1.byte,
+                prototype.name_span.0.byte,
+                prototype.name_span.1.byte,
+            );
+            if seen.insert(key) {
+                diagnostics.push(Diagnostic::new("E0225", format!("extension of method '{}' has a different signature from its declaration (clause 17.2.4)", extension.name), extension.name_span.0, extension.name_span.1));
+            }
+        }
+    }
+    diagnostics
 }
 
 /// The clause 31 predefined numeric names (T7.2), synthesized as
@@ -1863,7 +2028,15 @@ fn compose_builtin_numeric_interfaces(types: &mut Vec<ElaboratedType>) {
 /// interpreter composes static `on` blocks and static method bodies in.
 fn static_registry<K: RegistryKind>(declarations: &[Declaration]) -> BTreeMap<String, Vec<K>> {
     let mut registry: BTreeMap<String, Vec<K>> = BTreeMap::new();
-    for declaration in declarations {
+    for declaration in declarations
+        .iter()
+        .filter(|d| d.kind != DeclarationKind::Extend)
+        .chain(
+            declarations
+                .iter()
+                .filter(|d| d.kind == DeclarationKind::Extend),
+        )
+    {
         // Only struct/unit declarations and the extend blocks that
         // target them contribute; a `type` declaration has no members of
         // these kinds, and a template extension applies per instance

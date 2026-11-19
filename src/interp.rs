@@ -118,11 +118,13 @@
 //! emit-driven (14.2) and the grade is computed lazily (the report, or
 //! `covers.compute_overall_grade()`).
 //!
-//! The parser's `E0122` (an untyped `evaluate { ... }` whose result type
-//! cannot be inferred, clause 4.17.7) is also raised here: the inference
-//! contexts — the declared type of the assignment/`var` target or of the
-//! call's parameter — resolve at run time, so the diagnostic surfaces
-//! when an evaluation actually reaches the untyped block.
+//! E0122 reports an untyped evaluate without a resolved context (4.17.7).
+//! Variables, assignments, fields, parameters and returns supply scoped hints;
+//! new uses named instance/element contexts too (6.3). Method frames retain
+//! parameter/return metadata across suspension. Calls and expression bodies
+//! establish independent hint scopes. These contextual hints are separate
+//! from the existing arithmetic-precision resolver; full type inference is
+//! still unfinished.
 //!
 //! ## List identity (clause 4.11.4)
 //!
@@ -216,6 +218,8 @@ pub struct RunResult {
     pub output: String,
     pub diagnostics: Vec<Diagnostic>,
     pub coverage: Vec<crate::coverage::TypeCoverage>,
+    /// Failed DUT checks, independent of fatal interpreter diagnostics.
+    pub dut_errors: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -510,18 +514,122 @@ impl ObjectInstance {
     }
 }
 
+/// Private execution control is distinct from the public diagnostic contract.
+/// Statements consume suspension/stop; diagnostic-only API boundaries convert
+/// actual failures and report an internal error if control escapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExecError {
+    Diagnostic(Diagnostic),
+    Suspend,
+    Stop,
+}
+
+impl ExecError {
+    fn new(
+        code: &'static str,
+        message: impl Into<String>,
+        start: crate::lexer::Position,
+        end: crate::lexer::Position,
+    ) -> Self {
+        Self::Diagnostic(Diagnostic::new(code, message, start, end))
+    }
+
+    fn into_diagnostic(self) -> Diagnostic {
+        match self {
+            Self::Diagnostic(diagnostic) => diagnostic,
+            Self::Suspend | Self::Stop => Diagnostic::new(
+                "E0402",
+                "internal: execution control escaped its statement boundary",
+                origin_span().0,
+                origin_span().1,
+            ),
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Diagnostic(diagnostic) => diagnostic.render(),
+            other => other.clone().into_diagnostic().render(),
+        }
+    }
+}
+
+impl From<Diagnostic> for ExecError {
+    fn from(diagnostic: Diagnostic) -> Self {
+        Self::Diagnostic(diagnostic)
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct Frame {
     locals: std::collections::HashMap<String, Value>,
     local_types: std::collections::HashMap<String, TypeExpr>,
+    /// Kept with the frame across suspension, independently of caller hints.
+    return_type: Option<TypeExpr>,
+}
+
+struct InstanceRule {
+    declaration: crate::ast::ExpectDecl,
+    owner: usize,
+    te: crate::ast::TemporalExpr,
+    monitor: crate::temporal::RuleMonitor,
+    start: usize,
+    retired: bool,
+}
+
+struct TemporalEdgeHistory {
+    context: u64,
+    routine: crate::ast::EdgeRoutine,
+    expr: Expr,
+    cycle: u64,
+    previous: Option<i128>,
+    current: i128,
+}
+
+struct TemporalWaitSampling {
+    te: crate::ast::TemporalExpr,
+    frame: Frame,
+    me: Option<usize>,
+    observed: usize,
+}
+
+/// Completed evaluation nodes retain their values across a suspended call.
+/// Children are addressed by evaluation order within their parent, preserving
+/// lazy branches and repeated uses of the same expression in distinct scopes.
+#[derive(Debug, Clone, Default)]
+struct EvalNode {
+    value: Option<Value>,
+    children: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct StatementEvaluation {
+    level: usize,
+    nodes: Vec<EvalNode>,
+    cursor: Vec<(usize, usize)>,
+    waiting: Option<usize>,
+    resume: Option<Vec<PathLevel>>,
+    repeat_condition: bool,
+}
+
+impl StatementEvaluation {
+    fn new(level: usize) -> Self {
+        Self {
+            level,
+            nodes: vec![EvalNode::default()],
+            cursor: vec![(0, 0)],
+            waiting: None,
+            resume: None,
+            repeat_condition: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct StatementCall {
     receiver: usize,
     name: String,
-    args: Vec<Value>,
-    block: usize,
+    progress: crate::methods::Progress,
     entry_complete: bool,
     frame: Frame,
     span: crate::ast::Span,
@@ -554,12 +662,13 @@ enum Flow {
 /// re-entered without re-evaluating its condition/scrutinee, and a
 /// loop body is re-entered mid-iteration (the condition is re-checked
 /// only when the iteration completes, exactly like the `while` model
-/// this generalizes). The descent reaches every compound; only the
-/// value-expression calls, `on` blocks and `check` else bodies keep
-/// the conservative run-to-completion model. Whole statement calls
-/// and `compute` carry callee frames in the same path.
+/// this generalizes). Value-expression calls add a saved evaluation tree
+/// and a synthetic call level to the same path. Scoped evaluate/constructor
+/// actions, list callbacks, generation/observation, `on` blocks and check
+/// failure actions retain the atomic model.
 #[derive(Debug, Clone)]
 enum Child {
+    Evaluation(Box<StatementEvaluation>),
     /// A statement-position call, with its own locals and once-evaluated
     /// receiver/arguments. Further path levels descend into its body.
     Call(Box<StatementCall>),
@@ -574,11 +683,17 @@ enum Child {
     /// the continuation neither resets the counter nor replays the
     /// bounds (the body's reads go through the frame's bound
     /// temporary).
-    ForBody { counter: i128, end: i128 },
+    ForBody {
+        counter: i128,
+        end: i128,
+    },
     /// A `for each` body mid-iteration, carrying the list snapshot
     /// taken at loop entry (post-reversal) and the in-flight element's
     /// position; the element and index bindings live in the frame.
-    ForeachBody { position: usize, items: Vec<Value> },
+    ForeachBody {
+        position: usize,
+        items: Vec<Value>,
+    },
     /// The `then` branch of an `if` — the condition was evaluated
     /// before the suspension; resume does not re-evaluate it.
     IfThen,
@@ -586,7 +701,9 @@ enum Child {
     IfElse,
     /// The matched arm of a `case` (`None` = the default arm) — the
     /// scrutinee is not re-matched on resume.
-    CaseArm { index: Option<usize> },
+    CaseArm {
+        index: Option<usize>,
+    },
 }
 
 /// One level of a turn's statement walk: the statement index within
@@ -616,12 +733,12 @@ struct PendingSuspension {
 }
 
 /// One concurrently scheduled execution (clause 13.2.2): the main
-/// pseudo-coroutine (the `run()` bodies, in order) and every `start`ed
+/// pseudo-coroutine (the composed `run()` execution plan) and every `start`ed
 /// TCM. Suspension state is the statement path into the tree (the
 /// walk's position when the synchronization action suspended), the
 /// captured locals frame, and the cycle gate.
-struct Coroutine<'a> {
-    kind: CoroutineKind<'a>,
+struct Coroutine {
+    kind: CoroutineKind,
     /// The scheduler-wide identity of this coroutine — the locker's
     /// holder identity (clause 33: `lock()`/`release()` by the same
     /// entity).
@@ -649,26 +766,25 @@ struct Coroutine<'a> {
     wait_start: Option<usize>,
 }
 
-enum CoroutineKind<'a> {
-    /// The `run()` bodies, executed in order as one coroutine.
+enum CoroutineKind {
+    /// The composed `run()` plan, executed as one coroutine.
     Main {
-        blocks: Vec<&'a [Stmt]>,
-        next_block: usize,
+        instance: usize,
+        progress: crate::methods::Progress,
     },
     /// A started TCM: instance, method name (resolved per turn, so
     /// `is also` chains compose), evaluated arguments.
     Tcm {
         instance: usize,
         method: String,
-        args: Vec<Value>,
-        next_block: usize,
+        progress: crate::methods::Progress,
     },
 }
 
 enum TurnOutcome {
     Complete,
     Suspended,
-    Error(Diagnostic),
+    Error(ExecError),
 }
 
 /// splitmix64: small, seedable, deterministic — no external dependency.
@@ -716,6 +832,46 @@ struct SimTrigger {
     span: crate::ast::Span,
 }
 
+struct CoverageAxis {
+    binding: String,
+    source: String,
+    prototype: Value,
+    options: crate::coverage::ItemOptions,
+    buckets: Vec<(usize, i128, i128)>,
+}
+
+fn next_coverage_indices(indices: &mut [usize], limits: &[usize]) -> bool {
+    for (index, limit) in indices.iter_mut().zip(limits).rev() {
+        if *index + 1 < *limit {
+            *index += 1;
+            return true;
+        }
+        *index = 0;
+    }
+    false
+}
+
+fn coverage_point_bindings(axes: &[CoverageAxis], ranges: &[(i128, i128)]) -> Vec<(String, Value)> {
+    axes.iter()
+        .zip(ranges)
+        .map(|(axis, (lo, _))| {
+            let value = if matches!(axis.prototype, Value::Bool(_)) {
+                Value::Bool(*lo != 0)
+            } else {
+                Value::Int(*lo)
+            };
+            (axis.binding.clone(), value)
+        })
+        .collect()
+}
+
+fn coverage_midpoint(lo: i128, hi: i128) -> i128 {
+    let sign = 1u128 << 127;
+    let lo = (lo as u128) ^ sign;
+    let hi = (hi as u128) ^ sign;
+    ((lo + (hi - lo) / 2) ^ sign) as i128
+}
+
 struct Interp<'a> {
     types: &'a [crate::elab::ElaboratedType],
     instances: Vec<ObjectInstance>,
@@ -747,26 +903,31 @@ struct Interp<'a> {
     port_edges: BTreeMap<(String, String), String>,
     /// The run's temporal log (clause 12): one state per virtual cycle,
     /// recording which events occurred in it. `emit` writes here and
-    /// temporal `wait`s and `expect` rules read it. One global
-    /// timeline: all events share the per-cycle states.
+    /// temporal waits and per-instance rules read it. Physical instance
+    /// event keys isolate owners; events still share one global cycle log.
     temporal_log: Vec<crate::temporal::State>,
-    temporal_rule_owner: Option<usize>,
-    retired_temporal_rules: BTreeSet<u64>,
+    instance_rules: Vec<InstanceRule>,
+    next_rule_instance: usize,
+    rules_enabled: bool,
     sampling_temporal: bool,
     temporal_wait_contexts: BTreeMap<(Option<u64>, usize, usize, Option<usize>), u64>,
     next_temporal_context: u64,
+    temporal_edges: Vec<TemporalEdgeHistory>,
+    temporal_wait_sampling: BTreeMap<u64, TemporalWaitSampling>,
     /// The scheduled coroutines (13.2.2): the main `run()` chain first,
     /// then every `start`ed TCM, run round-robin.
-    coroutines: Vec<Coroutine<'a>>,
+    coroutines: Vec<Coroutine>,
+    method_layers: &'a BTreeMap<String, Vec<std::ops::Range<usize>>>,
     /// Set while a coroutine turn executes: statement walks record
     /// their descent for the resume path.
     tracing: bool,
-    /// Atomic regions (value-expression calls, `on` blocks,
-    /// `check` else bodies): waits inside keep the inline spin instead
+    /// Atomic regions (scoped action/list callbacks, generation/observation,
+    /// `on` blocks and check failure actions): waits keep the inline spin instead
     /// of suspending.
     atomic_depth: usize,
     /// The statement-tree descent of the current turn.
     exec_context: Vec<PathLevel>,
+    evaluations: Vec<StatementEvaluation>,
     /// The suspension raised by the current turn's synchronization
     /// action, collected when the turn unwinds.
     pending_suspension: Option<PendingSuspension>,
@@ -787,6 +948,7 @@ struct Interp<'a> {
     coverage: Vec<crate::coverage::TypeCoverage>,
     coverage_config: crate::coverage::CoverageConfig,
     coverage_was_enabled: bool,
+    coverage_illegal_pending: Vec<String>,
     /// Set by `stop_run()`; unwinds the whole run.
     stop_requested: bool,
     /// Failed `check that` conditions (`dut_error`), reported like
@@ -841,8 +1003,8 @@ struct Interp<'a> {
     /// the clause 35.4 `get_all_annotations()` reads this registry.
     attached_annotations: &'a BTreeMap<String, Vec<crate::elab::AttachedAnnotation>>,
     /// The type whose static method is currently executing (T2.2):
-    /// bare static-field and bare static-method references inside a
-    /// static method resolve against it (`me` does not exist there).
+    /// bare static-field references inside a static method resolve
+    /// against it (`me` does not exist there). Static calls use Type::name.
     static_context: Option<String>,
     /// The declared type expected of the expression currently being
     /// evaluated, when the evaluation site knows one: the declared type
@@ -851,16 +1013,11 @@ struct Interp<'a> {
     /// type from it; every site sets it immediately before its eval call
     /// and restores it afterwards.
     expected_type: Option<TypeExpr>,
-    /// The type name an untyped `new` creates with while the enclosing
-    /// `var x: t = new;` initializer evaluates (clause 18: the
-    /// variable's declared type is the instance's): set just before the
-    /// initializer evaluates, cleared right after.
-    new_type_hint: Option<String>,
     /// Field init-value evaluation failures (clause 6.9.1/6.9.4) that
     /// surfaced where no diagnostic can propagate — instance creation
     /// returns an index, not a `Result`. Drained into the run's
     /// diagnostics; the affected fields keep their type default.
-    pending_diagnostics: Vec<Diagnostic>,
+    pending_diagnostics: Vec<ExecError>,
     /// Type-level port bindings from `keep bind(p, q)` constraints
     /// (9.13): type name → the (port, port) edges among the type's own
     /// ports. Every instance of the type carries the same edges between
@@ -1190,15 +1347,20 @@ fn run_inner(
         sim_prev: BTreeMap::new(),
         port_edges: collect_port_edge_attributes(elaborated),
         temporal_log: Vec::new(),
-        temporal_rule_owner: None,
-        retired_temporal_rules: BTreeSet::new(),
+        instance_rules: Vec::new(),
+        next_rule_instance: 0,
+        rules_enabled: false,
         sampling_temporal: false,
         temporal_wait_contexts: BTreeMap::new(),
         next_temporal_context: 1u64 << 32,
+        temporal_edges: Vec::new(),
+        temporal_wait_sampling: BTreeMap::new(),
         coroutines: Vec::new(),
+        method_layers: &elaborated.method_layers,
         tracing: false,
         atomic_depth: 0,
         exec_context: Vec::new(),
+        evaluations: Vec::new(),
         pending_suspension: None,
         pending_wake_sync: None,
         current_coroutine_id: None,
@@ -1210,6 +1372,7 @@ fn run_inner(
             ..Default::default()
         },
         coverage_was_enabled: false,
+        coverage_illegal_pending: Vec::new(),
         stop_requested: false,
         dut_errors: 0,
         defines,
@@ -1222,7 +1385,6 @@ fn run_inner(
         attached_annotations: &elaborated.attached_annotations,
         static_context: None,
         expected_type: None,
-        new_type_hint: None,
         pending_diagnostics: Vec::new(),
         type_port_binds: collect_type_port_binds(elaborated),
         type_port_unbound: collect_type_port_unbound(elaborated),
@@ -1251,7 +1413,7 @@ fn run_inner(
         let value = match &field.init {
             Some(init) => {
                 let mut frame = Frame::default();
-                match interp.eval(init, &mut frame, None) {
+                match interp.eval_with_hint(Some(field.ty.clone()), init, &mut frame, None) {
                     Ok(value) => value,
                     Err(diagnostic) => {
                         interp.pending_diagnostics.push(diagnostic);
@@ -1268,27 +1430,27 @@ fn run_inner(
             .insert(field.name, value);
     }
     let types: &[crate::elab::ElaboratedType] = interp.types;
-    let Some(sys) = types
+    let Some(_) = types
         .iter()
         .find(|t| t.name == "sys" && t.kind == DeclarationKind::Unit)
     else {
         // No `sys`: a declarations-only program runs to completion with no
         // output.
         return RunResult {
+            dut_errors: interp.dut_errors,
             output: interp.output,
-            diagnostics: interp.pending_diagnostics,
+            diagnostics: interp
+                .pending_diagnostics
+                .into_iter()
+                .map(ExecError::into_diagnostic)
+                .collect(),
             coverage: if interp.coverage_was_enabled {
-                interp.coverage
+                crate::coverage::for_report(&interp.coverage)
             } else {
                 Vec::new()
             },
         };
     };
-    let run_blocks: Vec<&MethodDecl> = sys
-        .methods
-        .iter()
-        .filter(|method| method.name == "run")
-        .collect();
     let sys_index = interp.instantiate("sys");
     let mut diagnostics = Vec::new();
     // Table 1's setup phase (28.3): `sys.setup()` runs before any
@@ -1332,18 +1494,23 @@ fn run_inner(
         let sequence_index = interp.instantiate(&sequence.name);
         interp.instances[sequence_index].set("driver", Value::Object(driver_index));
         let types: &[crate::elab::ElaboratedType] = interp.types;
-        let Some(body) = types
-            .iter()
-            .find(|t| t.name == sequence.name)
-            .and_then(|t| t.methods.iter().find(|m| m.name == "body").cloned())
-        else {
+        if resolve_method_blocks(types, &sequence.name, "body", origin_span()).is_err() {
             continue;
-        };
-        let mut frame = Frame::default();
-        frame
-            .locals
-            .insert("driver".to_owned(), Value::Object(driver_index));
-        if let Err(diagnostic) = interp.exec_block(&body.body, &mut frame, Some(sequence_index)) {
+        }
+        let program =
+            crate::methods::Program::instance(types, interp.method_layers, &sequence.name, "body");
+        let mut locals = BTreeMap::new();
+        locals.insert("driver".to_owned(), Value::Object(driver_index));
+        interp.atomic_depth += 1;
+        let outcome = interp.execute_atomic_method(
+            &program,
+            Vec::new(),
+            Some(sequence_index),
+            origin_span(),
+            Some(&locals),
+        );
+        interp.atomic_depth -= 1;
+        if let Err(diagnostic) = outcome {
             interp.output.push_str(&format!(
                 "sequence {}: {}\n",
                 sequence.name,
@@ -1360,8 +1527,8 @@ fn run_inner(
     // eligible, one cycle passes.
     interp.coroutines.push(Coroutine {
         kind: CoroutineKind::Main {
-            blocks: run_blocks.iter().map(|b| b.body.as_slice()).collect(),
-            next_block: 0,
+            instance: sys_index,
+            progress: crate::methods::Progress::new(Vec::new()),
         },
         id: interp.next_coroutine_id,
         path: Vec::new(),
@@ -1381,19 +1548,8 @@ fn run_inner(
     interp.sample_sim_events();
     // The clause 11.4 live monitoring: one pass per scheduler cycle
     // boundary, over every not-yet-fired rule.
-    let expects: Vec<&crate::ast::ExpectDecl> = elaborated
-        .types
-        .iter()
-        .flat_map(|t| t.expects.iter())
-        .collect();
-    let mut expect_fired = vec![false; expects.len()];
-    // One streaming monitor per rule: the live passes feed it the run
-    // log incrementally and the quit pass reads its end-of-run verdict.
-    let mut rule_monitors: Vec<crate::temporal::RuleMonitor> = expects
-        .iter()
-        .map(|rule| crate::temporal::RuleMonitor::new(&rule.te))
-        .collect();
-    interp.temporal_rule_owner = Some(sys_index);
+    interp.rules_enabled = true;
+    interp.refresh_instance_rules();
     while !interp.coroutines.is_empty() && !interp.stop_requested {
         // The clause 33 wake pass: a blocking call parked a coroutine on
         // a sync object; service the oldest waiter whose condition
@@ -1424,13 +1580,7 @@ fn run_inner(
             // unsatisfiable over the log prefix fires here — the failure
             // is reported (else body runs, DUT error counted) at the
             // cycle it became certain, not deferred to quit.
-            check_expect_rules(
-                &mut interp,
-                &expects,
-                &mut expect_fired,
-                &mut rule_monitors,
-                sys_index,
-            );
+            check_expect_rules(&mut interp, false);
             let mut expired = Vec::new();
             for (position, co) in interp.coroutines.iter_mut().enumerate() {
                 if co.suspended_temporal {
@@ -1442,6 +1592,7 @@ fn run_inner(
             }
             for position in expired.into_iter().rev() {
                 let co = interp.coroutines.remove(position);
+                interp.retire_temporal_waits(co.id);
                 diagnostics.push(interp.error(
                     "E0409",
                     format!(
@@ -1458,6 +1609,7 @@ fn run_inner(
         interp.exec_context.clear();
         interp.pending_wake_sync = None;
         interp.current_coroutine_id = Some(co.id);
+        let previous_wait = (co.suspended_temporal, co.span, co.wait_start);
         interp.resume_wait_start = co.wait_start.take();
         let name = match &co.kind {
             CoroutineKind::Main { .. } => "run".to_owned(),
@@ -1470,12 +1622,19 @@ fn run_inner(
         interp.current_coroutine_id = None;
         interp.resume_wait_start = None;
         match outcome {
-            TurnOutcome::Complete => {}
+            TurnOutcome::Complete => interp.retire_temporal_waits(co.id),
             TurnOutcome::Suspended => {
-                co.temporal_waited = 0;
+                // Rechecking the same wait must not restart its age guard.
+                // A later wait gets its own span/start and a fresh budget.
+                if !co.suspended_temporal
+                    || previous_wait != (co.suspended_temporal, co.span, co.wait_start)
+                {
+                    co.temporal_waited = 0;
+                }
                 interp.coroutines.push(co);
             }
             TurnOutcome::Error(diagnostic) => {
+                interp.retire_temporal_waits(co.id);
                 if matches!(co.kind, CoroutineKind::Main { .. }) {
                     diagnostics.push(diagnostic);
                     break;
@@ -1502,19 +1661,14 @@ fn run_inner(
         // monitoring did not already fire.
         interp.run_phase_on_tree(sys_index, "check", &mut diagnostics);
     }
+    interp.flush_coverage_illegal();
     // 11.4: the quit-time re-check of the rules the live passes did not
     // already fire — the streaming monitors consume any log growth since
     // the last boundary and report their end-of-run verdicts (12.3.3:
     // the obligation windows exhaust when the run ends — the earliest
     // sound closure point).
     interp.sample_rule_values();
-    check_expect_rules_at_quit(
-        &mut interp,
-        &expects,
-        &mut expect_fired,
-        &mut rule_monitors,
-        sys_index,
-    );
+    check_expect_rules(&mut interp, true);
     // The finalize phase (28.3.3.8): `quit()` then `finalize()` on every
     // live instance, depth-first, sys first.
     if !interp.stop_requested {
@@ -1523,6 +1677,7 @@ fn run_inner(
             interp.call_phase_method(index, "finalize", &mut diagnostics);
         }
     }
+    interp.flush_coverage_illegal();
     // Specman closes every run with a DUT-error count; mirror it.
     if interp.dut_errors > 0 {
         interp.output.push_str(&format!(
@@ -1530,14 +1685,20 @@ fn run_inner(
             interp.dut_errors
         ));
     }
+    interp.prepare_coverage_instances(true);
+    interp.refresh_coverage_effects();
     // Field init-value failures collected during instance creation
     // (clause 6.9.1/6.9.4) join the run's diagnostics.
     diagnostics.append(&mut interp.pending_diagnostics);
     RunResult {
+        dut_errors: interp.dut_errors,
         output: interp.output,
-        diagnostics,
+        diagnostics: diagnostics
+            .into_iter()
+            .map(ExecError::into_diagnostic)
+            .collect(),
         coverage: if interp.coverage_was_enabled {
-            interp.coverage
+            crate::coverage::for_report(&interp.coverage)
         } else {
             Vec::new()
         },
@@ -1561,41 +1722,35 @@ fn origin() -> Position {
 /// retires — it is not re-checked. A rule whose TE cannot be evaluated
 /// over the log reports the gap honestly and retires too, so the live
 /// pass never spams.
-fn check_expect_rules(
-    interp: &mut Interp,
-    expects: &[&crate::ast::ExpectDecl],
-    expect_fired: &mut [bool],
-    rule_monitors: &mut [crate::temporal::RuleMonitor],
-    sys_index: usize,
-) {
-    for (rule_index, expect_rule) in expects.iter().enumerate() {
-        if expect_fired[rule_index] || interp.stop_requested {
+fn check_expect_rules(interp: &mut Interp, at_quit: bool) {
+    interp.refresh_instance_rules();
+    for context in 0..interp.instance_rules.len() {
+        if interp.instance_rules[context].retired || interp.stop_requested {
             continue;
         }
-        let kind = format!("{:?}", expect_rule.kind).to_lowercase();
-        let callbacks = historical_temporal_callbacks(rule_index as u64);
-        // The monitor consumes only FINALIZED states: the current
-        // cycle's state is still in progress (this cycle's emits record
-        // into it during turns), so it is handed over at the next
-        // boundary, after the cycle closed. The state index equals the
-        // cycle (pad_log keeps one state per cycle).
-        let final_len = (interp.cycle as usize).min(interp.temporal_log.len());
-        match rule_monitors[rule_index].observe(&interp.temporal_log[..final_len], &callbacks) {
-            Ok(true) => {
-                // The live fire: the streaming monitor matched the
-                // forbidden behavior of an invariant rule — the same
-                // prefix-certain verdict the previous full-rescan pass
-                // computed, now incremental.
-                fire_expect_rule(interp, expect_rule, &kind, sys_index);
-                expect_fired[rule_index] = true;
-                interp.retired_temporal_rules.insert(rule_index as u64);
+        let callbacks = historical_temporal_callbacks(context as u64);
+        let end = if at_quit {
+            interp.temporal_log.len()
+        } else {
+            (interp.cycle as usize).min(interp.temporal_log.len())
+        };
+        let rule = &mut interp.instance_rules[context];
+        let start = rule.start.min(end);
+        let verdict = rule
+            .monitor
+            .observe(&interp.temporal_log[start..end], &callbacks);
+        let kind = format!("{:?}", rule.declaration.kind).to_lowercase();
+        match verdict {
+            Ok(failed) => {
+                if failed || (at_quit && rule.monitor.failed_at_end()) {
+                    rule.retired = true;
+                    let owner = rule.owner;
+                    let declaration = rule.declaration.clone();
+                    fire_expect_rule(interp, &declaration, &kind, owner);
+                }
             }
-            Ok(false) => {}
             Err(err) => {
-                // The rule cannot be evaluated over the log: report the
-                // gap honestly, once, and retire the rule.
-                expect_fired[rule_index] = true;
-                interp.retired_temporal_rules.insert(rule_index as u64);
+                rule.retired = true;
                 interp.output.push_str(&format!(
                     "{kind} rule cannot be evaluated over the run: {err:?}\n"
                 ));
@@ -1605,13 +1760,13 @@ fn check_expect_rules(
 }
 
 /// Fire one expect/assume rule's failure: the `else` body runs on the
-/// sys instance (or, without one, the failure itself is the check
+/// declaring instance (or, without an else body, the failure is the check
 /// error, 11.4).
 fn fire_expect_rule(
     interp: &mut Interp,
     expect_rule: &crate::ast::ExpectDecl,
     kind: &str,
-    sys_index: usize,
+    owner: usize,
 ) {
     if expect_rule.else_body.is_empty() {
         // No `dut_error` clause: the failure itself is the check error
@@ -1622,8 +1777,7 @@ fn fire_expect_rule(
         ));
     } else {
         let mut frame = Frame::default();
-        if let Err(diagnostic) =
-            interp.exec_block(&expect_rule.else_body, &mut frame, Some(sys_index))
+        if let Err(diagnostic) = interp.exec_block(&expect_rule.else_body, &mut frame, Some(owner))
         {
             interp
                 .output
@@ -1632,46 +1786,9 @@ fn fire_expect_rule(
     }
 }
 
-/// The quit-time re-check of the expect/assume rules the live passes
-/// (one per scheduler cycle boundary) did not already fire — 12.3.3:
-/// the rule fails where all possibilities to satisfy it are exhausted.
-/// The `else` body (usually a `dut_error` call) runs on
-/// the sys instance; without one, the failure itself is the check
-/// error. Rules whose TE cannot be evaluated over the log report the
-/// gap honestly.
-fn check_expect_rules_at_quit(
-    interp: &mut Interp,
-    expects: &[&crate::ast::ExpectDecl],
-    expect_fired: &mut [bool],
-    rule_monitors: &mut [crate::temporal::RuleMonitor],
-    sys_index: usize,
-) {
-    for (rule_index, expect_rule) in expects.iter().enumerate() {
-        if expect_fired[rule_index] || interp.stop_requested {
-            continue;
-        }
-        let kind = format!("{:?}", expect_rule.kind).to_lowercase();
-        let callbacks = historical_temporal_callbacks(rule_index as u64);
-        // The monitor catches any log growth since the last boundary,
-        // then its end-of-run verdict decides (equivalent to the
-        // previous whole-log `rule_failed` re-scan).
-        match rule_monitors[rule_index].observe(&interp.temporal_log, &callbacks) {
-            Ok(_) => {}
-            Err(err) => {
-                expect_fired[rule_index] = true;
-                interp.retired_temporal_rules.insert(rule_index as u64);
-                interp.output.push_str(&format!(
-                    "{kind} rule cannot be evaluated over the run: {err:?}\n"
-                ));
-                continue;
-            }
-        }
-        if rule_monitors[rule_index].failed_at_end() {
-            fire_expect_rule(interp, expect_rule, &kind, sys_index);
-            expect_fired[rule_index] = true;
-            interp.retired_temporal_rules.insert(rule_index as u64);
-        }
-    }
+/// Internal physical event identity. The prefix cannot be an e identifier.
+fn instance_event_key(owner: usize, name: &str) -> String {
+    format!("#{owner}::{name}")
 }
 
 fn origin_span() -> crate::ast::Span {
@@ -1737,7 +1854,7 @@ impl<'a> Interp<'a> {
     /// empty (any struct may declare or extend them); a run-time error
     /// inside a hook is reported and the phase continues with the next
     /// instance.
-    fn run_phase_on_tree(&mut self, root: usize, name: &str, diagnostics: &mut Vec<Diagnostic>) {
+    fn run_phase_on_tree(&mut self, root: usize, name: &str, diagnostics: &mut Vec<ExecError>) {
         for index in self.field_tree(root) {
             self.call_phase_method(index, name, diagnostics);
         }
@@ -1745,7 +1862,7 @@ impl<'a> Interp<'a> {
 
     /// Run every composed block of the phase method `name` on one
     /// instance, if the instance's type defines any.
-    fn call_phase_method(&mut self, index: usize, name: &str, diagnostics: &mut Vec<Diagnostic>) {
+    fn call_phase_method(&mut self, index: usize, name: &str, diagnostics: &mut Vec<ExecError>) {
         let type_name = self.instances[index].type_name.clone();
         let defined = resolve_method_blocks(self.types, &type_name, name, origin_span()).is_ok();
         if !defined {
@@ -1849,9 +1966,9 @@ fn resolve_method_blocks<'a>(
     type_name: &str,
     name: &str,
     span: crate::ast::Span,
-) -> Result<Vec<&'a MethodDecl>, Diagnostic> {
+) -> Result<Vec<&'a MethodDecl>, ExecError> {
     let Some(ty) = types.iter().find(|t| t.name == type_name) else {
-        return Err(Diagnostic::new(
+        return Err(ExecError::new(
             "E0401",
             format!("unknown type '{type_name}'"),
             span.0,
@@ -1864,7 +1981,7 @@ fn resolve_method_blocks<'a>(
         .filter(|method| method.name == name)
         .collect();
     if blocks.is_empty() {
-        return Err(Diagnostic::new(
+        return Err(ExecError::new(
             "E0401",
             format!("method '{name}' not found on '{type_name}'"),
             span.0,
@@ -1872,6 +1989,14 @@ fn resolve_method_blocks<'a>(
         ));
     }
     Ok(blocks)
+}
+
+fn method_prototype<'a>(blocks: &[&'a MethodDecl]) -> Option<&'a MethodDecl> {
+    blocks
+        .iter()
+        .copied()
+        .find(|block| block.modifier.is_none())
+        .or_else(|| blocks.first().copied())
 }
 
 /// Select the recorded expression values for one rule or wait. Missing
@@ -1913,7 +2038,7 @@ impl<'a> Interp<'a> {
                     // and a custom value copies).
                     Some(init) => {
                         let mut frame = Frame::default();
-                        match self.eval(init, &mut frame, None) {
+                        match self.eval_with_hint(Some(field.ty.clone()), init, &mut frame, None) {
                             Ok(value) => {
                                 match self.bind_slot_value(value, Some(&field.ty), origin_span()) {
                                     Ok(value) => value,
@@ -1976,32 +2101,16 @@ impl<'a> Interp<'a> {
         // the instance can overwrite generated fields it set (a
         // documented approximation). The blocks run inline (an atomic
         // region: no suspension), with the fresh instance as `me`; a
-        // block's error is collected and instance creation still
+        // composed call's first error is collected and instance creation still
         // succeeds, like a field init failure.
-        if self.depth <= 100 {
-            let init_blocks: Vec<Vec<Stmt>> = types
-                .iter()
-                .find(|t| t.name == type_name)
-                .map(|ty| {
-                    ty.methods
-                        .iter()
-                        .filter(|method| method.name == "init")
-                        .map(|method| method.body.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            self.depth += 1;
-            self.atomic_depth += 1;
-            for body in &init_blocks {
-                let mut frame = Frame::default();
-                match self.exec_block(body, &mut frame, Some(index)) {
-                    Ok(Flow::Stop) => self.stop_requested = true,
-                    Ok(_) => {}
-                    Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
-                }
+        if self.depth <= 100
+            && resolve_method_blocks(types, type_name, "init", origin_span()).is_ok()
+        {
+            let saved_hint = self.expected_type.take();
+            if let Err(diagnostic) = self.call_method(index, "init", Vec::new(), origin_span()) {
+                self.pending_diagnostics.push(diagnostic);
             }
-            self.atomic_depth -= 1;
-            self.depth -= 1;
+            self.expected_type = saved_hint;
         }
         index
     }
@@ -2046,6 +2155,19 @@ impl<'a> Interp<'a> {
     }
 
     fn default_for(&mut self, ty: &TypeExpr) -> Value {
+        self.default_for_alias_depth(ty, 0)
+    }
+
+    fn default_for_alias_depth(&mut self, ty: &TypeExpr, alias_depth: usize) -> Value {
+        if alias_depth > 64 {
+            let diagnostic = self.error(
+                "E0402",
+                "type alias defaulting exceeds the 64-alias limit",
+                ty.span(),
+            );
+            self.pending_diagnostics.push(diagnostic);
+            return Value::Void;
+        }
         match ty {
             TypeExpr::Scalar { base, .. } => match base {
                 ScalarBase::Bool => Value::Bool(false),
@@ -2108,6 +2230,15 @@ impl<'a> Interp<'a> {
                             name: first.name.clone(),
                         };
                     }
+                }
+                // Scalar/list/reference aliases default through their
+                // declared representation, rather than creating an object
+                // whose type happens to be the alias's name (clause 5).
+                if let Some(declared) = types.iter().find(|declared| declared.name == *name)
+                    && declared.kind == DeclarationKind::Type
+                    && let Some(underlying) = &declared.underlying
+                {
+                    return self.default_for_alias_depth(underlying, alias_depth + 1);
                 }
                 if self.depth > 100 {
                     return Value::Void;
@@ -2236,7 +2367,7 @@ impl<'a> Interp<'a> {
         statements: &[Stmt],
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Result<Flow, Diagnostic> {
+    ) -> Result<Flow, ExecError> {
         for (index, statement) in statements.iter().enumerate() {
             self.exec_context.push(PathLevel { index, child: None });
             let flow = self.exec_statement(statement, frame, me);
@@ -2267,7 +2398,7 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         path: &[PathLevel],
-    ) -> Result<Flow, Diagnostic> {
+    ) -> Result<Flow, ExecError> {
         if path.is_empty() {
             return self.exec_block(statements, frame, me);
         }
@@ -2331,14 +2462,14 @@ impl<'a> Interp<'a> {
     /// replayed; the resumed body then flows into the statement's
     /// ordinary continuation, which keeps the context level on the
     /// stack so a re-suspension rebuilds the matching path.
-    fn exec_statement_resumable(
+    fn exec_statement_resumable_inner(
         &mut self,
         statement: &Stmt,
         child: &Child,
         rest: &[PathLevel],
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Result<Flow, Diagnostic> {
+    ) -> Result<Flow, ExecError> {
         if rest.is_empty() {
             // A descent always carries the position it continues at
             // (the leaf level); reaching a compound without one is a
@@ -2351,9 +2482,12 @@ impl<'a> Interp<'a> {
             ));
         }
         match (statement, child) {
-            (Stmt::Compute { .. } | Stmt::ExprStmt { .. }, Child::Call(call)) => {
-                self.exec_statement_call(call.as_ref().clone(), frame, Some(rest))
-            }
+            (Stmt::Compute { .. } | Stmt::ExprStmt { .. }, Child::Call(call)) => self
+                .exec_statement_call(call.as_ref().clone(), frame, Some(rest))
+                .map(|flow| match flow {
+                    Flow::Return(_) => Flow::Normal,
+                    other => other,
+                }),
             (Stmt::While { cond, body, .. }, Child::WhileBody) => {
                 let first_flow = self.exec_block_resumable(body, frame, me, rest)?;
                 self.while_loop(cond, body, frame, me, first_flow)
@@ -2451,7 +2585,7 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         first_flow: Flow,
-    ) -> Result<Flow, Diagnostic> {
+    ) -> Result<Flow, ExecError> {
         let mut pending = first_flow;
         loop {
             match pending {
@@ -2466,6 +2600,8 @@ impl<'a> Interp<'a> {
             if !keep {
                 return Ok(Flow::Normal);
             }
+            self.reset_evaluation_phase();
+            self.set_ctx_child(Child::WhileBody);
             pending = self.exec_block(body, frame, me)?;
         }
     }
@@ -2481,16 +2617,27 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         in_flight: Option<&[PathLevel]>,
-    ) -> Result<Flow, Diagnostic> {
-        let mut pending = match in_flight {
-            Some(rest) => self.exec_block_resumable(body, frame, me, rest)?,
-            None => self.exec_block(body, frame, me)?,
+    ) -> Result<Flow, ExecError> {
+        let resuming_condition = self
+            .evaluations
+            .last()
+            .is_some_and(|state| state.repeat_condition);
+        let mut pending = if resuming_condition {
+            Flow::Normal
+        } else {
+            match in_flight {
+                Some(rest) => self.exec_block_resumable(body, frame, me, rest)?,
+                None => self.exec_block(body, frame, me)?,
+            }
         };
         loop {
             match pending {
                 Flow::Normal | Flow::Continue => {}
                 Flow::Break => return Ok(Flow::Normal),
                 other => return Ok(other),
+            }
+            if let Some(state) = self.evaluations.last_mut() {
+                state.repeat_condition = true;
             }
             let Value::Bool(keep_going) = self.eval(cond, frame, me)? else {
                 return Err(self.error(
@@ -2502,6 +2649,8 @@ impl<'a> Interp<'a> {
             if keep_going {
                 return Ok(Flow::Normal);
             }
+            self.reset_evaluation_phase();
+            self.set_ctx_child(Child::RepeatBody);
             pending = self.exec_block(body, frame, me)?;
         }
     }
@@ -2524,7 +2673,7 @@ impl<'a> Interp<'a> {
         me: Option<usize>,
         mut i: i128,
         first_outcome: Option<Flow>,
-    ) -> Result<Flow, Diagnostic> {
+    ) -> Result<Flow, ExecError> {
         let mut pending = first_outcome;
         loop {
             match pending.take() {
@@ -2575,7 +2724,7 @@ impl<'a> Interp<'a> {
         me: Option<usize>,
         mut position: usize,
         in_flight: Option<&[PathLevel]>,
-    ) -> Result<Flow, Diagnostic> {
+    ) -> Result<Flow, ExecError> {
         if let Some(rest) = in_flight {
             match self.exec_block_resumable(body, frame, me, rest)? {
                 Flow::Normal | Flow::Continue => position += 1,
@@ -2605,48 +2754,92 @@ impl<'a> Interp<'a> {
         Ok(Flow::Normal)
     }
 
+    fn statement_evaluation(
+        &mut self,
+        saved: Option<StatementEvaluation>,
+        execute: impl FnOnce(&mut Self) -> Result<Flow, ExecError>,
+    ) -> Result<Flow, ExecError> {
+        if !self.suspend_eligible() || self.sampling_temporal {
+            return execute(self);
+        }
+        let level = self.exec_context.len() - 1;
+        let mut state = saved.unwrap_or_else(|| StatementEvaluation::new(level));
+        state.level = level;
+        state.cursor = vec![(0, 0)];
+        self.evaluations.push(state);
+        let result = execute(self);
+        let mut state = self
+            .evaluations
+            .pop()
+            .expect("statement evaluation was pushed");
+        match result {
+            Err(ExecError::Suspend) => {
+                state.cursor.clear();
+                state.resume = None;
+                let Some(pending) = self.pending_suspension.as_mut() else {
+                    return Err(self.error(
+                        "E0402",
+                        "internal: evaluation suspension without state",
+                        origin_span(),
+                    ));
+                };
+                pending.path[level].child = Some(Child::Evaluation(Box::new(state)));
+                Ok(Flow::Suspend)
+            }
+            Err(ExecError::Stop) => Ok(Flow::Stop),
+            other => other,
+        }
+    }
+
     fn exec_statement(
         &mut self,
         statement: &Stmt,
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Result<Flow, Diagnostic> {
+    ) -> Result<Flow, ExecError> {
+        self.statement_evaluation(None, |this| this.exec_statement_inner(statement, frame, me))
+    }
+
+    fn exec_statement_resumable(
+        &mut self,
+        statement: &Stmt,
+        child: &Child,
+        rest: &[PathLevel],
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Flow, ExecError> {
+        if let Child::Evaluation(saved) = child {
+            let mut state = saved.as_ref().clone();
+            state.resume = Some(rest.to_vec());
+            self.statement_evaluation(Some(state), |this| {
+                this.exec_statement_inner(statement, frame, me)
+            })
+        } else {
+            self.statement_evaluation(None, |this| {
+                this.exec_statement_resumable_inner(statement, child, rest, frame, me)
+            })
+        }
+    }
+
+    fn reset_evaluation_phase(&mut self) {
+        if let Some(state) = self.evaluations.last_mut()
+            && state.level + 1 == self.exec_context.len()
+        {
+            *state = StatementEvaluation::new(state.level);
+        }
+    }
+
+    fn exec_statement_inner(
+        &mut self,
+        statement: &Stmt,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Flow, ExecError> {
         match statement {
             Stmt::VarDecl { name, ty, init, .. } => {
-                // `var c: cfg = new;` — an untyped `new` in a var
-                // declaration with a declared struct type takes that
-                // type (clause 6.3's typed creation: the target's type
-                // is known). Other untyped `new` uses keep the explicit
-                // not-supported diagnostic below.
-                let inferred_new: Option<Expr> = match (ty, init) {
-                    (
-                        Some(
-                            var_ty @ TypeExpr::Named { .. } | var_ty @ TypeExpr::TemplateRef { .. },
-                        ),
-                        Some(Expr::New {
-                            ty: None,
-                            inits,
-                            span,
-                        }),
-                    ) => Some(Expr::New {
-                        ty: Some(var_ty.clone()),
-                        inits: inits.clone(),
-                        span: *span,
-                    }),
-                    _ => None,
-                };
-                let mut value = match (&inferred_new, init) {
-                    (Some(new_expr), _) => self.eval(new_expr, frame, me)?,
-                    (None, Some(expr)) => {
-                        // The declared type is the inference context for an
-                        // untyped `evaluate { ... }` in the initializer
-                        // (4.17.7); the `var x := e` form declares none.
-                        self.eval_with_hint(ty.clone(), expr, frame, me)?
-                    }
-                    // A declared type without an initializer takes the
-                    // type's default; the type-inferring `:=` form
-                    // always carries an initializer.
-                    (None, None) => match ty {
+                let mut value = match init {
+                    Some(expr) => self.eval_with_hint(ty.clone(), expr, frame, me)?,
+                    None => match ty {
                         Some(ty) => self.default_for(ty),
                         None => {
                             return Err(self.error(
@@ -2690,7 +2883,7 @@ impl<'a> Interp<'a> {
                 // The target's declared type is the inference context for
                 // an untyped `evaluate { ... }` in the assigned value
                 // (4.17.7).
-                let hint = self.static_type_of(target, frame, me);
+                let hint = self.contextual_type_of(target, frame, me);
                 let value = self.eval_with_hint(hint, value, frame, me)?;
                 match target {
                     Expr::HdlPath { path, span } => {
@@ -2715,7 +2908,16 @@ impl<'a> Interp<'a> {
                         }
                     }
                     Expr::Index { base, index, span } => {
-                        let index_value = self.eval(index, frame, me)?;
+                        let index_value = self.eval_with_hint(
+                            Some(TypeExpr::Scalar {
+                                base: ScalarBase::Int,
+                                width: None,
+                                span: index.span(),
+                            }),
+                            index,
+                            frame,
+                            me,
+                        )?;
                         let Value::Int(i) = index_value else {
                             return Err(self.error(
                                 "E0402",
@@ -2769,7 +2971,12 @@ impl<'a> Interp<'a> {
             }
             Stmt::Return { value, .. } => {
                 let value = match value {
-                    Some(expr) => self.eval(expr, frame, me)?,
+                    Some(expr) => {
+                        self.eval_with_hint(frame.return_type.clone(), expr, frame, me)?
+                    }
+                    None if frame.return_type.is_some() => {
+                        frame.locals.get("result").cloned().unwrap_or(Value::Void)
+                    }
                     None => Value::Void,
                 };
                 Ok(Flow::Return(value))
@@ -3012,6 +3219,10 @@ impl<'a> Interp<'a> {
                 }
             },
             Stmt::Emit { target, span } => {
+                let mut target = target;
+                while let Expr::Paren { expr, .. } = target {
+                    target = expr;
+                }
                 // 11.1.3.2: emit causes the event to occur; the action
                 // itself does not consume time.
                 if let Expr::StaticAccess {
@@ -3023,8 +3234,7 @@ impl<'a> Interp<'a> {
                     // instance, the static `on` blocks run with no `me`.
                     self.fire_static_event(type_name, member, *span, frame)?;
                 } else {
-                    let path = self.event_path(target)?;
-                    let owner = self.resolve_event_owner(target, frame, me);
+                    let (path, owner) = self.resolve_emitted_event(target, frame, me)?;
                     self.fire_event(&path, owner, *span, frame)?;
                 }
                 Ok(Flow::Normal)
@@ -3036,9 +3246,19 @@ impl<'a> Interp<'a> {
                 let Expr::Call { callee, args, .. } = call else {
                     return Err(self.error("E0402", "start expects a method call", *span));
                 };
+                let hints = if args.iter().any(expr_needs_context) {
+                    self.call_arg_hints(callee, args.len(), frame, me)
+                } else {
+                    Vec::new()
+                };
                 let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval(arg, frame, me)?);
+                for (index, arg) in args.iter().enumerate() {
+                    values.push(self.eval_with_hint(
+                        hints.get(index).cloned().flatten(),
+                        arg,
+                        frame,
+                        me,
+                    )?);
                 }
                 let (instance, name) = match callee.as_ref() {
                     Expr::Ident { name, .. } => {
@@ -3102,24 +3322,22 @@ impl<'a> Interp<'a> {
                 // immediately if the sampling event has already been
                 // emitted for the current tick" — it still runs only
                 // after the starter's turn yields, 17.2.2).
-                let tcm_event = blocks.first().and_then(|block| block.tcm_event.clone());
-                let (wake_event, eligible_at_cycle) =
-                    match tcm_event.map(|event| self.event_path(&event)) {
-                        Some(Ok(path)) if !is_every_cycle_event(&path) => {
-                            if self.event_occurred_this_cycle(&path) {
-                                (None, self.cycle)
-                            } else {
-                                (Some(path), self.cycle + 1)
-                            }
+                let event = self.entry_event_key(&blocks, &values, instance)?;
+                let (wake_event, eligible_at_cycle) = match event {
+                    Some(path) if !is_every_cycle_event(&path) => {
+                        if self.event_occurred_this_cycle(&path) {
+                            (None, self.cycle)
+                        } else {
+                            (Some(path), self.cycle + 1)
                         }
-                        _ => (None, self.cycle + 1),
-                    };
+                    }
+                    _ => (None, self.cycle + 1),
+                };
                 self.coroutines.push(Coroutine {
                     kind: CoroutineKind::Tcm {
                         instance,
                         method: name,
-                        args: values,
-                        next_block: 0,
+                        progress: crate::methods::Progress::new(values),
                     },
                     id: self.next_coroutine_id,
                     path: Vec::new(),
@@ -3145,9 +3363,19 @@ impl<'a> Interp<'a> {
                 let Expr::Call { callee, args, .. } = call else {
                     return Err(self.error("E0402", "compute expects a method call", *span));
                 };
+                let hints = if args.iter().any(expr_needs_context) {
+                    self.call_arg_hints(callee, args.len(), frame, me)
+                } else {
+                    Vec::new()
+                };
                 let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval(arg, frame, me)?);
+                for (position, arg) in args.iter().enumerate() {
+                    values.push(self.eval_with_hint(
+                        hints.get(position).cloned().unwrap_or(None),
+                        arg,
+                        frame,
+                        me,
+                    )?);
                 }
                 match callee.as_ref() {
                     Expr::Ident { name, .. } => {
@@ -3237,7 +3465,20 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<Flow, Diagnostic> {
+    ) -> Result<Flow, ExecError> {
+        self.atomic_depth += 1;
+        let result = self.exec_gen_inner(expr, frame, me, span);
+        self.atomic_depth -= 1;
+        result
+    }
+
+    fn exec_gen_inner(
+        &mut self,
+        expr: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<Flow, ExecError> {
         let Some(me_index) = me else {
             return Err(self.error("E0402", "gen requires an enclosing instance", span));
         };
@@ -3431,7 +3672,7 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me_index: usize,
         span: crate::ast::Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ExecError> {
         let Some(segments) = expr_path_segments(expr) else {
             return Err(self.error("E0402", "gen target must be a simple field path", span));
         };
@@ -3536,7 +3777,7 @@ impl<'a> Interp<'a> {
         &self,
         start_instance: usize,
         start_remaining: &[String],
-    ) -> Result<Option<(usize, Vec<String>, Expr)>, Diagnostic> {
+    ) -> Result<Option<(usize, Vec<String>, Expr)>, ExecError> {
         let mut instance = start_instance;
         let mut remaining: Vec<String> = start_remaining.to_vec();
         loop {
@@ -3630,7 +3871,7 @@ impl<'a> Interp<'a> {
         list_expr: &Expr,
         other: &[(usize, Expr)],
         span: crate::ast::Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ExecError> {
         let target_text = slot_remaining.join(".");
         self.check_chosen_from_target(slot_instance, slot_remaining, &target_text, span)?;
         let list_text = expr_text(list_expr);
@@ -3712,7 +3953,7 @@ impl<'a> Interp<'a> {
         slot_remaining: &[String],
         target_text: &str,
         span: crate::ast::Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ExecError> {
         let mut instance = slot_instance;
         let last = slot_remaining.len() - 1;
         for (position, segment) in slot_remaining.iter().enumerate() {
@@ -3817,7 +4058,7 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: usize,
         span: crate::ast::Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ExecError> {
         // The slot's declared type binds the value (T7.1's value
         // semantics: a custom numeric copies; a scalar into a
         // custom-numeric slot converts). The gen paths store sampled
@@ -3854,7 +4095,7 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ExecError> {
         let (instance, field) = self.rgf_target_instance_field(target, frame, me, span)?;
         let field_decl = self.rgf_field_declaration(instance, &field, span)?;
         if !field_decl.range_gen {
@@ -3870,7 +4111,8 @@ impl<'a> Interp<'a> {
                 span,
             ));
         };
-        let value = self.eval(value, frame, me)?;
+        let hint = self.contextual_type_of(target, frame, me);
+        let value = self.eval_with_hint(hint, value, frame, me)?;
         let numeric = match &value {
             Value::Int(v) => *v,
             Value::Bool(b) => *b as i128,
@@ -3924,7 +4166,7 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<Option<Value>, Diagnostic> {
+    ) -> Result<Option<Value>, ExecError> {
         if !matches!(
             name,
             "rgf_was_generated" | "rgf_get_range" | "rgf_was_reduced"
@@ -3977,7 +4219,7 @@ impl<'a> Interp<'a> {
         instance: usize,
         field: &str,
         span: crate::ast::Span,
-    ) -> Result<crate::ast::Field, Diagnostic> {
+    ) -> Result<crate::ast::Field, ExecError> {
         let type_name = self.instances[instance].type_name.clone();
         let types: &[crate::elab::ElaboratedType] = self.types;
         let Some(ty) = types.iter().find(|t| t.name == type_name) else {
@@ -3999,7 +4241,7 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<(usize, String), Diagnostic> {
+    ) -> Result<(usize, String), ExecError> {
         match target {
             Expr::MemberAccess { object, name, .. } => {
                 let base = self.eval(object, frame, me)?;
@@ -4110,7 +4352,7 @@ impl<'a> Interp<'a> {
         None
     }
 
-    fn gen_object(&mut self, index: usize, enclosing: &[Expr]) -> Result<(), Diagnostic> {
+    fn gen_object(&mut self, index: usize, enclosing: &[Expr]) -> Result<(), ExecError> {
         let type_name = self.instances[index].type_name.clone();
         let types: &[crate::elab::ElaboratedType] = self.types;
         let Some(ty) = types.iter().find(|t| t.name == type_name) else {
@@ -4430,7 +4672,7 @@ impl<'a> Interp<'a> {
         per_field: &BTreeMap<String, Vec<Expr>>,
         type_name: &str,
         span: crate::ast::Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ExecError> {
         for (name, field_ty) in rgf_fields {
             let Some(full_range) = self.type_value_range(field_ty) else {
                 return Err(self.error(
@@ -4481,7 +4723,7 @@ impl<'a> Interp<'a> {
         index: usize,
         full_set: &[(i128, i128)],
         span: crate::ast::Span,
-    ) -> Result<Vec<(i128, i128)>, Diagnostic> {
+    ) -> Result<Vec<(i128, i128)>, ExecError> {
         match expr {
             Expr::Paren { expr, .. } => self.rgf_contribution(expr, field, index, full_set, span),
             Expr::Binary {
@@ -4616,7 +4858,7 @@ impl<'a> Interp<'a> {
         set: &crate::ast::InSetExpr,
         index: usize,
         span: crate::ast::Span,
-    ) -> Result<Vec<(i128, i128)>, Diagnostic> {
+    ) -> Result<Vec<(i128, i128)>, ExecError> {
         match set {
             crate::ast::InSetExpr::Range(low, high) => {
                 let low = self.rgf_scalar_operand(low, index, span)?;
@@ -4656,7 +4898,7 @@ impl<'a> Interp<'a> {
         expr: &Expr,
         index: usize,
         span: crate::ast::Span,
-    ) -> Result<i128, Diagnostic> {
+    ) -> Result<i128, ExecError> {
         let value = self.eval(expr, &mut Frame::default(), Some(index))?;
         match &value {
             Value::Int(v) => Ok(*v),
@@ -4689,7 +4931,7 @@ impl<'a> Interp<'a> {
         ty: &TypeExpr,
         minimum: i128,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         match ty {
             TypeExpr::Scalar {
                 base: ScalarBase::Bool,
@@ -4749,7 +4991,7 @@ impl<'a> Interp<'a> {
         constraints: &[Expr],
         type_name: &str,
         span: crate::ast::Span,
-    ) -> Result<Option<Vec<(String, i128)>>, Diagnostic> {
+    ) -> Result<Option<Vec<(String, i128)>>, ExecError> {
         let bounds: std::collections::BTreeMap<String, (i64, i64)> = field_types
             .iter()
             .filter_map(|(name, ty)| crate::solve::int_bounds(ty).map(|b| (name.clone(), b)))
@@ -5105,7 +5347,7 @@ impl<'a> Interp<'a> {
     /// Sample one value of the declared type within its bounds. Struct
     /// fields are instantiated and randomized recursively (so their own
     /// constraints are enforced); non-literal widths use the default.
-    fn sample_type(&mut self, ty: &TypeExpr) -> Result<Value, Diagnostic> {
+    fn sample_type(&mut self, ty: &TypeExpr) -> Result<Value, ExecError> {
         match ty {
             TypeExpr::Scalar { base, width, .. } => Ok(match base {
                 ScalarBase::Uint => Value::Int(self.below_width(width, 32)),
@@ -5252,7 +5494,7 @@ impl<'a> Interp<'a> {
         object_index: usize,
         name: &str,
         span: crate::ast::Span,
-    ) -> Result<Vec<&MethodDecl>, Diagnostic> {
+    ) -> Result<Vec<&MethodDecl>, ExecError> {
         let type_name = self.instances[object_index].type_name.clone();
         resolve_method_blocks(self.types, &type_name, name, span)
     }
@@ -5348,7 +5590,7 @@ impl<'a> Interp<'a> {
         expr: &Expr,
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Result<Option<Flow>, Diagnostic> {
+    ) -> Result<Option<Flow>, ExecError> {
         if !self.suspend_eligible() {
             return Ok(None);
         }
@@ -5384,7 +5626,11 @@ impl<'a> Interp<'a> {
         }) {
             return Ok(None);
         }
-        let hints = self.call_arg_hints(callee, args.len(), frame, me);
+        let hints = if args.iter().any(expr_needs_context) {
+            self.call_arg_hints(callee, args.len(), frame, me)
+        } else {
+            Vec::new()
+        };
         let mut values = Vec::with_capacity(args.len());
         for (index, arg) in args.iter().enumerate() {
             values.push(self.eval_with_hint(
@@ -5406,6 +5652,183 @@ impl<'a> Interp<'a> {
             .map(Some)
     }
 
+    fn method_frame(
+        &mut self,
+        block: &MethodDecl,
+        prototype: &MethodDecl,
+        args: &[Value],
+        span: crate::ast::Span,
+    ) -> Result<Frame, ExecError> {
+        if args.len() != block.params.len() {
+            return Err(self.error(
+                "E0402",
+                format!(
+                    "method '{}' expects {} argument(s), got {}",
+                    block.name,
+                    block.params.len(),
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        let mut frame = Frame {
+            return_type: block
+                .return_type
+                .clone()
+                .or_else(|| prototype.return_type.clone()),
+            ..Frame::default()
+        };
+        for (index, (parameter, arg)) in block.params.iter().zip(args).enumerate() {
+            let declared = parameter.ty.as_ref().or_else(|| {
+                prototype
+                    .params
+                    .get(index)
+                    .and_then(|parameter| parameter.ty.as_ref())
+            });
+            if let Some(ty) = declared {
+                frame.local_types.insert(parameter.name.clone(), ty.clone());
+            }
+            let value = self.bind_slot_value(arg.clone(), declared, span)?;
+            frame.locals.insert(parameter.name.clone(), value);
+        }
+        Ok(frame)
+    }
+
+    /// Reference results start NULL; scalar/list/value results use the existing
+    /// representation defaults. Creating a result slot must not instantiate a
+    /// reference object or run its init hook.
+    fn method_result_default(&mut self, ty: Option<&TypeExpr>) -> Value {
+        let Some(ty) = ty.and_then(|ty| self.resolved_hint_type(ty, 0)) else {
+            return Value::Void;
+        };
+        let value_type = match &ty {
+            TypeExpr::Scalar { .. } | TypeExpr::List { .. } | TypeExpr::InlineEnum { .. } => true,
+            TypeExpr::Named { name, .. } => {
+                name == "set"
+                    || self.types.iter().any(|entry| {
+                        entry.name == *name
+                            && matches!(
+                                entry.kind,
+                                crate::ast::DeclarationKind::Type
+                                    | crate::ast::DeclarationKind::NumericType
+                            )
+                    })
+            }
+            TypeExpr::TemplateRef { name, args, .. } => {
+                let canonical = crate::ast::template_instance_name(name, args);
+                self.types.iter().any(|entry| {
+                    entry.name == canonical
+                        && entry.kind == crate::ast::DeclarationKind::NumericType
+                })
+            }
+            _ => false,
+        };
+        if value_type {
+            self.default_for(&ty)
+        } else {
+            Value::Void
+        }
+    }
+
+    fn method_execution_frame(
+        &mut self,
+        block: &MethodDecl,
+        prototype: &MethodDecl,
+        progress: &crate::methods::Progress,
+        kind: crate::methods::BodyKind,
+        span: crate::ast::Span,
+    ) -> Result<Frame, ExecError> {
+        let mut frame = self.method_frame(block, prototype, &progress.args, span)?;
+        if let Some(ty) = frame.return_type.clone()
+            && !block.params.iter().any(|p| p.name == "result")
+        {
+            let value = if kind == crate::methods::BodyKind::After {
+                self.bind_slot_value(progress.result.clone(), Some(&ty), span)?
+            } else {
+                self.method_result_default(Some(&ty))
+            };
+            frame.locals.insert("result".to_owned(), value);
+            frame.local_types.insert("result".to_owned(), ty);
+        }
+        Ok(frame)
+    }
+
+    fn complete_method_body(
+        progress: &mut crate::methods::Progress,
+        block: &MethodDecl,
+        kind: crate::methods::BodyKind,
+        on_return: usize,
+        frame: &Frame,
+        flow: Flow,
+    ) {
+        let returned = matches!(&flow, Flow::Return(_));
+        progress.result = match flow {
+            Flow::Return(value) => value,
+            _ if frame.return_type.is_some() => {
+                frame.locals.get("result").cloned().unwrap_or(Value::Void)
+            }
+            _ => Value::Void,
+        };
+        if kind == crate::methods::BodyKind::Before && !returned {
+            progress.args = block
+                .params
+                .iter()
+                .map(|p| {
+                    frame
+                        .locals
+                        .get(&p.name)
+                        .expect("bound method parameter")
+                        .clone()
+                })
+                .collect();
+        }
+        progress.pc = if returned { on_return } else { progress.pc + 1 };
+    }
+
+    fn execute_atomic_method(
+        &mut self,
+        program: &crate::methods::Program<'a>,
+        args: Vec<Value>,
+        me: Option<usize>,
+        span: crate::ast::Span,
+        locals: Option<&BTreeMap<String, Value>>,
+    ) -> Result<Value, ExecError> {
+        let mut progress = crate::methods::Progress::new(args);
+        while let Some(step) = program.steps.get(progress.pc).copied() {
+            if progress.control(step) {
+                continue;
+            }
+            let crate::methods::Step::Body {
+                method,
+                kind,
+                on_return,
+            } = step
+            else {
+                progress.result =
+                    self.method_result_default(program.prototype.return_type.as_ref());
+                progress.pc += 1;
+                continue;
+            };
+            let mut frame =
+                self.method_execution_frame(method, program.prototype, &progress, kind, span)?;
+            if let Some(locals) = locals {
+                for (name, value) in locals {
+                    frame
+                        .locals
+                        .entry(name.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+            let flow = self.exec_block(&method.body, &mut frame, me)?;
+            if matches!(flow, Flow::Stop) {
+                self.stop_requested = true;
+                break;
+            }
+            Self::complete_method_body(&mut progress, method, kind, on_return, &frame, flow);
+        }
+        Ok(progress.result)
+    }
+
     fn begin_statement_call(
         &mut self,
         receiver: usize,
@@ -5413,7 +5836,7 @@ impl<'a> Interp<'a> {
         args: Vec<Value>,
         span: crate::ast::Span,
         caller: &Frame,
-    ) -> Result<Flow, Diagnostic> {
+    ) -> Result<Flow, ExecError> {
         let declared = self
             .resolve_method(receiver, name, span)
             .is_ok_and(|blocks| blocks.iter().any(|block| !block.is_static));
@@ -5425,8 +5848,7 @@ impl<'a> Interp<'a> {
             StatementCall {
                 receiver,
                 name: name.to_owned(),
-                args,
-                block: 0,
+                progress: crate::methods::Progress::new(args),
                 entry_complete: false,
                 frame: Frame::default(),
                 span,
@@ -5434,6 +5856,10 @@ impl<'a> Interp<'a> {
             caller,
             None,
         )
+        .map(|flow| match flow {
+            Flow::Return(_) => Flow::Normal,
+            other => other,
+        })
     }
 
     /// Carry one method call through all its composed blocks. The path
@@ -5444,7 +5870,7 @@ impl<'a> Interp<'a> {
         mut call: StatementCall,
         caller: &Frame,
         mut resume: Option<&[PathLevel]>,
-    ) -> Result<Flow, Diagnostic> {
+    ) -> Result<Flow, ExecError> {
         if self.depth > 200 {
             return Err(self.error("E0406", "recursion too deep", call.span));
         }
@@ -5453,6 +5879,12 @@ impl<'a> Interp<'a> {
             let types = self.types;
             let type_name = self.instances[call.receiver].type_name.clone();
             let blocks = resolve_method_blocks(types, &type_name, &call.name, call.span)?;
+            let program = crate::methods::Program::instance(
+                types,
+                self.method_layers,
+                &type_name,
+                &call.name,
+            );
             let call_level = self.exec_context.len().checked_sub(1).ok_or_else(|| {
                 self.error(
                     "E0402",
@@ -5461,83 +5893,75 @@ impl<'a> Interp<'a> {
                 )
             })?;
             if !call.entry_complete {
-                if let Some(block) = blocks.first()
-                    && call.args.len() != block.params.len()
-                {
+                if call.progress.args.len() != program.prototype.params.len() {
                     return Err(self.error(
                         "E0402",
                         format!(
                             "method '{}' expects {} argument(s), got {}",
                             call.name,
-                            block.params.len(),
-                            call.args.len()
+                            program.prototype.params.len(),
+                            call.progress.args.len()
                         ),
                         call.span,
                     ));
                 }
-                // Clause 17.1.2: an inline TCM also synchronizes on
-                // its declared event before its first body action.
-                if let Some(event) = blocks.first().and_then(|block| block.tcm_event.as_ref()) {
-                    let event = self.event_path(event)?;
-                    if !is_every_cycle_event(&event) && !self.event_occurred_this_cycle(&event) {
-                        self.exec_context[call_level].child =
-                            Some(Child::Call(Box::new(call.clone())));
-                        // A synthetic leaf keeps entry distinct from
-                        // the body's first statement on resumption.
-                        self.exec_context.push(PathLevel {
-                            index: 0,
-                            child: None,
-                        });
-                        let flow =
-                            self.suspend_here(caller, call.span, false, self.cycle + 1, true, None);
-                        self.exec_context.pop();
-                        if let Some(pending) = &mut self.pending_suspension {
-                            pending.wake_event = Some(event);
-                        }
-                        return flow;
+                if let Some(event) =
+                    self.entry_event_key(&blocks, &call.progress.args, call.receiver)?
+                    && !is_every_cycle_event(&event)
+                    && !self.event_occurred_this_cycle(&event)
+                {
+                    self.exec_context[call_level].child = Some(Child::Call(Box::new(call.clone())));
+                    self.exec_context.push(PathLevel {
+                        index: 0,
+                        child: None,
+                    });
+                    let flow =
+                        self.suspend_here(caller, call.span, false, self.cycle + 1, true, None);
+                    self.exec_context.pop();
+                    if let Some(pending) = &mut self.pending_suspension {
+                        pending.wake_event = Some(event);
                     }
+                    return flow;
                 }
                 call.entry_complete = true;
                 resume = None;
             }
-            while call.block < blocks.len() {
-                let block = blocks[call.block];
-                if call.args.len() != block.params.len() {
-                    return Err(self.error(
-                        "E0402",
-                        format!(
-                            "method '{}' expects {} argument(s), got {}",
-                            call.name,
-                            block.params.len(),
-                            call.args.len()
-                        ),
-                        call.span,
-                    ));
+            while let Some(step) = program.steps.get(call.progress.pc).copied() {
+                if call.progress.control(step) {
+                    continue;
                 }
+                let crate::methods::Step::Body {
+                    method,
+                    kind,
+                    on_return,
+                } = step
+                else {
+                    call.progress.result =
+                        self.method_result_default(program.prototype.return_type.as_ref());
+                    call.progress.pc += 1;
+                    continue;
+                };
                 let mut frame = if resume.is_some() {
                     call.frame.clone()
                 } else {
-                    let mut frame = Frame::default();
-                    for (param, arg) in block.params.iter().zip(&call.args) {
-                        if let Some(ty) = &param.ty {
-                            frame.local_types.insert(param.name.clone(), ty.clone());
-                        }
-                        let value =
-                            self.bind_slot_value(arg.clone(), param.ty.as_ref(), call.span)?;
-                        frame.locals.insert(param.name.clone(), value);
-                    }
-                    frame
+                    self.method_execution_frame(
+                        method,
+                        program.prototype,
+                        &call.progress,
+                        kind,
+                        call.span,
+                    )?
                 };
                 call.frame = frame.clone();
                 self.exec_context[call_level].child = Some(Child::Call(Box::new(call.clone())));
                 let flow = match resume.take() {
                     Some(path) => self.exec_block_resumable(
-                        &block.body,
+                        &method.body,
                         &mut frame,
                         Some(call.receiver),
                         path,
                     )?,
-                    None => self.exec_block(&block.body, &mut frame, Some(call.receiver))?,
+                    None => self.exec_block(&method.body, &mut frame, Some(call.receiver))?,
                 };
                 match flow {
                     Flow::Suspend => {
@@ -5557,12 +5981,17 @@ impl<'a> Interp<'a> {
                         self.stop_requested = true;
                         return Ok(Flow::Stop);
                     }
-                    Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_) => {
-                        call.block += 1;
-                    }
+                    flow => Self::complete_method_body(
+                        &mut call.progress,
+                        method,
+                        kind,
+                        on_return,
+                        &frame,
+                        flow,
+                    ),
                 }
             }
-            Ok(Flow::Normal)
+            Ok(Flow::Return(call.progress.result))
         })();
         self.depth -= 1;
         result
@@ -5574,7 +6003,7 @@ impl<'a> Interp<'a> {
         name: &str,
         args: Vec<Value>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let type_name = self.instances[object_index].type_name.clone();
         let types: &[crate::elab::ElaboratedType] = self.types;
         let blocks = match resolve_method_blocks(types, &type_name, name, span) {
@@ -5621,67 +6050,30 @@ impl<'a> Interp<'a> {
             return Err(self.error("E0406", "recursion too deep", span));
         }
         self.depth += 1;
-        // Calls reached through value expressions remain atomic.
-        // Statement calls use exec_statement_call's saved frames.
+        // Atomic callback/fallback dispatch. Scheduled instance calls use
+        // exec_statement_call, including calls in ordinary expressions.
         self.atomic_depth += 1;
-        let mut result = Value::Void;
-        for block in blocks {
-            if args.len() != block.params.len() {
-                self.atomic_depth -= 1;
-                self.depth -= 1;
-                return Err(self.error(
-                    "E0402",
-                    format!(
-                        "method '{name}' expects {} argument(s), got {}",
-                        block.params.len(),
-                        args.len()
-                    ),
-                    span,
-                ));
-            }
-            let mut frame = Frame::default();
-            for (param, arg) in block.params.iter().zip(args.iter()) {
-                if let Some(ty) = &param.ty {
-                    frame.local_types.insert(param.name.clone(), ty.clone());
-                }
-                // A parameter binds by value (T7.1): a custom numeric
-                // argument copies, and a scalar argument converts when
-                // the parameter's declared type is a custom numeric
-                // type. The clause 31 dispatch passes struct objects,
-                // which bind unchanged.
-                let bound = self.bind_slot_value(arg.clone(), param.ty.as_ref(), span)?;
-                frame.locals.insert(param.name.clone(), bound);
-            }
-            match self.exec_block(&block.body, &mut frame, Some(object_index))? {
-                Flow::Return(value) => result = value,
-                Flow::Normal | Flow::Break | Flow::Continue => {}
-                // stop_run() inside a TCM unwinds the whole run; the flag
-                // is checked by the run loop and the calling scheduler.
-                Flow::Stop => {
-                    self.stop_requested = true;
-                }
-                // Suspension is disabled in atomic regions.
-                Flow::Suspend => {}
-            }
-        }
+        let program =
+            crate::methods::Program::instance(types, self.method_layers, &type_name, name);
+        let outcome = self.execute_atomic_method(&program, args, Some(object_index), span, None);
         self.atomic_depth -= 1;
         self.depth -= 1;
-        Ok(result)
+        outcome
     }
 
     /// `Type::method(args)` — the static method dispatch (clause
     /// 17.2.2): the composed static blocks of the declaring type run
     /// without a receiver. A static method is not a TCM: its body is an
-    /// atomic region like an inline call, and bare static-field /
-    /// static-method references inside it resolve against
-    /// `static_context` (this type).
+    /// atomic region like an inline call, and bare static-field references
+    /// inside it resolve against `static_context` (this type). Bare method
+    /// calls without a receiver remain unsupported; use Type::name.
     fn call_static_method(
         &mut self,
         type_name: &str,
         name: &str,
         args: Vec<Value>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let blocks: Vec<&MethodDecl> = self
             .static_methods
             .get(type_name)
@@ -5706,43 +6098,12 @@ impl<'a> Interp<'a> {
         self.atomic_depth += 1;
         let previous_context = self.static_context.take();
         self.static_context = Some(type_name.to_owned());
-        let mut result = Value::Void;
-        for block in &blocks {
-            if args.len() != block.params.len() {
-                self.static_context = previous_context;
-                self.atomic_depth -= 1;
-                self.depth -= 1;
-                return Err(self.error(
-                    "E0402",
-                    format!(
-                        "static method '{name}' expects {} argument(s), got {}",
-                        block.params.len(),
-                        args.len()
-                    ),
-                    span,
-                ));
-            }
-            let mut frame = Frame::default();
-            for (param, arg) in block.params.iter().zip(args.iter()) {
-                if let Some(ty) = &param.ty {
-                    frame.local_types.insert(param.name.clone(), ty.clone());
-                }
-                frame.locals.insert(param.name.clone(), arg.clone());
-            }
-            match self.exec_block(&block.body, &mut frame, None)? {
-                Flow::Return(value) => result = value,
-                Flow::Normal | Flow::Break | Flow::Continue => {}
-                Flow::Stop => {
-                    self.stop_requested = true;
-                }
-                // Suspension is disabled in atomic regions.
-                Flow::Suspend => {}
-            }
-        }
+        let program = crate::methods::Program::static_method(&blocks);
+        let outcome = self.execute_atomic_method(&program, args, None, span, None);
         self.static_context = previous_context;
         self.atomic_depth -= 1;
         self.depth -= 1;
-        Ok(result)
+        outcome
     }
 
     /// The value of `Type::field` from the static store (clause
@@ -5754,7 +6115,7 @@ impl<'a> Interp<'a> {
         type_name: &str,
         member: &str,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         self.statics
             .get(type_name)
             .and_then(|fields| fields.get(member))
@@ -5811,7 +6172,7 @@ impl<'a> Interp<'a> {
         values: Vec<Value>,
         span: crate::ast::Span,
         me: Option<usize>,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         if name == "out" {
             let text = self.format_values_checked(&values, span)?;
             self.output.push_str(&text);
@@ -5954,7 +6315,7 @@ impl<'a> Interp<'a> {
         name: &str,
         values: &[Value],
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let Some(_repeatable) = self.annotation_types.get(type_name) else {
             return Err(self.error(
                 "E0401",
@@ -6063,7 +6424,7 @@ impl<'a> Interp<'a> {
         name: &str,
         values: &[Value],
         span: crate::ast::Span,
-    ) -> Option<Diagnostic> {
+    ) -> Option<ExecError> {
         let (_, clause, (min, max)) = UNIMPLEMENTED_2019
             .iter()
             .find(|(candidate, _, _)| *candidate == name)?;
@@ -6092,7 +6453,7 @@ impl<'a> Interp<'a> {
     /// `pack(NULL, obj)` — concatenate the object's physical fields
     /// MSB-first into one integer (per-field widths from their scalar
     /// declarations; non-physical and `!` fields are excluded).
-    fn pack_object(&mut self, index: usize, span: crate::ast::Span) -> Result<Value, Diagnostic> {
+    fn pack_object(&mut self, index: usize, span: crate::ast::Span) -> Result<Value, ExecError> {
         let type_name = self.instances[index].type_name.clone();
         let types: &[crate::elab::ElaboratedType] = self.types;
         let Some(ty) = types.iter().find(|t| t.name == type_name) else {
@@ -6136,7 +6497,7 @@ impl<'a> Interp<'a> {
     /// field path from `sys` (`sys.u1`, `sys.u2[0]`), following the
     /// same field order the field tree walks. `E0402` for an instance
     /// outside the tree under sys (a local `var`'s struct).
-    fn instance_e_path(&self, target: usize, span: crate::ast::Span) -> Result<Value, Diagnostic> {
+    fn instance_e_path(&self, target: usize, span: crate::ast::Span) -> Result<Value, ExecError> {
         let Some(sys_index) = self
             .instances
             .iter()
@@ -6311,7 +6672,7 @@ impl<'a> Interp<'a> {
         name: &str,
         values: Vec<Value>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         match (name, values.as_slice()) {
             ("get_bound_set", []) => {
                 // 9.13.9: the bound set contains the port itself; a
@@ -6429,7 +6790,7 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         if args.len() < 3 || args.len().is_multiple_of(2) {
             return Err(self.error(
                 "E0402",
@@ -6493,6 +6854,32 @@ impl<'a> Interp<'a> {
                     }
                     config.max_int_buckets = count as u64;
                 }
+                "check_illegal_immediately" => {
+                    let Value::Bool(enabled) = self.eval(&pair[1], frame, me)? else {
+                        return Err(self.error(
+                            "E0402",
+                            "check_illegal_immediately expects a Boolean value",
+                            pair[1].span(),
+                        ));
+                    };
+                    config.check_illegal_immediately = enabled;
+                }
+                "at_least" => {
+                    let Value::Int(goal) = self.eval(&pair[1], frame, me)? else {
+                        return Err(self.error(
+                            "E0402",
+                            "at_least expects an integer",
+                            pair[1].span(),
+                        ));
+                    };
+                    config.at_least = u64::try_from(goal).map_err(|_| {
+                        self.error(
+                            "E0402",
+                            "at_least must be a nonnegative u64 value",
+                            pair[1].span(),
+                        )
+                    })?;
+                }
                 _ => {
                     return Err(self.error(
                         "E0419",
@@ -6502,7 +6889,9 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        if config.max_int_buckets != self.coverage_config.max_int_buckets {
+        if config.max_int_buckets != self.coverage_config.max_int_buckets
+            || config.at_least != self.coverage_config.at_least
+        {
             if self
                 .coverage
                 .iter()
@@ -6511,7 +6900,11 @@ impl<'a> Interp<'a> {
             {
                 return Err(self.error(
                     "E0402",
-                    "max_int_buckets cannot change after coverage sampling starts",
+                    if config.max_int_buckets != self.coverage_config.max_int_buckets {
+                        "max_int_buckets cannot change after coverage sampling starts"
+                    } else {
+                        "at_least cannot change after coverage sampling starts"
+                    },
                     span,
                 ));
             }
@@ -6536,7 +6929,7 @@ impl<'a> Interp<'a> {
         name: &str,
         values: Vec<Value>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         match (name, values.as_slice()) {
             ("sample_cg", [Value::Str(spec)]) => {
                 // 14.8.2.10: sample a cover group (all its instances)
@@ -6594,6 +6987,8 @@ impl<'a> Interp<'a> {
     /// prose normalises is Specman-internal). Stores the value for
     /// `get_overall_grade()`.
     fn compute_overall_grade_value(&mut self) -> f64 {
+        self.prepare_coverage_instances(true);
+        self.refresh_coverage_effects();
         if !self.coverage_was_enabled {
             self.overall_grade = Some(0.0);
             return 0.0;
@@ -6601,7 +6996,7 @@ impl<'a> Interp<'a> {
         let mut sum = 0.0f64;
         let mut count = 0usize;
         for entry in &self.coverage {
-            for group in &entry.groups {
+            for group in entry.groups.iter().filter(|group| group.is_reported()) {
                 if let Some(grade) = group.grade() {
                     sum += grade;
                     count += 1;
@@ -6622,7 +7017,7 @@ impl<'a> Interp<'a> {
         &mut self,
         spec: &str,
         span: crate::ast::Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ExecError> {
         let Some((type_name, group_name)) = spec.rsplit_once('.') else {
             return Err(self.error("E0402", "covers.sample_cg expects \"type.group\"", span));
         };
@@ -6641,7 +7036,7 @@ impl<'a> Interp<'a> {
             .groups
             .iter()
             .enumerate()
-            .filter(|(_, group)| group.name == group_name)
+            .filter(|(_, group)| group.name == group_name && group.unit_owner.is_none())
             .map(|(index, _)| index)
             .collect();
         if group_indices.is_empty() {
@@ -6661,7 +7056,7 @@ impl<'a> Interp<'a> {
         let mut frame = Frame::default();
         for owner in instance_indices {
             for group_index in &group_indices {
-                self.sample_group_on_instance(entry_index, *group_index, owner, &mut frame);
+                self.sample_group_on_instance(entry_index, *group_index, owner, &mut frame, span);
             }
         }
         Ok(())
@@ -6674,7 +7069,7 @@ impl<'a> Interp<'a> {
         name: &str,
         values: Vec<Value>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         if let Some(diagnostic) = self.unimplemented_2019(name, &values, span) {
             return Err(diagnostic);
         }
@@ -6710,7 +7105,7 @@ impl<'a> Interp<'a> {
         name: &str,
         values: Vec<Value>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         match (name, values.as_slice()) {
             ("start", [Value::Object(root)]) => {
                 let root = *root;
@@ -7027,7 +7422,7 @@ impl<'a> Interp<'a> {
         &self,
         handle: &Rc<RefCell<InstanceIteratorState>>,
         span: crate::ast::Span,
-    ) -> Result<Vec<InstancePathItem>, Diagnostic> {
+    ) -> Result<Vec<InstancePathItem>, ExecError> {
         let state = handle.borrow();
         if !state.started {
             return Err(self.error(
@@ -7051,7 +7446,7 @@ impl<'a> Interp<'a> {
         &self,
         handle: &Rc<RefCell<InstanceIteratorState>>,
         span: crate::ast::Span,
-    ) -> Result<InstancePathItem, Diagnostic> {
+    ) -> Result<InstancePathItem, ExecError> {
         Ok(self
             .iterator_current_path(handle, span)?
             .pop()
@@ -7067,7 +7462,7 @@ impl<'a> Interp<'a> {
         name: &str,
         values: Vec<Value>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         match (name, values.as_slice()) {
             ("get_instance", []) => Ok(Value::Object(item.instance)),
             ("get_instance", _) => Err(self.error(
@@ -7143,7 +7538,7 @@ impl<'a> Interp<'a> {
         expr: &Expr,
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Result<Option<Flow>, Diagnostic> {
+    ) -> Result<Option<Flow>, ExecError> {
         let Expr::Call { callee, args, span } = expr else {
             return Ok(None);
         };
@@ -7196,7 +7591,7 @@ impl<'a> Interp<'a> {
         values: Vec<Value>,
         span: crate::ast::Span,
         frame: &Frame,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let kind = sync.borrow().kind;
         // Locker surface.
         if kind == SyncKind::Locker {
@@ -7270,7 +7665,7 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
         frame: &Frame,
         statement_position: bool,
-    ) -> Result<SyncOutcome, Diagnostic> {
+    ) -> Result<SyncOutcome, ExecError> {
         sync.borrow_mut().transfer_attempted = true;
         let kind = sync.borrow().kind;
         if kind == SyncKind::RdvSemaphore {
@@ -7314,7 +7709,7 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
         frame: &Frame,
         statement_position: bool,
-    ) -> Result<SyncOutcome, Diagnostic> {
+    ) -> Result<SyncOutcome, ExecError> {
         let partner = if direction == SyncWaiter::Up {
             SyncWaiter::Down
         } else {
@@ -7373,7 +7768,7 @@ impl<'a> Interp<'a> {
         &mut self,
         sync: Rc<RefCell<SyncState>>,
         direction: SyncWaiter,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         sync.borrow_mut().transfer_attempted = true;
         let kind = sync.borrow().kind;
         let mut state = sync.borrow_mut();
@@ -7405,7 +7800,7 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
         frame: &Frame,
         statement_position: bool,
-    ) -> Result<SyncOutcome, Diagnostic> {
+    ) -> Result<SyncOutcome, ExecError> {
         if sync.borrow().holder.is_none() {
             let holder = self.current_coroutine_id;
             sync.borrow_mut().holder = holder;
@@ -7423,7 +7818,7 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
         frame: &Frame,
         statement_position: bool,
-    ) -> Result<SyncOutcome, Diagnostic> {
+    ) -> Result<SyncOutcome, ExecError> {
         let holder = self.current_coroutine_id;
         if holder.is_some() && sync.borrow().holder == holder {
             sync.borrow_mut().holder = None;
@@ -7447,7 +7842,7 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
         frame: &Frame,
         statement_position: bool,
-    ) -> Result<SyncOutcome, Diagnostic> {
+    ) -> Result<SyncOutcome, ExecError> {
         if !(statement_position && self.suspend_eligible()) {
             return Err(self.error(
                 "E0421",
@@ -7607,7 +8002,7 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
         frame: &Frame,
         statement_position: bool,
-    ) -> Result<SyncOutcome, Diagnostic> {
+    ) -> Result<SyncOutcome, ExecError> {
         if statement_position && self.suspend_eligible() {
             self.suspend_here(frame, span, true, self.cycle, false, None)?;
             return Ok(SyncOutcome::Yield);
@@ -7623,7 +8018,7 @@ impl<'a> Interp<'a> {
         sync: Rc<RefCell<SyncState>>,
         new_value: i128,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let (kind, transfer_attempted, max_value) = {
             let state = sync.borrow();
             (state.kind, state.transfer_attempted, state.max_value)
@@ -7658,7 +8053,7 @@ impl<'a> Interp<'a> {
         sync: Rc<RefCell<SyncState>>,
         new_max: i128,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let (kind, transfer_attempted, available) = {
             let state = sync.borrow();
             (state.kind, state.transfer_attempted, state.available)
@@ -7700,7 +8095,7 @@ impl<'a> Interp<'a> {
         name: &str,
         values: Vec<Value>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         match (name, values.as_slice()) {
             ("create_table", [Value::List(list)]) => {
                 let items = list.items.borrow().clone();
@@ -7870,7 +8265,7 @@ impl<'a> Interp<'a> {
         tag: &str,
         error_if_none: bool,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let key = crate::tables::with_csv_extension(file);
         let cache_key = (key.clone(), tag.to_owned());
         if let Some(cached) = self.table_cache.get(&cache_key) {
@@ -7901,16 +8296,16 @@ impl<'a> Interp<'a> {
         name: &str,
         values: Vec<Value>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let read_only = table.borrow().read_only;
         let source = table
             .borrow()
             .file_name
             .clone()
             .unwrap_or_else(|| "the table".to_owned());
-        let mutate = |name: &str| -> Result<(), Diagnostic> {
+        let mutate = |name: &str| -> Result<(), ExecError> {
             if read_only {
-                return Err(Diagnostic::new(
+                return Err(ExecError::new(
                     "E0402",
                     format!(
                         "'{name}' modifies a table read from '{source}', which is read-only; copy() it first (32.3)"
@@ -8164,7 +8559,7 @@ impl<'a> Interp<'a> {
         name: &str,
         values: Vec<Value>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let read_only = table.as_ref().is_some_and(|t| t.borrow().read_only);
         let source = table
             .as_ref()
@@ -8255,7 +8650,7 @@ impl<'a> Interp<'a> {
         value: &Value,
         depth: u32,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         if depth > 32 {
             return Err(self.error("E0406", "deep_copy nesting too deep", span));
         }
@@ -8376,7 +8771,7 @@ impl<'a> Interp<'a> {
         method: &str,
         args: Vec<Value>,
         span: crate::ast::Span,
-    ) -> Result<Option<Value>, Diagnostic> {
+    ) -> Result<Option<Value>, ExecError> {
         let type_name = self.instances[instance].type_name.clone();
         let types: &[crate::elab::ElaboratedType] = self.types;
         if resolve_method_blocks(types, &type_name, method, span).is_err() {
@@ -8410,7 +8805,7 @@ impl<'a> Interp<'a> {
         &mut self,
         type_name: &str,
         span: crate::ast::Span,
-    ) -> Result<usize, Diagnostic> {
+    ) -> Result<usize, ExecError> {
         match self.new_custom_numeric(type_name, span) {
             Value::Custom { instance, .. } => Ok(instance),
             _ => Err(self.error(
@@ -8431,7 +8826,7 @@ impl<'a> Interp<'a> {
         &mut self,
         value: &Value,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let Value::Custom {
             type_name,
             instance,
@@ -8480,7 +8875,7 @@ impl<'a> Interp<'a> {
         value: &Value,
         type_name: &str,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let (method, arg) = match value {
             Value::Int(v) => ("numeric_from_int", Value::Int(*v)),
             Value::Real(v) => ("numeric_from_real", Value::Real(*v)),
@@ -8518,7 +8913,7 @@ impl<'a> Interp<'a> {
         what: &str,
         method: &str,
         span: crate::ast::Span,
-    ) -> Diagnostic {
+    ) -> ExecError {
         self.error(
             "E0418",
             format!("{what} is not implemented by numeric type '{type_name}' ({method} missing)"),
@@ -8545,7 +8940,7 @@ impl<'a> Interp<'a> {
         value: Value,
         ty: Option<&TypeExpr>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         if let Some(TypeExpr::Named { name, .. }) = ty
             && self.is_custom_numeric_type(name)
         {
@@ -8605,7 +9000,7 @@ impl<'a> Interp<'a> {
         type_name: &str,
         op: BinaryOp,
         span: crate::ast::Span,
-    ) -> Result<usize, Diagnostic> {
+    ) -> Result<usize, ExecError> {
         match other {
             Value::Custom {
                 type_name: other_type,
@@ -8655,7 +9050,7 @@ impl<'a> Interp<'a> {
         lhs: Value,
         rhs: Value,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         use BinaryOp::*;
         let lhs_is_custom = matches!(lhs, Value::Custom { .. });
         let (type_name, instance, other_value) = if lhs_is_custom {
@@ -8768,7 +9163,7 @@ impl<'a> Interp<'a> {
         other_value: Value,
         type_name: &str,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let Value::Int(n) = other_value else {
             return Err(self.error("E0402", "shift amount must be an integer", span));
         };
@@ -8809,7 +9204,7 @@ impl<'a> Interp<'a> {
         type_name: &str,
         instance: usize,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let (method, symbol) = match op {
             UnaryOp::Negate => ("numeric_unary_minus", "-"),
             UnaryOp::Plus => ("numeric_unary_plus", "+"),
@@ -8844,7 +9239,7 @@ impl<'a> Interp<'a> {
         value: Value,
         ty: &TypeExpr,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let Value::Custom {
             type_name,
             instance,
@@ -8945,7 +9340,20 @@ impl<'a> Interp<'a> {
         &mut self,
         value: &Value,
         span: crate::ast::Span,
-    ) -> Result<String, Diagnostic> {
+    ) -> Result<String, ExecError> {
+        match self
+            .eval_action(|this| this.format_value_checked_inner(value, span).map(Value::Str))?
+        {
+            Value::Str(text) => Ok(text),
+            _ => unreachable!("formatted evaluation stores a string"),
+        }
+    }
+
+    fn format_value_checked_inner(
+        &mut self,
+        value: &Value,
+        span: crate::ast::Span,
+    ) -> Result<String, ExecError> {
         if let Value::Custom {
             type_name,
             instance,
@@ -8974,7 +9382,7 @@ impl<'a> Interp<'a> {
         &mut self,
         values: &[Value],
         span: crate::ast::Span,
-    ) -> Result<String, Diagnostic> {
+    ) -> Result<String, ExecError> {
         let mut text = String::new();
         for value in values {
             text.push_str(&self.format_value_checked(value, span)?);
@@ -8990,7 +9398,7 @@ impl<'a> Interp<'a> {
         item: &Value,
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let previous = frame.locals.insert("it".to_owned(), item.clone());
         let previous_type = frame.local_types.remove("it");
         let result = self.eval(expr, frame, me);
@@ -9020,7 +9428,7 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         if args.len() > 1 {
             return Err(self.error(
                 "E0402",
@@ -9066,7 +9474,7 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let [predicate] = args else {
             return Err(self.error(
                 "E0402",
@@ -9078,7 +9486,14 @@ impl<'a> Interp<'a> {
         let mut matches = Vec::new();
         let mut count = 0;
         for (index, item) in items.into_iter().enumerate() {
-            let Value::Bool(selected) = self.eval_list_item(predicate, &item, frame, me)? else {
+            let saved_hint = self.expected_type.replace(TypeExpr::Scalar {
+                base: ScalarBase::Bool,
+                width: None,
+                span: predicate.span(),
+            });
+            let result = self.eval_list_item(predicate, &item, frame, me);
+            self.expected_type = saved_hint;
+            let Value::Bool(selected) = result? else {
                 return Err(self.error(
                     "E0402",
                     format!("{name}() expects a boolean item expression"),
@@ -9132,7 +9547,7 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         if args.len() > 1 {
             return Err(self.error(
                 "E0402",
@@ -9263,7 +9678,7 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let mut intervals: Vec<(i128, i128)> = Vec::new();
         match items {
             crate::ast::InSetExpr::Items(exprs) => {
@@ -9326,8 +9741,8 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<i128, Diagnostic> {
-        let value = self.eval(expr, frame, me)?;
+    ) -> Result<i128, ExecError> {
+        let value = self.eval_with_hint(None, expr, frame, me)?;
         match &value {
             Value::Int(v) => Ok(*v),
             Value::Bool(b) => Ok(*b as i128),
@@ -9358,7 +9773,7 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<Vec<Value>, Diagnostic> {
+    ) -> Result<Vec<Value>, ExecError> {
         match items {
             crate::ast::InSetExpr::Items(exprs) => {
                 let mut values = Vec::with_capacity(exprs.len());
@@ -9474,7 +9889,7 @@ impl<'a> Interp<'a> {
         &mut self,
         values: Vec<Value>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let Some((format, arguments)) = values.split_first() else {
             return Err(self.error(
                 "E0402",
@@ -9520,8 +9935,128 @@ impl<'a> Interp<'a> {
         Ok(Value::Void)
     }
 
-    /// Resolve an `emit`/event target expression to its path key.
-    fn event_path(&mut self, target: &Expr) -> Result<String, Diagnostic> {
+    fn entry_event_key(
+        &self,
+        blocks: &[&MethodDecl],
+        args: &[Value],
+        owner: usize,
+    ) -> Result<Option<String>, ExecError> {
+        let Some(prototype) = method_prototype(blocks) else {
+            return Ok(None);
+        };
+        let Some(event) = &prototype.tcm_event else {
+            return Ok(None);
+        };
+        let path = self.event_path(event)?;
+        // Entry synchronization precedes the body frame. Object parameters
+        // already have evaluated values; binding their names here is pure.
+        let mut frame = Frame::default();
+        for (parameter, value) in prototype.params.iter().zip(args) {
+            frame.locals.insert(parameter.name.clone(), value.clone());
+        }
+        Ok(Some(self.scoped_event_key(&path, &frame, Some(owner))))
+    }
+
+    fn scoped_event_key(&self, path: &str, frame: &Frame, me: Option<usize>) -> String {
+        if path.starts_with('#') || is_every_cycle_event(path) {
+            return path.to_owned();
+        }
+        let segments: Vec<_> = path.split('.').collect();
+        let name = segments[segments.len() - 1];
+        if segments.len() == 1 {
+            if path.contains("::") {
+                return path.to_owned();
+            }
+            return me.map_or_else(|| path.to_owned(), |owner| instance_event_key(owner, name));
+        }
+        let mut owner = match segments[0] {
+            "sys" => self
+                .instances
+                .iter()
+                .position(|instance| instance.type_name == "sys"),
+            "me" | "self" => me,
+            first => {
+                if let Some((type_name, field)) = first.split_once("::") {
+                    match self
+                        .statics
+                        .get(type_name)
+                        .and_then(|fields| fields.get(field))
+                    {
+                        Some(Value::Object(owner)) => Some(*owner),
+                        _ => None,
+                    }
+                } else if self.defines.contains_key(first) {
+                    None
+                } else {
+                    match frame
+                        .locals
+                        .get(first)
+                        .or_else(|| me.and_then(|owner| self.instances[owner].get(first)))
+                    {
+                        Some(Value::Object(owner)) => Some(*owner),
+                        _ => None,
+                    }
+                }
+            }
+        };
+        for field in &segments[1..segments.len() - 1] {
+            owner = owner.and_then(|owner| match self.instances[owner].get(field) {
+                Some(Value::Object(owner)) => Some(*owner),
+                _ => None,
+            });
+        }
+        owner.map_or_else(|| path.to_owned(), |owner| instance_event_key(owner, name))
+    }
+
+    fn bind_temporal_events(
+        &self,
+        te: &crate::ast::TemporalExpr,
+        frame: &Frame,
+        me: Option<usize>,
+    ) -> crate::ast::TemporalExpr {
+        use crate::ast::TemporalExpr;
+        let mut bound = te.clone();
+        fn bind(interp: &Interp, te: &mut TemporalExpr, frame: &Frame, me: Option<usize>) {
+            match te {
+                TemporalExpr::EventRef { path } => {
+                    let key = interp.scoped_event_key(&path.join("."), frame, me);
+                    if is_every_cycle_event(&key) {
+                        *te = TemporalExpr::Cycle;
+                    } else {
+                        *path = vec![key];
+                    }
+                }
+                TemporalExpr::Sequence { items } => {
+                    for item in items {
+                        bind(interp, item, frame, me);
+                    }
+                }
+                TemporalExpr::Yield { lhs, rhs }
+                | TemporalExpr::And(lhs, rhs)
+                | TemporalExpr::Or(lhs, rhs) => {
+                    bind(interp, lhs, frame, me);
+                    bind(interp, rhs, frame, me);
+                }
+                TemporalExpr::Not(te)
+                | TemporalExpr::Fail(te)
+                | TemporalExpr::Eventually(te)
+                | TemporalExpr::Repeat { te, .. }
+                | TemporalExpr::Group(te) => bind(interp, te, frame, me),
+                TemporalExpr::Sampled { te, event } => {
+                    bind(interp, te, frame, me);
+                    bind(interp, event, frame, me);
+                }
+                TemporalExpr::Cycle
+                | TemporalExpr::True { .. }
+                | TemporalExpr::EdgeSample { .. } => {}
+            }
+        }
+        bind(self, &mut bound, frame, me);
+        bound
+    }
+
+    /// Render a target spelling before binding it to a physical event key.
+    fn event_path(&self, target: &Expr) -> Result<String, ExecError> {
         match target {
             Expr::Ident { name, .. } => Ok(name.clone()),
             Expr::MemberAccess { object, name, .. } => {
@@ -9553,30 +10088,54 @@ impl<'a> Interp<'a> {
     fn advance_temporal_cycles(&mut self, cycles: u64) {
         for _ in 0..cycles {
             self.sample_rule_values();
+            self.sample_wait_edge_values();
             self.cycle = self.cycle.saturating_add(1);
             self.pad_log();
         }
     }
 
-    fn sample_rule_values(&mut self) {
-        let Some(owner) = self.temporal_rule_owner else {
-            return;
-        };
-        if self.sampling_temporal {
+    fn refresh_instance_rules(&mut self) {
+        if !self.rules_enabled {
             return;
         }
+        while self.next_rule_instance < self.instances.len() {
+            let owner = self.next_rule_instance;
+            self.next_rule_instance += 1;
+            let Some(ty) = self
+                .types
+                .iter()
+                .find(|ty| ty.name == self.instances[owner].type_name)
+            else {
+                continue;
+            };
+            let declarations = ty.expects.clone();
+            for declaration in declarations {
+                let te = self.bind_temporal_events(&declaration.te, &Frame::default(), Some(owner));
+                self.instance_rules.push(InstanceRule {
+                    monitor: crate::temporal::RuleMonitor::new(&te),
+                    declaration,
+                    owner,
+                    te,
+                    start: self.cycle as usize,
+                    retired: false,
+                });
+            }
+        }
+    }
+
+    fn sample_rule_values(&mut self) {
+        if !self.rules_enabled || self.sampling_temporal {
+            return;
+        }
+        self.refresh_instance_rules();
         self.sampling_temporal = true;
-        let types = self.types;
-        for (context, rule) in types.iter().flat_map(|ty| ty.expects.iter()).enumerate() {
-            if self.retired_temporal_rules.contains(&(context as u64)) {
+        for context in 0..self.instance_rules.len() {
+            let rule = &self.instance_rules[context];
+            if rule.retired {
                 continue;
             }
-            self.sample_temporal_values(
-                &rule.te,
-                &mut Frame::default(),
-                Some(owner),
-                context as u64,
-            );
+            let (te, owner) = (rule.te.clone(), rule.owner);
+            self.sample_temporal_values(&te, &mut Frame::default(), Some(owner), context as u64);
         }
         self.sampling_temporal = false;
     }
@@ -9597,6 +10156,112 @@ impl<'a> Interp<'a> {
         for (expr, value) in numerics {
             state.record_numeric(context, expr, value);
         }
+        self.sample_temporal_edges(te, frame, me, context, false);
+    }
+
+    fn sample_wait_edge_values(&mut self) {
+        if self.sampling_temporal {
+            return;
+        }
+        self.sampling_temporal = true;
+        let waits: Vec<_> = self
+            .temporal_wait_sampling
+            .iter()
+            .map(|(context, sampling)| {
+                (
+                    *context,
+                    sampling.te.clone(),
+                    sampling.frame.clone(),
+                    sampling.me,
+                )
+            })
+            .collect();
+        for (context, te, mut frame, me) in waits {
+            self.sample_temporal_edges(&te, &mut frame, me, context, true);
+        }
+        self.sampling_temporal = false;
+    }
+
+    fn sample_temporal_edges(
+        &mut self,
+        te: &crate::ast::TemporalExpr,
+        frame: &mut Frame,
+        me: Option<usize>,
+        context: u64,
+        event_clocks_only: bool,
+    ) {
+        let mut edges = Vec::new();
+        crate::temporal::collect_edges(te, None, &mut edges);
+        for (routine, expr, sampling) in edges {
+            if event_clocks_only && temporal_sampling_is_global(sampling) {
+                continue;
+            }
+            let active = self.temporal_sampling_occurs(sampling);
+            let value = match active {
+                Some(false) => Some(false),
+                Some(true) => self.sample_temporal_edge(context, routine, expr, frame, me),
+                None => None,
+            };
+            self.temporal_log[self.cycle as usize].record_edge(context, routine, expr, value);
+        }
+    }
+
+    fn temporal_sampling_occurs(
+        &self,
+        sampling: Option<&crate::ast::TemporalExpr>,
+    ) -> Option<bool> {
+        match sampling {
+            None | Some(crate::ast::TemporalExpr::Cycle) => Some(true),
+            Some(crate::ast::TemporalExpr::Group(te)) => self.temporal_sampling_occurs(Some(te)),
+            Some(crate::ast::TemporalExpr::EventRef { path }) => Some(
+                is_every_cycle_event(&path.join("."))
+                    || self.temporal_log[self.cycle as usize].occurs(path),
+            ),
+            _ => None,
+        }
+    }
+
+    fn sample_temporal_edge(
+        &mut self,
+        context: u64,
+        routine: crate::ast::EdgeRoutine,
+        expr: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Option<bool> {
+        // The executed subset samples Boolean/integer/enumeral values.
+        // It uses the existing i128 value model; static edge-width
+        // legality and MVL/custom-numeric transitions are not checked.
+        let value = self.eval(expr, frame, me).ok()?;
+        let current = match value {
+            Value::Int(value) => value,
+            Value::Bool(value) => i128::from(value),
+            Value::Enum { type_name, name } => self.enumeral_index(&type_name, &name)?,
+            _ => return None,
+        };
+        let previous = if let Some(history) = self.temporal_edges.iter_mut().find(|history| {
+            history.context == context && history.routine == routine && history.expr == *expr
+        }) {
+            // Rechecking in the same virtual cycle updates the current
+            // sample, without changing which prior sample it compares to.
+            if history.cycle != self.cycle {
+                history.previous = Some(history.current);
+                history.cycle = self.cycle;
+            }
+            history.current = current;
+            history.previous
+        } else {
+            self.temporal_edges.push(TemporalEdgeHistory {
+                context,
+                routine,
+                expr: expr.clone(),
+                cycle: self.cycle,
+                previous: None,
+                current,
+            });
+            None
+        };
+        Some(crate::temporal::sampled_edge(routine, previous, current))
     }
 
     /// Fire one event occurrence — the shared path of `emit` (11.2) and
@@ -9612,13 +10277,21 @@ impl<'a> Interp<'a> {
         owner: Option<usize>,
         span: crate::ast::Span,
         frame: &mut Frame,
-    ) -> Result<(), Diagnostic> {
-        self.emitted.insert(path.to_owned());
+    ) -> Result<(), ExecError> {
+        let key = if is_every_cycle_event(path) {
+            path.to_owned()
+        } else {
+            owner.map_or_else(
+                || path.to_owned(),
+                |owner| instance_event_key(owner, path.rsplit('.').next().unwrap_or(path)),
+            )
+        };
+        self.emitted.insert(key.clone());
         self.pad_log();
-        self.temporal_log[self.cycle as usize].record(path);
-        self.wake_tcm_listeners(path);
+        self.temporal_log[self.cycle as usize].record(&key);
+        self.wake_tcm_listeners(&key);
         self.run_on_blocks(path, owner, span)?;
-        self.sample_cover_groups(path, owner, frame);
+        self.sample_cover_groups(path, owner, frame, span);
         Ok(())
     }
 
@@ -9791,7 +10464,13 @@ impl<'a> Interp<'a> {
     /// fired: each item's recorded expression evaluates in the emitting
     /// frame, or the item's field is read from the owner, and the value
     /// lands in the item's buckets.
-    fn sample_cover_groups(&mut self, path: &str, owner: Option<usize>, frame: &mut Frame) {
+    fn sample_cover_groups(
+        &mut self,
+        path: &str,
+        owner: Option<usize>,
+        frame: &mut Frame,
+        span: crate::ast::Span,
+    ) {
         let Some(owner) = owner else {
             return;
         };
@@ -9803,15 +10482,21 @@ impl<'a> Interp<'a> {
         else {
             return;
         };
+        let key = instance_event_key(owner, path.rsplit('.').next().unwrap_or(path));
         let group_indices: Vec<usize> = self.coverage[entry_index]
             .groups
             .iter()
             .enumerate()
-            .filter(|(_, group)| group.event_path.as_deref() == Some(path))
+            .filter(|(_, group)| {
+                group.unit_owner.is_none()
+                    && group.event_path.as_deref().is_some_and(|event| {
+                        self.scoped_event_key(event, &Frame::default(), Some(owner)) == key
+                    })
+            })
             .map(|(index, _)| index)
             .collect();
         for group_index in group_indices {
-            self.sample_group_on_instance(entry_index, group_index, owner, frame);
+            self.sample_group_on_instance(entry_index, group_index, owner, frame, span);
         }
     }
 
@@ -9821,64 +10506,993 @@ impl<'a> Interp<'a> {
     /// the cross items read the round's labels afterwards (14.4). The
     /// shared path of the emit-driven sampling (14.2) and the
     /// procedural `covers.sample_cg()` sampling (14.8.2.10).
+    fn coverage_unit_for(&self, owner: usize, scope: &str) -> Option<(usize, String)> {
+        let root = self
+            .instances
+            .iter()
+            .position(|instance| instance.type_name == "sys")?;
+        let paths = self.walk_instance_tree(root);
+        let path = paths
+            .iter()
+            .find(|path| path.last().is_some_and(|item| item.instance == owner))?;
+        self.coverage_unit_on_path(path, scope)
+    }
+
+    fn coverage_unit_on_path(
+        &self,
+        path: &[InstancePathItem],
+        scope: &str,
+    ) -> Option<(usize, String)> {
+        for position in (0..path.len()).rev() {
+            let unit = path[position].instance;
+            let name = &self.instances[unit].type_name;
+            if self
+                .types
+                .iter()
+                .any(|ty| ty.name == *name && ty.kind == DeclarationKind::Unit)
+                && self.type_is_a(name, scope)
+            {
+                return Some((unit, render_iterator_path(&path[..=position], "sys")));
+            }
+        }
+        None
+    }
+
+    fn coverage_boolean(
+        &mut self,
+        expr: &Expr,
+        owner: usize,
+        unit: Option<usize>,
+    ) -> Result<bool, ExecError> {
+        // Coverage options use their declaring struct context, never
+        // the locals of the method that happened to emit the event.
+        let mut frame = Frame::default();
+        if let Some(unit) = unit {
+            frame.locals.insert("inst".to_owned(), Value::Object(unit));
+        }
+        match self.atomic_value(|this| this.eval(expr, &mut frame, Some(owner)))? {
+            Value::Bool(value) => Ok(value),
+            _ => Err(self.error(
+                "E0402",
+                "coverage option expects a Boolean value (clause 14)",
+                expr.span(),
+            )),
+        }
+    }
+
+    fn coverage_effect_value(
+        &mut self,
+        expr: &Expr,
+        item: &str,
+        value: &Value,
+        candidate: Option<i128>,
+        unit: Option<usize>,
+    ) -> Result<Value, ExecError> {
+        let mut frame = Frame::default();
+        let value = match (value, candidate) {
+            (Value::Int(_), Some(value)) => Value::Int(value),
+            (Value::Bool(_), Some(value)) => Value::Bool(value != 0),
+            (_, None) => value.clone(),
+            _ => {
+                return Err(self.error(
+                    "E0402",
+                    "unsupported coverage predicate scalar domain (14.3)",
+                    expr.span(),
+                ));
+            }
+        };
+        frame.locals.insert(item.to_owned(), value);
+        if let Some(unit) = unit {
+            frame.locals.insert("inst".to_owned(), Value::Object(unit));
+        }
+        self.atomic_value(|this| this.eval(expr, &mut frame, None))
+    }
+
+    fn coverage_effect_matches(
+        &mut self,
+        expressions: &[Option<Expr>],
+        item: &str,
+        value: &Value,
+        unit: Option<usize>,
+    ) -> Result<bool, ExecError> {
+        for expr in expressions.iter().flatten() {
+            match self.coverage_effect_value(expr, item, value, None, unit)? {
+                Value::Bool(true) => return Ok(true),
+                Value::Bool(false) => {}
+                _ => {
+                    return Err(self.error(
+                        "E0402",
+                        "coverage ignore/illegal predicate expects a Boolean value (14.3)",
+                        expr.span(),
+                    ));
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn coverage_prototype(&self, ty: &TypeExpr, depth: u32) -> Option<Value> {
+        if depth > 32 {
+            return None;
+        }
+        match ty {
+            TypeExpr::Scalar {
+                base: crate::ast::ScalarBase::Bool,
+                ..
+            } => Some(Value::Bool(false)),
+            TypeExpr::Scalar {
+                base: crate::ast::ScalarBase::Real | crate::ast::ScalarBase::String,
+                ..
+            } => None,
+            TypeExpr::Scalar { .. } => Some(Value::Int(0)),
+            TypeExpr::Named { name, .. } => self
+                .types
+                .iter()
+                .find(|ty| ty.name == *name)
+                .and_then(|ty| ty.underlying.as_ref())
+                .and_then(|ty| self.coverage_prototype(ty, depth + 1)),
+            _ => None,
+        }
+    }
+
+    fn coverage_multi_matches(
+        &mut self,
+        expressions: &[Option<Expr>],
+        bindings: &[(String, Value)],
+        unit: Option<usize>,
+    ) -> Result<bool, ExecError> {
+        for expr in expressions.iter().flatten() {
+            let mut frame = Frame::default();
+            frame.locals.extend(bindings.iter().cloned());
+            if let Some(unit) = unit {
+                frame.locals.insert("inst".to_owned(), Value::Object(unit));
+            }
+            match self.atomic_value(|this| this.eval(expr, &mut frame, None))? {
+                Value::Bool(true) => return Ok(true),
+                Value::Bool(false) => {}
+                _ => {
+                    return Err(self.error(
+                        "E0402",
+                        "derived coverage predicate expects a Boolean value (14.4-14.5)",
+                        expr.span(),
+                    ));
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn coverage_basic_declaration(
+        &self,
+        entry: usize,
+        group: usize,
+        name: &str,
+    ) -> Option<&crate::ast::CoverItemDecl> {
+        self.types
+            .iter()
+            .find(|ty| ty.name == self.coverage[entry].type_name)?
+            .covers
+            .iter()
+            .filter(|decl| decl.name == self.coverage[entry].groups[group].name)
+            .flat_map(|decl| &decl.items)
+            .find(|item| {
+                item.kind == crate::ast::CoverItemKind::Item
+                    && item.names.first().is_some_and(|(source, _)| source == name)
+            })
+    }
+
+    fn coverage_basic_prototype(&self, entry: usize, group: usize, name: &str) -> Option<Value> {
+        let ty = self
+            .types
+            .iter()
+            .find(|ty| ty.name == self.coverage[entry].type_name)?;
+        let item = self.coverage_basic_declaration(entry, group, name);
+        let ty = item.and_then(|item| item.ty.as_ref()).or_else(|| {
+            ty.fields
+                .iter()
+                .find(|field| field.name == name)
+                .map(|field| &field.ty)
+        })?;
+        self.coverage_prototype(ty, 0)
+    }
+
+    fn coverage_domain_variable(&self, name: &str, unit: Option<usize>) -> bool {
+        !matches!(name, "me" | "self" | "NULL" | "TEST_DONE")
+            && !name.ends_with('$')
+            && !self.defines.contains_key(name)
+            && predefined_constant(name).is_none()
+            && !(name == "inst" && unit.is_some())
+    }
+
+    fn coverage_region_proof(
+        &mut self,
+        axes: &[CoverageAxis],
+        ranges: &[(i128, i128)],
+        expressions: &[Option<Expr>],
+        unit: Option<usize>,
+    ) -> Result<Option<bool>, ExecError> {
+        for (axis, bounds) in axes.iter().zip(ranges) {
+            let domains = if self.coverage_domain_variable(&axis.source, unit) {
+                BTreeMap::from([(
+                    axis.source.clone(),
+                    crate::coverage::ScalarDomain::new(&axis.prototype, *bounds),
+                )])
+            } else {
+                BTreeMap::new()
+            };
+            let value = if matches!(axis.prototype, Value::Bool(_)) {
+                Value::Bool(bounds.0 != 0)
+            } else {
+                Value::Int(bounds.0)
+            };
+            for expr in [
+                &axis.options.ignore,
+                &axis.options.instance_ignore,
+                &axis.options.illegal,
+                &axis.options.instance_illegal,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let mut evaluate = |expr: &Expr| {
+                    self.coverage_effect_value(expr, &axis.source, &value, None, unit)
+                        .map_err(ExecError::into_diagnostic)
+                };
+                match crate::coverage::prove_predicate(expr, &domains, &mut evaluate)? {
+                    Some(true) => return Ok(Some(false)),
+                    Some(false) => {}
+                    None => return Ok(None),
+                }
+            }
+        }
+        let domains = axes
+            .iter()
+            .zip(ranges)
+            .filter(|(axis, _)| self.coverage_domain_variable(&axis.binding, unit))
+            .map(|(axis, bounds)| {
+                (
+                    axis.binding.clone(),
+                    crate::coverage::ScalarDomain::new(&axis.prototype, *bounds),
+                )
+            })
+            .collect();
+        let bindings = coverage_point_bindings(axes, ranges);
+        for expr in expressions.iter().flatten() {
+            let mut evaluate = |expr: &Expr| {
+                let mut frame = Frame::default();
+                frame.locals.extend(bindings.iter().cloned());
+                if let Some(unit) = unit {
+                    frame.locals.insert("inst".to_owned(), Value::Object(unit));
+                }
+                self.atomic_value(|this| this.eval(expr, &mut frame, None))
+                    .map_err(ExecError::into_diagnostic)
+            };
+            match crate::coverage::prove_predicate(expr, &domains, &mut evaluate)? {
+                Some(true) => return Ok(Some(false)),
+                Some(false) => {}
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(true))
+    }
+
+    fn spend_coverage_domain_work(
+        &self,
+        budget: &mut usize,
+        amount: usize,
+        span: crate::ast::Span,
+    ) -> Result<(), ExecError> {
+        if *budget < amount {
+            return Err(self.error("E0402", "derived predicate classification exceeds the 65536 scalar-domain work limit (14.4-14.5)", span));
+        }
+        *budget -= amount;
+        Ok(())
+    }
+
+    fn coverage_region_witness(
+        &mut self,
+        axes: &[CoverageAxis],
+        ranges: Vec<(i128, i128)>,
+        expressions: &[Option<Expr>],
+        unit: Option<usize>,
+        budget: &mut usize,
+        span: crate::ast::Span,
+    ) -> Result<bool, ExecError> {
+        let varying: Vec<_> = axes
+            .iter()
+            .map(|axis| {
+                expressions
+                    .iter()
+                    .flatten()
+                    .any(|expr| crate::coverage::uses_item(expr, &axis.binding))
+                    || [
+                        &axis.options.ignore,
+                        &axis.options.instance_ignore,
+                        &axis.options.illegal,
+                        &axis.options.instance_illegal,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|expr| crate::coverage::uses_item(expr, &axis.source))
+            })
+            .collect();
+        let mut pending = vec![ranges];
+        while let Some(ranges) = pending.pop() {
+            self.spend_coverage_domain_work(budget, axes.len(), span)?;
+            match self.coverage_region_proof(axes, &ranges, expressions, unit)? {
+                Some(true) => return Ok(true),
+                Some(false) => continue,
+                None => {}
+            }
+            self.spend_coverage_domain_work(budget, axes.len(), span)?;
+            let bindings = coverage_point_bindings(axes, &ranges);
+            let mut legal = true;
+            for (axis, (_, value)) in axes.iter().zip(&bindings) {
+                if self.coverage_effect_matches(
+                    &[
+                        axis.options.ignore.clone(),
+                        axis.options.instance_ignore.clone(),
+                        axis.options.illegal.clone(),
+                        axis.options.instance_illegal.clone(),
+                    ],
+                    &axis.source,
+                    value,
+                    unit,
+                )? {
+                    legal = false;
+                    break;
+                }
+            }
+            if legal && !self.coverage_multi_matches(expressions, &bindings, unit)? {
+                return Ok(true);
+            }
+            if let Some(axis) = ranges
+                .iter()
+                .zip(&varying)
+                .position(|((lo, hi), used)| *used && lo < hi)
+            {
+                let mid = coverage_midpoint(ranges[axis].0, ranges[axis].1);
+                let mut higher = ranges.clone();
+                higher[axis].0 = mid + 1; // mid is strictly below hi
+                let mut lower = ranges;
+                lower[axis].1 = mid;
+                pending.push(higher);
+                pending.push(lower);
+            }
+        }
+        Ok(false)
+    }
+
+    fn classify_derived_effects(
+        &mut self,
+        entry: usize,
+        group: usize,
+        index: usize,
+        masks: &BTreeMap<(usize, usize), bool>,
+    ) -> Result<Option<BTreeSet<Vec<usize>>>, ExecError> {
+        let item = &self.coverage[entry].groups[group].derived[index];
+        let options = item.options.clone();
+        let sources = item.sources.clone();
+        let transition = item.kind == crate::ast::CoverItemKind::Transition;
+        let expressions = [
+            options.ignore,
+            options.instance_ignore,
+            options.illegal,
+            options.instance_illegal,
+        ];
+        let unit = self.coverage[entry].groups[group].unit_owner;
+        let mut names = sources.clone();
+        if transition {
+            names.extend(sources.iter().map(|source| format!("prev_{source}")));
+        }
+        let mut dependent = false;
+        let mut span = origin_span();
+        // Only fold a constant prefix: later expressions may be guarded by
+        // a source-dependent ignore predicate and must retain short circuit.
+        for expr in expressions.iter().flatten() {
+            span = expr.span();
+            if names
+                .iter()
+                .any(|name| crate::coverage::uses_item(expr, name))
+            {
+                dependent = true;
+                break;
+            }
+            if self.coverage_multi_matches(&[Some(expr.clone())], &[], unit)? {
+                return Ok(Some(BTreeSet::new()));
+            }
+        }
+        if !dependent {
+            return Ok(None);
+        }
+        let basics: Vec<_> = self.coverage[entry].groups[group]
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (index, item.clone()))
+            .collect();
+        let mut axes = Vec::new();
+        let inputs: Vec<_> = if transition {
+            vec![
+                (format!("prev_{}", sources[0]), sources[0].clone()),
+                (sources[0].clone(), sources[0].clone()),
+            ]
+        } else {
+            sources
+                .iter()
+                .map(|source| (source.clone(), source.clone()))
+                .collect()
+        };
+        if inputs
+            .iter()
+            .any(|(_, source)| !basics.iter().any(|(_, item)| item.name == *source))
+        {
+            return Err(self.error(
+                "E0402",
+                "derived predicate classification over composite sources is not implemented (14.4-14.5)",
+                span,
+            ));
+        }
+        for (binding, source) in inputs {
+            let Some((item_index, item)) = basics.iter().find(|(_, item)| item.name == source)
+            else {
+                return Err(self.error("E0402", "derived predicate classification over composite sources is not implemented (14.4-14.5)", span));
+            };
+            if item.buckets.is_empty() {
+                return Ok(None);
+            } // ungradeable: point filtering only
+            let Some(prototype) = self.coverage_basic_prototype(entry, group, &source) else {
+                return Err(self.error(
+                    "E0402",
+                    "derived predicate buckets require integral or Boolean sources (14.4-14.5)",
+                    span,
+                ));
+            };
+            let buckets = item
+                .buckets
+                .iter()
+                .enumerate()
+                .filter(|(bucket, data)| {
+                    !masks
+                        .get(&(*item_index, *bucket))
+                        .copied()
+                        .unwrap_or(data.excluded)
+                })
+                .map(|(bucket, data)| (bucket, data.lo, data.hi))
+                .collect();
+            axes.push(CoverageAxis {
+                binding,
+                source,
+                prototype,
+                options: item.options.clone(),
+                buckets,
+            });
+        }
+        if axes.iter().any(|axis| axis.buckets.is_empty()) {
+            return Ok(Some(BTreeSet::new()));
+        }
+        let mut budget = 65_536usize;
+        let envelope: Vec<_> = axes
+            .iter()
+            .map(|axis| {
+                (
+                    axis.buckets
+                        .iter()
+                        .map(|(_, lo, _)| *lo)
+                        .min()
+                        .expect("nonempty source buckets"),
+                    axis.buckets
+                        .iter()
+                        .map(|(_, _, hi)| *hi)
+                        .max()
+                        .expect("nonempty source buckets"),
+                )
+            })
+            .collect();
+        self.spend_coverage_domain_work(&mut budget, axes.len(), span)?;
+        match self.coverage_region_proof(&axes, &envelope, &expressions, unit)? {
+            Some(true) => return Ok(None),
+            Some(false) => return Ok(Some(BTreeSet::new())),
+            None => {}
+        }
+        let limits: Vec<_> = axes.iter().map(|axis| axis.buckets.len()).collect();
+        let mut coordinates = vec![0; axes.len()];
+        let mut allowed = BTreeSet::new();
+        loop {
+            let ranges = axes
+                .iter()
+                .zip(&coordinates)
+                .map(|(axis, index)| {
+                    let (_, lo, hi) = axis.buckets[*index];
+                    (lo, hi)
+                })
+                .collect();
+            if self.coverage_region_witness(&axes, ranges, &expressions, unit, &mut budget, span)? {
+                allowed.insert(
+                    axes.iter()
+                        .zip(&coordinates)
+                        .map(|(axis, index)| axis.buckets[*index].0)
+                        .collect(),
+                );
+            }
+            if !next_coverage_indices(&mut coordinates, &limits) {
+                break;
+            }
+        }
+        Ok(Some(allowed))
+    }
+
+    fn refresh_coverage_group_effects(
+        &mut self,
+        entry: usize,
+        group: usize,
+    ) -> Result<(), ExecError> {
+        let unit = self.coverage[entry].groups[group].unit_owner;
+        let items: Vec<_> = self.coverage[entry].groups[group]
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.name.clone(),
+                    item.options.clone(),
+                    item.buckets
+                        .iter()
+                        .map(|bucket| (bucket.lo, bucket.hi))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        // Commit masks only after the entire group has been classified. A
+        // failing predicate must not leave a partially updated denominator.
+        let mut masks = Vec::new();
+        for (item_index, (name, options, domains)) in items.into_iter().enumerate() {
+            let effects = [
+                options.ignore,
+                options.instance_ignore,
+                options.illegal,
+                options.instance_illegal,
+            ];
+            if effects.iter().all(Option::is_none) || domains.is_empty() {
+                continue;
+            }
+            let span = self
+                .coverage_basic_declaration(entry, group, &name)
+                .map_or(origin_span(), |item| item.span);
+            let Some(prototype) = self.coverage_basic_prototype(entry, group, &name) else {
+                return Err(self.error(
+                    "E0402",
+                    "coverage bucket effects require a known integral or Boolean item type (14.3)",
+                    span,
+                ));
+            };
+            let mut budget = 65_536usize;
+            for (bucket, domain) in domains.into_iter().enumerate() {
+                let mut excluded = Vec::new();
+                for expr in effects.iter().flatten() {
+                    // Match the observation path's short circuit: later
+                    // predicates are irrelevant for already excluded values.
+                    for remaining in complement_interval_set(&excluded, domain) {
+                        let mut evaluate = |expr: &Expr, candidate| {
+                            self.coverage_effect_value(expr, &name, &prototype, candidate, unit)
+                                .map_err(ExecError::into_diagnostic)
+                        };
+                        let matching = crate::coverage::effect_intervals(
+                            expr,
+                            &name,
+                            remaining,
+                            &prototype,
+                            &mut budget,
+                            &mut evaluate,
+                        )?;
+                        excluded = union_interval_sets(&excluded, &matching);
+                    }
+                }
+                masks.push((
+                    item_index,
+                    bucket,
+                    complement_interval_set(&excluded, domain).is_empty(),
+                ));
+            }
+        }
+        let prospective: BTreeMap<_, _> = masks
+            .iter()
+            .map(|(item, bucket, excluded)| ((*item, *bucket), *excluded))
+            .collect();
+        let mut derived_masks = Vec::new();
+        for index in 0..self.coverage[entry].groups[group].derived.len() {
+            derived_masks.push(self.classify_derived_effects(entry, group, index, &prospective)?);
+        }
+        for (item, bucket, excluded) in masks {
+            self.coverage[entry].groups[group].items[item].buckets[bucket].excluded = excluded;
+        }
+        for (item, allowed) in self.coverage[entry].groups[group]
+            .derived
+            .iter_mut()
+            .zip(derived_masks)
+        {
+            item.allowed = allowed;
+        }
+        self.coverage[entry].groups[group].refresh_derived();
+        Ok(())
+    }
+
+    fn refresh_coverage_effects(&mut self) {
+        if !self.coverage_was_enabled {
+            return;
+        }
+        let groups: Vec<_> = self
+            .coverage
+            .iter()
+            .enumerate()
+            .flat_map(|(entry, data)| {
+                data.groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, group)| group.is_reported())
+                    .map(move |(group, _)| (entry, group))
+            })
+            .collect();
+        for (entry, group) in groups {
+            if let Err(diagnostic) = self.refresh_coverage_group_effects(entry, group)
+                && !self.pending_diagnostics.contains(&diagnostic)
+            {
+                self.pending_diagnostics.push(diagnostic);
+            }
+        }
+    }
+
+    fn report_coverage_illegal(&mut self, message: String) {
+        if self.coverage_config.check_illegal_immediately {
+            self.dut_errors += 1;
+            self.output.push_str(&format!("dut_error: {message}\n"));
+        } else {
+            self.coverage_illegal_pending.push(message);
+        }
+    }
+
+    fn flush_coverage_illegal(&mut self) {
+        for message in std::mem::take(&mut self.coverage_illegal_pending) {
+            self.dut_errors += 1;
+            self.output.push_str(&format!("dut_error: {message}\n"));
+        }
+    }
+
+    fn prepare_coverage_instances(&mut self, refresh_visibility: bool) {
+        if !self.coverage_was_enabled {
+            return;
+        }
+        let Some(root) = self
+            .instances
+            .iter()
+            .position(|instance| instance.type_name == "sys")
+        else {
+            return;
+        };
+        let paths = self.walk_instance_tree(root);
+        let mut plans = Vec::new();
+        for (entry_index, entry) in self.coverage.iter().enumerate() {
+            for (group_index, group) in entry.groups.iter().enumerate() {
+                if group.unit_owner.is_some() {
+                    continue;
+                }
+                let Some(scope) = &group.options.unit_scope else {
+                    continue;
+                };
+                for path in &paths {
+                    let owner = path
+                        .last()
+                        .expect("instance walk path is nonempty")
+                        .instance;
+                    if self.instances[owner].type_name == entry.type_name
+                        && let Some((unit, label)) = self.coverage_unit_on_path(path, scope)
+                    {
+                        plans.push((entry_index, group_index, owner, unit, label));
+                    }
+                }
+            }
+        }
+        let mut refreshed = BTreeSet::new();
+        for (entry, base, owner, unit, path) in plans {
+            if !refreshed.insert((entry, base, unit)) {
+                continue;
+            }
+            let name = self.coverage[entry].groups[base].name.clone();
+            let index = if let Some(index) = self.coverage[entry]
+                .groups
+                .iter()
+                .position(|group| group.name == name && group.unit_owner == Some(unit))
+            {
+                index
+            } else {
+                let mut group = self.coverage[entry].groups[base].clone();
+                group.unit_owner = Some(unit);
+                group.unit_instance = Some(path);
+                self.coverage[entry].groups.push(group);
+                self.coverage[entry].groups.len() - 1
+            };
+            if !refresh_visibility {
+                continue;
+            }
+            let options = self.coverage[entry].groups[base].options.clone();
+            let items: Vec<_> = self.coverage[entry].groups[base]
+                .items
+                .iter()
+                .map(|item| item.options.clone())
+                .collect();
+            let hidden = match &options.instance_no_collect {
+                Some(expr) => match self.coverage_boolean(expr, owner, Some(unit)) {
+                    Ok(value) => value,
+                    Err(diagnostic) => {
+                        self.pending_diagnostics.push(diagnostic);
+                        true
+                    }
+                },
+                None => false,
+            };
+            self.coverage[entry].groups[index].options.hidden = options.hidden || hidden;
+            let derived: Vec<_> = self.coverage[entry].groups[base]
+                .derived
+                .iter()
+                .map(|item| item.options.clone())
+                .collect();
+            for (item_index, item) in derived.iter().enumerate() {
+                let hidden = match &item.instance_no_collect {
+                    Some(expr) => match self.coverage_boolean(expr, owner, Some(unit)) {
+                        Ok(value) => value,
+                        Err(diagnostic) => {
+                            self.pending_diagnostics.push(diagnostic);
+                            true
+                        }
+                    },
+                    None => false,
+                };
+                self.coverage[entry].groups[index].derived[item_index]
+                    .options
+                    .hidden = item.hidden || hidden;
+            }
+            for (item_index, item) in items.iter().enumerate() {
+                let hidden = match &item.instance_no_collect {
+                    Some(expr) => match self.coverage_boolean(expr, owner, Some(unit)) {
+                        Ok(value) => value,
+                        Err(diagnostic) => {
+                            self.pending_diagnostics.push(diagnostic);
+                            true
+                        }
+                    },
+                    None => false,
+                };
+                self.coverage[entry].groups[index].items[item_index]
+                    .options
+                    .hidden = item.hidden || hidden;
+            }
+        }
+    }
+
+    fn prepare_derived_item(&mut self, entry: usize, group: usize, owner: usize, index: usize) {
+        let options = self.coverage[entry].groups[group].derived[index]
+            .options
+            .clone();
+        let mut collect = match options.when {
+            Some(expr) => match self.coverage_boolean(&expr, owner, None) {
+                Ok(value) => value,
+                Err(diagnostic) => {
+                    self.pending_diagnostics.push(diagnostic);
+                    false
+                }
+            },
+            None => true,
+        };
+        if collect
+            && let Some(bindings) = self.coverage[entry].groups[group].derived_bindings(index)
+        {
+            let unit = self.coverage[entry].groups[group].unit_owner;
+            match self.coverage_multi_matches(
+                &[options.ignore, options.instance_ignore],
+                &bindings,
+                unit,
+            ) {
+                Ok(true) => collect = false,
+                Err(diagnostic) => {
+                    self.pending_diagnostics.push(diagnostic);
+                    collect = false;
+                }
+                Ok(false) => match self.coverage_multi_matches(
+                    &[options.illegal, options.instance_illegal],
+                    &bindings,
+                    unit,
+                ) {
+                    Ok(true) => {
+                        let data = &self.coverage[entry];
+                        let group = &data.groups[group];
+                        let suffix = group
+                            .unit_instance
+                            .as_ref()
+                            .map_or(String::new(), |path| format!("@{path}"));
+                        let values = bindings
+                            .iter()
+                            .map(|(name, value)| format!("{name}={}", self.format_value(value)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let message = format!(
+                            "illegal derived coverage value ({values}) in '{}.{}.{}{suffix}'",
+                            data.type_name, group.name, group.derived[index].name
+                        );
+                        self.report_coverage_illegal(message);
+                        collect = false;
+                    }
+                    Ok(false) => {}
+                    Err(diagnostic) => {
+                        self.pending_diagnostics.push(diagnostic);
+                        collect = false;
+                    }
+                },
+            }
+        }
+        self.coverage[entry].groups[group].derived[index].collect = collect;
+    }
+
+    fn sample_transition_graph(&mut self, entry: usize, group: usize, owner: usize, source: &str) {
+        let mut pending: BTreeSet<_> = self.coverage[entry].groups[group]
+            .transitions_from(source)
+            .into_iter()
+            .collect();
+        let mut seen = BTreeSet::new();
+        while let Some(index) = pending.pop_first() {
+            if !seen.insert(index) {
+                continue;
+            }
+            self.prepare_derived_item(entry, group, owner, index);
+            if let Some(name) = self.coverage[entry].groups[group].record_transition(index) {
+                pending.extend(self.coverage[entry].groups[group].transitions_from(&name));
+            }
+        }
+    }
+
     fn sample_group_on_instance(
         &mut self,
         entry_index: usize,
-        group_index: usize,
+        mut group_index: usize,
         owner: usize,
-        frame: &mut Frame,
+        _emitting_frame: &mut Frame,
+        span: crate::ast::Span,
     ) {
         if !self.coverage_config.mode {
             return;
         }
+        let settings = self.coverage[entry_index].groups[group_index]
+            .options
+            .clone();
+        if let Some(scope) = &settings.unit_scope {
+            let Some((unit, _)) = self.coverage_unit_for(owner, scope) else {
+                self.pending_diagnostics.push(self.error(
+                    "E0402",
+                    format!("coverage owner has no containing unit of type '{scope}' (14.2)"),
+                    span,
+                ));
+                return;
+            };
+            self.prepare_coverage_instances(false);
+            let name = self.coverage[entry_index].groups[group_index].name.clone();
+            group_index = self.coverage[entry_index]
+                .groups
+                .iter()
+                .position(|group| group.name == name && group.unit_owner == Some(unit))
+                .expect("prepared coverage instance");
+        }
+        if let Some(expr) = &settings.when {
+            match self.coverage_boolean(expr, owner, None) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(diagnostic) => {
+                    self.pending_diagnostics.push(diagnostic);
+                    return;
+                }
+            }
+        }
+        if let Err(diagnostic) = self.refresh_coverage_group_effects(entry_index, group_index) {
+            if !self.pending_diagnostics.contains(&diagnostic) {
+                self.pending_diagnostics.push(diagnostic);
+            }
+            return;
+        }
+        let unit = self.coverage[entry_index].groups[group_index].unit_owner;
         let type_name = self.instances[owner].type_name.clone();
-        // The items' recorded declarations (expression or field name),
-        // looked up in the elaborated type's cover groups by name.
-        let types: &[crate::elab::ElaboratedType] = self.types;
-        let item_sources: Vec<(String, Option<Expr>)> = types
+        let group_name = self.coverage[entry_index].groups[group_index].name.clone();
+        let sources: Vec<_> = self
+            .types
             .iter()
-            .find(|t| t.name == type_name)
-            .map(|ty| {
-                ty.covers
-                    .iter()
-                    .flat_map(|decl| decl.items.iter())
-                    .filter(|item| item.kind == crate::ast::CoverItemKind::Item)
-                    .filter_map(|item| {
-                        let name = item.names.first().map(|(name, _)| name.clone())?;
-                        Some((name, item.expr.clone()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.coverage[entry_index].groups[group_index].samples += 1;
-        let item_names: Vec<String> = self.coverage[entry_index].groups[group_index]
+            .find(|ty| ty.name == type_name)
+            .into_iter()
+            .flat_map(|ty| &ty.covers)
+            .filter(|group| group.name == group_name)
+            .flat_map(|group| &group.items)
+            .filter(|item| item.kind == crate::ast::CoverItemKind::Item)
+            .map(|item| (item.names[0].0.clone(), item.expr.clone()))
+            .collect();
+        let items: Vec<_> = self.coverage[entry_index].groups[group_index]
             .items
             .iter()
-            .map(|item| item.name.clone())
+            .map(|item| (item.name.clone(), item.options.clone()))
             .collect();
-        for name in item_names {
-            let Some((_, expr)) = item_sources
-                .iter()
-                .find(|(source_name, _)| *source_name == name)
-            else {
+        self.coverage[entry_index].groups[group_index].begin_sample();
+        let mut frame = Frame::default();
+        for (name, options) in items {
+            if let Some(expr) = &options.when {
+                match self.coverage_boolean(expr, owner, None) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(diagnostic) => {
+                        self.pending_diagnostics.push(diagnostic);
+                        continue;
+                    }
+                }
+            }
+            let Some((_, expr)) = sources.iter().find(|(source, _)| *source == name) else {
                 continue;
             };
             let value = match expr {
-                Some(expr) => self.eval(expr, frame, Some(owner)).ok(),
-                None => self.instances[owner].get(&name).cloned(),
+                Some(expr) => self.atomic_value(|this| this.eval(expr, &mut frame, Some(owner))),
+                None => self.instances[owner].get(&name).cloned().ok_or_else(|| {
+                    self.error("E0401", format!("unknown coverage field '{name}'"), span)
+                }),
             };
-            if let Some(value) = value {
-                self.coverage[entry_index].groups[group_index].sample(&name, &value);
+            match value {
+                Ok(value) => {
+                    match self.coverage_effect_matches(
+                        &[options.ignore, options.instance_ignore],
+                        &name,
+                        &value,
+                        unit,
+                    ) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(diagnostic) => {
+                            self.pending_diagnostics.push(diagnostic);
+                            continue;
+                        }
+                    }
+                    match self.coverage_effect_matches(
+                        &[options.illegal, options.instance_illegal],
+                        &name,
+                        &value,
+                        unit,
+                    ) {
+                        Ok(true) => {
+                            let path = self.coverage[entry_index].groups[group_index]
+                                .unit_instance
+                                .as_ref()
+                                .map_or(String::new(), |path| format!("@{path}"));
+                            self.report_coverage_illegal(format!("illegal coverage value {} in '{type_name}.{group_name}.{name}{path}'", self.format_value(&value)));
+                            continue;
+                        }
+                        Ok(false) => {
+                            self.coverage[entry_index].groups[group_index]
+                                .sample_basic(&name, &value);
+                            self.sample_transition_graph(entry_index, group_index, owner, &name);
+                        }
+                        Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
+                    }
+                }
+                Err(diagnostic) => self.pending_diagnostics.push(diagnostic),
             }
         }
-        // The cross items record after all of their sources have
-        // this round's labels (14.4).
-        self.coverage[entry_index].groups[group_index].record_crosses();
+        for index in 0..self.coverage[entry_index].groups[group_index].derived.len() {
+            if self.coverage[entry_index].groups[group_index].derived[index].kind
+                != crate::ast::CoverItemKind::Cross
+            {
+                continue;
+            }
+            self.prepare_derived_item(entry_index, group_index, owner, index);
+            if let Some(name) = self.coverage[entry_index].groups[group_index].record_cross(index) {
+                self.sample_transition_graph(entry_index, group_index, owner, &name);
+            }
+        }
+        self.coverage[entry_index].groups[group_index].refresh_derived();
     }
 
     /// Whether the running statement may suspend to the scheduler: a
-    /// coroutine turn, not inside an atomic region (value-expression
-    /// calls, `on` blocks, `check` else bodies — 13.2.2
+    /// coroutine turn, not inside an atomic callback/observation region
+    /// (`on` blocks and check failure actions included — 13.2.2
     /// delimits atomic fragments at the synchronization actions, and
     /// these regions keep the conservative run-to-completion model of
     /// v1; `on` bodies may not contain time-consuming actions at all,
@@ -9903,10 +11517,13 @@ impl<'a> Interp<'a> {
         eligible_at_cycle: u64,
         temporal: bool,
         wait_start: Option<usize>,
-    ) -> Result<Flow, Diagnostic> {
+    ) -> Result<Flow, ExecError> {
         let mut path = self.exec_context.clone();
         if skip_resume && let Some(last) = path.last_mut() {
             last.index += 1;
+            // The continuation belongs to the following statement, even if
+            // this synchronization action first resumed a value call.
+            last.child = None;
         }
         self.pending_suspension = Some(PendingSuspension {
             path,
@@ -9937,7 +11554,7 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Result<Flow, Diagnostic> {
+    ) -> Result<Flow, ExecError> {
         let start = self.resume_wait_start.take().unwrap_or(self.cycle as usize);
         let key = (self.current_coroutine_id, span.0.byte, start, me);
         let context = *self.temporal_wait_contexts.entry(key).or_insert_with(|| {
@@ -9945,11 +11562,73 @@ impl<'a> Interp<'a> {
             self.next_temporal_context += 1;
             context
         });
-        let result = self.temporal_wait_in_context(te, span, frame, me, (start, context));
+        let bound = self
+            .temporal_wait_sampling
+            .get(&context)
+            .map(|sampling| sampling.te.clone())
+            .unwrap_or_else(|| self.bind_temporal_events(te, frame, me));
+        self.temporal_wait_sampling
+            .entry(context)
+            .and_modify(|sampling| {
+                sampling.frame = frame.clone();
+            })
+            .or_insert_with(|| TemporalWaitSampling {
+                te: bound.clone(),
+                frame: frame.clone(),
+                me,
+                observed: 0,
+            });
+        let result = self.temporal_wait_in_context(&bound, span, frame, me, (start, context));
         if !matches!(result, Ok(Flow::Suspend)) {
             self.temporal_wait_contexts.remove(&key);
+            self.temporal_wait_sampling.remove(&context);
+            self.temporal_edges
+                .retain(|history| history.context != context);
         }
         result
+    }
+
+    /// Only the previous in-progress state and newly appended states
+    /// can have gained a match since the last check. Preserve a match
+    /// that occurred after the waiter's turn, without rescanning every
+    /// old prefix on every scheduler turn.
+    fn temporal_wait_succeeded(
+        &mut self,
+        te: &crate::ast::TemporalExpr,
+        start: usize,
+        context: u64,
+    ) -> Result<bool, crate::temporal::EvalError> {
+        let observed = self
+            .temporal_wait_sampling
+            .get(&context)
+            .map_or(0, |sampling| sampling.observed);
+        let states = &self.temporal_log[start..];
+        let callbacks = historical_temporal_callbacks(context);
+        for end in observed.saturating_sub(1)..states.len() {
+            if crate::temporal::succeeds(te, &states[..=end], &callbacks)? {
+                return Ok(true);
+            }
+        }
+        if let Some(sampling) = self.temporal_wait_sampling.get_mut(&context) {
+            sampling.observed = states.len();
+        }
+        Ok(false)
+    }
+
+    fn retire_temporal_waits(&mut self, coroutine: u64) {
+        let contexts: Vec<_> = self
+            .temporal_wait_contexts
+            .iter()
+            .filter(|(key, _)| key.0 == Some(coroutine))
+            .map(|(_, context)| *context)
+            .collect();
+        self.temporal_wait_contexts
+            .retain(|key, _| key.0 != Some(coroutine));
+        for context in contexts {
+            self.temporal_wait_sampling.remove(&context);
+            self.temporal_edges
+                .retain(|history| history.context != context);
+        }
     }
 
     fn temporal_wait_in_context(
@@ -9959,14 +11638,12 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         sampling: (usize, u64),
-    ) -> Result<Flow, Diagnostic> {
+    ) -> Result<Flow, ExecError> {
         let (start, context) = sampling;
         self.pad_log();
         if self.suspend_eligible() {
             self.sample_temporal_values(te, frame, me, context);
-            let callbacks = historical_temporal_callbacks(context);
-            let slice = &self.temporal_log[start..];
-            match crate::temporal::succeeds(te, slice, &callbacks) {
+            match self.temporal_wait_succeeded(te, start, context) {
                 Ok(true) => return Ok(Flow::Normal),
                 Ok(false) => {
                     return self.suspend_here(
@@ -9990,9 +11667,7 @@ impl<'a> Interp<'a> {
         let mut waited = 0u64;
         loop {
             self.sample_temporal_values(te, frame, me, context);
-            let callbacks = historical_temporal_callbacks(context);
-            let slice = &self.temporal_log[start..];
-            match crate::temporal::succeeds(te, slice, &callbacks) {
+            match self.temporal_wait_succeeded(te, start, context) {
                 Ok(true) => return Ok(Flow::Normal),
                 Ok(false) => {}
                 Err(err) => {
@@ -10023,7 +11698,7 @@ impl<'a> Interp<'a> {
     /// from their width and signedness, clause-5 `type` declarations
     /// from their underlying representation, enumeral types as
     /// `[0..count-1]`.
-    fn set_of_type(&self, ty: &TypeExpr) -> Result<Value, Diagnostic> {
+    fn set_of_type(&self, ty: &TypeExpr) -> Result<Value, ExecError> {
         let Some(range) = self.type_value_range(ty) else {
             return Err(self.error(
                 "E0402",
@@ -10077,7 +11752,7 @@ impl<'a> Interp<'a> {
         name: &str,
         args: &[Value],
         span: crate::ast::Span,
-    ) -> Option<Result<Value, Diagnostic>> {
+    ) -> Option<Result<Value, ExecError>> {
         let set = Value::Set(intervals.to_vec());
         let result = match name {
             "size" | "uint_size" => {
@@ -10160,7 +11835,7 @@ impl<'a> Interp<'a> {
         name: &str,
         args: &[Value],
         span: crate::ast::Span,
-    ) -> Option<Result<Value, Diagnostic>> {
+    ) -> Option<Result<Value, ExecError>> {
         let result = match (name, args) {
             // 27.4.22 size(): the number of items in the list.
             ("size", []) => Ok(Value::Int(items.len() as i128)),
@@ -10446,7 +12121,7 @@ impl<'a> Interp<'a> {
         list: &ListValue,
         items: Vec<Value>,
         result: Value,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         *list.items.borrow_mut() = items;
         Ok(result)
     }
@@ -10460,7 +12135,7 @@ impl<'a> Interp<'a> {
         items: &[Value],
         index: i128,
         span: crate::ast::Span,
-    ) -> Result<usize, Diagnostic> {
+    ) -> Result<usize, ExecError> {
         let len = items.len() as i128;
         if index < 0 || index >= len {
             Err(self.error(
@@ -10481,7 +12156,7 @@ impl<'a> Interp<'a> {
         items: &[Value],
         index: i128,
         span: crate::ast::Span,
-    ) -> Result<usize, Diagnostic> {
+    ) -> Result<usize, ExecError> {
         let len = items.len() as i128;
         if index < 0 || index > len {
             Err(self.error(
@@ -10504,7 +12179,7 @@ impl<'a> Interp<'a> {
         items: &[Value],
         name: &str,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let best = self.list_extreme_index(items, name, span)?;
         Ok(if name.ends_with("_index") {
             Value::Int(best as i128)
@@ -10518,7 +12193,7 @@ impl<'a> Interp<'a> {
         items: &[Value],
         name: &str,
         span: crate::ast::Span,
-    ) -> Result<usize, Diagnostic> {
+    ) -> Result<usize, ExecError> {
         if items.is_empty() {
             return Err(self.error("E0402", format!("{name} of an empty list"), span));
         }
@@ -10579,29 +12254,34 @@ impl<'a> Interp<'a> {
         (booleans, numerics)
     }
 
-    /// The instance whose `on` blocks an emitted event triggers: the
-    /// enclosing instance for a bare event name (the event is local to
-    /// its struct, clause 11.2), or the object the dotted path reads
-    /// through. `None` when no instance resolves — the firing is still
-    /// recorded, but no `on` blocks run.
-    fn resolve_event_owner(
+    /// Resolve an emitted event's receiver once (11.2). Receiver calls and
+    /// indexes may have effects; their textual spelling is only a label.
+    fn resolve_emitted_event(
         &mut self,
         target: &Expr,
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Option<usize> {
+    ) -> Result<(String, Option<usize>), ExecError> {
         match target {
-            Expr::Ident { .. } => me,
-            Expr::MemberAccess { object, .. } => {
-                let object_value = self.eval(object, frame, me).ok()?;
-                match object_value {
-                    Value::Object(index) => Some(index),
-                    _ => None,
-                }
+            Expr::Ident { name, .. } => Ok((name.clone(), me)),
+            Expr::MemberAccess {
+                object, name, span, ..
+            } => {
+                let value = self.eval(object, frame, me)?;
+                let Value::Object(owner) = value else {
+                    return Err(self.error(
+                        "E0402",
+                        "event target requires an object receiver",
+                        *span,
+                    ));
+                };
+                Ok((
+                    self.event_path(target).unwrap_or_else(|_| name.clone()),
+                    Some(owner),
+                ))
             }
-            // A static event has no instance owner.
-            Expr::StaticAccess { .. } => None,
-            _ => None,
+            Expr::Paren { expr, .. } => self.resolve_emitted_event(expr, frame, me),
+            _ => Err(self.error("E0402", "unsupported event target", target.span())),
         }
     }
 
@@ -10617,7 +12297,7 @@ impl<'a> Interp<'a> {
         path: &str,
         owner: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ExecError> {
         let Some(owner) = owner else {
             return Ok(());
         };
@@ -10677,7 +12357,7 @@ impl<'a> Interp<'a> {
         event_name: &str,
         span: crate::ast::Span,
         frame: &mut Frame,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ExecError> {
         // The well-formedness pass validated the spelling; the runtime
         // check is the backstop for the documented gaps (statics inside
         // template bodies).
@@ -10741,7 +12421,7 @@ impl<'a> Interp<'a> {
             self.atomic_depth -= 1;
             self.depth -= 1;
         }
-        self.sample_cover_groups(&path, None, frame);
+        self.sample_cover_groups(&path, None, frame, span);
         Ok(())
     }
 
@@ -10752,11 +12432,11 @@ impl<'a> Interp<'a> {
         name: &str,
         values: Vec<Value>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         // Diagnostics are built inline (no closure holds a borrow of
         // `self` across the mutable session accesses).
         let not_loaded = || {
-            Diagnostic::new(
+            ExecError::new(
                 "E0408",
                 "no simulator loaded — call hdl_load first",
                 span.0,
@@ -10880,7 +12560,9 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 if let Some(mut session) = self.hdl.take() {
-                    session.finish();
+                    session
+                        .finish_checked()
+                        .map_err(|message| self.error("E0408", message, span))?;
                 }
                 Ok(Value::Void)
             }
@@ -10888,12 +12570,150 @@ impl<'a> Interp<'a> {
         }
     }
 
+    fn eval_action(
+        &mut self,
+        execute: impl FnOnce(&mut Self) -> Result<Value, ExecError>,
+    ) -> Result<Value, ExecError> {
+        let active = self.suspend_eligible()
+            && !self.sampling_temporal
+            && self
+                .evaluations
+                .last()
+                .is_some_and(|state| state.level + 1 == self.exec_context.len());
+        if !active {
+            return execute(self);
+        }
+        let state = self.evaluations.last_mut().expect("active evaluation");
+        let (parent, ordinal) = *state.cursor.last().expect("evaluation cursor");
+        state.cursor.last_mut().unwrap().1 += 1;
+        let node = if let Some(node) = state.nodes[parent].children.get(ordinal) {
+            *node
+        } else {
+            let node = state.nodes.len();
+            state.nodes.push(EvalNode::default());
+            state.nodes[parent].children.push(node);
+            node
+        };
+        if let Some(value) = &state.nodes[node].value {
+            return Ok(value.clone());
+        }
+        state.cursor.push((node, 0));
+        let result = execute(self);
+        let state = self.evaluations.last_mut().expect("active evaluation");
+        state.cursor.pop();
+        if let Ok(value) = &result {
+            state.nodes[node].value = Some(value.clone());
+        }
+        result
+    }
+
+    fn atomic_value(
+        &mut self,
+        execute: impl FnOnce(&mut Self) -> Result<Value, ExecError>,
+    ) -> Result<Value, ExecError> {
+        self.atomic_depth += 1;
+        let result = execute(self);
+        self.atomic_depth -= 1;
+        result
+    }
+
     fn eval(
         &mut self,
         expr: &Expr,
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
+        self.eval_action(|this| {
+            // These action scopes have their own local lifetime and remain
+            // atomic until they gain explicit scope continuations.
+            if matches!(expr, Expr::Evaluate { .. } | Expr::New { .. }) {
+                this.atomic_value(|this| this.eval_inner(expr, frame, me))
+            } else {
+                this.eval_inner(expr, frame, me)
+            }
+        })
+    }
+
+    fn call_value_method(
+        &mut self,
+        receiver: usize,
+        name: &str,
+        args: Vec<Value>,
+        span: crate::ast::Span,
+        caller: &Frame,
+    ) -> Result<Value, ExecError> {
+        let active = self.suspend_eligible()
+            && !self.sampling_temporal
+            && self
+                .evaluations
+                .last()
+                .is_some_and(|state| state.level + 1 == self.exec_context.len());
+        let declared = self
+            .resolve_method(receiver, name, span)
+            .is_ok_and(|blocks| blocks.iter().any(|block| !block.is_static));
+        if !active || !declared {
+            return self.call_method(receiver, name, args, span);
+        }
+        let state = self.evaluations.last_mut().expect("active evaluation");
+        let node = state.cursor.last().expect("call evaluation cursor").0;
+        let resume = if state.waiting == Some(node) {
+            state.resume.take()
+        } else {
+            None
+        };
+        let (call, path) = match resume {
+            Some(path) => {
+                let Some(PathLevel {
+                    child: Some(Child::Call(call)),
+                    ..
+                }) = path.first()
+                else {
+                    return Err(self.error(
+                        "E0402",
+                        "internal: value call resume lacks call state",
+                        span,
+                    ));
+                };
+                (call.as_ref().clone(), Some(path[1..].to_vec()))
+            }
+            None => (
+                StatementCall {
+                    receiver,
+                    name: name.to_owned(),
+                    progress: crate::methods::Progress::new(args),
+                    entry_complete: false,
+                    frame: Frame::default(),
+                    span,
+                },
+                None,
+            ),
+        };
+        self.exec_context.push(PathLevel {
+            index: 0,
+            child: None,
+        });
+        let result = self.exec_statement_call(call, caller, path.as_deref());
+        self.exec_context.pop();
+        match result? {
+            Flow::Return(value) => {
+                self.evaluations.last_mut().unwrap().waiting = None;
+                Ok(value)
+            }
+            Flow::Suspend => {
+                self.evaluations.last_mut().unwrap().waiting = Some(node);
+                Err(ExecError::Suspend)
+            }
+            Flow::Stop => Err(ExecError::Stop),
+            _ => Ok(Value::Void),
+        }
+    }
+
+    fn eval_inner(
+        &mut self,
+        expr: &Expr,
+        frame: &mut Frame,
+        me: Option<usize>,
+    ) -> Result<Value, ExecError> {
         match expr {
             Expr::IntLiteral { text, .. } => {
                 parse_int_literal(text).map(Value::Int).ok_or_else(|| {
@@ -11129,6 +12949,8 @@ impl<'a> Interp<'a> {
                 self.read_qualified_field(index, qualifiers, field, *field_span, *span)
             }
             Expr::Call { callee, args, span } => {
+                let saved_hint = self.expected_type.take();
+                let result = (|| {
                 if matches!(callee.as_ref(), Expr::Ident { name, .. } if name == "set_config") {
                     return self.set_runtime_config(args, *span, frame, me);
                 }
@@ -11150,7 +12972,7 @@ impl<'a> Interp<'a> {
                 {
                     let receiver = self.eval(object, frame, me)?;
                     if let Value::List(list) = receiver {
-                        return self.call_list_query(&list, name, args, frame, me, *span);
+                        return self.atomic_value(|this| this.call_list_query(&list, name, args, frame, me, *span));
                     }
                     extreme_receiver = Some(receiver);
                 }
@@ -11159,7 +12981,7 @@ impl<'a> Interp<'a> {
                 {
                     let receiver = self.eval(object, frame, me)?;
                     if let Value::List(list) = receiver {
-                        return self.call_list_extreme(&list, name, args, frame, me, *span);
+                        return self.atomic_value(|this| this.call_list_extreme(&list, name, args, frame, me, *span));
                     }
                     extreme_receiver = Some(receiver);
                 }
@@ -11173,7 +12995,7 @@ impl<'a> Interp<'a> {
                     && let Value::List(list) = self.eval(object, frame, me)?
                 {
                     let items = list.items.borrow().clone();
-                    return self.call_list_aggregate(&items, name, args, frame, me, *span);
+                    return self.atomic_value(|this| this.call_list_aggregate(&items, name, args, frame, me, *span));
                 }
                 // A call argument's parameter type is the inference
                 // context for an untyped `evaluate { ... }` in the
@@ -11181,11 +13003,9 @@ impl<'a> Interp<'a> {
                 // use it, and best-effort: a builtin or unknown callee
                 // contributes no hints (the call itself reports its own
                 // error).
-                let hints = if args.iter().any(expr_has_untyped_evaluate) {
+                let hints = if args.iter().any(expr_needs_context) {
                     self.call_arg_hints(callee, args.len(), frame, me)
-                } else {
-                    Vec::new()
-                };
+                } else { Vec::new() };
                 let mut values = Vec::with_capacity(args.len());
                 for (position, arg) in args.iter().enumerate() {
                     let hint = hints.get(position).cloned().unwrap_or(None);
@@ -11203,7 +13023,7 @@ impl<'a> Interp<'a> {
                                 *span,
                             ));
                         };
-                        self.call_method(index, name, values, *span)
+                        self.call_value_method(index, name, values, *span, frame)
                     }
                     Expr::MemberAccess { object, name, .. } => {
                         // Objection/other builtins called through an
@@ -11300,7 +13120,7 @@ impl<'a> Interp<'a> {
                                         }
                                     }
                                 }
-                                self.call_method(index, name, values, *span)
+                                self.call_value_method(index, name, values, *span, frame)
                             }
                             Value::Port {
                                 owner,
@@ -11398,7 +13218,7 @@ impl<'a> Interp<'a> {
                                 *span,
                             ));
                         };
-                        self.call_method(index, field, values, *span)
+                        self.call_value_method(index, field, values, *span, frame)
                     }
                     // `Type::method(args)` — the static method call
                     // (clause 17.2.2): dispatched without a receiver.
@@ -11407,10 +13227,16 @@ impl<'a> Interp<'a> {
                     } => self.call_static_method(type_name, member, values, *span),
                     _ => Err(self.error("E0402", "call target not supported", *span)),
                 }
+                })();
+                self.expected_type = saved_hint;
+                result
             }
             Expr::Index { base, index, span } => {
-                let base_value = self.eval(base, frame, me)?;
-                let index_value = self.eval(index, frame, me)?;
+                let base_value = self.eval_with_hint(None, base, frame, me)?;
+                let index_value = self.eval_with_hint(
+                            Some(TypeExpr::Scalar { base: ScalarBase::Int, width: None, span: index.span() }),
+                            index, frame, me,
+                        )?;
                 let (Value::List(list), Value::Int(i)) = (&base_value, &index_value) else {
                     return Err(self.error(
                         "E0402",
@@ -11507,7 +13333,7 @@ impl<'a> Interp<'a> {
                 let value = self.eval(inner, frame, me)?;
                 match (op, value) {
                     (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-                    (UnaryOp::Negate, Value::Int(i)) => Ok(Value::Int(-i)),
+                    (UnaryOp::Negate, Value::Int(i)) => i.checked_neg().map(Value::Int).ok_or_else(|| self.error("E0402", "integer negation overflow", *span)),
                     (UnaryOp::Negate, Value::Real(r)) => Ok(Value::Real(-r)),
                     (UnaryOp::Plus, value @ (Value::Int(_) | Value::Real(_))) => Ok(value),
                     (UnaryOp::BitNot, Value::Int(i)) => Ok(Value::Int(!i)),
@@ -11653,105 +13479,53 @@ impl<'a> Interp<'a> {
                 Ok(Value::Int((value >> l) & mask))
             }
             Expr::InSet { element, set, span } => {
-                let value = self.eval(element, frame, me)?;
+                let value = self.eval_with_hint(None, element, frame, me)?;
                 let contained = match set {
                     crate::ast::InSetExpr::Items(items) => {
-                        let mut found = false;
-                        for item in items {
-                            let item_value = self.eval(item, frame, me)?;
-                            if matches!(
-                                self.apply_binary(
-                                    BinaryOp::Eq,
-                                    value.clone(),
-                                    item_value,
-                                    *span,
-                                    &Precision::unbounded(),
-                                )?,
-                                Value::Bool(true)
-                            ) {
-                                found = true;
-                                break;
+                        if let Value::List(list) = &value {
+                            // A bracket literal denotes a set: repetition on
+                            // the left does not consume a distinct set member.
+                            let mut candidates = Vec::with_capacity(items.len());
+                            for item in items {
+                                candidates.push(self.eval_with_hint(None, item, frame, me)?);
                             }
+                            let values = list.items.borrow().clone();
+                            self.list_membership(&values, &candidates, false, *span)?
+                        } else {
+                            let mut found = false;
+                            for item in items {
+                                let item_value = self.eval_with_hint(None, item, frame, me)?;
+                                if self.membership_equal(&value, &item_value, *span)? {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            found
                         }
-                        found
                     }
                     crate::ast::InSetExpr::Range(low, high) => {
-                        let Value::Int(low_v) = self.eval(low, frame, me)? else {
-                            return Err(self.error(
-                                "E0402",
-                                "range bound must be an integer",
-                                *span,
-                            ));
-                        };
-                        let Value::Int(high_v) = self.eval(high, frame, me)? else {
-                            return Err(self.error(
-                                "E0402",
-                                "range bound must be an integer",
-                                *span,
-                            ));
-                        };
-                        let Value::Int(v) = &value else {
-                            return Err(self.error(
-                                "E0402",
-                                "range membership expects an integer",
-                                *span,
-                            ));
-                        };
-                        low_v <= *v && *v <= high_v
+                        let low = self.set_literal_bound(low, frame, me, *span)?;
+                        let high = self.set_literal_bound(high, frame, me, *span)?;
+                        self.set_membership(&value, &[(low, high)], *span)?
                     }
-                    // A general set expression (4.11.6's set-exp): the
-                    // operand evaluates to a set — membership over its
-                    // intervals — or to a list, whose items are compared
-                    // item-by-item.
                     crate::ast::InSetExpr::Expr(set_expr) => {
-                        let container = self.eval(set_expr, frame, me)?;
+                        let container = self.eval_with_hint(None, set_expr, frame, me)?;
                         match container {
-                            Value::Set(intervals) => match &value {
-                                Value::Int(v) => {
-                                    intervals.iter().any(|(lo, hi)| *lo <= *v && *v <= *hi)
-                                }
-                                Value::Bool(b) => {
-                                    let v = *b as i128;
-                                    intervals.iter().any(|(lo, hi)| *lo <= v && v <= *hi)
-                                }
-                                _ => {
-                                    return Err(self.error(
-                                        "E0402",
-                                        "set membership expects an integer, boolean or enumerand",
-                                        *span,
-                                    ));
-                                }
-                            },
+                            Value::Set(intervals) => self.set_membership(&value, &intervals, *span)?,
                             Value::List(list) => {
                                 let items = list.items.borrow().clone();
-                                let mut found = false;
-                                for item in items {
-                                    if matches!(
-                                        self.apply_binary(
-                                            BinaryOp::Eq,
-                                            value.clone(),
-                                            item,
-                                            *span,
-                                            &Precision::unbounded(),
-                                        )?,
-                                        Value::Bool(true)
-                                    ) {
-                                        found = true;
-                                        break;
-                                    }
+                                if let Value::List(left) = &value {
+                                    let values = left.items.borrow().clone();
+                                    self.list_membership(&values, &items, true, *span)?
+                                } else {
+                                    self.list_membership(&[value], &items, false, *span)?
                                 }
-                                found
                             }
-                            other => {
-                                return Err(self.error(
-                                    "E0402",
-                                    format!(
-                                        "'in' expects a set or list, got {}",
-                                        self.value_kind(&other)
-                                    ),
-                                    *span,
-                                ));
-                            }
+                            other => return Err(self.error(
+                                "E0402",
+                                format!("'in' expects a set or list, got {}", self.value_kind(&other)),
+                                *span,
+                            )),
                         }
                     }
                 };
@@ -11889,34 +13663,18 @@ impl<'a> Interp<'a> {
                 // monomorphized template instance's canonical name for a
                 // template reference — and runs the `with` assignments
                 // against the fresh instance. An untyped `new` creates
-                // with the enclosing `var x: t = new;`'s declared type
-                // (clause 18) when one is evaluating; other untyped
-                // spellings stay the explicit not-supported diagnostic.
-                let new_name = match ty {
-                    None => match self.new_type_hint.clone() {
-                        Some(name) => name,
-                        None => {
-                            return Err(self.error(
-                                "E0402",
-                                "untyped 'new' instance creation is not supported yet",
-                                *span,
-                            ));
-                        }
-                    },
-                    Some(new_ty) => match new_ty {
-                        TypeExpr::Named { name, .. } => name.clone(),
-                        TypeExpr::TemplateRef { name, args, .. } => {
-                            crate::ast::template_instance_name(name, args)
-                        }
-                        _ => {
-                            return Err(self.error(
-                                "E0402",
-                                "'new' supports named and template-instance types only",
-                                new_ty.span(),
-                            ));
-                        }
-                    },
+                // with a named contextual type supplied by a declaration,
+                // assignment, parameter, return or list element. Missing
+                // instance contexts retain the explicit runtime diagnostic.
+                let context = self.expected_type.as_ref().and_then(|hint| self.resolved_hint_type(hint, 0));
+                let context = match context {
+                    Some(TypeExpr::List { element, .. }) if ty.is_none() => Some(*element),
+                    other => other,
                 };
+                let inferred = ty.as_ref().or(context.as_ref());
+                let new_name = inferred.and_then(|ty| self.creation_type_name(ty)).ok_or_else(|| {
+                    self.error("E0402", if ty.is_none() { "untyped 'new' requires a named instance type context" } else { "'new' supports named and template-instance types only" }, *span)
+                })?;
                 if self.depth > 100 {
                     return Ok(Value::Void);
                 }
@@ -11992,10 +13750,13 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 self.depth += 1;
+                let saved_hint = self.expected_type.take();
                 let index = self.instantiate(&new_name);
                 let mut frame = Frame::default();
-                let flow = self.exec_block(inits, &mut frame, Some(index))?;
+                let flow = self.exec_block(inits, &mut frame, Some(index));
+                self.expected_type = saved_hint;
                 self.depth -= 1;
+                let flow = flow?;
                 // The `with` block is an assignment list; a `stop_run`
                 // inside it unwinds the run like any other statement.
                 if matches!(flow, Flow::Stop) {
@@ -12044,6 +13805,129 @@ impl<'a> Interp<'a> {
         }
     }
 
+    fn membership_equal(
+        &mut self,
+        left: &Value,
+        right: &Value,
+        span: crate::ast::Span,
+    ) -> Result<bool, ExecError> {
+        Ok(matches!(
+            self.apply_binary(
+                BinaryOp::Eq,
+                left.clone(),
+                right.clone(),
+                span,
+                &Precision::unbounded()
+            )?,
+            Value::Bool(true)
+        ))
+    }
+
+    /// List containment is order-independent and respects multiplicity
+    /// (4.11.6). Snapshot inputs before comparisons, which can dispatch
+    /// custom numeric methods and mutate their original lists.
+    fn list_membership(
+        &mut self,
+        values: &[Value],
+        candidates: &[Value],
+        consume: bool,
+        span: crate::ast::Span,
+    ) -> Result<bool, ExecError> {
+        if !consume {
+            for value in values {
+                let mut found = false;
+                for candidate in candidates {
+                    if self.membership_equal(value, candidate, span)? {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        // Find a distinct match for every left item. A greedy first match
+        // is insufficient: mixed int/real comparisons can round two distinct
+        // integers to one real. Iterative augmenting paths can move an earlier
+        // match without recursion or mutating either input list.
+        let mut left_matches = vec![None; values.len()];
+        let mut right_matches: Vec<Option<usize>> = vec![None; candidates.len()];
+        for root in 0..values.len() {
+            let mut parents: Vec<Option<usize>> = vec![None; candidates.len()];
+            let mut queue = std::collections::VecDeque::from([root]);
+            let mut free = None;
+            'search: while let Some(left) = queue.pop_front() {
+                for (right, candidate) in candidates.iter().enumerate() {
+                    if parents[right].is_some()
+                        || !self.membership_equal(&values[left], candidate, span)?
+                    {
+                        continue;
+                    }
+                    parents[right] = Some(left);
+                    if let Some(owner) = right_matches[right] {
+                        queue.push_back(owner);
+                    } else {
+                        free = Some(right);
+                        break 'search;
+                    }
+                }
+            }
+            let Some(mut right) = free else {
+                return Ok(false);
+            };
+            loop {
+                let left = parents[right].expect("the augmenting path visited this candidate");
+                let previous = left_matches[left].replace(right);
+                right_matches[right] = Some(left);
+                match previous {
+                    Some(previous) => right = previous,
+                    None => break,
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn set_membership(
+        &self,
+        value: &Value,
+        intervals: &[(i128, i128)],
+        span: crate::ast::Span,
+    ) -> Result<bool, ExecError> {
+        // Values of a contained list are tested independently against the
+        // set; list multiplicity is relevant only against another list.
+        let scalar = |value: &Value| -> Result<bool, ExecError> {
+            let index = match value {
+                Value::Int(value) => Some(*value),
+                Value::Bool(value) => Some(*value as i128),
+                Value::Enum { type_name, name } => self.enumeral_index(type_name, name),
+                _ => None,
+            }
+            .ok_or_else(|| {
+                self.error(
+                    "E0402",
+                    "set membership expects an integer, boolean or enumerand",
+                    span,
+                )
+            })?;
+            Ok(intervals
+                .iter()
+                .any(|(low, high)| *low <= index && index <= *high))
+        };
+        if let Value::List(list) = value {
+            for item in list.items.borrow().iter() {
+                if !scalar(item)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        } else {
+            scalar(value)
+        }
+    }
+
     /// The runtime half of `expr is [not] a <type>` (clause 4.17.1). Scalar
     /// kinds match by value shape (integers are one runtime value, so
     /// `is a int` and `is a uint` both accept it); named types match by
@@ -12054,7 +13938,7 @@ impl<'a> Interp<'a> {
         value: &Value,
         ty: &TypeExpr,
         span: crate::ast::Span,
-    ) -> Result<bool, Diagnostic> {
+    ) -> Result<bool, ExecError> {
         match ty {
             TypeExpr::Scalar { base, .. } => Ok(matches!(
                 (base, value),
@@ -12212,22 +14096,126 @@ impl<'a> Interp<'a> {
         expr: &Expr,
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let saved = std::mem::replace(&mut self.expected_type, hint);
         let result = self.eval(expr, frame, me);
         self.expected_type = saved;
         result
     }
 
-    /// The declared type of an expression, when statically known: a
-    /// local's declared type, a field of the enclosing instance, or a
-    /// field reached through names of known instance type. Used as the
-    /// inference context for an untyped `evaluate { ... }` (4.17.7).
+    /// Resolve alias representations with the same finite bound as defaulting.
+    fn resolved_hint_type(&self, ty: &TypeExpr, depth: usize) -> Option<TypeExpr> {
+        if depth > 64 {
+            return None;
+        }
+        if let TypeExpr::Named { name, .. } = ty
+            && let Some(declared) = self
+                .types
+                .iter()
+                .find(|entry| entry.name == *name && entry.kind == DeclarationKind::Type)
+            && let Some(underlying) = &declared.underlying
+        {
+            return self.resolved_hint_type(underlying, depth + 1);
+        }
+        Some(ty.clone())
+    }
+
+    fn creation_type_name(&self, ty: &TypeExpr) -> Option<String> {
+        Self::statement_type_name(&self.resolved_hint_type(ty, 0)?)
+    }
+
+    /// Recover a stable declaration kind for an inferred local. Empty or
+    /// heterogeneous lists and unknown value families supply no type hint.
+    fn value_type_hint(&self, value: &Value, depth: usize) -> Option<TypeExpr> {
+        self.value_type_hint_cached(value, depth, &mut BTreeMap::new())
+    }
+
+    fn value_type_hint_cached(
+        &self,
+        value: &Value,
+        depth: usize,
+        lists: &mut BTreeMap<usize, Option<TypeExpr>>,
+    ) -> Option<TypeExpr> {
+        if depth > 16 {
+            return None;
+        }
+        let span = origin_span();
+        let scalar = |base| TypeExpr::Scalar {
+            base,
+            width: None,
+            span,
+        };
+        Some(match value {
+            Value::Int(_) => scalar(ScalarBase::Int),
+            Value::Bool(_) => scalar(ScalarBase::Bool),
+            Value::Real(_) => scalar(ScalarBase::Real),
+            Value::Str(_) => scalar(ScalarBase::String),
+            Value::Object(index) => TypeExpr::Named {
+                name: self.instances.get(*index)?.type_name.clone(),
+                span,
+            },
+            Value::Enum { type_name, .. } if self.types.iter().any(|ty| ty.name == *type_name) => {
+                TypeExpr::Named {
+                    name: type_name.clone(),
+                    span,
+                }
+            }
+            Value::List(list) => {
+                let identity = Rc::as_ptr(&list.items) as usize;
+                if let Some(cached) = lists.get(&identity) {
+                    return cached.clone();
+                }
+                lists.insert(identity, None); // Includes an in-progress cycle.
+                let items = list.items.borrow();
+                let first = self.value_type_hint_cached(items.first()?, depth + 1, lists)?;
+                if !items.iter().skip(1).all(|item| {
+                    self.value_type_hint_cached(item, depth + 1, lists).as_ref() == Some(&first)
+                }) {
+                    return None;
+                }
+                let result = TypeExpr::List {
+                    element: Box::new(first),
+                    key: None,
+                    span,
+                };
+                lists.insert(identity, Some(result.clone()));
+                result
+            }
+            Value::Set(_) => TypeExpr::Named {
+                name: "set".to_owned(),
+                span,
+            },
+            Value::InstanceIterator(_) => TypeExpr::Named {
+                name: "instance_iterator".to_owned(),
+                span,
+            },
+            _ => return None,
+        })
+    }
+
+    /// Resolve context types without evaluating any receiver/index/argument.
+    fn contextual_type_of(
+        &self,
+        expr: &Expr,
+        frame: &Frame,
+        me: Option<usize>,
+    ) -> Option<TypeExpr> {
+        self.context_type_of(expr, frame, me, 0)
+    }
+
     fn static_type_of(&self, expr: &Expr, frame: &Frame, me: Option<usize>) -> Option<TypeExpr> {
+        let owner = me
+            .map(|index| self.instances[index].type_name.as_str())
+            .or(self.static_context.as_deref())
+            .unwrap_or("");
+        let resolve = |owner: &str, ty: &TypeExpr| {
+            crate::coverage::constant_scalar_type(self.types, owner, ty)
+                .unwrap_or_else(|| ty.clone())
+        };
         match expr {
             Expr::Ident { name, .. } => {
                 if let Some(ty) = frame.local_types.get(name) {
-                    return Some(ty.clone());
+                    return Some(resolve(owner, ty));
                 }
                 if let Some(index) = me {
                     let type_name = &self.instances[index].type_name;
@@ -12236,7 +14224,7 @@ impl<'a> Interp<'a> {
                         .iter()
                         .find(|t| t.name == *type_name)
                         .and_then(|t| t.fields.iter().find(|f| f.name == *name))
-                        .map(|f| f.ty.clone());
+                        .map(|f| resolve(type_name, &f.ty));
                 }
                 None
             }
@@ -12252,10 +14240,189 @@ impl<'a> Interp<'a> {
                     .iter()
                     .find(|t| t.name == type_name)
                     .and_then(|t| t.fields.iter().find(|f| f.name == *name))
-                    .map(|f| f.ty.clone())
+                    .map(|f| resolve(&type_name, &f.ty))
+            }
+            Expr::StaticAccess {
+                type_name, member, ..
+            } => {
+                let owner = self.static_field_owner_from(type_name, member)?;
+                let field = self
+                    .static_fields
+                    .get(&owner)?
+                    .iter()
+                    .find(|field| field.name == *member)?;
+                Some(resolve(&owner, &field.ty))
             }
             _ => None,
         }
+    }
+
+    fn context_type_of(
+        &self,
+        expr: &Expr,
+        frame: &Frame,
+        me: Option<usize>,
+        depth: usize,
+    ) -> Option<TypeExpr> {
+        if depth > 64 {
+            return None;
+        }
+        match expr {
+            Expr::Ident { name, span } => {
+                if name == "me" || name == "self" {
+                    return Some(TypeExpr::Named {
+                        name: self.instances.get(me?)?.type_name.clone(),
+                        span: *span,
+                    });
+                }
+                if let Some(ty) = frame.local_types.get(name) {
+                    return Some(ty.clone());
+                }
+                // An inferred local shadows owner fields even when its value
+                // has no recoverable shape. Never borrow a hidden field's type.
+                if let Some(value) = frame.locals.get(name) {
+                    return self.value_type_hint(value, 0);
+                }
+                if let Some(index) = me {
+                    let owner = &self.instances[index].type_name;
+                    if let Some(field) = self
+                        .types
+                        .iter()
+                        .find(|ty| ty.name == *owner)
+                        .and_then(|ty| ty.fields.iter().find(|field| field.name == *name))
+                    {
+                        return Some(field.ty.clone());
+                    }
+                }
+                if let Some(owner) = self.bare_static_field_owner(me, name) {
+                    return self
+                        .static_fields
+                        .get(&owner)?
+                        .iter()
+                        .find(|field| field.name == *name)
+                        .map(|field| field.ty.clone());
+                }
+                None
+            }
+            Expr::MemberAccess { object, name, .. }
+            | Expr::QualifiedField {
+                base: object,
+                field: name,
+                ..
+            } => {
+                let base = self.context_type_of(object, frame, me, depth + 1)?;
+                let owner = self.creation_type_name(&base)?;
+                self.types
+                    .iter()
+                    .find(|ty| ty.name == owner)?
+                    .fields
+                    .iter()
+                    .find(|field| field.name == *name)
+                    .map(|field| field.ty.clone())
+            }
+            Expr::StaticAccess {
+                type_name, member, ..
+            } => self
+                .static_fields
+                .get(type_name)?
+                .iter()
+                .find(|field| field.name == *member)
+                .map(|field| field.ty.clone()),
+            Expr::Index { base, .. } => match self
+                .resolved_hint_type(&self.context_type_of(base, frame, me, depth + 1)?, 0)?
+            {
+                TypeExpr::List { element, .. } => Some(*element),
+                _ => None,
+            },
+            Expr::Ternary {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                let left = self.resolved_hint_type(
+                    &self.context_type_of(then_expr, frame, me, depth + 1)?,
+                    0,
+                )?;
+                let right = self.resolved_hint_type(
+                    &self.context_type_of(else_expr, frame, me, depth + 1)?,
+                    0,
+                )?;
+                (left.render() == right.render()).then_some(left)
+            }
+            Expr::ListConcat { items, .. } => {
+                let mut element: Option<TypeExpr> = None;
+                for item in items {
+                    let kind = self.resolved_hint_type(
+                        &self.context_type_of(item, frame, me, depth + 1)?,
+                        0,
+                    )?;
+                    let kind = match kind {
+                        TypeExpr::List { element, .. } => *element,
+                        kind => kind,
+                    };
+                    if element
+                        .as_ref()
+                        .is_some_and(|previous| previous.render() != kind.render())
+                    {
+                        return None;
+                    }
+                    element = Some(kind);
+                }
+                Some(TypeExpr::List {
+                    element: Box::new(element?),
+                    key: None,
+                    span: expr.span(),
+                })
+            }
+            Expr::Paren { expr, .. } => self.context_type_of(expr, frame, me, depth + 1),
+            Expr::New { ty: Some(ty), .. } | Expr::Evaluate { ty: Some(ty), .. } => {
+                Some(ty.clone())
+            }
+            Expr::Call { callee, .. } => self
+                .context_method(callee, frame, me, depth + 1)?
+                .return_type
+                .clone(),
+            _ => None,
+        }
+    }
+
+    fn context_method(
+        &self,
+        callee: &Expr,
+        frame: &Frame,
+        me: Option<usize>,
+        depth: usize,
+    ) -> Option<&'a MethodDecl> {
+        if depth > 64 {
+            return None;
+        }
+        let (owner, name, is_static) = match callee {
+            Expr::Ident { name, .. } if !crate::builtins::is_builtin_routine(name) => {
+                (self.instances.get(me?)?.type_name.clone(), name, false)
+            }
+            Expr::MemberAccess { object, name, .. }
+            | Expr::QualifiedField {
+                base: object,
+                field: name,
+                ..
+            } => {
+                let ty = self.context_type_of(object, frame, me, depth + 1)?;
+                (self.creation_type_name(&ty)?, name, false)
+            }
+            Expr::StaticAccess {
+                type_name, member, ..
+            } => (type_name.clone(), member, true),
+            _ => return None,
+        };
+        let methods = if is_static {
+            self.static_methods.get(&owner)?
+        } else {
+            &self.types.iter().find(|ty| ty.name == owner)?.methods
+        };
+        methods
+            .iter()
+            .find(|method| method.name == *name && method.modifier.is_none())
+            .or_else(|| methods.iter().find(|method| method.name == *name))
     }
 
     /// The parameter types of a called method, one per argument position
@@ -12270,48 +14437,14 @@ impl<'a> Interp<'a> {
         frame: &Frame,
         me: Option<usize>,
     ) -> Vec<Option<TypeExpr>> {
-        let mut hints: Vec<Option<TypeExpr>> = vec![None; arg_count];
-        // The type the callee is a method of, and the callee's name.
-        let (type_name, method_name) = match callee {
-            Expr::Ident { name, .. } => {
-                if crate::builtins::is_builtin_routine(name) {
-                    return hints;
-                }
-                let Some(index) = me else {
-                    return hints;
-                };
-                (self.instances[index].type_name.clone(), name.clone())
-            }
-            Expr::MemberAccess { object, name, .. } => {
-                let type_name = match self.static_type_of(object, frame, me) {
-                    Some(TypeExpr::Named { name, .. }) => name,
-                    Some(TypeExpr::WhenQualified { value, base, .. }) => {
-                        match when_view_name(&value, &base) {
-                            Some(view) => view,
-                            None => return hints,
-                        }
-                    }
-                    _ => return hints,
-                };
-                (type_name, name.clone())
-            }
-            _ => return hints,
-        };
-        let types: &[crate::elab::ElaboratedType] = self.types;
-        let Some(ty) = types.iter().find(|t| t.name == type_name) else {
-            return hints;
-        };
-        for method in &ty.methods {
-            if method.name != *method_name {
-                continue;
-            }
-            for (position, param) in method.params.iter().enumerate().take(arg_count) {
-                if hints[position].is_none() {
-                    hints[position] = param.ty.clone();
-                }
-            }
-        }
-        hints
+        let method = self.context_method(callee, frame, me, 0);
+        (0..arg_count)
+            .map(|position| {
+                method
+                    .and_then(|method| method.params.get(position))
+                    .and_then(|parameter| parameter.ty.clone())
+            })
+            .collect()
     }
 
     /// Whether one `in_table` row element matches the tuple element's
@@ -12326,7 +14459,7 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<bool, Diagnostic> {
+    ) -> Result<bool, ExecError> {
         match element {
             crate::ast::TableElem::Scalar(expr) => {
                 let other = self.eval(expr, frame, me)?;
@@ -12407,7 +14540,7 @@ impl<'a> Interp<'a> {
         ty: &TypeExpr,
         value: &Value,
         span: crate::ast::Span,
-    ) -> Result<bool, Diagnostic> {
+    ) -> Result<bool, ExecError> {
         let Some(range) = self.type_value_range(ty) else {
             return Err(self.error(
                 "E0402",
@@ -12448,7 +14581,18 @@ impl<'a> Interp<'a> {
         rhs: Value,
         span: crate::ast::Span,
         precision: &Precision,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
+        self.eval_action(|this| this.apply_binary_inner(op, lhs, rhs, span, precision))
+    }
+
+    fn apply_binary_inner(
+        &mut self,
+        op: BinaryOp,
+        lhs: Value,
+        rhs: Value,
+        span: crate::ast::Span,
+        precision: &Precision,
+    ) -> Result<Value, ExecError> {
         use BinaryOp::*;
         let err = |kind: &str| {
             self.error(
@@ -12624,7 +14768,12 @@ impl<'a> Interp<'a> {
                     if b == 0 {
                         return Err(self.error("E0403", "division by zero", span));
                     }
-                    let value = if op == Div { a / b } else { a % b };
+                    let value = if op == Div {
+                        a.checked_div(b)
+                    } else {
+                        a.checked_rem(b)
+                    }
+                    .ok_or_else(|| self.error("E0402", "integer division overflow", span))?;
                     Ok(Value::Int(precision.cast_operand(value)))
                 }
                 _ => {
@@ -12706,7 +14855,7 @@ impl<'a> Interp<'a> {
         field: &str,
         field_span: crate::ast::Span,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let Some(view) = self.find_qualified_field_view(index, qualifiers, field) else {
             return Err(self.error(
                 "E0401",
@@ -12834,7 +14983,7 @@ impl<'a> Interp<'a> {
         view: &crate::elab::ElaboratedType,
         field: &str,
         span: crate::ast::Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ExecError> {
         let Some(declaration) = view.fields.iter().find(|f| f.name == field) else {
             return Err(self.error("E0401", format!("unknown field '{field}'"), span));
         };
@@ -12901,7 +15050,7 @@ impl<'a> Interp<'a> {
         target: &Expr,
         frame: &mut Frame,
         me: Option<usize>,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         match target {
             Expr::Ident { name, .. } => {
                 if let Some(port) = name.strip_suffix('$') {
@@ -12982,7 +15131,7 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ExecError> {
         match target {
             Expr::Ident { name, .. } => {
                 if let Some(port) = name.strip_suffix('$') {
@@ -12995,28 +15144,39 @@ impl<'a> Interp<'a> {
                     frame.locals.insert(name.clone(), value);
                     return Ok(());
                 }
-                if let Some(index) = me {
-                    // The field's declared type binds the value (T7.1's
-                    // value semantics: a custom numeric copies, a
-                    // scalar converts through numeric_from_*).
+                if let Some(index) = me
+                    && self.instances[index].get(name).is_some()
+                {
+                    // Instance fields precede the static namespace.
                     let declared = self.declared_type_of(name, false, frame, index);
                     let value = self.bind_slot_value(value, declared.as_ref(), span)?;
-                    if self.instances[index].set(name, value.clone()) {
-                        return Ok(());
-                    }
-                    // A static field named bare (T2.1): the write lands
-                    // in the declaring type's store entry — the same
-                    // resolution the read side uses.
-                    if let Some(owner) = self.bare_static_field_owner(me, name) {
-                        self.statics
-                            .entry(owner)
-                            .or_default()
-                            .insert(name.clone(), value);
-                        return Ok(());
-                    }
-                    return Err(self.error("E0401", format!("unknown field '{name}'"), span));
+                    self.instances[index].set(name, value);
+                    return Ok(());
                 }
-                Err(self.error("E0401", format!("unknown identifier '{name}'"), span))
+                // Static methods/on blocks have no instance receiver. Use
+                // the same declaring-owner walk as reads, including parents.
+                if let Some(owner) = self.bare_static_field_owner(me, name) {
+                    let declared = self
+                        .static_fields
+                        .get(&owner)
+                        .and_then(|fields| fields.iter().find(|field| field.name == *name))
+                        .map(|field| field.ty.clone());
+                    let value = self.bind_slot_value(value, declared.as_ref(), span)?;
+                    self.statics
+                        .entry(owner)
+                        .or_default()
+                        .insert(name.clone(), value);
+                    return Ok(());
+                }
+                Err(self.error(
+                    "E0401",
+                    if me.is_some() {
+                        format!("unknown field '{name}'")
+                    } else {
+                        format!("unknown identifier '{name}'")
+                    },
+                    span,
+                ))
             }
             Expr::MemberAccess { object, name, .. } => {
                 // `unit.port$ = value` — simple_port write.
@@ -13135,7 +15295,7 @@ impl<'a> Interp<'a> {
         port: &str,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Result<Value, ExecError> {
         let Some(index) = me else {
             return Err(self.error("E0402", "port access requires an enclosing instance", span));
         };
@@ -13159,7 +15319,7 @@ impl<'a> Interp<'a> {
         value: Value,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ExecError> {
         let Some(index) = me else {
             return Err(self.error("E0402", "port access requires an enclosing instance", span));
         };
@@ -13323,8 +15483,8 @@ impl<'a> Interp<'a> {
         code: &'static str,
         message: impl Into<String>,
         span: crate::ast::Span,
-    ) -> Diagnostic {
-        Diagnostic::new(code, message, span.0, span.1)
+    ) -> ExecError {
+        ExecError::new(code, message, span.0, span.1)
     }
 }
 
@@ -13353,9 +15513,9 @@ fn render_iterator_path(path: &[InstancePathItem], root_label: &str) -> String {
 /// A 1-based table column index against a width (the number of columns
 /// or cells): validated per 32.3's numbering — columns start at 1,
 /// column 0 is the row-index pseudo-column and is never a cell here.
-fn column_index(width: usize, column: i128, span: crate::ast::Span) -> Result<usize, Diagnostic> {
+fn column_index(width: usize, column: i128, span: crate::ast::Span) -> Result<usize, ExecError> {
     if column < 1 || column > width as i128 {
-        return Err(Diagnostic::new(
+        return Err(ExecError::new(
             "E0404",
             format!("table column index {column} out of range (1..{width})"),
             span.0,
@@ -13372,10 +15532,10 @@ fn insert_row_at(
     position: i128,
     row: Rc<RefCell<crate::tables::TableRowValue>>,
     span: crate::ast::Span,
-) -> Result<(), Diagnostic> {
+) -> Result<(), ExecError> {
     let rows_len = table.rows.len();
     if position < 0 || position > rows_len as i128 {
-        return Err(Diagnostic::new(
+        return Err(ExecError::new(
             "E0404",
             format!("table row insert position {position} out of range (0..={rows_len})"),
             span.0,
@@ -13582,7 +15742,7 @@ fn scalar_range(base: ScalarBase, width: &Option<Box<Expr>>) -> Option<(i128, i1
 /// values; the unbounded mode keeps exactly that behavior, so only the
 /// ≤32-bit and 64-bit modes change results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Precision {
+pub(crate) enum Precision {
     /// (a) every operand type is at most 32 bits: compute in 32 bits,
     /// unsigned when any operand is unsigned.
     Bits32 { unsigned: bool },
@@ -13609,7 +15769,7 @@ impl Precision {
 
     /// The width this context computes at (`None` for the unbounded and
     /// real modes, where values are not wrapped).
-    fn bits(self) -> Option<u32> {
+    pub(crate) fn bits(self) -> Option<u32> {
         match self {
             Precision::Bits32 { .. } => Some(32),
             Precision::Bits64 { .. } => Some(64),
@@ -13627,7 +15787,7 @@ impl Precision {
     /// Cast one operand into the context: truncate to the width and
     /// interpret it signed or unsigned (5.6.3's "operands are cast").
     /// The unbounded and real modes keep the value as is.
-    fn cast_operand(self, value: i128) -> i128 {
+    pub(crate) fn cast_operand(self, value: i128) -> i128 {
         match self.bits() {
             None => value,
             Some(bits) => wrap_to_width(value, bits, self.unsigned()),
@@ -13707,7 +15867,7 @@ fn is_star_width(width: &Option<Box<Expr>>) -> bool {
 
 /// The 5.6.3 context type set from the operands' static types — the
 /// four rules (a)–(d), tried in order.
-fn precision_context(lhs: Option<&TypeExpr>, rhs: Option<&TypeExpr>) -> Precision {
+pub(crate) fn precision_context(lhs: Option<&TypeExpr>, rhs: Option<&TypeExpr>) -> Precision {
     use OperandClass::*;
     let (l, r) = (operand_class(lhs), operand_class(rhs));
     // No operand carries a static type (two literals, call results,
@@ -13764,7 +15924,7 @@ fn wrap_to_width(value: i128, bits: u32, unsigned: bool) -> i128 {
 
 /// Intersection of two canonical interval sets (sorted, disjoint): a
 /// two-pointer sweep; the result is canonical again.
-fn intersect_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
+pub(crate) fn intersect_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
     let mut result = Vec::new();
     let mut i = 0usize;
     let mut j = 0usize;
@@ -13785,7 +15945,7 @@ fn intersect_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128,
 
 /// Union of two canonical interval sets: concatenation plus the
 /// canonicalization merge.
-fn union_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
+pub(crate) fn union_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i128)> {
     let mut all = a.to_vec();
     all.extend_from_slice(b);
     canonical_set(all)
@@ -13793,7 +15953,10 @@ fn union_interval_sets(a: &[(i128, i128)], b: &[(i128, i128)]) -> Vec<(i128, i12
 
 /// The complement of a canonical interval set within `domain` (the
 /// field type's full range): the gaps between the set's intervals.
-fn complement_interval_set(set: &[(i128, i128)], domain: (i128, i128)) -> Vec<(i128, i128)> {
+pub(crate) fn complement_interval_set(
+    set: &[(i128, i128)],
+    domain: (i128, i128),
+) -> Vec<(i128, i128)> {
     let mut result = Vec::new();
     let mut cursor = domain.0;
     for &(low, high) in set {
@@ -14223,7 +16386,7 @@ fn rgf_atom_side(
 
 /// Canonicalize intervals (5.2.12): sort, merge overlapping and
 /// neighboring ones, drop empties.
-fn canonical_set(mut intervals: Vec<(i128, i128)>) -> Vec<(i128, i128)> {
+pub(crate) fn canonical_set(mut intervals: Vec<(i128, i128)>) -> Vec<(i128, i128)> {
     intervals.retain(|(lo, hi)| lo <= hi);
     intervals.sort();
     let mut merged: Vec<(i128, i128)> = Vec::new();
@@ -14800,6 +16963,15 @@ fn is_every_cycle_event(path: &str) -> bool {
     )
 }
 
+fn temporal_sampling_is_global(sampling: Option<&crate::ast::TemporalExpr>) -> bool {
+    match sampling {
+        None | Some(crate::ast::TemporalExpr::Cycle) => true,
+        Some(crate::ast::TemporalExpr::Group(te)) => temporal_sampling_is_global(Some(te)),
+        Some(crate::ast::TemporalExpr::EventRef { path }) => is_every_cycle_event(&path.join(".")),
+        _ => false,
+    }
+}
+
 /// The `keep <port>.edge() == <value>` attribute values (9.7.3) per
 /// (type name, port name), read structurally from the composed
 /// constraints (either orientation, call on either side). Values outside
@@ -14951,70 +17123,72 @@ fn type_set_key(ty: &TypeExpr) -> Option<String> {
     }
 }
 
-/// Whether the expression anywhere contains an `evaluate { ... }` block
-/// without an explicit type — the only case a call argument needs its
-/// parameter's declared type as the inference context (4.17.7).
-fn expr_has_untyped_evaluate(expr: &Expr) -> bool {
+/// Context lookup is only needed for an untyped contextual expression.
+/// Typed expression bodies establish their own scopes and are barriers here.
+fn expr_needs_context(expr: &Expr) -> bool {
     match expr {
-        Expr::Evaluate { ty, .. } => ty.is_none(),
-        Expr::Unary { expr, .. } | Expr::Paren { expr, .. } | Expr::CastAs { expr, .. } => {
-            expr_has_untyped_evaluate(expr)
-        }
-        Expr::Binary { lhs, rhs, .. } => {
-            expr_has_untyped_evaluate(lhs) || expr_has_untyped_evaluate(rhs)
-        }
+        Expr::Evaluate { ty, .. } | Expr::New { ty, .. } => ty.is_none(),
+        Expr::Unary { expr, .. }
+        | Expr::Paren { expr, .. }
+        | Expr::CastAs { expr, .. }
+        | Expr::IsA { expr, .. } => expr_needs_context(expr),
+        Expr::Binary { lhs, rhs, .. } => expr_needs_context(lhs) || expr_needs_context(rhs),
         Expr::Ternary {
             cond,
             then_expr,
             else_expr,
             ..
         } => {
-            expr_has_untyped_evaluate(cond)
-                || expr_has_untyped_evaluate(then_expr)
-                || expr_has_untyped_evaluate(else_expr)
+            expr_needs_context(cond)
+                || expr_needs_context(then_expr)
+                || expr_needs_context(else_expr)
         }
-        Expr::Index { base, index, .. } => {
-            expr_has_untyped_evaluate(base) || expr_has_untyped_evaluate(index)
-        }
+        Expr::Index { base, index, .. } => expr_needs_context(base) || expr_needs_context(index),
         Expr::BitSlice {
             base, high, low, ..
-        } => {
-            expr_has_untyped_evaluate(base)
-                || expr_has_untyped_evaluate(high)
-                || expr_has_untyped_evaluate(low)
+        } => expr_needs_context(base) || expr_needs_context(high) || expr_needs_context(low),
+        Expr::MemberAccess { object, .. } | Expr::QualifiedField { base: object, .. } => {
+            expr_needs_context(object)
         }
-        Expr::MemberAccess { object, .. } => expr_has_untyped_evaluate(object),
         Expr::Call { callee, args, .. } => {
-            expr_has_untyped_evaluate(callee) || args.iter().any(expr_has_untyped_evaluate)
+            expr_needs_context(callee) || args.iter().any(expr_needs_context)
         }
         Expr::InSet { element, set, .. } => {
             let set_has = match set {
-                crate::ast::InSetExpr::Items(items) => items.iter().any(expr_has_untyped_evaluate),
+                crate::ast::InSetExpr::Items(items) => items.iter().any(expr_needs_context),
                 crate::ast::InSetExpr::Range(low, high) => {
-                    expr_has_untyped_evaluate(low) || expr_has_untyped_evaluate(high)
+                    expr_needs_context(low) || expr_needs_context(high)
                 }
-                crate::ast::InSetExpr::Expr(expr) => expr_has_untyped_evaluate(expr),
+                crate::ast::InSetExpr::Expr(expr) => expr_needs_context(expr),
             };
-            expr_has_untyped_evaluate(element) || set_has
+            expr_needs_context(element) || set_has
         }
         Expr::InTable { tuple, rows, .. } => {
-            tuple.iter().any(expr_has_untyped_evaluate)
+            tuple.iter().any(expr_needs_context)
                 || rows.iter().any(|row| {
                     row.iter().any(|element| match element {
-                        crate::ast::TableElem::Scalar(expr) => expr_has_untyped_evaluate(expr),
+                        crate::ast::TableElem::Scalar(expr) => expr_needs_context(expr),
                         crate::ast::TableElem::Set(crate::ast::InSetExpr::Items(items)) => {
-                            items.iter().any(expr_has_untyped_evaluate)
+                            items.iter().any(expr_needs_context)
                         }
                         crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
-                            expr_has_untyped_evaluate(low) || expr_has_untyped_evaluate(high)
+                            expr_needs_context(low) || expr_needs_context(high)
                         }
                         crate::ast::TableElem::Set(crate::ast::InSetExpr::Expr(expr)) => {
-                            expr_has_untyped_evaluate(expr)
+                            expr_needs_context(expr)
                         }
                         crate::ast::TableElem::TypeSet { .. } => false,
                     })
                 })
         }
+        Expr::ListConcat { items, .. } => items.iter().any(expr_needs_context),
+        Expr::SetLiteral { items, .. } => match items {
+            crate::ast::InSetExpr::Items(items) => items.iter().any(expr_needs_context),
+            crate::ast::InSetExpr::Range(low, high) => {
+                expr_needs_context(low) || expr_needs_context(high)
+            }
+            crate::ast::InSetExpr::Expr(expr) => expr_needs_context(expr),
+        },
         _ => false,
     }
 }
@@ -15247,126 +17421,103 @@ impl<'a> Interp<'a> {
     /// One scheduler turn (13.2.2): execute the coroutine atomically
     /// from its resume point until it completes, suspends at a
     /// synchronization action, or errors.
-    fn run_coroutine_turn(&mut self, co: &mut Coroutine<'a>) -> TurnOutcome {
-        // The kind's payload is copied out so the turn's &mut self
-        // calls never hold a borrow of `co`.
-        enum Plan<'a> {
-            Main {
-                blocks: Vec<&'a [Stmt]>,
-                next: usize,
-            },
-            Tcm {
-                instance: usize,
-                name: String,
-                args: Vec<Value>,
-                next: usize,
-            },
-        }
-        let plan = match &co.kind {
-            CoroutineKind::Main { blocks, next_block } => Plan::Main {
-                blocks: blocks.clone(),
-                next: *next_block,
-            },
+    fn run_coroutine_turn(&mut self, co: &mut Coroutine) -> TurnOutcome {
+        let (instance, name, mut progress, main) = match &co.kind {
+            CoroutineKind::Main { instance, progress } => {
+                (*instance, "run".to_owned(), progress.clone(), true)
+            }
             CoroutineKind::Tcm {
                 instance,
                 method,
-                args,
-                next_block,
-            } => Plan::Tcm {
-                instance: *instance,
-                name: method.clone(),
-                args: args.clone(),
-                next: *next_block,
-            },
+                progress,
+            } => (*instance, method.clone(), progress.clone(), false),
         };
-        match plan {
-            Plan::Main { blocks, mut next } => {
-                let block_count = blocks.len();
-                while next < block_count {
-                    let body = blocks[next];
-                    match self.run_body(body, co) {
-                        Ok(Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_)) => {
-                            next += 1;
-                            co.path.clear();
-                            co.frame = Frame::default();
-                        }
-                        Ok(Flow::Stop) => {
-                            self.stop_requested = true;
-                            if let CoroutineKind::Main { next_block, .. } = &mut co.kind {
-                                *next_block = next;
-                            }
-                            return TurnOutcome::Complete;
-                        }
-                        Ok(Flow::Suspend) => {
-                            if let CoroutineKind::Main { next_block, .. } = &mut co.kind {
-                                *next_block = next;
-                            }
-                            return self.take_suspension(co);
-                        }
-                        Err(diagnostic) => return TurnOutcome::Error(diagnostic),
-                    }
-                }
+        let type_name = self.instances[instance].type_name.clone();
+        if resolve_method_blocks(self.types, &type_name, &name, co.span).is_err() {
+            return if main {
                 TurnOutcome::Complete
+            } else {
+                TurnOutcome::Error(self.error(
+                    "E0401",
+                    format!("method '{name}' not found for the started TCM"),
+                    co.span,
+                ))
+            };
+        }
+        let program =
+            crate::methods::Program::instance(self.types, self.method_layers, &type_name, &name);
+        while let Some(step) = program.steps.get(progress.pc).copied() {
+            if progress.control(step) {
+                continue;
             }
-            Plan::Tcm {
-                instance,
-                name,
-                args,
-                mut next,
-            } => {
-                let types: &[crate::elab::ElaboratedType] = self.types;
-                let type_name = self.instances[instance].type_name.clone();
-                let Ok(blocks) = resolve_method_blocks(types, &type_name, &name, co.span) else {
-                    return TurnOutcome::Error(Diagnostic::new(
-                        "E0401",
-                        format!("method '{name}' not found for the started TCM"),
-                        co.span.0,
-                        co.span.1,
-                    ));
+            let crate::methods::Step::Body {
+                method,
+                kind,
+                on_return,
+            } = step
+            else {
+                progress.result =
+                    self.method_result_default(program.prototype.return_type.as_ref());
+                progress.pc += 1;
+                continue;
+            };
+            if co.path.is_empty() {
+                co.frame = match self.method_execution_frame(
+                    method,
+                    program.prototype,
+                    &progress,
+                    kind,
+                    co.span,
+                ) {
+                    Ok(frame) => frame,
+                    Err(error) => return TurnOutcome::Error(error),
                 };
-                let block_count = blocks.len();
-                while next < block_count {
-                    let block = blocks[next];
-                    if co.path.is_empty() {
-                        // A fresh `is also` block binds its parameters
-                        // from the start-time arguments.
-                        co.frame = Frame::default();
-                        for (param, arg) in block.params.iter().zip(args.iter()) {
-                            if let Some(ty) = &param.ty {
-                                co.frame.local_types.insert(param.name.clone(), ty.clone());
-                            }
-                            co.frame.locals.insert(param.name.clone(), arg.clone());
+            }
+            match self.run_body(&method.body, co) {
+                Ok(Flow::Suspend) => {
+                    match &mut co.kind {
+                        CoroutineKind::Main {
+                            progress: saved, ..
                         }
+                        | CoroutineKind::Tcm {
+                            progress: saved, ..
+                        } => *saved = progress,
                     }
-                    match self.run_body(&block.body, co) {
-                        Ok(Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_)) => {
-                            next += 1;
-                            co.path.clear();
-                        }
-                        Ok(Flow::Stop) => {
-                            self.stop_requested = true;
-                            break;
-                        }
-                        Ok(Flow::Suspend) => {
-                            if let CoroutineKind::Tcm { next_block, .. } = &mut co.kind {
-                                *next_block = next;
-                            }
-                            return self.take_suspension(co);
-                        }
-                        Err(diagnostic) => return TurnOutcome::Error(diagnostic),
-                    }
+                    return self.take_suspension(co);
                 }
-                if let CoroutineKind::Tcm { next_block, .. } = &mut co.kind {
-                    *next_block = next;
+                Ok(Flow::Stop) => {
+                    self.stop_requested = true;
+                    break;
                 }
-                TurnOutcome::Complete
+                Ok(flow) => {
+                    Self::complete_method_body(
+                        &mut progress,
+                        method,
+                        kind,
+                        on_return,
+                        &co.frame,
+                        flow,
+                    );
+                    co.path.clear();
+                    co.frame = Frame::default();
+                }
+                Err(error) => return TurnOutcome::Error(error),
             }
         }
+        match &mut co.kind {
+            CoroutineKind::Main {
+                progress: saved, ..
+            }
+            | CoroutineKind::Tcm {
+                progress: saved, ..
+            } => *saved = progress,
+        }
+        TurnOutcome::Complete
     }
 
     /// Execute one body, resuming through the statement path when
     /// suspended.
-    fn run_body(&mut self, body: &'a [Stmt], co: &mut Coroutine<'a>) -> Result<Flow, Diagnostic> {
+    fn run_body(&mut self, body: &'a [Stmt], co: &mut Coroutine) -> Result<Flow, ExecError> {
         if co.path.is_empty() {
             self.exec_block(body, &mut co.frame, co.me)
         } else {
@@ -15375,7 +17526,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Collect the suspension the turn raised.
-    fn take_suspension(&mut self, co: &mut Coroutine<'a>) -> TurnOutcome {
+    fn take_suspension(&mut self, co: &mut Coroutine) -> TurnOutcome {
         match self.pending_suspension.take() {
             Some(suspension) => {
                 co.path = suspension.path;
@@ -15394,5 +17545,74 @@ impl<'a> Interp<'a> {
                 origin_span(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod simulator_cleanup_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct FailingFinish(Rc<Cell<bool>>);
+
+    impl crate::hdl::Simulator for FailingFinish {
+        fn load(_: &str, _: &str) -> Result<Self, String> {
+            Err("test-only backend".to_owned())
+        }
+        fn name(&self) -> &'static str {
+            "owned-finish-test"
+        }
+        fn set(&mut self, _: &str, _: i64) -> Result<(), String> {
+            unreachable!()
+        }
+        fn get(&mut self, _: &str) -> Result<i128, String> {
+            unreachable!()
+        }
+        fn run(&mut self, _: u64) -> Result<(), String> {
+            unreachable!()
+        }
+        fn finish(&mut self) {
+            unreachable!("checked finish must dispatch")
+        }
+        fn finish_checked(&mut self) -> Result<(), String> {
+            Err("owned finish failure".to_owned())
+        }
+    }
+
+    impl Drop for FailingFinish {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    #[test]
+    fn checked_finish_error_reaches_the_cli_diagnostic_contract() {
+        let source = include_str!("../tests/fixtures/hdl-session/finish-error.e");
+        let parsed = crate::parser::parse(source);
+        let elaborated = crate::elab::elaborate(&parsed.declarations);
+        assert!(parsed.diagnostics.is_empty());
+        assert!(elaborated.diagnostics.is_empty());
+        assert!(crate::typing::check_types(&elaborated).is_empty());
+        let dropped = Rc::new(Cell::new(false));
+        let result = run_inner(
+            &elaborated,
+            1,
+            Some(crate::hdl::SignalSource::Real(Box::new(FailingFinish(
+                Rc::clone(&dropped),
+            )))),
+        );
+        assert_eq!(
+            result.output,
+            include_str!("../tests/fixtures/hdl-session/finish-error.out")
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|d| format!("{}\n", d.render()))
+                .collect::<String>(),
+            include_str!("../tests/fixtures/hdl-session/finish-error.run.expected")
+        );
+        assert!(dropped.get());
     }
 }

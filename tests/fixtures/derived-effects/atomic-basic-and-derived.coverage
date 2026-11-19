@@ -1,0 +1,6 @@
+sys.cg samples=0 grade=0.000
+n buckets=2 grade=0.000 samples=0
+0..100000 [0..100000] goal=1 hits=0
+100001 [100001..100001] goal=1 hits=0
+first samples=0 combinations=0 total=Some(2) goal=1 weight=1 grade=Some(0.0)
+second samples=0 combinations=0 total=Some(2) goal=1 weight=1 grade=Some(0.0)

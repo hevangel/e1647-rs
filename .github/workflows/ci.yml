@@ -14,6 +14,13 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
+      - name: Qualification runner protocol tests
+        run: python3 -m unittest discover -s tests -p qualification_runner_test.py
+      - name: HDL artifact oracle tests (not simulation)
+        run: python3 -m unittest discover -s tests -p hdl_qualification_test.py
+      - run: cargo build --bin e1647
+      - name: Native candidate cases (no reference run)
+        run: python3 scripts/qualify.py --native-only
 
   # The pumpkin solver backend is verified here: it is a pure-Rust crate,
   # but its build script needs a C compiler, which the local windows-gnu
@@ -28,12 +35,8 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features
 
-  # The core library (lexer/parser/elaborator/interpreter) compiles for
-  # wasm32. The one backend that needs a child process (the xezim VPI
-  # bridge) is native-only — under target_arch = "wasm32" it is not
-  # compiled and the null simulator backend answers there (see
-  # src/hdl.rs). A compilation check only: there is no browser sandbox
-  # API and no wasm runtime test yet.
+  # Standalone WASM ABI plus real Chromium worker/API/demo tests. Native
+  # xezim process spawning is excluded; no host imports are permitted.
   check-wasm:
     runs-on: ubuntu-latest
     steps:
@@ -43,3 +46,50 @@ jobs:
           targets: wasm32-unknown-unknown
       - run: cargo check --target wasm32-unknown-unknown
       - run: cargo check --target wasm32-unknown-unknown --all-targets
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --prefix browser --ignore-scripts
+      - run: node scripts/build_browser.mjs
+      - run: node browser/node_modules/playwright/cli.js install --with-deps chromium
+      - run: node scripts/test_browser.mjs
+      - name: Retain browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-sandbox-evidence
+          path: local/browser-sandbox/
+          if-no-files-found: warn
+          retention-days: 7
+
+
+  # Real native/VPI simulation in the image built from this checkout.
+  # This asserts the explicit xezim profile, not general e/HDL ordering.
+  check-hdl-profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the pinned simulator and current bridge image
+        run: docker compose build toolchain
+      - name: Record the concrete image and tool versions
+        run: |
+          mkdir -p local/hdl-profile
+          docker image inspect e1647-rs-toolchain:latest --format '{{.Id}}' > local/hdl-profile/image-provenance.txt
+          docker compose run --rm toolchain bash -c 'rustc --version && cargo --version && xezim -V && python3 --version && cc -dumpfullversion' >> local/hdl-profile/image-provenance.txt
+      - name: Assert native outputs, VPI errors, VCD and HDL coverage
+        run: docker compose run --rm qualify-hdl
+      - name: Assign generated evidence to the runner user
+        if: always()
+        run: |
+          if docker image inspect e1647-rs-toolchain:latest >/dev/null 2>&1 && [ -d local/hdl-profile ]; then
+            docker compose run --rm toolchain chown -R "$(id -u):$(id -g)" /workspace/local/hdl-profile
+          fi
+      - name: Retain owned profile evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdl-profile-evidence
+          path: local/hdl-profile/
+          if-no-files-found: warn
+          retention-days: 7

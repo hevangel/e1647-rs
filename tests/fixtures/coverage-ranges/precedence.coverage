@@ -1,0 +1,14 @@
+sys.cg samples=14 grade=0.600
+n buckets=6 grade=0.200
+0..1 [0..1] goal=5 hits=6
+2..3 [2..3] goal=5 hits=2
+4..5 [4..5] goal=5 hits=2
+free [6..7] goal=0 hits=2
+named [8..8] goal=4 hits=1
+9 [9..9] goal=4 hits=1
+fallback buckets=1 grade=1.000
+fallback [10..11] goal=3 hits=14
+sys.global_cg samples=1 grade=0.000
+flag buckets=2 grade=0.000
+FALSE [0..0] goal=2 hits=0
+TRUE [1..1] goal=2 hits=1

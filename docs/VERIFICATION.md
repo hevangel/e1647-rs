@@ -3716,43 +3716,54 @@ implicit index bindings remain unsupported. Traversal snapshots the
 receiver before predicate evaluation, so mutation does not change the
 items visited. Other expression-taking list methods remain gaps.
 
-## 2026-11-12 — Nested statement-call continuations
+## 2026-11-12 — Integrate reviewed scalar temporal edges into main
 
-Statement-position instance methods, including ordinary helper methods,
-now preserve their caller/callee frames across suspension (13.2.2).
-The existing call-path machinery retains evaluated arguments, receivers,
-local variables and composed-body positions for nested and recursive
-calls and `compute`. Dispatch checks declared methods before resource
-method interception, avoiding repeated receiver evaluation for user
-methods named `down` or `up`. Entry-event synchronization (17.1.2)
-parks on the scheduler event wake pass. Argument-count errors are checked
-before parking. A `stop_run()` expression statement propagates Stop
-through the saved caller chain.
+PR #64 was merged into `agent/temporal-sampled-history` after that
+branch's original main merge. This integration brings its scalar temporal
+edge work to a feature branch based on current main, retaining the current
+license and the later frontend/type-checking changes.
 
-Seven independently authored fixture sets in `tests/fixtures/tcm-calls/`
-pin nested blocking calls, concurrent callers with distinct locals,
-recursive calls and composed bodies, receiver/argument side effects,
-TCM entry synchronization, arity diagnostics and stopping nested callers.
-The resource-context regression now tests a value-expression call, which
-remains atomic, rather than an ordinary statement call.
+Recorded `change`/`rise`/`fall` results cover Boolean, integer and
+enumeral expressions (12.2.18). Numeric rise/fall compare magnitude;
+the first sample establishes a baseline. Rule/wait contexts retain
+separate histories. Explicit event clocks gate sampling and inner clocks
+override enclosing clocks. Active waits retain late-arriving clocked
+samples and consume matches since the previous observation. Completed,
+failed and expired waits retire their sampling state.
 
-Verification on `agent/complete-tcm-continuations`:
+Seven independently authored runtime fixture sets cover transitions,
+initial baselines, numeric magnitude, enumerals, explicit clocks,
+concurrent locals, successive waits, late clocks and exact E0402 output
+for unsupported real samples. Three core regressions cover comparisons,
+cloned monitors/context isolation and nested clock selection.
+
+The inherited verification-log merge had placed the edge entry inside
+the keyed-extrema entry and its verification inside the predicate-query
+entry. Those entries are separated here. Four CSV tests now normalize
+Windows path separators before embedding paths in e string literals;
+a checkout path containing a backslash followed by t otherwise became
+a tab and caused unrelated file-read failures.
+
+Verification on `agent/integrate-temporal-edges`:
 
 - `cargo fmt --all -- --check` — passed.
 - `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
-- `cargo test --all-targets` — 451 passed, 0 failed.
+- `cargo test --all-targets` — 454 passed, 0 failed.
 - `git diff --check` — passed.
 
-The initial fixture runs exposed a missed entry-event wake and failure
-to propagate `stop_run()` through expression statements; both are fixed
-and included in the final all-target result. No all-feature, WASM or
-Specman reference run was performed for this increment. This is regression
-evidence, not differential qualification or a conformance claim.
+The initial all-target run failed four CSV path tests; the final result
+above includes their path fixes. No local all-feature, WASM or Specman
+run was performed. PR #64 records the original reference basis as the
+lawful local 2016 redline's shared behavior with the 2019 clause-number
+mapping; this integration adds no new standard-reading qualification.
 
-Value-expression calls, receivers whose types cannot be resolved before
-evaluation, `on` blocks and check failure bodies still use atomic
-execution. General expression continuations, per-instance event identity,
-temporal edge expressions and precise HDL event ordering remain gaps.
+This is regression evidence, not differential qualification or conformance.
+Static edge-width legality, real/MVL/custom-numeric edge samples,
+multiple distinct samples within one virtual cycle, general event-specific
+compound timelines, per-instance rule timelines and precise HDL event
+ordering remain gaps. The TCM call-continuation increment is separate
+(PR #65) and is not included in this branch.
+
 ## 2026-11-12 — Runtime coverage configuration
 
 `set_config(cover, ...)` now controls runtime coverage enablement and
@@ -3811,3 +3822,1751 @@ images or proprietary output were committed. This is implementation
 regression evidence, not differential qualification or conformance.
 Per-unit-instance storage, dynamic coverage filters, the remaining range
 parameters and the broader configuration API are still unfinished.
+
+## 2026-11-12 — Per-unit coverage and sampling filters
+
+Coverage groups now accept header `using` options and collect separate
+per-unit groups for `per_unit_instance [= unit_type]` (14.2, 14.2.2).
+The default scope for a unit declaration is its context unit type; a
+struct requires an explicit unit type. The bounded, visited-set instance
+walk chooses the nearest matching unit through inheritance and flattened
+lists, keeps first-visited alias paths, and terminates on cycles.
+Unsampled units retain zero-hit groups. A sampled detached owner without
+the requested containing unit reports E0402 at the sampling action.
+
+Group/basic-item `when` expressions evaluate in a fresh owning-struct
+frame, without inheriting the emitting method's locals. Group/item
+`instance_no_collect` expressions bind `inst` to the associated unit for
+report visibility (14.2.2, 14.3.4). Visibility is refreshed for grade/report
+queries. Hidden groups/items keep sampling storage internally; the reported
+view removes them and the per-unit schema placeholders. Hidden source
+items therefore still feed crosses/transitions. Crosses require all
+sources to be sampled in the current round; transitions keep their last
+sampled source value, and every declared transition over that source
+updates. Same-named items in different groups resolve within their group.
+
+Structural option-expression/scope validation runs after composition and
+reports E0224, registered in the module header and diagnostic allocation
+catalogue. It rejects missing/unknown/non-unit scopes and scope changes
+after group/item instance_no_collect. Full option type checking is still
+unfinished; non-Boolean runtime filters report E0402. The older regression
+that used instance_no_collect without per_unit_instance now declares the
+required scope explicitly.
+
+Eighteen independently authored fixture sets under
+`tests/fixtures/coverage-instances/` cover separate units, unsampled holes,
+ancestor/nearest/inherited scope, shared aliases in lists, cycles,
+procedural sampling, group/item filters, emitter-local isolation, hidden
+sources, multiple transitions, same-named group items, complex header
+expressions, detached owners, malformed expressions and invalid/frozen
+scopes. A CLI test checks unit path labels and elab rejection of bad
+scopes. README/status/roadmap/architecture/CLI help describe behavior and
+limits; `examples/coverage_units.e` demonstrates collection.
+
+Verification on `agent/coverage-unit-instances` (based on PR #67):
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 454 passed, 0 failed.
+- `cargo test --test coverage_instances` — 2 passed, 0 failed,
+  covering all eighteen fixture sets and the CLI checks.
+- `cargo run -- run examples/coverage_units.e --seed 1 --coverage` —
+  passed; sys.a and sys.b each report one sample and grade 50%.
+- `git diff --check` — passed.
+
+Initial fixture iterations caught reserved event naming and a unit-reference
+type unsupported by the existing frontend; the independently authored
+fixtures were corrected while preserving their isolation/cycle checks.
+The initial legacy scope regression failed until its required scope was
+made explicit. The final checks above pass. No local all-feature, WASM
+or Specman comparison was run.
+
+Reference basis: read-only visual study of the lawful local 2016 redline
+coverage options and type/instance relationship pages, with 2019 clause
+numbers mapped through the migration plan. No standard text, images or
+vendor output were committed. This is regression evidence, not differential
+qualification or conformance. Unit association is limited to the existing
+bounded primary field-tree walk. General ignore/illegal/radix semantics,
+instance_ignore/instance_illegal, remaining range parameters, derived-item
+filters, item using-also overrides, full option type checking and the
+broader runtime configuration API remain gaps.
+
+## 2026-11-12 — Integral coverage range parameters and goal precedence
+
+Integral `range(...)` entries now parse their positional name, bucket width
+and hit-goal parameters (14.3). A positive width subdivides inclusive
+bounds, preserving a short final bucket. Named ranges require an undefined
+width; constant string concatenation is supported for names. Integer
+bounds/widths/goals use checked i128 literal/predefined-limit arithmetic,
+including negative values and parenthesized expressions. Unsupported
+constants, overflow, division by zero, invalid widths/goals, reversed/open
+bounds and malformed parameters report E0224 with source spans.
+Construction is capped at 65536 buckets per item, including aggregate
+entries and extreme signed domains, before attempting unbounded allocation.
+
+Range-local goal metadata preserves range > item > group > global
+precedence. `set_config(cover, at_least, N)` supplies the default before
+sampling; changing it after sampling reports E0402 without resetting hits.
+Zero-goal buckets retain counts but leave bucket-grade denominators and do
+not show holes, including per-instance report entries. Bare per_instance
+flags are recognized. Unnamed ranges receive stable bucket labels so
+crosses/transitions use bucket identity rather than the raw sampled value.
+
+Twenty-nine independently authored fixture sets in
+`tests/fixtures/coverage-ranges/` pin subdivision/tails, negative bounds,
+constant expressions and names, goal precedence, zero-goal grading and
+holes, unnamed bucket identity, per-unit copies, overlapping-first-match
+behavior, full signed-domain bounds, exact construction limits, malformed
+parameters, overflow/zero-division, invalid goals, late changes and explicit
+real/string range diagnostics. A CLI test verifies zero-goal reporting.
+README, status, roadmap, architecture, CLI help and the E0224 allocation
+are updated. `examples/coverage_ranges.e` demonstrates four graded buckets
+plus an ungraded optional bucket.
+
+Verification on `agent/coverage-range-options` (based on PR #68):
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 456 passed, 0 failed.
+- `cargo test --test coverage_ranges` — 2 passed, 0 failed; all
+  twenty-nine fixture sets and the CLI check are also in the final suite.
+- `cargo run -- run examples/coverage_ranges.e --seed 1 --coverage` —
+  passed; ten samples, three of four graded buckets covered, grade 75%,
+  with the zero-goal optional bucket excluded from that denominator.
+- `git diff --check` — passed.
+
+The implementation replaces the earlier numeric-argument heuristic and
+prevents item/group defaults from overwriting explicit range goals. Initial
+compilation caught incorrect operator variant spellings; these were fixed
+before the final checks. No local all-feature, WASM or Specman comparison
+was performed.
+
+Reference basis: read-only visual inspection of the lawful local 2016
+redline coverage range/goal tables and grading prose, using the migration
+plan's 2019 clause mapping. No standard text/images or vendor output were
+committed. The zero-goal exclusion is this implementation's reading of the
+shared behavior and has not been differentially qualified. Real/enumeral
+bounds, user-defined constant-name resolution, typed item-domain/precision
+proofs, broader coverage options and procedural goal overrides remain gaps.
+This is regression evidence, not IEEE conformance.
+
+
+## 2026-11-13 — Basic coverage ignore/illegal predicates
+
+On `agent/coverage-ignore-illegal`, based on PR #69, implemented basic-item
+`ignore`, `illegal`, `instance_ignore` and `instance_illegal` predicates
+(IEEE 1647-2019, 14.3/14.3.4), plus the Boolean runtime coverage setting
+`check_illegal_immediately` (29.9). Global predicates admit their own item
+and constants; instance predicates additionally admit associated-unit
+`inst` field/index paths. Calls, owner/local access, instance options
+without unit scope and derived-item filters report E0224. Non-Boolean
+results and unsupported classification report E0402.
+
+Ignored/illegal observations never enter basic hits or derived histories.
+Wholly excluded buckets leave grades, holes and the returned report;
+partially excluded buckets retain their legal goals. Comparisons, scalar
+membership and Boolean compositions classify integer/Boolean intervals;
+other pure expressions enumerate with a shared 65536-candidate budget per
+item refresh. Short circuit domains avoid evaluating guarded arithmetic
+on irrelevant values. A failing classification cannot partially commit a
+group's masks. Integer division/remainder overflow now reports E0402
+rather than panicking on i128 minimum divided by minus one.
+
+Derived keys preserve bucket indices independently of display names.
+Current masks filter recorded combinations and recompute denominators;
+restoring masks exposes earlier legal history, while excluded observations
+remain absent. Out-of-range bucketed observations do not create impossible
+derived goals. Immediate illegal observations report at sampling; deferred
+observations flush after check hooks, with a final flush after finalize or
+stop. The original DUT-error summary includes these failures.
+
+Thirty-two independently authored fixture sets in
+`tests/fixtures/coverage-effects/` cover basic and per-unit predicates,
+partial/fully excluded bins, unsampled holes, crosses/transitions, equal
+bucket labels, dynamic unit masks and history restoration, Boolean/string
+items, negative modulo, guarded division, immediate/deferred/stop/finalize
+reporting, global/instance OR composition, signed extrema, wide arithmetic,
+integer overflow and scope/type diagnostics. A CLI test checks exclusion
+and immediate ordering. README, status, roadmap, architecture, CLI help and
+the diagnostic allocation describe the new behavior and limitations.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 458 passed, 0 failed (17 test binaries).
+- `cargo test --test coverage_effects` — 2 passed, 0 failed, including all
+  thirty-two fixture sets; also included in the final full-suite result.
+- `cargo run -- run examples/coverage_effects.e --seed 1 --coverage` —
+  completed with the intended one DUT error for value 5; six sampling
+  events, four legal item samples, four graded buckets hit, grade 100%.
+- `git diff --check` — passed.
+
+Clippy initially found two collapsible-if style errors; both were corrected
+before the final checks. Existing coverage fixtures passed unchanged.
+No local all-feature, WASM runtime or Specman comparison was performed.
+
+Reference basis: the lawful local 2016 redline coverage option tables and
+shared coverage behavior, using the migration plan's 2019 clause mapping;
+no standard text/images or vendor output committed. Ignore currently takes
+precedence over illegal on overlap. That precedence, mutable-mask behavior
+and exact deferred-phase placement have not been reference-qualified.
+Real/enumeral ranges, derived-item filters, general option type checking,
+complete typed-domain/precision proofs and wider configuration remain gaps.
+Unbucketed real/string items filter observed values without bucket-domain
+classification. This is regression evidence, not IEEE conformance.
+
+
+## 2026-11-13 — Derived coverage collection and grading options
+
+On `agent/derived-coverage-options`, based on PR #70, cross and transition
+items now apply `when`, `no_collect`, `instance_no_collect`, `at_least` and
+`weight` (IEEE 1647-2019, 14.4/14.5). Transition filters run with a fresh
+owner frame at the legal source observation; cross filters run after the
+round's basic sources. Suppression of a derived sample does not suppress
+basic collection or rewind the previous legal source value. Per-unit
+presentation expressions bind `inst` to the associated unit; hiding leaves
+sampling storage intact and excludes presentation/grade contributions.
+
+Derived grades count combinations reaching their hit goal. Item-local
+goals override group defaults, which override runtime at_least; weights
+use item > group > 1. Zero goals are ungraded and zero weights contribute
+nothing. Derived items now participate in the weighted per-type aggregate
+of mixed per-instance groups, fixing their earlier omission. Three existing
+coverage-effect fixture grades changed: ignore-cross-transition and
+ignore-precedence are 0.806, duplicate-labels is 0.852 (three-decimal
+rendering). Their sample/hit histories are unchanged. Weight parsing now
+uses checked constant u64 validation (basic/group spellings included),
+with E0224 for malformed, negative, fractional or overflowing values.
+
+Weight sums use floating-point totals rather than overflowing u64 sums.
+Derived combination products use checked u64 multiplication, including a
+transition with 65536 source buckets (4294967296 possible pairs) without
+host-pointer-width multiplication. Totals refresh against the final merged
+schema, so later group extensions can supply sources. Unsupported product
+sizes remain ungradeable rather than panicking. CLI output includes derived
+goals and weights. The generic Boolean-option diagnostic now cites clause
+14, covering both basic and derived options.
+
+Twenty-five independently authored fixture sets in
+`tests/fixtures/coverage-derived/` cover filter/history behavior, fresh owner
+frames and method predicates, multiple transitions over one source, stale
+cross prevention, visibility restoration, per-unit filters, local/group/
+runtime goal precedence, extension defaults, weights and mixed instance
+grades, zero goals/weights, maximal weights, product overflow, the largest
+transition domain and spanned scope/type/value diagnostics. A library test
+checks hidden data retention and a CLI test checks goal/weight reporting.
+`examples/coverage_derived.e` demonstrates two filtered derived items.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 461 passed, 0 failed (18 test binaries).
+- `cargo test --test coverage_derived` — 3 passed, 0 failed; the fixture,
+  library and CLI tests are included in the final full-suite result.
+- `cargo run -- run examples/coverage_derived.e --seed 1 --coverage` —
+  passed: six events, each derived item has three samples and two observed
+  combinations; one combination reaches goal 2, giving both grades and
+  the group grade 25%.
+- `git diff --check` — passed.
+
+The first new-fixture run exposed an expected-output formatting mismatch
+(0 versus the interpreter's real-valued 0.0), corrected before the final
+run. Clippy found one nested-if style issue, also corrected. No local
+all-feature, WASM runtime or Specman comparison was performed.
+
+Reference basis: visual inspection of current cross/transition option
+rows in the lawful local 2016 redline, excluding deleted rows, with the
+migration plan's 2019 clause mapping. No standard text/images or vendor
+output committed. Derived ignore/illegal predicates, crossing/transiting
+other derived items, full option typing, text metadata, real/enumeral
+ranges and procedural overrides remain unfinished. Exact side-effectful
+filter ordering and the inherited grading model still need differential
+qualification. This is regression evidence, not IEEE conformance.
+
+
+## 2026-11-13 — Coverage source graphs and nested histories
+
+On `agent/coverage-source-graphs`, based on PR #71, crosses and transitions
+can consume earlier basic or derived coverage items in the same group
+(IEEE 1647-2019, 14.4/14.5). Source names share a validated group namespace;
+unknown/forward/self references, duplicates and invalid source counts report
+E0224. Base declarations precede their extensions in the merged graph,
+including when the extension physically precedes the base. The parser now
+records individual coverage-item start positions rather than reusing the
+group header for their spans, so structural diagnostics point to the item.
+
+Source observations retain their previous value, current-round freshness
+and a stable basic-bucket or parent-key identity. Iterative transition work
+sets follow declaration order as sources are produced; declaration-ordered
+crosses can consume fresh crosses/transitions and produce further children.
+Filtered parents supply no child source; filtered child transitions still
+advance parent history. Hidden parents remain usable sources. Repeating
+the library round-completion call does not duplicate derived observations.
+
+The refresh pass propagates current basic masks through all parent-key
+references and recomputes possible-combination counts without enumerating
+the Cartesian product. Restoring unit masks restores original legal history;
+excluded observations remain absent. Empty domains dominate unknown or
+unrepresentable products. Duplicate display labels retain distinct bucket
+identities. Unbucketed strings/reals retain actual value labels while their
+derived coverage remains ungraded. Nested transition labels are parenthesized
+to preserve their structure.
+
+Expanded source tuples are capped at 65536 scalar components, diagnosed
+with E0224 before execution. This is an implementation resource policy,
+separate from the bucket/product bounds and not a standard restriction.
+A boundary library test executes a sixteen-level transition chain through
+seventeen observations, producing a final value with exactly 65536 scalar
+components without recursive history walks. The next level is diagnosed.
+
+Thirty-three independently authored fixture sets in
+`tests/fixtures/coverage-graphs/` cover all basic cross/transition source
+combinations, mixed chains, filter history and order, stale-parent prevention,
+hidden/default names, paused collection, per-unit histories, dynamic mask
+removal/restoration, duplicate labels, out-of-range values, unbucketed
+strings/reals, empty/unbounded products, extension order, invalid names/arity
+and graph limits. Additional library and CLI tests check round idempotence,
+nested history rendering and the resource boundary. README, status, roadmap,
+architecture, CLI help and the E0224 allocation describe the behavior.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 465 passed, 0 failed (19 test binaries),
+  including all four graph tests and all thirty-three fixture sets.
+- `cargo run -- run examples/coverage_graphs.e --seed 1 --coverage` —
+  passed: four events, two nested transition observations and two distinct
+  combinations out of sixteen, grade 0.125 (CLI rounds this to 12%).
+- `git diff --check` — passed.
+
+The new diagnostic fixtures exposed and drove the item-span fix. Two early
+fixture helpers used contextual keyword spellings that the expression
+parser does not accept; the independent fixtures now use ordinary names.
+Existing fixtures passed without changes. A Git object-write permission
+failure in the working checkout was recovered by a fresh isolated checkout;
+all 144 changed/new files were SHA-256 verified after transfer. Formatting,
+Clippy and all 465 tests passed again there before submission. No security
+settings were changed. No local all-feature, WASM runtime or Specman
+comparison was performed.
+
+Reference basis: previously inspected current cross/transition rows in the
+lawful local 2016 redline, using the migration plan's 2019 clause mapping.
+No standard text/images or vendor output committed. Derived ignore/illegal
+predicates and instance variants, full option typing, procedural overrides,
+radix/implicit buckets and real/enumeral ranges remain unfinished. Nested
+Cartesian-product grading and exact side-effectful filter ordering still
+need differential qualification. This is regression evidence, not IEEE
+conformance.
+
+
+## 2026-11-13 — Derived scalar ignore/illegal predicates
+
+On `agent/derived-coverage-effects`, based on PR #72, cross/transition
+`ignore`, `illegal`, `instance_ignore` and `instance_illegal` predicates
+operate over participating basic scalar items (IEEE 1647-2019, 14.4/14.5).
+Transitions additionally bind `prev_<source>`. Owned snapshots retain
+integer, Boolean, real, string and enumeral values independently of bucket
+labels and later field updates. Alias/source-expression values are captured
+once at observation; classification never evaluates the source expression.
+Predicate frames contain their inputs/constants and, for instance variants,
+the associated unit as `inst`. Owner/local access, calls and composite-valued
+operands remain E0224; non-Boolean results are E0402.
+
+Ignored/illegal derived observations do not enter histories or become child
+sources. Basic source history still advances. Illegal values use the existing
+immediate/deferred DUT reporting, including the final stop/finalize flush.
+Classification inspects domains without producing DUT errors. Ignore retains
+precedence over illegal, using the existing explicitly unqualified overlap
+policy.
+
+For bucketed integral/Boolean inputs, classification retains a bucket tuple
+only after finding a legal scalar witness. It considers the basic sources'
+ignore/illegal filters, including partially excluded bins, and the derived
+predicates in short-circuit order. The per-derived-item refresh budget is
+65536 scalar-candidate visits; exceeding it reports E0402 before committing
+masks. Constant prefixes can exclude whole nodes without enumeration,
+including nested or unbucketed sources. All basic and derived masks commit
+together after every classifier succeeds. Finite masks propagate through
+parent-key identities and restore original legal history when unit masks
+are restored. Unbucketed real/string/enumeral inputs filter actual points
+without acquiring finite grades.
+
+Unit scope now freezes after instance_ignore/instance_illegal as well as
+instance_no_collect (14.3.4). E0224's scope-freeze diagnostic says instance
+coverage options, and its existing fixture was updated. The old negative
+derived-rejected fixture became a positive derived-ignore fixture with the
+new expected result; its group grade is 0.792 under the existing mixed
+per-instance model. Other existing fixtures are unchanged.
+
+Thirty-five independently authored fixture sets in
+`tests/fixtures/derived-effects/` cover scalar crosses, prev-source transitions,
+partial bins, source-filter legality, fresh frames and expression snapshots,
+Boolean/string/real/enumeral observations, immediate/deferred/stop errors,
+unsampled illegal domains, guarded arithmetic, nested parent filtering and
+constant masks, per-unit variants and mask restoration, scope freezing,
+resource bounds, atomic basic/derived mask failure and unsupported/type
+boundaries. A CLI test checks DUT ordering and retained-combination grades.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 467 passed, 0 failed (20 test binaries),
+  including both derived-effect tests and all thirty-five fixture sets.
+- `cargo test --test derived_effects` — 2 passed, 0 failed.
+- `cargo run -- run examples/derived_effects.e --seed 1 --coverage` —
+  passed: four events, two retained non-stuttering transitions, both goals
+  reached, grade 100%.
+- `git diff --check` — passed.
+
+Initial compilation caught a shadowed validator parameter in list expressions;
+it was corrected before the checks. An early fixture-generation script had
+a syntax typo, corrected before any new fixture files were generated. No
+local all-feature, WASM runtime or Specman comparison was performed.
+
+Reference basis: the previously inspected current cross/transition option
+rows in the lawful local 2016 redline, with the migration plan's 2019 clause
+mapping. No standard text/images or vendor output committed. Composite-valued
+predicate operands and source-dependent classification over mixed composite
+inputs remain diagnosed (E0224/E0402); whole-node constant predicates work.
+General wide-domain classification, complete option typing and typed-domain/
+precision proofs remain unfinished. Point-only unbucketed filtering does not
+retroactively reclassify individual historical points; finite masks remove
+whole tuples. Overlap precedence, mutable-mask semantics, Cartesian-product
+grading and exact reporting/filter ordering still need differential evidence.
+This is regression evidence, not IEEE conformance.
+
+
+## 2026-11-13 — Conservative coverage domain proofs
+
+On `agent/coverage-domain-proofs`, based on PR #73, derived integral/Boolean
+classification uses conservative interval proofs, iterative splitting and
+ordinary concrete checks (IEEE 1647-2019 coverage, 14.4/14.5). The proof
+module is `src/coverage/proof.rs`. A known result guarantees the same Boolean
+value without evaluation errors across a region; unknown results retain
+ordinary evaluation. Supported proofs include relational comparisons,
+Boolean logic/conditionals, membership and checked arithmetic bounds.
+
+Short-circuit and list-membership order are preserved. Potentially shielded
+errors remain unknown until a selected branch or concrete check reaches
+them. Arithmetic intervals require checked endpoints; wrapping/overflow
+regions do not become unlimited-mathematics proofs. Singleton inputs use the
+actual evaluator. Name domains honor define/predefined precedence and the
+implicit inst binding. This preserves the current predicate-frame numeric
+model; it adds no field-width precision support or general type proof.
+
+A uniform proof over the source envelope can retain its full domain or
+exclude a node without enumerating Cartesian tuples. Uncertain bucket
+regions use an iterative work list, uniform proofs and concrete lower-end
+witnesses. The first referenced varying axis splits, using an overflow-safe
+sign-biased u128 midpoint over the full i128 storage domain. Basic source
+filters participate in the proof/check sequence. The 65536 scalar-domain
+work budget charges region proofs and concrete checks by their axis count;
+excess work remains E0402 and all masks still commit atomically.
+
+The previous n == n resource fixtures now have an exact exclusion proof.
+Their three resource/transaction cases use a non-symbolic remainder tautology
+instead and retain their negative boundary checks; diagnostic wording now
+identifies scalar-domain work rather than only scalar candidates. Other
+existing expected results are unchanged.
+
+A regression first reproduced false E0402 when a physically earlier group
+extension's transition shadowed an aliased basic source declaration. Basic
+and derived classifiers now share declaration/prototype lookup that selects
+Item kind, preserving alias type and declaration spans. A second fixture
+checks named scalar aliases. Separately, negating the internal integer
+minimum now returns E0402 integer negation overflow instead of panicking.
+
+Thirty-one independently authored fixture sets in
+`tests/fixtures/domain-proofs/` cover billion-value and full-storage signed
+ranges, inequality witnesses, comparisons, safe arithmetic bounds, guarded
+division, membership order, conditional/logical proofs, partial basic masks,
+per-unit thresholds, predefined-name precedence, integer wrapping/error
+boundaries and both alias regressions. An additional independent oracle
+compares masks and hit counts against all 25 concrete input pairs in fourteen
+small-domain programs (350 samples), including division guards and membership
+short circuits. No new dependencies or external reference modifications.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 469 passed, 0 failed (21 test binaries),
+  including both domain-proof tests and all thirty-one fixture sets.
+- `cargo test --test domain_proofs` — 2 passed, 0 failed.
+- `cargo run -- run examples/coverage_domain_proofs.e --seed 1 --coverage` —
+  passed: four events over two billion-wide ranges, two legal samples in one
+  retained combination, grade 100%.
+- `git diff --check` — passed.
+
+The alias fixture failed with the old lookup before the fix and passed
+with the shared lookup. All newly authored domain fixtures passed; the
+independent oracle agrees with concrete sampling for every program. No
+local all-feature, WASM runtime or Specman comparison was performed.
+
+Reference scope: independently authored arithmetic/proof logic against the
+repository's evaluator and existing coverage model, retaining the lawful
+reference basis and 2019 clause mapping recorded in preceding entries.
+No standard text/images or vendor output committed. Unproved nonlinear or
+wide shapes can still exhaust the work budget. Composite predicates, full
+option typing and typed-domain/precision proofs remain unfinished. Exact
+IEEE grading, mutable masks and side-effectful filter/report ordering still
+require differential qualification. This is regression evidence, not IEEE
+conformance.
+
+
+## 2026-11-14 — Conservative Boolean coverage option typing
+
+The post-composition type pass now checks the effective `when`,
+`instance_no_collect`, `ignore`, `illegal`, `instance_ignore` and
+`instance_illegal` expressions using the coverage model's shared option
+parser (2019 clauses 14.2-14.5). Definite non-Boolean results report E0220;
+ordinary conservative expression traversal also reports missing members,
+non-list indexing and incompatible operands (E0221-E0223). Structural option
+errors remain E0224 from elaboration; no diagnostic code was added.
+
+Sampling filters read the owner rather than item aliases. Visibility reads
+the owner and the selected unit as `inst`. Effect predicates have no owner
+receiver and bind sampled basic values, including transition `prev_`
+snapshots. In per-unit groups the implicit `inst` binding takes precedence
+over a same-named source, matching the evaluator. Basic kind lookup uses the
+existing sampled-expression check once, so its diagnostics are not duplicated.
+Group extensions use the final effective options. Scoped bindings are removed
+before checking methods and other types. Define names remain unknown before
+local/field lookup, preserving runtime precedence without guessing their
+value kinds; supported predefined integer constants keep their runtime kind.
+
+Thirteen independently authored fixture sets under
+`tests/fixtures/typing-coverage-options/` cover non-Boolean results on all six
+option forms, aliases versus owner fields, selected-unit types, transition
+snapshots, inheritance and physically earlier extensions, synthesized when
+views, scope isolation, last effective options, member/index/operator and
+method-argument diagnostics, define/predefined precedence, implicit-unit
+shadowing, unknown expressions and valid execution. Two test functions add
+the byte-exact fixture contract and CLI rejection/execution checks.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 471 passed, 0 failed (21 test binaries).
+- The focused `cargo test --test typing` passed its first seven new fixture
+  sets and CLI checks; subsequent full-suite verification passed all thirteen
+  final fixture sets and all nine typing tests.
+- An additional CLI `elab` audit of all 139 existing successful coverage
+  fixtures across the eight coverage/runtime fixture directories accepted all
+  139. Their expected diagnostic files were unchanged.
+- `git diff --check` — passed.
+
+Reference scope: independently authored checks against the repository's
+existing Boolean option evaluation and 2019 coverage clause mapping. No
+standard text, vendor output or external source was copied. No Specman run,
+local all-feature run or WASM runtime run was performed. This extends the
+conservative checker; define-value inference, composite source operands,
+complete expression/name resolution and other option types remain incomplete.
+It provides no IEEE conformance claim.
+
+
+## 2026-11-14 — Nested value and temporal type-check traversal
+
+The conservative checker previously skipped children of membership, casts,
+slices, table tests, set literals, selects, chosen-from directives and scoped
+expression bodies. For example, an absent member used only as a list index
+could pass the CLI's type gate. The pass now traverses ordinary expression
+children with an exhaustive Expr match, and statement value children with an
+exhaustive Stmt match. Raw distribution choices, type-embedded expressions,
+recorded foreach index-name paths and temporal event-reference paths retain
+their separate unresolved grammar/scope rather than being interpreted as
+ordinary values. This is traversal, not complete name resolution.
+
+An `evaluate` body (2019 4.17.7) gets a scoped result local, preserving the
+owner and other caller locals; an explicit result type propagates its kind.
+Implicit result types remain unknown here. A `new ... with` body (6.3) gets
+a fresh locals frame, the explicit new object as receiver, and no enclosing
+return type, matching the interpreter. All contexts restore after checking.
+New instance_iterator expressions now retain the iterator kind rather than
+being mistaken for ordinary struct objects. Slices and table tests retain
+Int and Bool results respectively; cast results remain unknown because the
+runtime fallback preserves the input value.
+
+Nested statement values in print/gen/emit/wait/start/compute, rgf assignments
+and counted-loop bounds now traverse. Temporal rule/wait propositions, edge
+operands and repeat bounds traverse recursively (clauses 11-13), as do rule
+else actions. The duplicated bound representation of a single written
+exact-count true-match repeat is checked once. Event/port members remain
+unknown rather than producing false missing-field errors. No new temporal
+operand rule or execution support was added. Known method arguments now infer
+once before signature validation, avoiding duplicate nested diagnostics on
+bare, member and subtype-qualified calls.
+
+Seventeen independently authored fixture sets under
+`tests/fixtures/typing-traversal/` cover every newly traversed value family,
+statement contexts, temporal composition, scope restoration/isolation,
+explicit and implicit contexts, known result propagation, legitimate
+unknowns/events/ports, composed when-view coverage and single diagnostics
+through nested calls. A define/predefined name collision fixture first
+reproduced three false E0220 diagnostics: the checker was using same-named
+fields rather than runtime constants. Lookup now respects that precedence
+in every checked context, with define values left unknown. The fixture and
+its runtime checks pass after the fix. Two new test functions provide the
+byte-exact fixture contract plus CLI rejection and valid execution checks.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 473 passed, 0 failed (21 test binaries),
+  including all seventeen new fixture sets and all eleven typing tests.
+- `cargo test --test typing` — 11 passed, 0 failed on the final seventeen
+  fixture sets; CLI elab/run rejected hidden operand errors and valid runtime
+  scope checks produced their independently specified output.
+- Additional CLI elab audit: all 176 pre-existing successful fixture
+  declarations inspected produced no E022x type diagnostics. Existing
+  expected diagnostics were unchanged.
+- `git diff --check` — passed.
+
+Reference scope: independently authored traversal/scoping checks against the
+repository's evaluator and existing 2019 clause mapping. No standard text,
+vendor output or external code was copied. No local all-feature run, WASM
+runtime test or Specman comparison was performed. Index-kind and membership
+compatibility checks, static member typing, conditional is-a bindings,
+contextual inference, define-value typing and type-embedded expressions remain
+unfinished. No full type-system or IEEE conformance claim is made.
+
+
+## 2026-11-14 — Static namespace typing and alias defaults
+
+Qualified static fields now contribute their declared kinds, and qualified
+static calls infer arguments once, check the declaring prototype and retain
+its result kind (2019 4.17.4, 6.9.3, 17.2.2). Exact registry ownership remains
+with E0307; an inherited or instance member is not silently resolved through
+a Type:: access. A declaration is preferred over an extension physically
+earlier in the source. Static extensions inherit omitted parameter/result
+annotations from that declaration for conservative body checking; full
+signature equivalence remains unfinished.
+
+Static initializers, methods and handlers are checked once from the declaring
+registries, not repeatedly through composed inheritance/when views. Source
+provenance in the bounded base chain identifies registered copies even when
+elaboration rewrites a type expression. Static methods/handlers have a
+namespace but no me receiver. Bare static fields follow the same bounded
+owner walk as the runtime, after local lookup. Qualified foreign-event
+handlers use the owner of the handler, not the event's owner. Static
+initializers retain the current runtime's no-receiver/no-bare-namespace
+context. New initializer frames clear and restore the caller static context;
+evaluate retains it. Unregistered/template entries remain conservative.
+
+The positive runtime fixture first exposed two existing failures. A static
+scalar alias defaulted to a fictitious object and failed arithmetic (E0402).
+After alias defaulting was corrected, a bare field write in a static method
+failed E0401 despite the read resolving its declaring owner. Bare writes now
+use the same owner walk outside the instance-only branch, with local/instance
+precedence and the registered field type preserved. Nested calls and foreign
+handlers verify that writes land in the correct shared store.
+
+Shared defaulting follows declared scalar/list/reference/enum alias
+representations rather than constructing an alias object. Up to 64 aliases
+are accepted; excess or recursive default chains report E0402 at the type
+expression. Tests cover a cycle, exactly 64 aliases and 65 aliases, with
+independently specified runtime diagnostics. This is a bounded runtime check,
+not complete alias-cycle validation during name resolution.
+
+Nineteen independently authored fixture sets under
+`tests/fixtures/typing-static/` cover qualified reads/assignments/calls,
+member/index/operator errors, single diagnostics through nested arguments,
+prototype inheritance, declaration order, inherited-entry deduplication,
+static handler ownership, bare parent fields, new/evaluate context isolation,
+initializer context, define precedence, alias representations and depth
+boundaries. Three test functions add the diagnostic fixtures, CLI rejection
+and two successful runtime scope/default programs, plus exact runtime alias
+boundary diagnostics.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 476 passed, 0 failed (21 test binaries),
+  including all nineteen new fixture sets and all fourteen typing tests.
+- `cargo test --test typing` — 14 passed, 0 failed, including CLI execution
+  of the static scopes and alias defaults programs and all three alias
+  boundary cases.
+- Additional CLI elab audit: 176 pre-existing successful fixture declarations
+  produced no E022x type diagnostics. Existing expected files were unchanged.
+- `git diff --check` — passed.
+
+Reference scope: independently authored tests against the registered static
+model and existing 2019 migration plan/evaluator rules. Inspection of the
+lawful local 2016 PDF did not supply qualification for the newer static-method
+rules. No 2019 standard text or vendor output was copied; no external pins
+were changed. No Specman comparison, local all-feature run or WASM runtime
+run was performed. Bare static method calls still lack runtime dispatch and
+remain unknown to the checker; qualified Type:: calls are supported. General
+name resolution, static initialization ordering/forward references, template
+static registration, signature equivalence, contextual inference and full
+constant/type resolution remain unfinished. No IEEE conformance is claimed.
+
+
+## 2026-11-14 — integrate reviewed coverage and typing stack
+
+PRs #68–#77 were merged into their parent feature branches after #67
+reached main. Those merges did not propagate the later implementation to
+main. This integration joins main at 29135b7 with the reviewed stack at
+5fcb153, retaining its history and independently authored fixture corpus.
+Before this log entry, the integration tree exactly matched 5fcb153
+(tree 0d8a4f011b5d7e25ac22b6e9ac77cd61a5adbeb7). No new language
+behavior is introduced by the merge; the preceding entries document the
+individual coverage and typing changes and their limits.
+
+Verification on the integration tree:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 476 passed, 0 failed (21 test binaries).
+
+No local all-feature, WASM runtime or Specman run was performed for this
+integration. Temporal edge execution and nested TCM statement-call
+continuations remain separate integration PRs (#66 and #65). Full language
+support and IEEE conformance remain unclaimed.
+
+
+## 2026-11-14 — contextual evaluate/new typing and native hints
+
+Known declaration, assignment-target, field-initializer, parameter and
+return kinds now supply scoped contexts to untyped `evaluate` (4.17.7)
+and `new` (6.3) bodies. Explicit annotations override surrounding hints.
+Materialized templates retain object kinds; concatenation inference
+flattens list operands like native evaluation. Extension bodies inherit
+omitted parameter/result annotations from the declaration prototype.
+
+Native context lookup follows metadata for indexed/static/qualified targets,
+method results, me/self receivers, equal-shaped branches, list literals and
+supported inferred-local shapes, without evaluating receivers/indexes/args.
+It is separate from arithmetic-precision lookup: ordinary inferred integer
+arithmetic retains its prior unbounded behavior. Inferred locals shadow
+fields even when their shape is unknown; a regression reproduced E0122 for
+a valid contextual argument before correcting that precedence. List-shape
+recovery is depth-bounded and memoized by identity, rejecting cycles without
+repeatedly traversing shared lists. The cyclic-value test deliberately uses
+unchecked malformed native input; it does not claim valid cyclic e lists.
+
+Call arguments get their parameter contexts; list predicates get Bool.
+Calls, init actions and new/evaluate bodies isolate enclosing hints, restoring
+them on error. Shared method-frame construction retains prototype parameter
+metadata and return types through suspension, including started TCMs. The
+runtime retains E0122/E0402 when evaluate/new context is unavailable.
+
+Twenty independently authored fixture pairs in
+`tests/fixtures/typing-context/` cover contextual mismatch diagnostics,
+explicit overrides, fresh scopes, aliases/templates, flattened constructors,
+qualified calls, fields, returns, predicate contexts and missing-context
+boundaries. Four positive CLI programs exercise scopes, field initializers,
+extension metadata and return contexts after TCM suspension. Receiver/index
+counters assert single evaluation. Five runtime diagnostic goldens exercise
+unavailable contexts, call/init boundaries and cyclic-value shape recovery.
+The existing new-scopes golden gains one definite field mismatch exposed by
+contextual checking. The old negative `p = new` runtime test now uses
+`var p := new`, preserving an actually absent context while assignments gain
+support.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 479 passed, 0 failed (21 test binaries).
+- `cargo test --test typing` — 17 passed, 0 failed.
+- CLI elab audit: 176 pre-existing successful fixture declarations produced
+  no E0220–E0223 diagnostics.
+- `git diff --check` — passed.
+
+No Specman comparison, local all-feature run or WASM runtime run was performed.
+General bidirectional/flow-sensitive inference, constant/type-embedded
+resolution, full signatures/name resolution and custom numeric/subtype
+inference remain unfinished. No IEEE conformance is claimed.
+
+
+## 2026-11-14 — list indexes, membership typing and contained lists
+
+Known list indexes now reject definite non-integer/non-enumeral kinds with
+E0223 (5.2.11). Unknown receivers remain conservative; E0222 still reports
+a definitely non-list receiver. Index expressions receive their own integer
+context rather than inheriting a stored result's kind, including assignment
+indexes. Existing enum-to-index conversion limits remain runtime limitations;
+accepting an enum kind here is conservative, not a new native conversion claim.
+
+Membership (4.11.6) checks known right-hand list/set containers and compatible
+scalar or contained-list element kinds. Declared sets, literals and
+set_of_values/full_set_of_values retain a Set kind with no scalar-domain
+metadata. Unknown/custom numeric kinds and fine numeric/enum domain questions
+stay conservative. Native inferred set values can supply contextual hints.
+Operand traversal/evaluation runs once; a Boolean membership result context
+does not leak into its operands. A dedicated E0122 golden pins the currently
+unresolved untyped-evaluate operand context.
+
+Native list-to-list membership now means order-independent containment,
+including repeated left values needing distinct right matches. Iterative
+augmenting paths allow reassignment of a prior match when mixed int/real
+comparison rounding gives overlapping candidates. Scalar membership keeps
+ordinary equality dispatch. Inputs are snapshotted before comparisons, and
+neither list is consumed or reordered. Set/range membership tests scalar or
+contained-list values against integer intervals; Boolean/enumeral values use
+their indices. Repetition does not consume distinct set entries. Enum range
+bounds use the existing set-literal conversion. Real-valued set membership
+and full scalar-domain validation remain gaps.
+
+Eleven independently authored fixture pairs under
+`tests/fixtures/typing-membership/` cover invalid index kinds, assignments,
+non-list bases, incompatible membership elements/containers, aliases/sets,
+known method/static results, nested diagnostic traversal, unknowns and valid
+types. Positive execution covers order, duplicate counts, empties, negation,
+strings/booleans/enumerals, object/null identities, input preservation,
+single receiver/argument evaluation, contextual index evaluate, inferred sets
+and overlapping numeric candidates. An independently generated histogram
+oracle checks all 225 ordered pairs of binary-valued lists of lengths 0–3.
+The existing traversal membership golden gains one definite invalid-container
+diagnostic on its arithmetic result; its other diagnostics are unchanged.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 483 passed, 0 failed (21 test binaries).
+- `cargo test --test typing` — 21 passed, 0 failed.
+- CLI elab audit: 176 pre-existing successful fixture declarations produced
+  no E0220–E0223 diagnostics.
+- `git diff --check` — passed.
+
+Reference scope: the local lawful 2016 redline's list-index and membership
+pages were visually inspected; code/docs cite the 2019 clause map already
+used by the migration/parser. This is shared-subset implementation evidence,
+not independent 2019 or commercial-simulator qualification. No standard text,
+images or vendor output is committed; external pins are unchanged. No Specman
+comparison, local all-feature run or WASM runtime run was performed. Full name
+resolution, set-domain typing, type-embedded scopes and general inference
+remain unfinished. No IEEE conformance is claimed.
+
+## 2026-11-12 — Nested statement-call continuations
+
+Statement-position instance methods, including ordinary helper methods,
+now preserve their caller/callee frames across suspension (13.2.2).
+The existing call-path machinery retains evaluated arguments, receivers,
+local variables and composed-body positions for nested and recursive
+calls and `compute`. Dispatch checks declared methods before resource
+method interception, avoiding repeated receiver evaluation for user
+methods named `down` or `up`. Entry-event synchronization (17.1.2)
+parks on the scheduler event wake pass. Argument-count errors are checked
+before parking. A `stop_run()` expression statement propagates Stop
+through the saved caller chain.
+
+Seven independently authored fixture sets in `tests/fixtures/tcm-calls/`
+pin nested blocking calls, concurrent callers with distinct locals,
+recursive calls and composed bodies, receiver/argument side effects,
+TCM entry synchronization, arity diagnostics and stopping nested callers.
+The resource-context regression now tests a value-expression call, which
+remains atomic, rather than an ordinary statement call.
+
+Verification on `agent/complete-tcm-continuations`:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 451 passed, 0 failed.
+- `git diff --check` — passed.
+
+The initial fixture runs exposed a missed entry-event wake and failure
+to propagate `stop_run()` through expression statements; both are fixed
+and included in the final all-target result. No all-feature, WASM or
+Specman reference run was performed for this increment. This is regression
+evidence, not differential qualification or a conformance claim.
+
+Value-expression calls, receivers whose types cannot be resolved before
+evaluation, `on` blocks and check failure bodies still use atomic
+execution. General expression continuations, per-instance event identity,
+temporal edge expressions and precise HDL event ordering remain gaps.
+
+
+## 2026-11-14 — combined execution, coverage and typing integration
+
+This branch joins the pending statement-continuation work (#65,
+0be54b8) and temporal-edge work (#66, 3405510) with the coverage/typing
+stack through #80 (9d747d4). Main had only #67 at integration time;
+this remains a feature-branch review, not a claim that the combined work
+has reached main. Both source histories and their existing fixture files
+are preserved. The verification log retains #66's repaired historical
+entries followed by every later coverage/typing/TCM entry. Active docs and
+CLI claims are reconciled, including stale negative claims about contextual
+new, set literals and statement-call suspension.
+
+Four independently authored fixture sets under
+`tests/fixtures/execution-integration/` exercise the combined behavior:
+
+- Two concurrent nested callers preserve locals and typed parameters across
+  semaphore waits and explicitly clocked temporal edges. Omitted composed
+  method annotations retain prototype kinds; contextual new returns execute
+  after suspension. Constructor counters verify eight new instances beyond
+  the baseline; the original packet references remain unchanged.
+- Nested compute entry events, alias parameter/result types and a contextual
+  constructor on a member compute call retain their frames and arguments.
+  Four constructor invocations beyond the baseline prove arguments are not
+  replayed while parking/resuming the nested calls.
+- Concurrent helpers sample separate unit coverage groups after suspension.
+  Each owner has two samples, one hit in each Boolean bucket and grade 1.0.
+- Root event spellings wake started/temporal waits consistently. A same-named
+  child event does not wake a sys-qualified listener. Bare, sys-qualified,
+  me-qualified and alias-receiver root emissions invoke root on actions once
+  each and contribute exactly four coverage samples, without replay/duplication.
+
+The fixtures exposed two implementation gaps. Bare root emissions were not
+visible as sys-qualified clock/entry events, stranding nested waits until the
+shared cycle budget. Resolved sys emissions now record/wake both bare and
+sys-qualified keys; root coverage selects matching groups once. On actions
+remain single-shot. Other instances retain the existing path model: arbitrary
+instance/event alias resolution and per-instance timelines are not supplied
+by this repair. Compute argument evaluation also lacked parameter hints;
+it now uses the same guarded metadata-only lookup and scoped evaluation as
+ordinary/started calls, fixing E0402 for its contextual constructor argument.
+
+Verification on the combined implementation:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 491 passed, 0 failed (23 test binaries).
+- The integration test binary contains three tests, covering all four new
+  fixture sets through parse/elaboration/type checking/native CLI plus exact
+  unit-owner and root-alias coverage assertions.
+- Existing #65 and #66 fixture/test files compare byte-for-byte unchanged
+  against their submitted heads.
+- `git diff --check` — passed; no conflict markers remain in src/docs/tests.
+
+The initial combined baseline passed before the new integration fixtures;
+their first run then reproduced the root clock/entry-path failure and missing
+compute constructor context. Both are fixed in the final all-target result.
+The coverage assertion uses the API's fractional grade (1.0), not percent.
+No Specman comparison, local all-feature run or WASM runtime run was performed.
+General expression continuations, name resolution/types, general solving,
+remaining coverage/libraries, per-instance temporal/event identity, precise
+HDL ordering and browser runtime qualification remain unfinished. No IEEE
+conformance is claimed.
+
+
+## 2026-11-15 — instance event identities and rule ownership
+
+Instance events (11.1–11.2, 12.2.5) now use a physical owner plus event/port
+name as their internal log/wake key. Bare, dotted, me/self and object-alias
+references resolve to that identity; same-named events on distinct instances
+remain separate. Static event identities stay type-qualified. The temporal
+parser accepts Type::event paths, including static object fields followed by
+an instance event. The pure temporal core retains its opaque string-key API.
+
+Emission receiver expressions, including calls and indexes, evaluate once.
+Their spelling is only a label; the resolved owner drives wake-up, on actions
+and coverage collection. Invalid non-object receivers report E0402 at their
+member expression. Parenthesized static emissions retain static dispatch.
+TCM entry events bind in the callee/prototype parameter scope using already
+evaluated arguments, for both started and nested compute calls. Every-cycle
+standalone event references bind to the global cycle atom.
+
+Rules (11.4) are materialized once per created physical instance, rather
+than once per declared type with every expression/failure body evaluated on
+sys. Each owns a monitor, expression-sampling context, registration-cycle
+window and retirement flag. Later allocations join monitoring; declarations
+without instances create no monitors. Aliases do not duplicate monitors.
+Inherited rules apply to their actual derived instances. Wait event paths bind
+at entry and retain their identity across resumption. Rules bind event paths
+at registration; active reference rebinding remains outside this subset.
+
+A suspended wait previously reset its age on every recheck, bypassing the
+existing 1000-cycle wait guard until the global 5000-cycle budget. Its span
+and starting state now distinguish continued checks from a new wait. The
+wrong-owner fixture expires at cycle 1002 after 1001 waiting cycles; a separate
+fixture completes two successive waits whose total duration exceeds 1000
+cycles while each remains within its own budget. These are implementation
+resource limits, not a standard-language timeout rule.
+
+Fifteen independently authored fixture sets under
+`tests/fixtures/instance-events/` cover owner isolation, receiver/local aliases,
+already-emitted entry clocks, me/self, parameter clocks, per-instance rule
+expressions and failure actions, unused declarations, clocked edge histories,
+late-created objects, inherited rules and alias deduplication, static versus
+instance events, static object fields, event ports, single evaluation of
+call/index receivers, exact receiver/timeout diagnostics and wait-age reset.
+All pass parsing/elaboration/conservative typing. Thirteen execute through the
+native CLI with exact output; two use native diagnostic goldens. A second test
+asserts coverage samples exactly twice for sys.a and once for sys.b across
+aliased emissions. Existing fixture goldens remain unchanged.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 493 passed, 0 failed (24 test binaries).
+- `cargo test --test instance_events` — 2 passed, 0 failed, covering all
+  fifteen fixture sets and the coverage-owner assertions.
+- `git diff --check` — passed.
+
+Reference scope: independently authored behavior tests against the existing
+2019 event, temporal-member and TCM model; no new standard text or vendor
+output was copied, and no external pins changed. No Specman comparison,
+local all-feature run or WASM runtime run was performed. Indexed temporal
+path syntax, rebinding event references during active attempts, unresolved
+path/name resolution, first-class event values, distinct same-cycle samples,
+full event-specific compound timelines and precise HDL event ordering remain
+gaps. One global cycle log is still used despite independent owner identities
+and rule/wait sampling contexts. No IEEE conformance is claimed.
+
+
+## 2026-11-15 — reproducible qualification case runner
+
+The planned EDA Playground reference comparison could not start: browser
+inventory reported that the browser access host was unavailable, with no
+browser sessions exposed. No account credentials were read or submitted,
+no CAPTCHA/login was attempted and no new Specman result is claimed.
+The repository EDA Playground skill was read; its reference-run recording
+requirements remain applicable when the service becomes accessible.
+
+Independent work adds scripts/qualify.py, a manifest-driven native/reference
+adapter runner using the Python standard library. It requires an explicit
+native-only or reference-command mode. Both backends receive the same staged
+source snapshot and seed; adapters must echo the exact case/hash/seed identity
+and execution status. Tool name/version/host profile are adapter-reported
+metadata. Commands use argv arrays without a shell. Failure exits, timeouts,
+invalid/duplicate/missing markers, malformed envelopes, failed adapter status,
+source mutation and disagreement with the independent oracle all fail.
+Matching unexpected answers from both backends do not pass.
+
+Reports retain source/command/native-launcher fingerprints, clause references,
+owned result values and status categories. They do not contain raw stdout,
+stderr or command arguments. Native-only reports use
+native_expected_values_only and explicitly mark comparison not_run and
+reference not_requested. No real simulator adapter is supplied or qualified;
+the owned protocol fixture process is test-only evidence of runner mechanics.
+
+Three independently authored, self-contained code-segment cases under
+tests/fixtures/qualification/ cover instance event ownership, list
+multiplicity and contextual constructor/return values. Their expected marker
+maps were specified independently in qualification/cases.json, with native
+diagnostic/output goldens. A Rust test checks all three through the frontend
+and native interpreter. CI adds Python protocol tests, a native binary build
+and an explicit native-only corpus run. README/status/roadmap/architecture
+state the distinction between infrastructure and reference qualification.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 494 passed, 0 failed (25 test binaries).
+- `py -m unittest discover -s tests -p qualification_runner_test.py` —
+  14 passed, including real owned subprocesses for success, mismatches,
+  malformed/failed responses, source mutation/deletion, timeout, output cap,
+  failed exits and report privacy. This is not a reference simulator run.
+- `py scripts/qualify.py --native
+  B:/e1647-rs/local/tcm-continuations-review/target/debug/e1647.exe
+  --native-only --report B:/e1647-rs/local/qualification-native.json` —
+  3 cases passed; each native status ok, comparison not_run and reference
+  not_requested. The generated report remains ignored local data.
+- `git diff --check` — passed.
+
+Python 3.13 private temporary-directory ACLs prevented the restricted token
+from writing staged input. The Python checks passed with normal user access;
+no ACL or security policy was weakened. Work staging remains under gitignored
+local/qualification-work. The adapter owns simulator descendant cleanup;
+process timeout alone does not prove every simulator child/session stopped.
+The output cap is checked after capture, not a streaming memory bound.
+Imported dependency staging, a licensed Specman adapter and live comparison
+of these candidates remain unfinished. No local all-feature, WASM runtime
+or commercial-simulator run was performed. No IEEE conformance is claimed.
+
+
+## 2026-11-15 — scheduled value-expression call continuations
+
+A new independent assignment fixture first reproduced the atomic-call gap:
+`prefix() + pending()` exhausted the temporal wait budget while its started
+producer could not run. Scheduled ordinary instance calls now use the saved
+call engine inside value expressions. A statement evaluation tree retains
+completed values and ordered child positions; the pending call resumes its
+callee frame through a synthetic path level. The original expression AST
+continues to supply precision and contextual type metadata. Private execution
+control distinguishes suspension and stop from user diagnostics.
+
+The call engine retains the last return value across composed blocks, while
+statement calls discard it as before. Loop header evaluation resets after
+committed bodies; repeat-until distinguishes a pending condition from a
+pending body. Completed operator and print-formatting results are retained,
+including side effects in custom numeric callbacks. Consumed synchronization
+clears the prior child's continuation before advancing to the next statement;
+the numeric-wait-header fixture exposed and verifies this repair. Atomic
+fallback dispatch also restores depth/static context on errors.
+
+Fifteen independently authored fixture sets under tests/fixtures/value-calls/
+cover the reproducer, nested and recursive value calls, arguments, typed and
+runtime-resolved receivers, composed returns, contextual returns, lazy
+branches, mutable fields/conditions retained across another coroutine's turn,
+while/repeat/for/foreach headers and suspended bodies, list/index assignment,
+print parts, TCM entry events, concurrent FIFO resource calls, compute/start
+arguments, numeric wait counts, precision, stop and errors after suspension.
+Thirteen pass frontend typing and the native CLI with exact output goldens;
+two pin exact native diagnostics (division by zero after sync and a blocked
+call without a producer). The existing E0421 test now places its blocking
+call inside an explicitly atomic evaluate scope, preserving that check.
+README/status/roadmap/architecture/CLI help state the implemented scope.
+
+Verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 495 passed, 0 failed (26 test binaries).
+- Focused value-call fixture test — passed for all fifteen fixture sets.
+- `git diff --check` — passed.
+
+Scoped evaluate/constructor actions, list callbacks, generation/coverage
+observation, static methods, on blocks and check failure actions remain
+atomic. Any further legal callback suspension needs separate scope handling
+and qualification of the applicable restrictions: static methods are not TCMs,
+on actions prohibit time-consuming actions, and evaluate excludes wait/sync/
+return. This change does not qualify those contexts or general simulator
+ordering. No local all-feature, WASM
+runtime or Specman run was performed. No IEEE conformance is claimed.
+
+
+## 2026-11-15 — bounded HDL sessions and real xezim profile
+
+The available extended EDA image supplied xezim 0.11.3, revision 058f2bba,
+matching Dockerfile's full source pin. Its image ID was
+sha256:2c2d7265c7d157ac99201232025af5faf975221693a7ebdc4aba80df8c031f54
+and its compiler was rustc 1.99.0. The older local e1647-rs-toolchain tag did
+not expose xezim on PATH; that tag alone was not accepted as qualification.
+The current source was mounted read-only into the extended image, the owned
+bridge compiled against /opt/xezim/include, and generated data written only
+under the host's ignored local/hdl-qualification directory.
+
+A code review found that RUN accepted an ERR reply and then waited for READY,
+which never follows a rejected command. Native sessions now fail immediately
+on ERR and use a bounded response reader with one deadline for each complete
+startup/command/finish exchange. Replies match reserved tokens exactly;
+malformed/out-of-order responses, EOF, invalid UTF-8, overlong output and
+missing replies close/reap the owned child. Subsequent calls preserve the
+failure. Local invalid paths/values send no command. Checked finish observes
+BYE and a successful child exit; CLI failures report E0408. Legacy finish()
+cleanup remains available without returning errors.
+
+The owned C bridge now parses complete numeric/argument forms, rejects command
+truncation, retains both halves of a 64-bit delay and explicitly limits
+vpiIntVal transfers to signed 32-bit values over signals of 1..32 bits.
+X/Z reads and wide signals fail instead of being silently narrowed/coerced.
+E1647_XEZIM_WAVE=1 enables optional --wave instrumentation; startup/command
+limits use E1647_XEZIM_TIMEOUT_MS (default30000, accepted1..300000).
+
+New owned Rust subprocess tests cover success, lookalike log prefixes, invalid
+local requests, startup/command/finish timeouts, shared RUN deadlines, ERR,
+out-of-order/malformed/overflow replies, EOF, output bounds and failed exit.
+A separate injected backend fixture verifies checked-finish E0408 propagation,
+that later statements do not run, and that the backend is dropped. These are
+transport/interpreter mechanics, not reference simulation evidence.
+
+scripts/qualify_hdl.py performs actual Linux/xezim qualification. Six owned
+fixture programs plus both existing mixed counter examples pass exact output,
+diagnostic and exit-code oracles. The real bridge also rejects malformed raw
+commands without applying a rejected SET. For the positive fixture, the VCD
+has a 1ps timescale, three rising edges at ticks3/5/7, counter values0/1/2/3,
+the two signed-word bit patterns, and final tick9. HDL code coverage records
+nine covered statements, three always-block executions and three clock
+rises/falls. This is HDL code coverage, separate from e cover-group coverage.
+The script verifies these contents, rejects an unqualified simulator revision,
+checks input/binary stability and records hashes without raw stdout/stderr.
+Artifacts and reports remain ignored local data. Three Python oracle tests
+reject corrupted values/times/widths and incorrect coverage counts.
+
+Exact checks and observed results:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed, no warnings.
+- `cargo test --all-targets` — 504 passed, 0 failed, 0 ignored (27 binaries).
+- `py -m unittest discover -s tests -p hdl_qualification_test.py` — 3 passed.
+  Python private-temp ACLs required normal user access on Windows; no ACL or
+  security policy was changed. Linux CI runs the same mechanical tests.
+- `docker compose config --quiet` — passed.
+- In the extended image, `cc -Wall -Wextra -Werror -shared -fPIC
+  -I/opt/xezim/include -o /artifacts/bridge.so c/xezim_bridge.c` — passed.
+- In that image, `cargo build --locked --target-dir /artifacts/target
+  --bin e1647` — passed.
+- In that image, `E1647_XEZIM_BRIDGE=/artifacts/bridge.so python3
+  scripts/qualify_hdl.py --native /artifacts/target/debug/e1647
+  --report /artifacts/qualification.json` — passed:8 cases plus raw bridge
+  assertions, VCD and HDL coverage contents verified.
+- `git diff --check` — passed.
+
+README/status/roadmap/architecture/CLI help and HDL_QUALIFICATION.md describe
+the contract and scope. Dockerfile adds Python3 and strict bridge compilation;
+compose adds qualify-hdl. The full Dockerfile image was not rebuilt locally;
+the actual qualification used the fingerprinted existing extended image.
+Default CI exercises portable mechanics, not a real simulator. No local
+all-feature, WASM-runtime or Specman run was performed. The untagged response
+protocol reserves exact token lines; standalone sessions do not manage child
+process trees (the Linux runner adds process-group cleanup). Arbitrary signal
+types, large-delay/max-time behavior, general e/HDL scheduling, VHDL/VHPI and
+browser execution remain unqualified. No IEEE conformance is claimed.
+
+
+## 2026-11-15 — Dockerfile and Compose qualification
+
+Follow-up to the explicit HDL profile: the current Dockerfile was built from
+source without updating the xezim pin. `docker build --tag
+e1647-rs-toolchain:hdl-profile .` passed; xezim's release compilation completed
+in 5m25s and the strict owned C bridge build/dependency prefetch also passed.
+The pre-existing latest image was preserved. The new image identity was
+sha256:a301937544b5ba48a37c2315187ff192f1c46be848fcb1ebdf4ef905bdee8d2d,
+with base manifest
+sha256:cc9edbcadf2c27013a642b1d1bb7504e26b1142d6b5ebe58f64cf2eb2bc128ae.
+It reported xezim0.11.3/git058f2bba, Rust/Cargo1.100.0, Python3.13.5 and
+GCC14.2.0; ldd found its runtime libraries.
+
+An ignored image-only override selected the new tag for qualify-hdl and
+verify. Actual commands from the repository worktree:
+
+- `docker compose -f compose.yml -f
+  ../../local/compose-container-qualification.yml run --rm qualify-hdl` —
+  passed: all8 cases plus raw bridge, VCD and HDL coverage assertions. The
+  generated local/hdl-profile/report.json records observed binary/input
+  fingerprints. The retained VCD and HDL coverage files were inspected as
+  present and their checked values confirmed.
+- `docker compose -f compose.yml -f
+  ../../local/compose-container-qualification.yml run --rm verify` — passed:
+  fmt check; Clippy all-targets/all-features with warnings denied;
+  cargo test all-targets/all-features513 passed,0 failed,0 ignored,27 binaries.
+- `cargo fmt --all -- --check` — passed locally.
+- `cargo clippy --all-targets -- -D warnings` — passed locally.
+- `cargo test --all-targets` —504 passed,0 failed,0 ignored,27 binaries locally.
+- `git diff --check` — passed.
+
+A login-shell inspection initially hid Dockerfile PATH tools; the non-login
+shell used by Compose resolved them correctly. An attempted --no-build option
+was unsupported by this Compose version; the actual supported run commands
+above succeeded. Neither invocation issue was treated as simulator evidence
+or as a failed image build. No environment/security settings were changed.
+
+The CI workflow now has a separate check-hdl-profile job: build the pinned
+simulator/current bridge image, record image/tool identity, run the actual
+qualification service and retain only owned staged inputs, reports, VCD and
+HDL coverage as a seven-day artifact. Container-generated evidence ownership
+is assigned to the CI runner user before upload, preserving private staging
+directory modes. Portable unit/oracle jobs remain distinct
+from simulation evidence. This closes the previously unverified Dockerfile/
+Compose path; historical entries correctly describe their earlier scope.
+Floating base/transitive resolutions can change image bytes, so each new image
+must run qualification. No byte-reproducible-build, general e/HDL ordering,
+VHDL, browser-runtime or Specman qualification is claimed.
+
+## 2026-11-15 — Single-source browser sandbox API
+
+Added a version-1 standalone default-feature WASM ABI and a local browser
+demo. The shared native pipeline parses/checks/runs one source; imports are
+rejected. Results include spanned diagnostics, console output, independent
+DUT failure counts and basic coverage summaries. Decimal seed/counter/bound
+strings preserve wide integers. The client creates and terminates a fresh
+module worker/instance for each request, with cancellation and a default
+three-second deadline. The build fixes linear memory at 16 MiB initially
+and 128 MiB maximum; the module has no host imports.
+
+Actual checks on Windows with the native GNU toolchain:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 509 passed, 0 failed, 0 ignored,
+  across 28 test binaries. This includes four serialization/pipeline unit
+  tests and one fixture integration test sharing five browser input cases.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed; release WASM copied to the
+  ignored browser artifact with the explicit memory linker limits.
+- `npm.cmd install --prefix browser --ignore-scripts` — passed, two packages
+  installed, zero audit vulnerabilities reported; Playwright pinned at 1.64.1.
+  `npm.cmd ci --prefix browser --ignore-scripts` also passed with the lockfile.
+- With `PLAYWRIGHT_BROWSERS_PATH=B:/e1647-rs/local/playwright-browsers`,
+  `node browser/node_modules/playwright/cli.js install chromium` — passed.
+- With that same cache variable, `node scripts/test_browser.mjs` — passed:
+  eight browser assertion groups in Chromium headless 156.0.8078.4.
+  Parse/check/run and u64-max seeds, type/syntax spans, failed DUT checks,
+  import rejection, basic coverage, input limits, busy/cancel/recovery,
+  fetch and synchronous WASM deadlines, WASM traps, load/seed/operation
+  errors, invalid buffers/UTF-8, allocation/result quotas, release/reuse,
+  zero host imports and the actual 128 MiB memory maximum were asserted.
+  Demo run controls and HTML-shaped output rendered as text were asserted;
+  the retained demo screenshot was also inspected visually.
+- `git diff --check` — passed.
+
+An initial installed-Chrome launch exited before opening a page; it was
+not counted as runtime evidence. The pinned Playwright Chromium download
+and subsequent real-browser runs succeeded. An initial diagnostic lookup
+used the nonexistent CLI `check` command; `elab` provided the expected
+fixture diagnostic and the shared API tests passed. Owned report/screenshot
+and native test log live under ignored local evidence paths.
+
+CI now builds this artifact and runs the same real Chromium suite, retaining
+owned browser evidence for seven days. CI results are pending until the PR
+runs. Native all-feature, new container/HDL and Specman runs were not repeated
+for this increment. This closes the scoped experimental browser API
+milestone; it does not qualify other browser engines, derived coverage
+serialization, full language semantics or whole-process resource/security
+guarantees. See [BROWSER_SANDBOX.md](BROWSER_SANDBOX.md) for the API and limits.
+
+## 2026-11-15 — Conditional is-a binding types
+
+The conservative type pass now retains matched kinds for explicit
+`is a T(name)` bindings along proven Boolean paths. True/false facts compose
+through parentheses, not, lazy and/or and implication. Known bindings reach
+if/else bodies, while bodies, check failure actions and ternary arms. A join
+retains only kinds common to every incoming path; possible replacement
+bindings invalidate earlier facts and stale frame-local kinds. Operands are
+inferred once. This changes static diagnostics, not runtime binding lifetimes,
+the tested operand's type, or general flow-sensitive inference.
+
+Independently authored fixtures under tests/fixtures/typing-bindings assert
+ten exact E0220/E0221 diagnostics, conservative silence for ambiguous joins,
+nonbinding negated is-a, shadowed locals and replacement bindings. Both elab
+and run reject the error fixture. The valid native run exercises branch,
+lazy operand, negation, implication, loop and ternary bindings and reports
+`guarded bindings passed` with all DUT checks satisfied.
+
+Actual verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed after replacing a
+  Clippy-reported unnecessary temporary vector during invalidation.
+- `cargo test --all-targets` — 511 passed, 0 failed, 0 ignored, 28 binaries.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- With PLAYWRIGHT_BROWSERS_PATH selecting the ignored local cache,
+  `node scripts/test_browser.mjs` — all nine assertion groups passed in
+  Chromium 156.0.8078.4. The new group asserts the same ten guarded-binding
+  diagnostics byte-for-byte through the actual worker/WASM check API and
+  executes the valid fixture successfully through its run API.
+- `git diff --check` — passed.
+
+The preceding sandbox PR #87 also completed all eight push/PR CI jobs:
+default, all-feature solver, real WASM/browser and real HDL image/profile
+checks. New CI results for this increment are pending. No local all-feature,
+new HDL/container or Specman run was performed for these typing changes;
+no new language execution or IEEE conformance claim is made.
+
+## 2026-11-15 — Expressions retained in type positions
+
+The conservative post-composition pass now traverses expressions retained in
+type annotations: scalar/formal widths, nested list keys/elements, when bases,
+template type/value arguments and unresolved typeof/typeof_item placeholders.
+Entry sites cover alias underlying types, fields (including statics), method
+parameters/results, locals, coverage items, casts, is-a, constructors,
+evaluate, set_of_values/full_set_of_values and in_table type sets. Known
+non-integer scalar-width kinds produce E0223; enum/integer/unknown kinds
+remain conservative. This does not add general width evaluation or prove
+numeric width bounds.
+
+Key expressions bind it to the element kind. All method parameters shadow
+owner fields before dependent annotations are checked. Type-position checks
+isolate expected value hints and restore local/binding state; a dedicated
+fixture proves that a binding inside a width cannot erase the enclosing
+frame's known integer kind. Alias expansion is not repeated at use sites;
+the type visitor has a depth bound of 64. Expressions already replaced during
+elaboration are not reconstructed and remain a pre-elaboration checking gap.
+
+Independently authored fixtures under tests/fixtures/typing-type-expressions
+cover exact diagnostic spans, parameter/static/key scopes, template values,
+retained placeholders, conservative unknown widths and valid native execution.
+The unresolved fixture also retains the existing E0208/E0313 diagnostics;
+run stops at those earlier-stage errors, while the complete fixture pipeline
+additionally checks its nested E0221 diagnostics. Initial fixture attempts
+used ambiguous template argument syntax and assumed a different diagnostic
+order; these were corrected to the parser's existing syntax and stage order.
+
+Actual checks:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 513 passed, 0 failed, 0 ignored, 28 binaries.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all ten groups passed in Chromium
+  156.0.8078.4. Seventeen new annotation/value diagnostics match native
+  expected files byte-for-byte, and the valid fixture also runs in WASM.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `git diff --check` — passed.
+
+PR #88's eight push/PR CI jobs completed successfully (default Rust,
+all-feature solver, real WASM/browser and real HDL image/profile jobs).
+CI for this increment is pending. No new local all-feature, HDL/container or
+Specman run was performed; no full type system or IEEE conformance is claimed.
+
+## 2026-11-15 — Present interface implementation contracts
+
+Added the missing comparison between a concrete present method prototype and
+its effective implemented interface requirements (6.3/6.13). Definite arity,
+annotation-presence, scalar/list/nominal parameter/result, known-width and
+static mismatches now report E0311 once per type/method. Interface inheritance,
+struct like chains and extend contributors participate. Missing prototypes
+remain accepted statically; calling a missing implementation still reports
+the existing runtime E0414.
+
+Plain aliases follow the repository's current representation model, bounded
+at 64 expansions; ranged aliases remain uncertain. Constant width/value
+expressions use the existing bounded evaluator. Default int/uint widths and
+bit/nibble/byte unsigned widths normalize; long bases retain their distinct
+arithmetic identities. Symbolic widths, ranged/custom types, conditional or
+template-only implementations, extension-only blocks and full extension/type
+equivalence remain conservative. This does not close full signature checking.
+
+Independently authored fixtures in tests/fixtures/interface-signatures cover
+16 exact E0311 diagnostics, inherited/extended contributors, renamed parameters,
+plain aliases, equal constant widths, byte versus uint(bits:8), conservative
+unknown cases and missing-method staging. Parse/elab/run all reject the
+contract errors. The valid native and browser runs execute interface calls
+and verify results before printing `interface signatures passed`. The missing
+case checks successfully and fails only when run, with E0414. Initial fixture
+runs failed while expected files were unfinished and the missing-method test
+incorrectly asserted E0407; the observed existing E0414 and exact expected
+files were recorded before final verification.
+
+Actual checks:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 515 passed, 0 failed, 0 ignored, 28 binaries.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all eleven groups passed in Chromium
+  156.0.8078.4, including byte-for-byte comparison of all 16 new contract
+  diagnostics and valid/missing-method run staging through actual workers/WASM.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for preceding PR #89 completed successfully.
+CI for this increment is pending; no new local all-feature, HDL/container or
+Specman run was performed. No full type system or IEEE conformance is claimed.
+
+## 2026-11-15 — Composed method-extension contracts and static order
+
+Added E0225 after composition/final type-position resolution for definite
+method-extension contract changes (17.2.4): arity, explicit parameter/result
+annotations and static prefix. Omitted annotations inherit by parameter
+position/result, as the runtime already does. The pass covers regular composed
+methods, when views, substituted template instances and static registries.
+It reuses the bounded signature comparison, leaving symbolic/ranged types and
+unresolved or extension-only declarations conservative. Repeated source pairs
+in inherited/registry copies report once; a compatible template instance does
+not hide an incompatible instance from the same source, in either encounter
+order. Full signature equivalence and is-first/is-only execution policies
+remain unfinished.
+
+Static registry collection also now matches its documented composition order:
+declarations precede extend contributions even when an extend appears earlier
+in the file. The independent valid fixture checks static method results and
+static handler ordering, compatible renamed/omitted annotations, inherited
+instance methods, equivalent byte widths and suspended TCM extension results.
+Its observed success text is `method extension contracts passed`.
+
+Fixture development exposed an existing lexer gap: the tick in
+`active_state'flag` starts an apostrophe numeral token. The when-view fixture
+uses `mode` to exercise composition; the unresolved disambiguation case is
+now an explicit roadmap item. An initial Boolean determinant fixture was
+also outside the current when parser's identifier form. These parser failures
+were corrected before verification; they were not counted as E0225 evidence.
+A CLI-help edit initially re-encoded existing comment punctuation using the
+Windows locale; the original UTF-8 bytes were restored before staging, leaving
+only the intended help change.
+
+Actual verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 517 passed, 0 failed, 0 ignored, 28 binaries.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all twelve groups passed in actual
+  Chromium 156.0.8078.4. Ten E0225 diagnostics across four fixtures match
+  expected files byte-for-byte. Parse accepts the contract-only error case;
+  check rejects it. The valid fixture executes through worker/WASM, including
+  static order and suspended instance calls.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for preceding PR #90 completed successfully.
+CI for this increment is pending. No new local all-feature, HDL/container or
+Specman run was performed; no IEEE conformance is claimed.
+
+## 2026-11-15 — Tick/numeral lexical disambiguation
+
+Fixed the concrete `when active_state'flag` regression recorded in the
+preceding entry. A tick adjacent to an identifier now selects qualification,
+including suffixes whose complete spelling could be an unsized numeral, such
+as `p.active_state'hFF` or `p.active_state'bX`. Otherwise a standalone numeric
+candidate must end at an identifier boundary; a prefix such as `'fla` can no
+longer split the identifier flag. Simple closed quoted HDL paths also retain
+their quotes when the first name looks numeric. The previous identifier's
+byte end supplies adjacency; whitespace/comments break it, preserving complete
+separated radix spellings used as numeric operands or macro arguments.
+
+The original method-contract when fixture now uses flag without a workaround.
+New independently authored fixtures check qualified fields/method calls and
+real sized/unsized/prefixed numerals together in execution, ordinary downstream
+type diagnostics with exact spans, and numeric-looking dotted/single-name HDL
+path parsing. New lexer tests preserve MVL numeral tokens, partial-name
+boundaries, quote chains, comments and UTF-8 byte/line/column positions. MVL
+execution and escaped/indexed HDL path grammar are not added.
+
+Initial fixture attempts treated reserved hex as an ordinary identifier and
+included indexed HDL paths that the parser does not support. They were
+corrected to the existing keyword/grammar boundaries; indexed forms remain
+covered only as lexical tokens, not as parsed/executed HDL paths.
+
+Actual checks:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 521 passed, 0 failed, 0 ignored, 28 binaries.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all thirteen groups passed in actual
+  Chromium 156.0.8078.4. The new group checks both exact downstream E0220
+  diagnostics, numeric-looking path parsing and the valid qualified run's
+  `tick qualifiers passed` output through actual worker/WASM execution.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for preceding PR #91 completed successfully.
+CI for this increment is pending. No new local all-feature, HDL/container or
+Specman run was performed; no IEEE conformance is claimed.
+
+
+## 2026-11-16 — Composed method execution policies
+
+Replaced sequential body execution with a shared first/also/only execution
+plan. Independently authored fixtures exercise same-layer ordering and only
+replacement; inherited wrappers around subtype bodies, including when views
+and templates; scalar argument handoff and restoration; implicit typed result
+slots; normal and early returns; explicit NULL reference returns without hidden
+object construction; static methods; and suspension in inline/started TCMs and
+main run. Constructor init, setup/check/run hooks, injected any_unit wrappers
+and inline sequence MAIN use the same plan. A native stress case executes 1200
+first extensions using iterative plan compilation.
+
+The result slot shadows an owner field of the same name and receives the
+inherited return type in the conservative checker. Three independently
+expected E0220 diagnostics check invalid assignments in core, also and static
+bodies. Browser tests execute all seven positive fixtures and compare those
+three diagnostics byte-for-byte with the expected fixture.
+
+An existing lawful local historical 2016 PDF was consulted to study wrapper
+semantics. This is not new 2019 reference qualification. No standard text,
+examples, proprietary code or vendor output was copied into the repository.
+No new Specman run was performed. Constructor timing, inline sequence execution
+and the existing atomic regions retain their documented approximations.
+
+Initial Clippy verification rejected a single-range array initializer; the
+fallback now borrows a named range. An approval-service usage-limit failure
+prevented one subsequent verification attempt from executing. After recovery,
+verification ran through the same approval path with these actual results:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 523 passed, 0 failed, 0 ignored, 29 binaries.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all fourteen groups passed in actual
+  Chromium 156.0.8078.4.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for preceding PR #92 completed successfully.
+CI for this increment is pending. No new local all-feature or HDL/container
+run was performed; no IEEE conformance is claimed.
+
+
+## 2026-11-16 — Browser derived coverage summaries
+
+The version-1 browser response now adds a derived array to each reported
+coverage group. Cross/transition summaries include their kind, source names,
+samples, hit goal, weight, possible-combination total, native grade and an
+array of observed label/hit pairs. Counts, totals, goals and weights remain
+decimal strings; an ungradeable total/grade is null and an empty domain retains
+its zero total. Hidden groups/items remain filtered by the native reporting
+view. This serializes the existing collector; it adds no language semantics.
+
+Independent expected JSON fixtures cover a nested cross over a hidden
+transition; distinct observations with identical rendered labels; a fully
+masked per-unit graph; a zero domain with an unbucketed input; and unbucketed
+string crosses/transitions with maximum-u64 goals/weights, zero goals/weights
+and Unicode names. The same five expected responses are checked byte-for-byte
+in native tests and parsed/compared through actual worker/WASM execution in
+Chromium. Basic-only groups retain an empty derived array. Label arrays retain
+separate observations; detailed bucket identities and unsampled combinations
+are outside this summary API.
+
+An initial escape-heavy coverage-name fixture exposed existing raw-token name
+handling. The serialization fixture now uses an ordinary Unicode name; quoted
+string observation labels still exercise JSON escaping. General coverage-name
+constant decoding remains separate work, rather than redefining its expected
+language behavior here.
+
+Actual verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 524 passed, 0 failed, 0 ignored, 29 binaries.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all fifteen groups passed in actual
+  Chromium 156.0.8078.4.
+- `git diff --check` — passed.
+
+At the latest observation, preceding PR #93's six native/solver/WASM CI jobs
+passed and its two HDL-profile jobs were still running. CI for this increment
+is pending. No new Specman, local all-feature or HDL/container run was
+performed; no IEEE conformance is claimed.
+
+
+## 2026-11-16 — Constant coverage names and decoded range labels
+
+Derived name options now consume the whole top-level expression and evaluate
+the supported literal-string concatenation/grouping subset. Each literal uses
+the same escape decoder as runtime strings, as do coverage range labels.
+Graph validation and schema construction use the same computed name, allowing
+later derived sources to reference a concatenated name and rejecting decoded
+name collisions. Invalid, missing, non-string or unsupported expressions
+report E0224 rather than truncating to a leading literal or falling back to
+a generated name. Missing values retain their option's source position.
+Named constants and arbitrary expressions remain outside this subset; this
+is not general constant resolution or full coverage option typing.
+
+Four independent fixture cases exercise a hidden concatenated cross name
+referenced by a later cross; grouped names and quote/backslash/Unicode
+escapes; range-label escapes and a concatenation boundary that must not be
+decoded twice; six exact invalid-name diagnostics (wrong kind, mixed addition,
+unresolved name, trailing tokens, incomplete addition and missing value); and
+a duplicate computed name. Two independently expected browser JSON reports
+match native serialization byte-for-byte and real worker/WASM results; the
+same seven E0224 diagnostics match expected files through browser check.
+
+Actual verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 524 passed, 0 failed, 0 ignored, 29 binaries.
+  New sources extend existing fixture loops rather than adding test functions.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all sixteen groups passed in actual
+  Chromium 156.0.8078.4.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for PR #93 passed. At the latest observation, PR
+#94's six native/solver/WASM jobs passed and its two HDL-profile jobs remained
+running. CI for this increment is pending. No new Specman, local all-feature
+or HDL/container run was performed; no IEEE conformance is claimed.
+
+
+## 2026-11-16 — Initialized const fields in coverage schemas
+
+A post-composition pass resolves supported explicitly initialized plain
+integer/string const fields in coverage names, ranges, hit goals and weights.
+Inherited members and qualified static consts use the composed owning type.
+Supported pure field initializers fold to literal AST values for instance and
+static storage too: previously a dependent field initializer executed without
+an owner scope and could fail even when its schema had resolved successfully.
+Reference/initializer spans and option separators are retained. Runtime filter
+options retain their original expressions and scopes.
+
+The evaluator supports integer arithmetic, unary signs, parentheses, string
+concatenation and supported const field dependencies. It shares the existing
+direct-operand arithmetic precision context instead of introducing a separate
+32/64-bit wrapping model. Whole option/range-parameter expressions fold before
+references become literals, preserving typed operand precision. Successful
+field values are memoized; cycles, combined dependency/expression depth beyond
+64, untyped arithmetic overflow and division by zero stop resolution. String
+concatenation and schema names/labels have a 256 KiB value bound. Unsupported
+fields shadowing predefined constants report E0224 instead of silently using
+the predefined value. Explicit widths/aliases, enums, dynamic initializers,
+general defines and broader constant expressions remain incomplete.
+
+Five independent fixtures cover inherited per-unit schemas, forward static
+initialization, named range bounds/widths/goals, group/item weight precedence,
+computed nested source names, runtime/schema value agreement, 32/64-bit
+arithmetic boundaries, escape preservation, cyclic/mutable/sized/dividing
+initializers, predefined-name shadowing and dependency/string-size limits.
+Expected counts and grades are authored independently. The native JSON test
+and actual browser worker/WASM agree on the full inherited coverage payload.
+Browser tests also execute the arithmetic case and compare exact error spans.
+
+Initial compilation corrected AST variant/member-span names and a Clippy
+unnecessary mutable borrow. The first runtime fixture exposed the owner-less
+initializer gap described above; it was fixed rather than replacing dependent
+initializers with literals in the source. The reserved step field spelling was
+changed to bucket_width. The string-size limit's elaboration fixture expects
+E0224; the complete CLI/browser pipeline also reports three existing type
+checker errors for the unfurled unsupported string addition. A separate
+browser expected file records all four diagnostics, verified against the
+native CLI as well. General runtime string addition remains outside this pass.
+
+Actual verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 524 passed, 0 failed, 0 ignored, 29 binaries.
+  New sources extend existing fixture loops.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all seventeen groups passed in actual
+  Chromium 156.0.8078.4, including the dependency and size-limit probes.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for both PR #94 and PR #95 passed. CI for this
+increment is pending. No new Specman, local all-feature or HDL/container run
+was performed; no IEEE conformance is claimed.
+
+
+## 2026-11-16 — Constant alias and sized representations
+
+The initialized-const pass now follows aliases to its supported integer/string
+scalar representations. Known int/uint widths from 1 through 127 and star
+widths participate, including supported constant width expressions. Explicitly
+sized initializers must already fit; this does not add general storage
+narrowing or change the i128 storage model. Cyclic aliases, unresolved widths,
+widths outside the supported range and out-of-range sized values stay
+unresolved and report E0224 when used in a coverage schema.
+
+Runtime direct-operand precision uses the same representation resolver for
+locals/parameters, instance fields and qualified static fields. This fixes
+alias operands that previously selected an untyped arithmetic context and
+static operands that previously supplied no precision context. Coverage
+expression folding and ordinary method arithmetic therefore agree on tested
+32/64-bit wrapping and wide/star-width contexts. Runtime filter execution,
+other expression shapes, enum constants and dynamic initialization retain
+their documented limits.
+
+Two independently authored fixtures exercise chained numeric/string aliases,
+constant width expressions, a signed 8-bit lower bound and unsigned 127-bit
+upper bound, alias method parameters, wide/star-width arithmetic, qualified
+static constants, named ranges/crosses and zero-goal reports. Exact console
+values verify arithmetic without allowing comparison-context casts to mask
+an incorrect stored value. An independent browser JSON expectation checks the
+full coverage payload. Five exact E0224 cases cover cyclic aliases, width 128,
+unsigned overflow/negative initialization and a computed zero width. The
+preceding unsupported-sized fixture now uses a mutable width, since a literal
+8-bit representation has become supported.
+
+Actual verification:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed.
+- `cargo test --all-targets` — 524 passed, 0 failed, 0 ignored, 29 binaries.
+  New sources extend existing fixture loops.
+- `cargo check --target wasm32-unknown-unknown --all-targets` — passed.
+- `node scripts/build_browser.mjs` — passed with the shipped memory limits.
+- With the ignored local PLAYWRIGHT_BROWSERS_PATH cache,
+  `node scripts/test_browser.mjs` — all eighteen groups passed in actual
+  Chromium 156.0.8078.4, including the exact output, report and error checks.
+- `git diff --check` — passed.
+
+All eight push/PR CI jobs for preceding PR #96 passed. CI for this increment
+is pending. No new Specman, local all-feature or HDL/container run was
+performed; no IEEE conformance is claimed.

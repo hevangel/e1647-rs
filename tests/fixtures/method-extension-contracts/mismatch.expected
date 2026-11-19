@@ -1,0 +1,7 @@
+9:5: error[E0225]: extension of method 'f' has a different signature from its declaration (clause 17.2.4)
+10:5: error[E0225]: extension of method 'g' has a different signature from its declaration (clause 17.2.4)
+11:5: error[E0225]: extension of method 'untyped' has a different signature from its declaration (clause 17.2.4)
+12:5: error[E0225]: extension of method 'void_result' has a different signature from its declaration (clause 17.2.4)
+13:12: error[E0225]: extension of method 's' has a different signature from its declaration (clause 17.2.4)
+14:12: error[E0225]: extension of method 'f' has a different signature from its declaration (clause 17.2.4)
+15:5: error[E0225]: extension of method 's' has a different signature from its declaration (clause 17.2.4)

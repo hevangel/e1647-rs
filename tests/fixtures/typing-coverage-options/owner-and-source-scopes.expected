@@ -1,0 +1,4 @@
+6:61: error[E0220]: coverage ignore: a value of kind 'int' cannot be stored into 'bool'
+7:46: error[E0220]: coverage when: a value of kind 'int' cannot be stored into 'bool'
+8:40: error[E0220]: coverage ignore: a value of kind 'int' cannot be stored into 'bool'
+10:43: error[E0220]: coverage illegal: a value of kind 'int' cannot be stored into 'bool'

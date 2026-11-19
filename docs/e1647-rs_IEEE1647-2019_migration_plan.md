@@ -1139,6 +1139,8 @@ Phase 12 — Docs/claims [Sonnet]
 | E0217 | check | (reserved; see E0309) |
 | E0218 | check | illegal keyed-list key |
 | E0219 | check | conflicting inherited interface signatures |
+| E0224 | check/elab | coverage option/range/weight parameters, source-graph order/names/arity/size, scalar/derived effect-predicate scope or per-unit-instance scope (post-migration qualification) |
+| E0225 | elab | definite composed method-extension contract mismatch: arity, explicit annotations or static prefix; omitted annotations inherit (post-migration qualification) |
 | E0304 | elab | static member in `when` subtype |
 | E0305 | elab | static field physical/generated |
 | E0306 | elab | static field of unit-instance type |
@@ -1146,7 +1148,7 @@ Phase 12 — Docs/claims [Sonnet]
 | E0308 | elab | static member added to `global` |
 | E0309 | elab | static method extended outside its struct |
 | E0310 | elab | static event in `when` subtype |
-| E0311 | elab | struct implements interfaces with conflicting signatures |
+| E0311 | check/elab | conflicting implemented-interface signatures or definite mismatch in a present concrete implementation prototype (post-migration qualification) |
 | E0312 | elab | struct assigned to an interface it does not implement |
 | E0313 | elab | template value actual not a constant of the right type |
 | E0314 | elab | template instance violates `conditions` |

@@ -1,0 +1,2 @@
+8:25: error[E0307]: 'child_s::n': 'n' is not a static member declared in 'child_s' (clause 4.17.4)
+9:25: error[E0307]: 'base_s::read': 'read' is not a static member declared in 'base_s' (clause 4.17.4)

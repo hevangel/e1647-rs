@@ -1,0 +1,8 @@
+7:51: error[E0220]: assignment: a value of kind 'string' cannot be stored into 'int'
+9:42: error[E0220]: assignment: a value of kind 'string' cannot be stored into 'int'
+10:32: error[E0220]: assignment: a value of kind 'string' cannot be stored into 'int'
+11:34: error[E0220]: assignment: a value of kind 'string' cannot be stored into 'int'
+13:36: error[E0220]: assignment: a value of kind 'string' cannot be stored into 'int'
+14:41: error[E0220]: assignment: a value of kind 'string' cannot be stored into 'int'
+15:35: error[E0220]: assignment: a value of kind 'string' cannot be stored into 'int'
+16:51: error[E0220]: assignment: a value of kind 'string' cannot be stored into 'int'

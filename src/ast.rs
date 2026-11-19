@@ -532,8 +532,8 @@ pub struct OnDecl {
 /// A `cover <event> is { .. };` coverage group (clause 14.2). The
 /// sampling event is recorded; items, crosses and transitions are
 /// recorded structurally, and every option clause (`using ...`) is kept
-/// as raw tokens — the option semantics (weights, at_least, per_instance)
-/// belong to the coverage data model, a later milestone.
+/// as raw tokens. The coverage model parses supported options with their
+/// original spans; the type pass checks effective Boolean expressions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverGroupDecl {
     pub name: String,
@@ -1455,13 +1455,14 @@ pub struct SelectArm {
 }
 
 /// A temporal expression (clause 12): the grammar behind `expect`/
-/// `assume` members. Structure only — sampling propagation (12.1.4) and
-/// evaluation over paths (12.3) are the temporal engine, a later
-/// milestone.
+/// `assume` members. Sampling propagation (12.1.4) and path evaluation
+/// (12.3) run in the temporal core; the interpreter binds instance event
+/// identities and supplies recorded expression histories.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TemporalExpr {
     /// `@event` — the unary event operator (12.2.5); dotted path, the
-    /// last segment may carry the HDL `$` suffix.
+    /// last segment may carry the HDL `$` suffix. A static event uses
+    /// one type-qualified `Type::event` segment.
     EventRef { path: Vec<String> },
     /// `cycle` (12.2.3).
     Cycle,

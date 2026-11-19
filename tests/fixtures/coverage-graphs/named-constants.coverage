@@ -1,0 +1,10 @@
+derived_u.cg@sys.a samples=4 grade=0.281
+n buckets=2 grade=1.000 samples=4
+0 [0..0] goal=2 hits=2
+1 [1..1] goal=2 hits=2
+pair samples=4 combinations=2 total=Some(4) goal=2 weight=3 grade=Some(0.5)
+pair_history samples=3 combinations=2 total=Some(16) goal=2 weight=3 grade=Some(0.0625)
+(0, FALSE) hits=2
+(1, FALSE) hits=2
+(0, FALSE)→(1, FALSE) hits=2
+(1, FALSE)→(0, FALSE) hits=1

@@ -1,0 +1,6 @@
+5:18: error[E0223]: the comparison compares 'string' with 'int'
+6:18: error[E0223]: the comparison compares 'int' with 'string'
+7:18: error[E0223]: the comparison compares 'string' with 'int'
+8:18: error[E0223]: the comparison compares 'int' with 'string'
+9:18: error[E0223]: the comparison compares 'bool' with 'int'
+10:18: error[E0223]: the comparison compares 'int' with 'string'

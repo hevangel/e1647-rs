@@ -16,3 +16,10 @@ local/
 
 # Local Mimosa security-scanner state
 .mimosa/
+
+# Python qualification-runner bytecode caches
+__pycache__/
+
+# Generated browser artifact and test dependencies/evidence
+/browser/e1647.wasm
+/browser/node_modules/
