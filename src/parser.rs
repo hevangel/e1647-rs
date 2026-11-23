@@ -3830,7 +3830,8 @@ impl Parser {
             } else if self.at_punct("(") {
                 self.bump();
                 let mut args = Vec::new();
-                let config_call = matches!(&expr, Expr::Ident { name, .. } if name == "set_config");
+                let config_call = matches!(&expr, Expr::Ident { name, .. }
+                    if matches!(name.as_str(), "set_config" | "set_config_max"));
                 if !self.at_punct(")") {
                     loop {
                         if config_call && (args.is_empty() || args.len() % 2 == 1) {
@@ -6066,4 +6067,13 @@ pub(crate) fn parse_expression_tokens(
             eof,
         )
     })
+}
+
+/// Recover the element type carried by a runtime list.
+pub(crate) fn parse_type_text(source: &str) -> Option<TypeExpr> {
+    let tokens = lexer::tokenize(source).ok()?;
+    let eof = tokens.last()?.end;
+    let mut parser = Parser::new(tokens, eof);
+    let ty = parser.parse_type()?;
+    (parser.peek().is_none() && parser.diagnostics.is_empty()).then_some(ty)
 }

@@ -1,7 +1,7 @@
 //! Conservative, total-result interval proofs for coverage predicates.
 //! Unknown results retain ordinary evaluation and bounded domain splitting.
 
-use super::{bare_item, uses_item};
+use super::{bare_item, real_from_ordinal, real_ordinal, uses_item};
 use crate::{
     ast::{BinaryOp, Expr, InSetExpr, UnaryOp},
     diagnostic::Diagnostic,
@@ -12,7 +12,13 @@ use std::collections::BTreeMap;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ScalarDomain {
     Int(i128, i128),
+    Real(i128, i128),
     Bool(Option<bool>),
+    /// The proof engine evaluates singleton enumerals through the
+    /// interpreter, and splits wider regions instead of doing arithmetic.
+    Enumeral {
+        fixed: bool,
+    },
 }
 
 impl ScalarDomain {
@@ -25,6 +31,10 @@ impl ScalarDomain {
             } else {
                 None
             })
+        } else if matches!(prototype, Value::Real(_)) {
+            Self::Real(lo, hi)
+        } else if matches!(prototype, Value::Enum { .. }) {
+            Self::Enumeral { fixed: lo == hi }
         } else {
             Self::Int(lo, hi)
         }
@@ -33,13 +43,16 @@ impl ScalarDomain {
     fn fixed(self) -> bool {
         match self {
             Self::Int(lo, hi) => lo == hi,
+            Self::Real(lo, hi) => lo == hi,
             Self::Bool(value) => value.is_some(),
+            Self::Enumeral { fixed } => fixed,
         }
     }
 
     fn join(self, other: Self) -> Option<Self> {
         match (self, other) {
             (Self::Int(a, b), Self::Int(c, d)) => Some(Self::Int(a.min(c), b.max(d))),
+            (Self::Real(a, b), Self::Real(c, d)) => Some(Self::Real(a.min(c), b.max(d))),
             (Self::Bool(a), Self::Bool(b)) => Some(Self::Bool(if a == b { a } else { None })),
             _ => None,
         }
@@ -66,7 +79,7 @@ fn domain(
     domains: &BTreeMap<String, ScalarDomain>,
     evaluate: &mut ConstantEval<'_>,
 ) -> Result<Option<ScalarDomain>, Diagnostic> {
-    use ScalarDomain::{Bool, Int};
+    use ScalarDomain::{Bool, Int, Real};
     // This also resolves arbitrary supported pure expressions on singleton
     // inputs using the actual interpreter, preserving its operand semantics.
     if domains
@@ -76,6 +89,10 @@ fn domain(
         return Ok(match evaluate(expr)? {
             Value::Bool(value) => Some(Bool(Some(value))),
             Value::Int(value) => Some(Int(value, value)),
+            Value::Real(value) if value.is_finite() => {
+                let ordinal = real_ordinal(value);
+                Some(Real(ordinal, ordinal))
+            }
             _ => None,
         });
     }
@@ -84,7 +101,8 @@ fn domain(
         Expr::Paren { expr, .. } => domain(expr, domains, evaluate)?,
         Expr::Unary { op, expr, .. } => match (op, domain(expr, domains, evaluate)?) {
             (UnaryOp::Not, Some(Bool(value))) => Some(Bool(value.map(|value| !value))),
-            (UnaryOp::Plus, Some(value @ Int(..))) => Some(value),
+            (UnaryOp::Plus, Some(value @ (Int(..) | Real(..)))) => Some(value),
+            (UnaryOp::Negate, Some(Real(lo, hi))) => Some(Real(-hi - 1, -lo - 1)),
             (UnaryOp::Negate, Some(Int(lo, hi))) => hi
                 .checked_neg()
                 .zip(lo.checked_neg())
@@ -221,7 +239,22 @@ fn compare(
     same: bool,
 ) -> Option<Option<bool>> {
     use BinaryOp::*;
-    use ScalarDomain::{Bool, Int};
+    use ScalarDomain::{Bool, Int, Real};
+    if matches!(left, Real(..)) || matches!(right, Real(..)) {
+        let comparison_ordinal = |ordinal| {
+            if ordinal == real_ordinal(-0.0) {
+                0
+            } else {
+                ordinal
+            }
+        };
+        let ordinal_interval = |domain| match domain {
+            Real(lo, hi) => Some(Int(comparison_ordinal(lo), comparison_ordinal(hi))),
+            Int(lo, hi) => Some(Int(real_ordinal(lo as f64), real_ordinal(hi as f64))),
+            _ => None,
+        };
+        return compare(op, ordinal_interval(left)?, ordinal_interval(right)?, same);
+    }
     let value = match (left, right) {
         (Int(a, b), Int(c, d)) => {
             if same {
@@ -256,7 +289,10 @@ fn compare(
 }
 
 fn arithmetic(op: BinaryOp, left: ScalarDomain, right: ScalarDomain) -> Option<ScalarDomain> {
-    use ScalarDomain::Int;
+    use ScalarDomain::{Int, Real};
+    if matches!(left, Real(..)) || matches!(right, Real(..)) {
+        return real_arithmetic(op, left, right);
+    }
     let (Int(a, b), Int(c, d)) = (left, right) else {
         return None;
     };
@@ -285,4 +321,53 @@ fn arithmetic(op: BinaryOp, left: ScalarDomain, right: ScalarDomain) -> Option<S
         _ => return None,
     };
     Some(Int(lo, hi))
+}
+
+/// Bound finite binary64 arithmetic by evaluating the monotone corners.
+/// Crossing zero in a divisor can introduce nonfinite values.
+fn real_arithmetic(op: BinaryOp, left: ScalarDomain, right: ScalarDomain) -> Option<ScalarDomain> {
+    let endpoints = |domain| match domain {
+        ScalarDomain::Real(lo, hi) => Some((real_from_ordinal(lo), real_from_ordinal(hi))),
+        ScalarDomain::Int(lo, hi) => Some((lo as f64, hi as f64)),
+        _ => None,
+    };
+    let ((a, b), (c, d)) = (endpoints(left)?, endpoints(right)?);
+    let (lo, hi) = match op {
+        BinaryOp::Add => (a + c, b + d),
+        BinaryOp::Sub => (a - d, b - c),
+        BinaryOp::Mul | BinaryOp::Div => {
+            if op == BinaryOp::Div && c <= 0.0 && d >= 0.0 {
+                return None;
+            }
+            let operation = |lhs, rhs| {
+                if op == BinaryOp::Mul {
+                    lhs * rhs
+                } else {
+                    lhs / rhs
+                }
+            };
+            let values = [
+                operation(a, c),
+                operation(a, d),
+                operation(b, c),
+                operation(b, d),
+            ];
+            if values.iter().any(|value| !value.is_finite()) {
+                return None;
+            }
+            (
+                values.into_iter().fold(f64::INFINITY, f64::min),
+                values.into_iter().fold(f64::NEG_INFINITY, f64::max),
+            )
+        }
+        _ => return None,
+    };
+    if !(lo.is_finite() && hi.is_finite()) {
+        return None;
+    }
+    // Results at numeric zero may have either sign.
+    Some(ScalarDomain::Real(
+        real_ordinal(if lo == 0.0 { -0.0 } else { lo }),
+        real_ordinal(if hi == 0.0 { 0.0 } else { hi }),
+    ))
 }

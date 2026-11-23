@@ -1,0 +1,5 @@
+sys.cg samples=4 grade=0.875
+n buckets=2 grade=1.000
+-0.5..0.25 [-0.5..0.25] goal=1 hits=2
+peak [1.5..1.5] goal=2 hits=2
+transition__n samples=3 combinations=3

@@ -143,17 +143,22 @@ pub(crate) fn eval_const_expr(
         return None;
     }
     match expr {
-        Expr::IntLiteral { text, .. } => crate::interp::parse_int_literal(text).map(Const::Int),
+        Expr::IntLiteral { text, .. } | Expr::BitLiteral { text, .. } => {
+            crate::interp::parse_int_literal(text).map(Const::Int)
+        }
         Expr::RealLiteral { text, .. } => text.parse::<f64>().ok().map(Const::Real),
         Expr::BoolLiteral { value, .. } => Some(Const::Bool(*value)),
         Expr::StringLiteral { value, .. } => Some(Const::Str(value.clone())),
         Expr::Formal { name, .. } => eval_const_expr(values.get(name)?, values, defines, depth + 1),
-        Expr::Ident { name, .. } => eval_const_expr(defines.get(name)?, values, defines, depth + 1),
+        Expr::Ident { name, .. } => match defines.get(name) {
+            Some(expr) => eval_const_expr(expr, values, defines, depth + 1),
+            None => crate::interp::predefined_constant(name).map(Const::Int),
+        },
         Expr::Paren { expr, .. } => eval_const_expr(expr, values, defines, depth + 1),
         Expr::Unary { op, expr, .. } => {
             let inner = eval_const_expr(expr, values, defines, depth + 1)?;
             match (op, inner) {
-                (crate::ast::UnaryOp::Negate, Const::Int(v)) => Some(Const::Int(-v)),
+                (crate::ast::UnaryOp::Negate, Const::Int(v)) => v.checked_neg().map(Const::Int),
                 (crate::ast::UnaryOp::Negate, Const::Real(v)) => Some(Const::Real(-v)),
                 (crate::ast::UnaryOp::Plus, inner) => Some(inner),
                 (crate::ast::UnaryOp::Not, Const::Bool(v)) => Some(Const::Bool(!v)),
@@ -624,6 +629,9 @@ pub struct Elaborated {
     /// In declaration order; `extend` blocks are folded into their targets
     /// and do not appear separately.
     pub types: Vec<ElaboratedType>,
+    /// Declared integer subtype intervals for reflection. An entry without
+    /// bounds denotes a range that could not be evaluated as integer constants.
+    pub subtype_ranges: BTreeMap<String, Option<(i128, i128)>>,
     /// `define` constants by name (literal values only).
     pub defines: BTreeMap<String, crate::ast::Expr>,
     /// Sequence declarations recovered from the parser's synthesized
@@ -845,6 +853,20 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
     // constant expression (8.5.2's actuals, 8.5.3's conditions and
     // 8.5.4's defaults) may reference, shared by every stage below.
     let defines = collect_defines(declarations);
+    let subtype_ranges = declarations
+        .iter()
+        .filter_map(|declaration| {
+            let (low, high) = declaration.subtype_range.as_ref()?;
+            let evaluate_bound = |expr| match eval_const_expr(expr, &BTreeMap::new(), &defines, 0) {
+                Some(Const::Int(value)) => Some(value),
+                _ => None,
+            };
+            Some((
+                declaration.name.clone(),
+                evaluate_bound(low).zip(evaluate_bound(high)),
+            ))
+        })
+        .collect();
     // The monomorphization worklist (8.3), seeded by the composed
     // declarations' `implementing` entries and grown by the
     // substitution passes.
@@ -1537,6 +1559,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
     let mut result = Elaborated {
         method_layers,
         types,
+        subtype_ranges,
         defines,
         sequences,
         diagnostics: elaborator.diagnostics,

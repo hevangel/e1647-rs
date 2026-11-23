@@ -115,6 +115,20 @@ expression with `it` bound to each item. Filtering preserves order and
 returns a fresh list; implicit index bindings remain unsupported.
 `and_all` and `or_all` also accept an expression and reduce its Boolean
 results across the list.
+`first`, `last` and their index forms stop at the first match in the
+search direction. A search with no match reports `E0402`.
+`all_different` checks for duplicate items or expression keys.
+`unique()` and `unique(expr)` return the first original item for each
+distinct value or key in a fresh list.
+`sort()` and `sort(expr)` return stable sorted copies for comparable
+integer, real, or string keys of one kind.
+`sort_by_field(field)` sorts struct items by a named scalar field.
+`get_indices(indexes)` returns a fresh list in index order, including duplicates.
+`resize(size)` changes a list in place, keeping its prefix and filling
+new slots with the element type's defaults. An optional second argument
+supplies an expression evaluated for each new slot. Pass `FALSE` as the
+third argument to replace the entire list, and use `UNDEF` as the second
+argument to select typed defaults. One call can fill up to 65536 slots.
 
 Coverage starts disabled. Enable it in a `sys.setup()` extension:
 
@@ -130,15 +144,25 @@ extend sys {
 without clearing counts; `count_only` also collects counts. Boolean
 values can enable or disable collection. The bucket limit accepts
 0–65536 and can change before the first sampling event. Other
-configuration categories/options and `set_config_max` remain unsupported.
+configuration categories/options remain unsupported.
 `set_config(cover, at_least, N)` sets the default hit goal before sampling.
+`set_config_max(cover, ...)` raises `max_int_buckets` and `at_least`
+before sampling and accepts a lower or equal request as a no-op.
 Range goals override item goals, which override group/global defaults.
 Integral ranges support a bucket width and per-range goal, for example
 `range([0..9], "", 3, 2)` creates buckets 0–2, 3–5, 6–8 and 9, each
 with goal 2. A named range uses `UNDEF` for its width. Zero-goal buckets
 retain counts but do not contribute to bucket grades or show holes.
-Explicit range construction is limited to 65536 buckets per item;
-real/enumeral bounds and general constant/type resolution remain gaps.
+Explicit range construction is limited to 65536 buckets per item.
+Enumeral ranges use declaration order, including aliases and inline
+field types. Real items accept finite constant bounds and positive
+widths, including supported arithmetic over initialized const fields.
+Subdivided intervals are upper-exclusive until the
+last bucket, which includes the range endpoint. Basic real bucket
+masks support comparisons, Boolean combinations, and bounded interval
+classification of real arithmetic. Cross and transition masks use the
+same arithmetic proofs on direct sources. Wider unresolved predicates
+and general constant/type resolution remain gaps.
 Run the independently authored example with
 `cargo run -- run examples/coverage_config.e --seed 1 --coverage`.
 The range example is `examples/coverage_ranges.e`.

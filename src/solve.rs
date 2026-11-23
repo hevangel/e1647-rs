@@ -11,6 +11,9 @@
 //! multiplication of two non-constant sides no longer gives up — a
 //! polynomial ([`BoolNode::Poly`]): the product expands into monomials
 //! (total degree capped at 4).
+//! Bounded integer quotient comparisons with nonzero literal divisors
+//! translate to inclusive ranges. Remainder equalities translate to
+//! bounded disjunctions of matching values or a single congruence.
 //!
 //! Two solving paths sit behind [`solve`]:
 //! - **Linear problems** go to the backend conjunction solver: each `Any`
@@ -90,6 +93,13 @@ pub struct Polynomial {
 pub enum BoolNode {
     Atom(Linear),
     Poly(Polynomial),
+    /// Compare a bounded field's remainder to a fixed value.
+    Remainder {
+        field: String,
+        divisor: i64,
+        remainder: i64,
+        cmp: Cmp,
+    },
     All(Vec<BoolNode>),
     Any(Vec<BoolNode>),
 }
@@ -99,7 +109,7 @@ impl BoolNode {
     fn has_polynomial(&self) -> bool {
         match self {
             BoolNode::Poly(_) => true,
-            BoolNode::Atom(_) => false,
+            BoolNode::Atom(_) | BoolNode::Remainder { .. } => false,
             BoolNode::All(children) | BoolNode::Any(children) => {
                 children.iter().any(BoolNode::has_polynomial)
             }
@@ -136,9 +146,8 @@ pub enum SolveOutcome {
     Unsupported,
 }
 
-/// Declared bounds of an integer scalar type, capped to the solver's i32
-/// domain (`uint` defaults to 31 bits here; arithmetic is not truncated,
-/// only the randomization domain is).
+/// Integer bounds for the solver. Unsized int/uint use the solver's
+/// 31-bit default; explicitly wider fields use the runtime sampler.
 pub fn int_bounds(ty: &crate::ast::TypeExpr) -> Option<(i64, i64)> {
     use crate::ast::{ScalarBase, TypeExpr};
     let TypeExpr::Scalar { base, width, .. } = ty else {
@@ -148,14 +157,18 @@ pub fn int_bounds(ty: &crate::ast::TypeExpr) -> Option<(i64, i64)> {
         Expr::IntLiteral { text, .. } => crate::interp::parse_int_literal(text),
         _ => None,
     });
-    let bits = width_literal.map(|v| v.clamp(1, 31) as u32);
+    let solver_width = || match width_literal {
+        Some(width) if width > 31 => None,
+        Some(width) => Some(width.max(1) as u32),
+        None => Some(31),
+    };
     match base {
         ScalarBase::Uint => {
-            let bits = bits.unwrap_or(31);
+            let bits = solver_width()?;
             Some((0, (1i64 << bits) - 1))
         }
         ScalarBase::Int => {
-            let bits = bits.unwrap_or(31);
+            let bits = solver_width()?;
             Some((-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1))
         }
         // The long bases are 64-bit wide (Table 17, clause 5.2.3.1);
@@ -285,6 +298,29 @@ fn translate_comparison(
     expr: &Expr,
     bounds: &BTreeMap<String, (i64, i64)>,
 ) -> Result<BoolNode, TranslationError> {
+    use crate::ast::BinaryOp;
+
+    if let Expr::Binary { op, lhs, rhs, .. } = expr {
+        let comparison = match op {
+            BinaryOp::Eq => Some(Cmp::Eq),
+            BinaryOp::NotEq => Some(Cmp::Ne),
+            BinaryOp::Lt => Some(Cmp::Lt),
+            BinaryOp::Le => Some(Cmp::Le),
+            BinaryOp::Gt => Some(Cmp::Gt),
+            BinaryOp::Ge => Some(Cmp::Ge),
+            _ => None,
+        };
+        if let Some(direct) = comparison
+            && let Some(node) = division_comparison(lhs, rhs, direct, bounds)
+                .or_else(|| division_comparison(rhs, lhs, reverse_cmp(direct), bounds))
+        {
+            return if direct == Cmp::Ne {
+                negate_node(node)
+            } else {
+                Ok(node)
+            };
+        }
+    }
     match translate_atom(expr, bounds) {
         Ok(linear) => Ok(BoolNode::Atom(linear)),
         Err(atom_error) => match polynomial_comparison(expr, bounds) {
@@ -292,6 +328,179 @@ fn translate_comparison(
             Err(_) => Err(atom_error),
         },
     }
+}
+
+/// Restrict operands to signed 32-bit values so that the interpreter's
+/// integer precision cannot alter them.
+fn division_comparison(
+    mut operation: &Expr,
+    result: &Expr,
+    mut cmp: Cmp,
+    bounds: &BTreeMap<String, (i64, i64)>,
+) -> Option<BoolNode> {
+    use crate::ast::BinaryOp;
+
+    while let Expr::Paren { expr, .. } = operation {
+        operation = expr;
+    }
+    let Expr::Binary { op, lhs, rhs, .. } = operation else {
+        return None;
+    };
+    if !matches!(op, BinaryOp::Div | BinaryOp::Mod) {
+        return None;
+    }
+    let Expr::Ident { name, .. } = lhs.as_ref() else {
+        return None;
+    };
+    let &(lower, upper) = bounds.get(name)?;
+    let mut divisor = signed_decimal(rhs)?;
+    let mut result = signed_decimal(result)?;
+    let limit = i64::from(i32::MAX);
+    if lower < i64::from(i32::MIN)
+        || upper > limit
+        || !(-limit..=limit).contains(&divisor)
+        || divisor == 0
+        || i32::try_from(result).is_err()
+        || (lower >= 0 && (divisor < 0 || result < 0))
+        || (*op == BinaryOp::Div && lower == i64::from(i32::MIN) && divisor == -1)
+    {
+        return None;
+    }
+    if divisor < 0 {
+        divisor = -divisor;
+        if *op == BinaryOp::Div {
+            result = -result;
+            cmp = reverse_cmp(cmp);
+        }
+    }
+    let atom = |cmp, rhs| {
+        BoolNode::Atom(Linear {
+            terms: vec![(name.clone(), 1)],
+            rhs,
+            cmp,
+        })
+    };
+    if *op == BinaryOp::Mod {
+        if lower < 0 {
+            let comparison = if cmp == Cmp::Ne { Cmp::Eq } else { cmp };
+            let (low, high) = remainder_bounds(
+                comparison,
+                result,
+                lower.max(1 - divisor),
+                upper.max(0).min(divisor - 1),
+            );
+            if low > high {
+                return Some(BoolNode::Any(Vec::new()));
+            }
+            return Some(BoolNode::Remainder {
+                field: name.clone(),
+                divisor,
+                remainder: result,
+                cmp: comparison,
+            });
+        }
+        if !matches!(cmp, Cmp::Eq | Cmp::Ne) {
+            let max_remainder = (divisor - 1).min(upper);
+            let (low, high) = remainder_bounds(cmp, result, 0, max_remainder);
+            if low > high {
+                return Some(BoolNode::Any(Vec::new()));
+            }
+            if low == 0 && high == max_remainder {
+                return Some(BoolNode::All(Vec::new()));
+            }
+            return Some(BoolNode::Remainder {
+                field: name.clone(),
+                divisor,
+                remainder: result,
+                cmp,
+            });
+        }
+        if result >= divisor {
+            return Some(BoolNode::Any(Vec::new()));
+        }
+        let first = lower + (result - lower).rem_euclid(divisor);
+        if first > upper {
+            return Some(BoolNode::Any(Vec::new()));
+        }
+        let count = (upper - first) / divisor + 1;
+        if count > MAX_BRANCH_COMBINATIONS as i64 {
+            return Some(BoolNode::Remainder {
+                field: name.clone(),
+                divisor,
+                remainder: result,
+                cmp: Cmp::Eq,
+            });
+        }
+        return Some(BoolNode::Any(
+            (0..count)
+                .map(|offset| atom(Cmp::Eq, first + offset * divisor))
+                .collect(),
+        ));
+    }
+    // Truncation toward zero extends the preimage away from zero.
+    // Quotient zero includes both sides of zero.
+    let product = result * divisor;
+    let start = if result <= 0 {
+        product - divisor + 1
+    } else {
+        product
+    };
+    let end = if result >= 0 {
+        product + divisor - 1
+    } else {
+        product
+    };
+    let (low, high) = match cmp {
+        Cmp::Eq | Cmp::Ne => (start.max(lower), end.min(upper)),
+        Cmp::Lt => (lower, (start - 1).min(upper)),
+        Cmp::Le => (lower, end.min(upper)),
+        Cmp::Gt => (lower.max(end + 1), upper),
+        Cmp::Ge => (lower.max(start), upper),
+    };
+    if low > high || high < lower {
+        return Some(BoolNode::Any(Vec::new()));
+    }
+    Some(BoolNode::All(vec![atom(Cmp::Ge, low), atom(Cmp::Le, high)]))
+}
+
+fn signed_decimal(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::IntLiteral { text, .. } => {
+            i64::try_from(crate::interp::parse_int_literal(text)?).ok()
+        }
+        Expr::Paren { expr, .. } => signed_decimal(expr),
+        Expr::Unary {
+            op: crate::ast::UnaryOp::Negate,
+            expr,
+            ..
+        } => signed_decimal(expr)?.checked_neg(),
+        _ => None,
+    }
+}
+
+fn reverse_cmp(cmp: Cmp) -> Cmp {
+    match cmp {
+        Cmp::Eq | Cmp::Ne => cmp,
+        Cmp::Lt => Cmp::Gt,
+        Cmp::Le => Cmp::Ge,
+        Cmp::Gt => Cmp::Lt,
+        Cmp::Ge => Cmp::Le,
+    }
+}
+
+/// Restrict an ordered comparison to the possible residual interval.
+fn remainder_bounds(cmp: Cmp, value: i64, minimum: i64, maximum: i64) -> (i64, i64) {
+    let low = match cmp {
+        Cmp::Eq | Cmp::Ge => minimum.max(value),
+        Cmp::Gt => minimum.max(value + 1),
+        _ => minimum,
+    };
+    let high = match cmp {
+        Cmp::Eq | Cmp::Le => maximum.min(value),
+        Cmp::Lt => maximum.min(value - 1),
+        _ => maximum,
+    };
+    (low, high)
 }
 
 /// Negate one translated boolean tree: every comparison flips
@@ -306,6 +515,17 @@ fn negate_node(node: BoolNode) -> Result<BoolNode, TranslationError> {
             cmp: flip_cmp(polynomial.cmp),
             ..polynomial
         })),
+        BoolNode::Remainder {
+            field,
+            divisor,
+            remainder,
+            cmp,
+        } => Ok(BoolNode::Remainder {
+            field,
+            divisor,
+            remainder,
+            cmp: flip_cmp(cmp),
+        }),
         BoolNode::All(children) => {
             let negated = children
                 .into_iter()
@@ -369,12 +589,10 @@ fn linear_comparison(
     let left = affine_of(lhs, bounds)?;
     let right = affine_of(rhs, bounds)?;
     // l (cmp) r  ⟺  Σ (l.terms - r.terms) (cmp) r.constant - l.constant
-    let mut merged: BTreeMap<String, i64> = BTreeMap::new();
-    for (name, coefficient) in left.terms {
-        *merged.entry(name).or_insert(0) += coefficient;
-    }
+    let mut merged = left.terms;
     for (name, coefficient) in right.terms {
-        *merged.entry(name).or_insert(0) -= coefficient;
+        let slot = merged.entry(name).or_insert(0);
+        *slot = slot.checked_sub(coefficient).ok_or(IR_INTEGER_OVERFLOW)?;
     }
     let terms: Vec<(String, i64)> = merged
         .into_iter()
@@ -382,7 +600,10 @@ fn linear_comparison(
         .collect();
     Ok(Linear {
         terms,
-        rhs: right.constant - left.constant,
+        rhs: right
+            .constant
+            .checked_sub(left.constant)
+            .ok_or(IR_INTEGER_OVERFLOW)?,
         cmp,
     })
 }
@@ -419,12 +640,10 @@ fn polynomial_comparison(
     let left = poly_of(lhs, bounds)?;
     let right = poly_of(rhs, bounds)?;
     // l (cmp) r  ⟺  Σ (l.terms - r.terms) (cmp) r.constant - l.constant
-    let mut merged: BTreeMap<BTreeMap<String, u32>, i64> = BTreeMap::new();
-    for (monomial, coefficient) in &left.terms {
-        *merged.entry(monomial.clone()).or_insert(0) += *coefficient;
-    }
-    for (monomial, coefficient) in &right.terms {
-        *merged.entry(monomial.clone()).or_insert(0) -= *coefficient;
+    let mut merged = left.terms;
+    for (monomial, coefficient) in right.terms {
+        let slot = merged.entry(monomial).or_insert(0);
+        *slot = slot.checked_sub(coefficient).ok_or(IR_INTEGER_OVERFLOW)?;
     }
     let terms: Vec<(BTreeMap<String, u32>, i64)> = merged
         .into_iter()
@@ -432,7 +651,10 @@ fn polynomial_comparison(
         .collect();
     let polynomial = Polynomial {
         terms,
-        rhs: right.constant - left.constant,
+        rhs: right
+            .constant
+            .checked_sub(left.constant)
+            .ok_or(IR_INTEGER_OVERFLOW)?,
         cmp,
     };
     check_magnitude(&polynomial, bounds)?;
@@ -573,7 +795,8 @@ impl PolyExpr {
                 let coefficient = left_coefficient.checked_mul(*right_coefficient).ok_or(
                     TranslationError::Unsupported("polynomial coefficient overflow"),
                 )?;
-                *result.terms.entry(monomial).or_insert(0) += coefficient;
+                let slot = result.terms.entry(monomial).or_insert(0);
+                *slot = slot.checked_add(coefficient).ok_or(IR_INTEGER_OVERFLOW)?;
             }
             // left-term × right-constant
             let scaled = left_coefficient.checked_mul(other.constant).ok_or(
@@ -581,7 +804,8 @@ impl PolyExpr {
             )?;
             if scaled != 0 {
                 let monomial = left_monomial.clone();
-                *result.terms.entry(monomial).or_insert(0) += scaled;
+                let slot = result.terms.entry(monomial).or_insert(0);
+                *slot = slot.checked_add(scaled).ok_or(IR_INTEGER_OVERFLOW)?;
             }
         }
         // left-constant × right-terms
@@ -591,7 +815,8 @@ impl PolyExpr {
                     TranslationError::Unsupported("polynomial coefficient overflow"),
                 )?;
                 let monomial = right_monomial.clone();
-                *result.terms.entry(monomial).or_insert(0) += scaled;
+                let slot = result.terms.entry(monomial).or_insert(0);
+                *slot = slot.checked_add(scaled).ok_or(IR_INTEGER_OVERFLOW)?;
             }
         }
         result.constant =
@@ -639,7 +864,11 @@ fn poly_of(
             op: crate::ast::UnaryOp::Negate,
             expr,
             ..
-        } => Ok(poly_of(expr, bounds)?.negated()),
+        } => {
+            let mut result = PolyExpr::constant(0);
+            result.subtract(&poly_of(expr, bounds)?)?;
+            Ok(result)
+        }
         Expr::Unary {
             op: crate::ast::UnaryOp::Plus,
             expr,
@@ -677,18 +906,8 @@ fn poly_of(
     }
 }
 
-impl PolyExpr {
-    fn negated(self) -> Self {
-        let mut terms = BTreeMap::new();
-        for (monomial, coefficient) in self.terms {
-            terms.insert(monomial, -coefficient);
-        }
-        Self {
-            terms,
-            constant: -self.constant,
-        }
-    }
-}
+const IR_INTEGER_OVERFLOW: TranslationError =
+    TranslationError::Unsupported("solver coefficient or constant out of range");
 
 /// An affine expression `Σ (coefficient · variable) + constant` over the
 /// problem variables.
@@ -712,31 +931,39 @@ impl Affine {
         Self { terms, constant: 0 }
     }
 
-    fn add(mut self, other: &Affine) -> Self {
+    fn add(mut self, other: &Affine) -> Result<Self, TranslationError> {
         for (name, coefficient) in &other.terms {
-            *self.terms.entry(name.clone()).or_insert(0) += coefficient;
+            let slot = self.terms.entry(name.clone()).or_insert(0);
+            *slot = slot.checked_add(*coefficient).ok_or(IR_INTEGER_OVERFLOW)?;
         }
-        self.constant += other.constant;
-        self
+        self.constant = self
+            .constant
+            .checked_add(other.constant)
+            .ok_or(IR_INTEGER_OVERFLOW)?;
+        Ok(self)
     }
 
-    fn subtract(mut self, other: &Affine) -> Self {
+    fn subtract(mut self, other: &Affine) -> Result<Self, TranslationError> {
         for (name, coefficient) in &other.terms {
-            *self.terms.entry(name.clone()).or_insert(0) -= coefficient;
+            let slot = self.terms.entry(name.clone()).or_insert(0);
+            *slot = slot.checked_sub(*coefficient).ok_or(IR_INTEGER_OVERFLOW)?;
         }
-        self.constant -= other.constant;
-        self
+        self.constant = self
+            .constant
+            .checked_sub(other.constant)
+            .ok_or(IR_INTEGER_OVERFLOW)?;
+        Ok(self)
     }
 
-    fn scale(self, factor: i64) -> Self {
-        Self {
-            terms: self
-                .terms
-                .into_iter()
-                .map(|(name, coefficient)| (name, coefficient * factor))
-                .collect(),
-            constant: self.constant * factor,
+    fn scale(mut self, factor: i64) -> Result<Self, TranslationError> {
+        for coefficient in self.terms.values_mut() {
+            *coefficient = coefficient.checked_mul(factor).ok_or(IR_INTEGER_OVERFLOW)?;
         }
+        self.constant = self
+            .constant
+            .checked_mul(factor)
+            .ok_or(IR_INTEGER_OVERFLOW)?;
+        Ok(self)
     }
 }
 
@@ -773,7 +1000,7 @@ fn affine_of(
             op: crate::ast::UnaryOp::Negate,
             expr,
             ..
-        } => Ok(affine_of(expr, bounds)?.scale(-1)),
+        } => affine_of(expr, bounds)?.scale(-1),
         Expr::Unary {
             op: crate::ast::UnaryOp::Plus,
             expr,
@@ -784,13 +1011,13 @@ fn affine_of(
             lhs,
             rhs,
             ..
-        } => Ok(affine_of(lhs, bounds)?.add(&affine_of(rhs, bounds)?)),
+        } => affine_of(lhs, bounds)?.add(&affine_of(rhs, bounds)?),
         Expr::Binary {
             op: crate::ast::BinaryOp::Sub,
             lhs,
             rhs,
             ..
-        } => Ok(affine_of(lhs, bounds)?.subtract(&affine_of(rhs, bounds)?)),
+        } => affine_of(lhs, bounds)?.subtract(&affine_of(rhs, bounds)?),
         Expr::Binary {
             op: crate::ast::BinaryOp::Mul,
             lhs,
@@ -801,9 +1028,9 @@ fn affine_of(
             let right = affine_of(rhs, bounds)?;
             // Only literal × affine stays linear.
             if left.terms.is_empty() {
-                Ok(right.scale(left.constant))
+                right.scale(left.constant)
             } else if right.terms.is_empty() {
-                Ok(left.scale(right.constant))
+                left.scale(right.constant)
             } else {
                 Err(TranslationError::Unsupported(
                     "non-linear multiplication in constraint",
@@ -844,22 +1071,9 @@ pub fn solve(problem: &Problem, seed: u64) -> SolveOutcome {
     if problem.constraints.iter().any(BoolNode::has_polynomial) {
         return solve_by_enumeration(problem, seed);
     }
-    let mut combos: Vec<Vec<BoolNode>> = vec![Vec::new()];
-    for constraint in &problem.constraints {
-        let alternatives = branch_alternatives(constraint);
-        let mut next = Vec::with_capacity(combos.len() * alternatives.len());
-        for combo in &combos {
-            for alternative in &alternatives {
-                let mut expanded = combo.clone();
-                expanded.extend(alternative.iter().cloned());
-                next.push(expanded);
-            }
-        }
-        combos = next;
-        if combos.len() > MAX_BRANCH_COMBINATIONS {
-            return SolveOutcome::Unsupported;
-        }
-    }
+    let Some(combos) = conjunction_alternatives(&problem.constraints) else {
+        return SolveOutcome::Unsupported;
+    };
     let mut satisfying: Vec<Vec<i128>> = Vec::new();
     let mut any_unsupported = false;
     for combo in &combos {
@@ -874,7 +1088,7 @@ pub fn solve(problem: &Problem, seed: u64) -> SolveOutcome {
         }
     }
     if !satisfying.is_empty() {
-        let values = &satisfying[seed as usize % satisfying.len()];
+        let values = &satisfying[(seed % satisfying.len() as u64) as usize];
         return SolveOutcome::Solved(values.clone());
     }
     if any_unsupported {
@@ -894,7 +1108,10 @@ pub fn solve(problem: &Problem, seed: u64) -> SolveOutcome {
 fn solve_by_enumeration(problem: &Problem, seed: u64) -> SolveOutcome {
     let mut domain_product: u128 = 1;
     for var in &problem.vars {
-        let size = (var.upper - var.lower + 1) as u128;
+        if var.lower > var.upper {
+            return SolveOutcome::Unsat;
+        }
+        let size = (i128::from(var.upper) - i128::from(var.lower) + 1) as u128;
         domain_product = domain_product.saturating_mul(size);
         if domain_product > MAX_ENUMERATION_STATES {
             return SolveOutcome::Unsupported;
@@ -947,6 +1164,7 @@ fn enumerate_solutions(problem: &Problem, visit: &mut dyn FnMut(usize, &[i128]) 
     );
 }
 
+/// Return true when the visitor requests an early stop.
 fn walk(
     depth: usize,
     vars: &[BoundedInt],
@@ -967,7 +1185,7 @@ fn walk(
             let index = *count;
             *count += 1;
             let snapshot: Vec<i128> = assignment.iter().map(|value| i128::from(*value)).collect();
-            return visit(index, &snapshot);
+            return !visit(index, &snapshot);
         }
         return false;
     };
@@ -1060,6 +1278,18 @@ fn eval_partial_node(node: &BoolNode, map: &BTreeMap<&str, i128>) -> PartialEval
             Some(value) => holds(polynomial.cmp, value),
             None => PartialEval::Unknown,
         },
+        BoolNode::Remainder {
+            field,
+            divisor,
+            remainder,
+            cmp,
+        } => match map
+            .get(field.as_str())
+            .and_then(|value| value.checked_rem(i128::from(*divisor)))
+        {
+            Some(value) => holds(*cmp, value - i128::from(*remainder)),
+            None => PartialEval::Unknown,
+        },
     }
 }
 
@@ -1087,7 +1317,7 @@ fn bool_eval(value: bool) -> PartialEval {
 /// translation-time magnitude check makes the overflow unreachable in
 /// practice).
 fn linear_value(linear: &Linear, map: &BTreeMap<&str, i128>) -> Option<i128> {
-    let mut value = i128::from(-linear.rhs);
+    let mut value = -i128::from(linear.rhs);
     for (name, coefficient) in &linear.terms {
         let assigned = map.get(name.as_str())?;
         value = value.checked_add(i128::from(*coefficient).checked_mul(*assigned)?)?;
@@ -1098,7 +1328,7 @@ fn linear_value(linear: &Linear, map: &BTreeMap<&str, i128>) -> Option<i128> {
 /// `Σ coefficient·Π variable^exponent - rhs`; `None` on an unassigned
 /// variable or an overflow.
 fn polynomial_value(polynomial: &Polynomial, map: &BTreeMap<&str, i128>) -> Option<i128> {
-    let mut value = i128::from(-polynomial.rhs);
+    let mut value = -i128::from(polynomial.rhs);
     for (monomial, coefficient) in &polynomial.terms {
         let mut product = i128::from(*coefficient);
         for (name, exponent) in monomial {
@@ -1110,25 +1340,51 @@ fn polynomial_value(polynomial: &Polynomial, map: &BTreeMap<&str, i128>) -> Opti
     Some(value)
 }
 
-/// The conjunction lists implied by one node: an atom is its own single
-/// alternative, an `All` contributes its children unchanged, and an `Any`
-/// contributes the union of its branches' alternatives (recursively, so
-/// nested disjunctions flatten into the same product). A polynomial
-/// never reaches the branch expansion — `solve` routes polynomial
-/// problems to the enumeration solver first.
-fn branch_alternatives(node: &BoolNode) -> Vec<Vec<BoolNode>> {
+/// Expand a linear node into flat conjunctions within the branch budget.
+fn branch_alternatives(node: &BoolNode) -> Option<Vec<Vec<BoolNode>>> {
     match node {
-        BoolNode::Atom(atom) => vec![vec![BoolNode::Atom(atom.clone())]],
-        BoolNode::Poly(_) => Vec::new(),
-        BoolNode::All(children) => vec![children.clone()],
+        BoolNode::Atom(_) | BoolNode::Remainder { .. } => Some(vec![vec![node.clone()]]),
+        BoolNode::Poly(_) => None,
+        BoolNode::All(children) => conjunction_alternatives(children),
         BoolNode::Any(branches) => {
             let mut alternatives = Vec::new();
             for branch in branches {
-                alternatives.extend(branch_alternatives(branch));
+                let expanded = branch_alternatives(branch)?;
+                if alternatives.len() + expanded.len() > MAX_BRANCH_COMBINATIONS {
+                    return None;
+                }
+                alternatives.extend(expanded);
             }
-            alternatives
+            Some(alternatives)
         }
     }
+}
+
+fn conjunction_alternatives(nodes: &[BoolNode]) -> Option<Vec<Vec<BoolNode>>> {
+    let mut combinations = vec![Vec::new()];
+    for node in nodes {
+        let alternatives = branch_alternatives(node)?;
+        let count = combinations.len() * alternatives.len();
+        if count > MAX_BRANCH_COMBINATIONS {
+            return None;
+        }
+        if let [only] = alternatives.as_slice() {
+            for combination in &mut combinations {
+                combination.extend_from_slice(only);
+            }
+            continue;
+        }
+        let mut next = Vec::with_capacity(count);
+        for combination in &combinations {
+            for alternative in &alternatives {
+                let mut expanded = combination.clone();
+                expanded.extend_from_slice(alternative);
+                next.push(expanded);
+            }
+        }
+        combinations = next;
+    }
+    Some(combinations)
 }
 
 /// Solve one flattened conjunction with the best available backend.
@@ -1146,7 +1402,7 @@ fn solve_conjunction(problem: &Problem, seed: u64) -> SolveOutcome {
 
 #[cfg(feature = "solver-pumpkin")]
 mod pumpkin_backend {
-    use super::{BoolNode, Cmp, Problem, SolveOutcome};
+    use super::{BoolNode, Cmp, Problem, SolveOutcome, remainder_bounds};
     use pumpkin_conflict_resolvers::resolvers::ResolutionResolver;
     use pumpkin_solver::Solver;
     use pumpkin_solver::core::constraints::NegatableConstraint;
@@ -1223,6 +1479,97 @@ mod pumpkin_backend {
                 Ok(())
             }
             BoolNode::Atom(linear) => post_atom(solver, variables, bounds, linear),
+            BoolNode::Remainder {
+                field,
+                divisor,
+                remainder,
+                cmp,
+            } => {
+                let &(lower, upper) = bounds.get(field.as_str()).ok_or(())?;
+                if *divisor <= 0 || *divisor > I32_LIMIT || i32::try_from(*remainder).is_err() {
+                    return Err(());
+                }
+                let variable = variables[field.as_str()];
+                if lower < 0 || *cmp != Cmp::Eq {
+                    let (quotient_low, quotient_high) = (lower / divisor, upper / divisor);
+                    let (residual_low, residual_high) = remainder_bounds(
+                        *cmp,
+                        *remainder,
+                        lower.min(0).max(1 - divisor),
+                        upper.max(0).min(divisor - 1),
+                    );
+                    if residual_low > residual_high
+                        || lower - quotient_high * divisor - residual_high < i64::from(i32::MIN)
+                        || upper - quotient_low * divisor - residual_low > i64::from(i32::MAX)
+                    {
+                        return Err(());
+                    }
+                    let quotient =
+                        solver.new_bounded_integer(quotient_low as i32, quotient_high as i32);
+                    if lower < 0 {
+                        // The linear equation alone would allow the wrong
+                        // residual sign. Enforce truncation toward zero.
+                        let denominator =
+                            solver.new_bounded_integer(*divisor as i32, *divisor as i32);
+                        let tag = solver.new_constraint_tag();
+                        solver
+                            .add_constraint(pumpkin_constraints::division(
+                                variable,
+                                denominator,
+                                quotient,
+                                tag,
+                            ))
+                            .post();
+                    }
+                    let residual =
+                        solver.new_bounded_integer(residual_low as i32, residual_high as i32);
+                    let tag = solver.new_constraint_tag();
+                    solver
+                        .add_constraint(pumpkin_constraints::equals(
+                            [
+                                variable.scaled(1),
+                                quotient.scaled(-(*divisor as i32)),
+                                residual.scaled(-1),
+                            ],
+                            0,
+                            tag,
+                        ))
+                        .post();
+                    if *cmp == Cmp::Ne && (residual_low..=residual_high).contains(remainder) {
+                        let tag = solver.new_constraint_tag();
+                        solver
+                            .add_constraint(pumpkin_constraints::not_equals(
+                                [residual],
+                                *remainder as i32,
+                                tag,
+                            ))
+                            .post();
+                    }
+                    return Ok(());
+                }
+                // x = divisor * quotient + remainder. Bound the auxiliary
+                // quotient using the first and last possible matching values.
+                if !(0..*divisor).contains(remainder) {
+                    return Err(());
+                }
+                let first = lower + (*remainder - lower).rem_euclid(*divisor);
+                if first > upper {
+                    return Err(());
+                }
+                let quotient = solver.new_bounded_integer(
+                    ((first - remainder) / divisor) as i32,
+                    ((upper - remainder) / divisor) as i32,
+                );
+                let tag = solver.new_constraint_tag();
+                solver
+                    .add_constraint(pumpkin_constraints::equals(
+                        [variable.scaled(1), quotient.scaled(-(*divisor as i32))],
+                        *remainder as i32,
+                        tag,
+                    ))
+                    .post();
+                Ok(())
+            }
             // `solve` expands every `Any` into branch combinations and
             // routes every polynomial problem to the enumeration solver
             // before the backend sees a problem; reaching one here is a
@@ -1250,14 +1597,14 @@ mod pumpkin_backend {
             };
             return if holds { Ok(()) } else { Err(()) };
         }
-        if linear.rhs.abs() > I32_LIMIT {
+        if !(-I32_LIMIT..=I32_LIMIT).contains(&linear.rhs) {
             return Err(());
         }
         // The sum of scaled terms must stay inside the solver's i32 domain.
         let mut lower_sum: i64 = 0;
         let mut upper_sum: i64 = 0;
         for (name, coefficient) in &linear.terms {
-            if coefficient.abs() > I32_LIMIT {
+            if !(-I32_LIMIT..=I32_LIMIT).contains(coefficient) {
                 return Err(());
             }
             let Some(&(lo, hi)) = bounds.get(name.as_str()) else {

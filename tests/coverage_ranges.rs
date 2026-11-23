@@ -1,6 +1,55 @@
 use std::{fs, path::Path, process::Command};
 
 #[test]
+fn real_ranges_reject_invalid_bounds_and_widths() {
+    for (range, message) in [
+        ("range([0.0..1e999]);", "finite numeric constants"),
+        ("range([0.0..1.0 / 0.0]);", "finite numeric constants"),
+        (
+            "range([0.0..1.0], \"\", 0.0);",
+            "bucket width must be positive",
+        ),
+        ("range([1.0..0.0]);", "lower bound exceeds upper bound"),
+        (
+            "range([1e16..1.0000000000000002e16], \"\", 0.25);",
+            "width cannot advance",
+        ),
+        (
+            "range([0.0..1.0], \"named\", 0.25);",
+            "require an empty name",
+        ),
+    ] {
+        let source = format!(
+            "extend sys {{ event cg; cover cg is {{ item n: real using ranges = {{ {range} }}; }}; }};"
+        );
+        let parsed = e1647::parser::parse(&source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let elaborated = e1647::elab::elaborate(&parsed.declarations);
+        assert!(
+            elaborated.diagnostics.iter().any(
+                |diagnostic| diagnostic.code == "E0224" && diagnostic.message.contains(message)
+            )
+        );
+    }
+}
+
+#[test]
+fn string_aliases_cannot_declare_coverage_ranges() {
+    let parsed = e1647::parser::parse(
+        "type text_t: string; type alias_t: text_t; extend sys { event cg; \
+         !text_value: alias_t; cover cg is { item text_value using ranges = { range([0..1]); }; }; };",
+    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let elaborated = e1647::elab::elaborate(&parsed.declarations);
+    assert!(elaborated.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0224"
+            && diagnostic
+                .message
+                .contains("not permitted for string items")
+    }));
+}
+
+#[test]
 fn coverage_range_fixtures() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/coverage-ranges");
     let mut paths: Vec<_> = fs::read_dir(directory)
@@ -71,9 +120,11 @@ fn coverage_range_fixtures() {
                         if item.buckets.len() > 8 && index >= 2 && index < item.buckets.len() - 2 {
                             continue;
                         }
+                        let (lo, hi) = bucket.bounds_text();
+                        let end = if bucket.upper_inclusive() { ']' } else { ')' };
                         report.push_str(&format!(
-                            "{} [{}..{}] goal={} hits={}\n",
-                            bucket.label, bucket.lo, bucket.hi, bucket.goal, bucket.hits
+                            "{} [{lo}..{hi}{end} goal={} hits={}\n",
+                            bucket.label, bucket.goal, bucket.hits
                         ));
                     }
                 }

@@ -29,8 +29,9 @@
 //! Structural option/scope errors report E0224 after composition. The
 //! interpreter evaluates Boolean filters and per-unit visibility. The
 //! conservative type pass checks supported Boolean option expressions in
-//! their owner/source/unit scopes. Full option type checking, predicates over composite-valued sources, radix
-//! semantics, real/enumeral ranges and general
+//! their owner/source/unit scopes. Basic item radix options format numeric
+//! bucket labels. Full option type checking, predicates over composite-valued
+//! sources, general real predicates and general
 //! constant/type resolution for range parameters,
 //! item `using also` overrides and the wider runtime configuration API
 //! remain unfinished. No conformance is claimed.
@@ -62,6 +63,8 @@ pub(crate) struct GroupOptions {
     pub when: Option<Expr>,
     pub unit_scope: Option<String>,
     pub instance_no_collect: Option<Expr>,
+    radix: CoverageRadix,
+    per_instance: bool,
 }
 
 /// One bucket of an item: an inclusive integer range with a hit goal
@@ -72,11 +75,68 @@ pub struct CoverBucket {
     pub excluded: bool,
     /// Preserve range-local precedence over item/group/global defaults.
     pub(crate) explicit_goal: bool,
+    numeric_label: bool,
+    real_bounds_bits: Option<(u64, u64, bool)>,
     pub label: String,
+    /// Integral bounds, or the declaration-order indexes for an enumeral.
+    /// Use `real_bounds` for a real bucket.
     pub lo: i128,
     pub hi: i128,
     pub goal: u64,
     pub hits: u64,
+}
+
+impl CoverBucket {
+    pub fn real_bounds(&self) -> Option<(f64, f64)> {
+        self.real_bounds_bits
+            .map(|(lo, hi, _)| (f64::from_bits(lo), f64::from_bits(hi)))
+    }
+
+    pub fn upper_inclusive(&self) -> bool {
+        self.real_bounds_bits
+            .is_none_or(|(_, _, inclusive)| inclusive)
+    }
+
+    pub fn bounds_text(&self) -> (String, String) {
+        match self.real_bounds() {
+            Some((lo, hi)) => (lo.to_string(), hi.to_string()),
+            None => (self.lo.to_string(), self.hi.to_string()),
+        }
+    }
+
+    pub(crate) fn effect_bounds(&self) -> (i128, i128) {
+        if let Some((low, high)) = self.real_bounds() {
+            let first = real_ordinal(if low == 0.0 { -0.0 } else { low });
+            let inclusive = self.upper_inclusive();
+            let high = if high == 0.0 {
+                if inclusive { 0.0 } else { -0.0 }
+            } else {
+                high
+            };
+            (first, real_ordinal(high) - i128::from(!inclusive))
+        } else {
+            (self.lo, self.hi)
+        }
+    }
+}
+
+/// Ordered binary64 values, including both signed zeros so arithmetic
+/// on concrete witnesses retains its original semantics.
+pub(crate) fn real_ordinal(value: f64) -> i128 {
+    let magnitude = i128::from(value.abs().to_bits());
+    if value.is_sign_negative() {
+        -magnitude - 1
+    } else {
+        magnitude
+    }
+}
+
+pub(crate) fn real_from_ordinal(ordinal: i128) -> f64 {
+    if ordinal < 0 {
+        -f64::from_bits((ordinal.unsigned_abs() - 1) as u64)
+    } else {
+        f64::from_bits(ordinal as u64)
+    }
 }
 
 /// One item's collected data. `buckets` empty means the item is
@@ -84,6 +144,7 @@ pub struct CoverBucket {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoverItemData {
     pub(crate) options: ItemOptions,
+    pub(crate) enum_domain: Option<CoverageEnum>,
     pub name: String,
     pub buckets: Vec<CoverBucket>,
     /// Samples whose value fell outside every bucket (or had no bucket
@@ -198,6 +259,7 @@ impl ScalarSample {
 struct Observation {
     scalar: Option<ScalarSample>,
     label: String,
+    numeric_label_bounds: Option<(i128, i128)>,
     bucket: BucketIdentity,
 }
 
@@ -243,6 +305,7 @@ pub struct CoverDerivedData {
     pub(crate) allowed: Option<BTreeSet<Vec<usize>>>,
     explicit_goal: bool,
     explicit_weight: bool,
+    radix: Option<CoverageRadix>,
     /// Required observations per derived combination; zero is ungraded.
     pub goal: u64,
     /// Weight in the group's per-type grade.
@@ -429,23 +492,44 @@ impl CoverGroupData {
         let Some(item) = self.items.iter().find(|item| item.name == item_name) else {
             return;
         };
-        let as_int = value_to_int(value);
-        let index = as_int.and_then(|value| {
-            item.buckets
-                .iter()
-                .position(|bucket| value >= bucket.lo && value <= bucket.hi)
+        let as_int = match &item.enum_domain {
+            Some(domain) => domain.ordinal(value),
+            None => value_to_int(value),
+        };
+        let index = item.buckets.iter().position(|bucket| {
+            if let Some((lo, hi)) = bucket.real_bounds() {
+                let number = match value {
+                    crate::interp::Value::Real(number) => *number,
+                    crate::interp::Value::Int(number) => *number as f64,
+                    _ => return false,
+                };
+                number >= lo && (number < hi || (number == hi && bucket.upper_inclusive()))
+            } else {
+                as_int.is_some_and(|value| (bucket.lo..=bucket.hi).contains(&value))
+            }
         });
         let bucket = if item.buckets.is_empty() {
             BucketIdentity::Unbucketed
         } else {
             index.map_or(BucketIdentity::Outside, BucketIdentity::Basic)
         };
-        let label = item_label(item, as_int).unwrap_or_else(|| render_value(value));
+        let label = index
+            .map(|index| item.buckets[index].label.clone())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| render_value(value));
+        let numeric_label_bounds = match index.map(|index| &item.buckets[index]) {
+            Some(bucket) if bucket.numeric_label => Some((bucket.lo, bucket.hi)),
+            None if matches!(value, crate::interp::Value::Int(_)) => {
+                as_int.map(|value| (value, value))
+            }
+            _ => None,
+        };
         self.remember(
             item_name,
             Observation {
                 scalar: ScalarSample::capture(value),
                 label,
+                numeric_label_bounds,
                 bucket,
             },
         );
@@ -565,12 +649,15 @@ impl CoverGroupData {
     }
 
     fn record_derived(&mut self, index: usize, observations: Vec<Observation>) -> String {
+        let item = &mut self.derived[index];
         let labels: Vec<_> = observations
             .iter()
-            .map(|value| value.label.clone())
+            .map(|value| match (item.radix, value.numeric_label_bounds) {
+                (Some(radix), Some((lo, hi))) => radix.format_range(lo, hi),
+                _ => value.label.clone(),
+            })
             .collect();
         let buckets = observations.into_iter().map(|value| value.bucket).collect();
-        let item = &mut self.derived[index];
         let rendered = render_combination(item.kind, &labels);
         let label = if item.kind == CoverItemKind::Transition {
             format!("({rendered})")
@@ -584,6 +671,7 @@ impl CoverGroupData {
             Observation {
                 scalar: None,
                 label,
+                numeric_label_bounds: None,
                 bucket,
             },
         );
@@ -696,21 +784,6 @@ fn value_to_int(value: &crate::interp::Value) -> Option<i128> {
     }
 }
 
-/// The label of the bucket containing the value (14.3), or `None` when
-/// the item has no buckets or the value misses them all.
-fn item_label(item: &CoverItemData, as_int: Option<i128>) -> Option<String> {
-    let as_int = as_int?;
-    let bucket = item
-        .buckets
-        .iter()
-        .find(|bucket| as_int >= bucket.lo && as_int <= bucket.hi)?;
-    if bucket.label.is_empty() {
-        Some(format!("{as_int}"))
-    } else {
-        Some(bucket.label.clone())
-    }
-}
-
 fn render_value(value: &crate::interp::Value) -> String {
     match value {
         crate::interp::Value::Int(value) => format!("{value}"),
@@ -806,14 +879,15 @@ pub(crate) fn build_types(
             if decl.is_also {
                 continue;
             }
+            let options = group_options(ty, &decl.name).unwrap_or_default();
             let items: Vec<CoverItemData> = decl
                 .items
                 .iter()
-                .filter_map(|item| build_item(item, config))
+                .filter_map(|item| build_item(item, config, &options, ty, types))
                 .collect();
             let derived = build_derived(decl, config);
             groups.push(CoverGroupData {
-                options: group_options(ty, &decl.name).unwrap_or_default(),
+                options,
                 unit_instance: None,
                 unit_owner: None,
                 name: decl.name.clone(),
@@ -836,32 +910,13 @@ pub(crate) fn build_types(
                 .iter_mut()
                 .find(|group| group.name == decl.name && group.event_path == group_event_path(decl))
             {
+                let options = &base.options;
                 base.items.extend(
                     decl.items
                         .iter()
-                        .filter_map(|item| build_item(item, config)),
+                        .filter_map(|item| build_item(item, config, options, ty, types)),
                 );
                 base.derived.extend(build_derived(decl, config));
-            }
-        }
-        // Group-level options: `per_instance = TRUE` marks every item
-        // per-instance (the group-level spelling of 14.4.2).
-        for decl in &ty.covers {
-            if decl.is_also {
-                continue;
-            }
-            let group_per_instance = decl
-                .options
-                .iter()
-                .any(|entry| scan_bool_option(entry, "per_instance") == Some(true));
-            if group_per_instance
-                && let Some(group) = groups.iter_mut().find(|group| {
-                    group.name == decl.name && group.event_path == group_event_path(decl)
-                })
-            {
-                for item in &mut group.items {
-                    item.per_instance = true;
-                }
             }
         }
         // Group defaults (14.9.3/14.9.4) apply where an item has no
@@ -979,6 +1034,7 @@ fn build_derived(decl: &CoverGroupDecl, config: &CoverageConfig) -> Vec<CoverDer
             allowed: None,
             explicit_goal: coverage_goal(&entry.using).ok().flatten().is_some(),
             explicit_weight: coverage_weight(&entry.using).ok().flatten().is_some(),
+            radix: coverage_radix(&entry.using).ok().flatten(),
             goal: coverage_goal(&entry.using)
                 .ok()
                 .flatten()
@@ -1031,7 +1087,13 @@ fn group_event_path(decl: &CoverGroupDecl) -> Option<String> {
 
 /// Build one item's data: explicit `ranges` buckets when the recorded
 /// `using` tokens carry them, the 14.3 defaults otherwise.
-fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItemData> {
+fn build_item(
+    item: &CoverItemDecl,
+    config: &CoverageConfig,
+    group_options: &GroupOptions,
+    owner: &crate::elab::ElaboratedType,
+    types: &[crate::elab::ElaboratedType],
+) -> Option<CoverItemData> {
     if item.kind != CoverItemKind::Item {
         // Cross/transition schemas are built separately below.
         return None;
@@ -1047,13 +1109,30 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
         .ok()
         .flatten()
         .unwrap_or(config.at_least);
-    let per_instance = scan_bool_option(&item.using, "per_instance").unwrap_or(false);
+    let per_instance = coverage_per_instance(&item.using)
+        .ok()
+        .flatten()
+        .unwrap_or(group_options.per_instance);
     let weight = coverage_weight(&item.using).ok().flatten().unwrap_or(1);
-    let ranges = match parse_ranges(&item.using) {
+    let radix = coverage_radix(&item.using)
+        .ok()
+        .flatten()
+        .unwrap_or(group_options.radix);
+    let enum_domain = coverage_enum(item, owner, types);
+    let scalar_type = coverage_scalar_item_type(item, owner, types);
+    let real = matches!(
+        &scalar_type,
+        Some(TypeExpr::Scalar {
+            base: ScalarBase::Real,
+            ..
+        })
+    );
+    let ranges = match parse_ranges(&item.using, radix, enum_domain.as_ref(), real) {
         Ok(ranges) => ranges,
         Err(_) => {
             return Some(CoverItemData {
                 options: item_options(item).unwrap_or_default(),
+                enum_domain,
                 name,
                 buckets: Vec::new(),
                 ungradeable_hits: 0,
@@ -1071,16 +1150,16 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
         // bucket count at 2^width (a `uint(bits: 2)` has four possible
         // values, so four buckets); booleans over their two values;
         // anything else has no default bucket set and is ungradeable.
-        match &item.ty {
+        match &scalar_type {
             Some(ty) if type_is_bool(ty) => (bool_buckets(), None),
             Some(ty) if type_is_int(ty) => {
                 let buckets = match declared_int_width(ty) {
                     Some(bits) => {
                         let possible = 1u128 << bits.min(100) as u32;
                         let count = possible.min(config.max_int_buckets as u128) as u64;
-                        default_int_buckets(count)
+                        default_int_buckets(count, radix)
                     }
-                    None => default_int_buckets(config.max_int_buckets),
+                    None => default_int_buckets(config.max_int_buckets, radix),
                 };
                 let note = if buckets.is_empty() {
                     Some("max_int_buckets is 0: no default buckets")
@@ -1102,6 +1181,7 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
     }
     Some(CoverItemData {
         options: item_options(item).unwrap_or_default(),
+        enum_domain,
         name,
         buckets,
         ungradeable_hits: 0,
@@ -1112,20 +1192,39 @@ fn build_item(item: &CoverItemDecl, config: &CoverageConfig) -> Option<CoverItem
     })
 }
 
-/// Scan `name = TRUE|FALSE` in recorded option tokens.
-fn scan_bool_option(tokens: &[Token], name: &str) -> Option<bool> {
-    let value = option_value(tokens, name)?;
-    if value.is_empty() {
-        return Some(true);
+/// A bare flag enables per-bucket grading, and an explicit FALSE
+/// overrides an inherited group default.
+fn coverage_per_instance(tokens: &[Token]) -> Result<Option<bool>, crate::diagnostic::Diagnostic> {
+    coverage_flag(
+        tokens,
+        "per_instance",
+        "per_instance expects a flag or Boolean literal (14.4.2)",
+    )
+}
+
+fn coverage_flag(
+    tokens: &[Token],
+    name: &str,
+    message: &str,
+) -> Result<Option<bool>, crate::diagnostic::Diagnostic> {
+    let Some(entry) = option_entry(tokens, name) else {
+        return Ok(None);
+    };
+    if entry.len() == 1 {
+        return Ok(Some(true));
     }
-    match value {
-        [token] => match token_word(token)? {
-            "TRUE" | "true" => Some(true),
-            "FALSE" | "false" => Some(false),
-            _ => None,
-        },
-        _ => None,
+    if let Ok(mut expr) = crate::parser::parse_expression_tokens(option_expression(entry)) {
+        while let Expr::Paren { expr: inner, .. } = expr {
+            expr = *inner;
+        }
+        match expr {
+            Expr::BoolLiteral { value, .. } => return Ok(Some(value)),
+            Expr::Ident { name, .. } if name == "true" => return Ok(Some(true)),
+            Expr::Ident { name, .. } if name == "false" => return Ok(Some(false)),
+            _ => {}
+        }
     }
+    Err(option_error(entry, message))
 }
 
 /// Use the complete top-level option expression, never a matching word in
@@ -1153,6 +1252,8 @@ fn bool_buckets() -> Vec<CoverBucket> {
         CoverBucket {
             excluded: false,
             explicit_goal: false,
+            numeric_label: false,
+            real_bounds_bits: None,
             label: "FALSE".to_owned(),
             lo: 0,
             hi: 0,
@@ -1162,6 +1263,8 @@ fn bool_buckets() -> Vec<CoverBucket> {
         CoverBucket {
             excluded: false,
             explicit_goal: false,
+            numeric_label: false,
+            real_bounds_bits: None,
             label: "TRUE".to_owned(),
             lo: 1,
             hi: 1,
@@ -1174,12 +1277,63 @@ fn bool_buckets() -> Vec<CoverBucket> {
 /// The 14.3 default integer buckets: one bucket per value, "for only
 /// the first 16 possible values (0 through 15)" — the count being the
 /// `max_int_buckets` coverage configuration option's default (14.9).
-fn default_int_buckets(max: u64) -> Vec<CoverBucket> {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CoverageRadix {
+    #[default]
+    Decimal,
+    Hexadecimal,
+    Binary,
+}
+
+impl CoverageRadix {
+    fn format_range(self, lo: i128, hi: i128) -> String {
+        if lo == hi {
+            self.format(lo)
+        } else {
+            format!("{}..{}", self.format(lo), self.format(hi))
+        }
+    }
+
+    fn format(self, value: i128) -> String {
+        let magnitude = value.unsigned_abs();
+        let sign = if value < 0 { "-" } else { "" };
+        match self {
+            Self::Decimal => value.to_string(),
+            Self::Hexadecimal => format!("{sign}0x{magnitude:x}"),
+            Self::Binary => format!("{sign}0b{magnitude:b}"),
+        }
+    }
+}
+
+fn coverage_radix(
+    tokens: &[Token],
+) -> Result<Option<CoverageRadix>, crate::diagnostic::Diagnostic> {
+    let Some(entry) = option_entry(tokens, "radix") else {
+        return Ok(None);
+    };
+    let word = match option_expression(entry) {
+        [token] => token_word(token),
+        _ => None,
+    };
+    match word {
+        Some("DEC") => Ok(Some(CoverageRadix::Decimal)),
+        Some("HEX") => Ok(Some(CoverageRadix::Hexadecimal)),
+        Some("BIN") => Ok(Some(CoverageRadix::Binary)),
+        _ => Err(option_error(
+            entry,
+            "coverage radix must be DEC, HEX or BIN (14.6)",
+        )),
+    }
+}
+
+fn default_int_buckets(max: u64, radix: CoverageRadix) -> Vec<CoverBucket> {
     (0..max)
         .map(|value| CoverBucket {
             excluded: false,
             explicit_goal: false,
-            label: format!("{value}"),
+            numeric_label: true,
+            real_bounds_bits: None,
+            label: radix.format(i128::from(value)),
             lo: value as i128,
             hi: value as i128,
             goal: 1,
@@ -1234,9 +1388,141 @@ fn type_is_int(ty: &TypeExpr) -> bool {
     )
 }
 
-/// Integral range construction (14.3). Width, name and hit goal are
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoverageEnum {
+    type_name: String,
+    names: Vec<String>,
+}
+
+impl CoverageEnum {
+    pub(crate) fn value_at(&self, ordinal: i128) -> Option<crate::interp::Value> {
+        let name = self.names.get(usize::try_from(ordinal).ok()?)?;
+        Some(crate::interp::Value::Enum {
+            type_name: self.type_name.clone(),
+            name: name.clone(),
+        })
+    }
+
+    fn ordinal(&self, value: &crate::interp::Value) -> Option<i128> {
+        let crate::interp::Value::Enum { type_name, name } = value else {
+            return None;
+        };
+        if type_name != &self.type_name {
+            return None;
+        }
+        self.names
+            .iter()
+            .position(|known| known == name)
+            .map(|index| index as i128)
+    }
+
+    fn bound(&self, tokens: &[Token]) -> Result<i128, crate::diagnostic::Diagnostic> {
+        if let [token] = tokens
+            && let Some(name) = token_word(token)
+            && let Some(index) = self.names.iter().position(|known| known == name)
+        {
+            return Ok(index as i128);
+        }
+        Err(option_error(
+            tokens,
+            "coverage range bound must name a member of the item's enumeral type (14.3)",
+        ))
+    }
+
+    fn label(&self, lo: i128, hi: i128) -> String {
+        let first = &self.names[lo as usize];
+        if lo == hi {
+            first.clone()
+        } else {
+            format!("{first}..{}", self.names[hi as usize])
+        }
+    }
+}
+
+fn coverage_enum(
+    item: &CoverItemDecl,
+    owner: &crate::elab::ElaboratedType,
+    types: &[crate::elab::ElaboratedType],
+) -> Option<CoverageEnum> {
+    let mut ty = coverage_item_type(item, owner)?;
+    for _ in 0..=64 {
+        match ty {
+            TypeExpr::InlineEnum { names, .. } if !names.is_empty() => {
+                return Some(CoverageEnum {
+                    type_name: crate::interp::inline_enum_key(names),
+                    names: names.clone(),
+                });
+            }
+            TypeExpr::Named { name, .. } => {
+                let declared = types.iter().find(|ty| ty.name == *name)?;
+                if !declared.enumerals.is_empty() {
+                    return Some(CoverageEnum {
+                        type_name: name.clone(),
+                        names: declared
+                            .enumerals
+                            .iter()
+                            .map(|entry| entry.name.clone())
+                            .collect(),
+                    });
+                }
+                ty = declared.underlying.as_ref()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn coverage_item_type<'a>(
+    item: &'a CoverItemDecl,
+    owner: &'a crate::elab::ElaboratedType,
+) -> Option<&'a TypeExpr> {
+    item.ty.as_ref().or_else(|| {
+        let (name, _) = item.names.first()?;
+        owner
+            .fields
+            .iter()
+            .find(|field| field.name == *name)
+            .map(|field| &field.ty)
+    })
+}
+
+fn coverage_scalar_item_type(
+    item: &CoverItemDecl,
+    owner: &crate::elab::ElaboratedType,
+    types: &[crate::elab::ElaboratedType],
+) -> Option<TypeExpr> {
+    let mut ty = coverage_item_type(item, owner)?;
+    for _ in 0..=64 {
+        match ty {
+            TypeExpr::Scalar { .. } => {
+                return Some(
+                    constants::scalar_type(types, &owner.name, ty).unwrap_or_else(|| ty.clone()),
+                );
+            }
+            TypeExpr::Named { name, .. } => {
+                ty = types
+                    .iter()
+                    .find(|entry| {
+                        entry.name == *name && entry.kind == crate::ast::DeclarationKind::Type
+                    })?
+                    .underlying
+                    .as_ref()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Integral and enumeral range construction (14.3). Width, name and hit goal are
 /// positional parameters; unsupported forms are diagnosed, never guessed.
-fn parse_ranges(using: &[Token]) -> Result<Vec<CoverBucket>, crate::diagnostic::Diagnostic> {
+fn parse_ranges(
+    using: &[Token],
+    radix: CoverageRadix,
+    enum_domain: Option<&CoverageEnum>,
+    real: bool,
+) -> Result<Vec<CoverBucket>, crate::diagnostic::Diagnostic> {
     let Some(tokens) = option_value(using, "ranges") else {
         return Ok(Vec::new());
     };
@@ -1291,18 +1577,6 @@ fn parse_ranges(using: &[Token]) -> Result<Vec<CoverBucket>, crate::diagnostic::
                 "coverage ranges require one value or two finite bounds (14.3)",
             ));
         }
-        let lo = constant_integer(bounds[0])?;
-        let hi = if bounds.len() == 2 {
-            constant_integer(bounds[1])?
-        } else {
-            lo
-        };
-        if lo > hi {
-            return Err(option_error(
-                parameters[0],
-                "coverage range lower bound exceeds upper bound (14.3)",
-            ));
-        }
         let name = parameters
             .get(1)
             .map(|tokens| {
@@ -1313,6 +1587,104 @@ fn parse_ranges(using: &[Token]) -> Result<Vec<CoverBucket>, crate::diagnostic::
             })
             .transpose()?
             .unwrap_or_default();
+        let goal = parameters
+            .get(3)
+            .filter(|tokens| !is_undef(tokens))
+            .map(|tokens| unsigned_goal(tokens))
+            .transpose()?;
+        if real {
+            let width = parameters
+                .get(2)
+                .filter(|tokens| !is_undef(tokens))
+                .map(|tokens| {
+                    let width = real_range_bound(tokens)?;
+                    if width <= 0.0 {
+                        return Err(option_error(
+                            tokens,
+                            "coverage range bucket width must be positive (14.3)",
+                        ));
+                    }
+                    if !name.is_empty() {
+                        return Err(option_error(
+                            tokens,
+                            "subdivided coverage ranges require an empty name (14.3)",
+                        ));
+                    }
+                    Ok(width)
+                })
+                .transpose()?;
+            let lo = real_range_bound(bounds[0])?;
+            let hi = match bounds.get(1) {
+                Some(end) => real_range_bound(end)?,
+                None => lo,
+            };
+            if lo > hi {
+                return Err(option_error(
+                    parameters[0],
+                    "coverage range lower bound exceeds upper bound (14.3)",
+                ));
+            }
+            let mut start = lo;
+            // Compute every boundary from the original lower bound so
+            // rounding does not accumulate across the subdivision.
+            for step in 1.. {
+                if buckets.len() >= 65_536 {
+                    return Err(option_error(
+                        entry,
+                        "coverage ranges exceed the 65536 bucket construction limit (14.3)",
+                    ));
+                }
+                let end = width.map_or(hi, |width| width.mul_add(f64::from(step), lo).min(hi));
+                if start < hi && end <= start {
+                    return Err(option_error(
+                        entry,
+                        "real coverage range width cannot advance at this precision (14.3)",
+                    ));
+                }
+                let inclusive = end == hi;
+                let label = if !name.is_empty() {
+                    name.clone()
+                } else if start == end {
+                    start.to_string()
+                } else if inclusive {
+                    format!("{start}..{end}")
+                } else {
+                    format!("{start}..<{end}")
+                };
+                buckets.push(CoverBucket {
+                    excluded: false,
+                    explicit_goal: goal.is_some(),
+                    numeric_label: false,
+                    real_bounds_bits: Some((start.to_bits(), end.to_bits(), inclusive)),
+                    label,
+                    lo: 0,
+                    hi: 0,
+                    goal: goal.unwrap_or(1),
+                    hits: 0,
+                });
+                if inclusive {
+                    break;
+                }
+                start = end;
+            }
+            continue;
+        }
+        let bound = |tokens: &[Token]| match enum_domain {
+            Some(domain) => domain.bound(tokens),
+            None => constant_integer(tokens),
+        };
+        let lo = bound(bounds[0])?;
+        let hi = if bounds.len() == 2 {
+            bound(bounds[1])?
+        } else {
+            lo
+        };
+        if lo > hi {
+            return Err(option_error(
+                parameters[0],
+                "coverage range lower bound exceeds upper bound (14.3)",
+            ));
+        }
         let width = match parameters.get(2) {
             None => None,
             Some(tokens) if is_undef(tokens) => None,
@@ -1333,11 +1705,6 @@ fn parse_ranges(using: &[Token]) -> Result<Vec<CoverBucket>, crate::diagnostic::
                 Some(width)
             }
         };
-        let goal = parameters
-            .get(3)
-            .filter(|tokens| !is_undef(tokens))
-            .map(|tokens| unsigned_goal(tokens))
-            .transpose()?;
         let count = match width {
             None => Some(1),
             Some(width) => hi
@@ -1360,14 +1727,16 @@ fn parse_ranges(using: &[Token]) -> Result<Vec<CoverBucket>, crate::diagnostic::
             });
             let label = if !name.is_empty() {
                 name.clone()
-            } else if start == end {
-                start.to_string()
+            } else if let Some(domain) = enum_domain {
+                domain.label(start, end)
             } else {
-                format!("{start}..{end}")
+                radix.format_range(start, end)
             };
             buckets.push(CoverBucket {
                 excluded: false,
                 explicit_goal: goal.is_some(),
+                numeric_label: name.is_empty() && enum_domain.is_none(),
+                real_bounds_bits: None,
                 label,
                 lo: start,
                 hi: end,
@@ -1413,6 +1782,39 @@ fn split_parameters<'a>(tokens: &'a [Token], separator: &str) -> Vec<&'a [Token]
 
 fn is_undef(tokens: &[Token]) -> bool {
     matches!(tokens, [token] if token_word(token) == Some("UNDEF"))
+}
+
+fn real_range_bound(tokens: &[Token]) -> Result<f64, crate::diagnostic::Diagnostic> {
+    fn evaluate(expr: &Expr) -> Option<f64> {
+        match expr {
+            Expr::RealLiteral { text, .. } => text.replace('_', "").parse().ok(),
+            Expr::IntLiteral { text, .. } | Expr::BitLiteral { text, .. } => {
+                crate::interp::parse_int_literal(text).map(|value| value as f64)
+            }
+            Expr::Paren { expr, .. }
+            | Expr::Unary {
+                op: crate::ast::UnaryOp::Plus,
+                expr,
+                ..
+            } => evaluate(expr),
+            Expr::Unary {
+                op: crate::ast::UnaryOp::Negate,
+                expr,
+                ..
+            } => evaluate(expr).map(|value| -value),
+            _ => None,
+        }
+    }
+    crate::parser::parse_expression_tokens(tokens)
+        .ok()
+        .and_then(|expr| evaluate(&expr))
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| {
+            option_error(
+                tokens,
+                "real coverage range bounds require finite numeric constants (14.3)",
+            )
+        })
 }
 
 fn constant_integer(tokens: &[Token]) -> Result<i128, crate::diagnostic::Diagnostic> {
@@ -1592,13 +1994,6 @@ fn option_expr(
     let Some(value) = option_value(tokens, name) else {
         return Ok(None);
     };
-    if value.is_empty() && name == "no_collect" {
-        let token = tokens.first().expect("present option has a token");
-        return Ok(Some(Expr::BoolLiteral {
-            value: true,
-            span: (token.start, token.end),
-        }));
-    }
     crate::parser::parse_expression_tokens(value)
         .map(Some)
         .map_err(|diagnostic| {
@@ -1609,14 +2004,12 @@ fn option_expr(
 }
 
 fn hidden_option(tokens: &[Token]) -> Result<bool, crate::diagnostic::Diagnostic> {
-    match option_expr(tokens, "no_collect")? {
-        None => Ok(false),
-        Some(Expr::BoolLiteral { value, .. }) => Ok(value),
-        Some(_) => Err(option_error(
-            tokens,
-            "no_collect expects a flag or Boolean literal (14.2)",
-        )),
-    }
+    Ok(coverage_flag(
+        tokens,
+        "no_collect",
+        "no_collect expects a flag or Boolean literal (14.2)",
+    )?
+    .unwrap_or(false))
 }
 
 pub(crate) fn item_options(
@@ -1641,8 +2034,9 @@ pub(crate) fn group_options(
     let mut scope_frozen = false;
     for decl in ty.covers.iter().filter(|decl| decl.name == name) {
         for entry in &decl.options {
-            if let Some(value) = option_value(entry, "per_unit_instance") {
-                let scope = if value.is_empty() {
+            if let Some(scope_entry) = option_entry(entry, "per_unit_instance") {
+                let value = option_expression(scope_entry);
+                let scope = if scope_entry.len() == 1 {
                     if ty.kind != crate::ast::DeclarationKind::Unit {
                         return Err(option_error(
                             entry,
@@ -1672,6 +2066,12 @@ pub(crate) fn group_options(
             }
             coverage_goal(entry)?;
             coverage_weight(entry)?;
+            if let Some(radix) = coverage_radix(entry)? {
+                options.radix = radix;
+            }
+            if let Some(per_instance) = coverage_per_instance(entry)? {
+                options.per_instance = per_instance;
+            }
             options.hidden |= hidden_option(entry)?;
             if let Some(expr) = option_expr(entry, "when")? {
                 options.when = Some(expr);
@@ -1840,23 +2240,39 @@ pub(crate) fn validate_types(
                 if let Err(diagnostic) = coverage_weight(&item.using) {
                     diagnostics.push(diagnostic);
                 }
+                if let Err(diagnostic) = coverage_radix(&item.using) {
+                    diagnostics.push(diagnostic);
+                }
+                if item.kind == CoverItemKind::Item
+                    && let Err(diagnostic) = coverage_per_instance(&item.using)
+                {
+                    diagnostics.push(diagnostic);
+                }
                 if item.kind == CoverItemKind::Item
                     && let Some(tokens) = option_value(&item.using, "ranges")
                 {
-                    let unsupported = match &item.ty {
+                    let scalar_type = coverage_scalar_item_type(item, ty, types);
+                    let unsupported = match &scalar_type {
                         Some(TypeExpr::Scalar {
                             base: ScalarBase::String,
                             ..
                         }) => Some("coverage ranges are not permitted for string items (14.3)"),
-                        Some(TypeExpr::Scalar {
-                            base: ScalarBase::Real,
-                            ..
-                        }) => Some("real coverage ranges are not implemented (14.3)"),
                         _ => None,
                     };
                     if let Some(message) = unsupported {
                         diagnostics.push(option_error(tokens, message));
-                    } else if let Err(diagnostic) = parse_ranges(&item.using) {
+                    } else if let Err(diagnostic) = parse_ranges(
+                        &item.using,
+                        CoverageRadix::default(),
+                        coverage_enum(item, ty, types).as_ref(),
+                        matches!(
+                            scalar_type,
+                            Some(TypeExpr::Scalar {
+                                base: ScalarBase::Real,
+                                ..
+                            })
+                        ),
+                    ) {
                         diagnostics.push(diagnostic);
                     }
                 }
@@ -2102,6 +2518,10 @@ pub(crate) fn effect_intervals(
     let scalar = |value: Value| match (prototype, value) {
         (Value::Int(_), Value::Int(value)) => Ok(value),
         (Value::Bool(_), Value::Bool(value)) => Ok(i128::from(value)),
+        (Value::Real(_), Value::Real(value)) if value.is_finite() => {
+            Ok(real_ordinal(if value == 0.0 { 0.0 } else { value }))
+        }
+        (Value::Real(_), Value::Int(value)) => Ok(real_ordinal(value as f64)),
         _ => Err(error(
             "coverage effect comparison requires compatible scalar values (14.3)",
         )),
@@ -2179,10 +2599,15 @@ pub(crate) fn effect_intervals(
                     ));
                 }
                 let value = scalar(evaluate(constant, None)?)?;
+                let first = if matches!(prototype, Value::Real(_)) && value == 0 {
+                    real_ordinal(-0.0)
+                } else {
+                    value
+                };
                 let set = match (op, left) {
-                    (BinaryOp::Eq, _) => vec![(value, value)],
-                    (BinaryOp::NotEq, _) => complement_interval_set(&[(value, value)], domain),
-                    (BinaryOp::Lt, true) | (BinaryOp::Gt, false) => value
+                    (BinaryOp::Eq, _) => vec![(first, value)],
+                    (BinaryOp::NotEq, _) => complement_interval_set(&[(first, value)], domain),
+                    (BinaryOp::Lt, true) | (BinaryOp::Gt, false) => first
                         .checked_sub(1)
                         .map(|hi| vec![(i128::MIN, hi)])
                         .unwrap_or_default(),
@@ -2191,13 +2616,14 @@ pub(crate) fn effect_intervals(
                         .checked_add(1)
                         .map(|lo| vec![(lo, i128::MAX)])
                         .unwrap_or_default(),
-                    _ => vec![(value, i128::MAX)],
+                    _ => vec![(first, i128::MAX)],
                 };
                 return Ok(intersect_interval_sets(&set, &[domain]));
             }
         }
         Expr::InSet { element, set, .. }
-            if bare_item(element, item)
+            if !matches!(prototype, Value::Real(_))
+                && bare_item(element, item)
                 && !inset_expressions(set)
                     .iter()
                     .any(|expr| uses_item(expr, item)) =>
@@ -2235,6 +2661,33 @@ pub(crate) fn effect_intervals(
             return Ok(intersect_interval_sets(&set, &[domain]));
         }
         _ => {}
+    }
+    if matches!(prototype, Value::Real(_)) {
+        let mut pending = vec![domain];
+        let mut matched = Vec::new();
+        while let Some((lo, hi)) = pending.pop() {
+            *budget = budget.checked_sub(1).ok_or_else(|| {
+                error(
+                    "real coverage predicates exceed the 65536 region classification limit (14.3)",
+                )
+            })?;
+            let domains = BTreeMap::from([(item.to_owned(), ScalarDomain::Real(lo, hi))]);
+            match prove_predicate(expr, &domains, &mut |expr| evaluate(expr, Some(lo)))? {
+                Some(true) => matched.push((lo, hi)),
+                Some(false) => {}
+                None if lo == hi => {
+                    if boolean(evaluate(expr, Some(lo))?)? {
+                        matched.push((lo, hi));
+                    }
+                }
+                None => {
+                    let mid = lo + (hi - lo) / 2;
+                    pending.push((mid + 1, hi));
+                    pending.push((lo, mid));
+                }
+            }
+        }
+        return Ok(canonical_set(matched));
     }
     if domain.1.abs_diff(domain.0) >= *budget as u128 {
         return Err(error(

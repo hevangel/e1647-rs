@@ -15,5 +15,12 @@ extend sys {
         var still_string: string = it;
         xs.and_all(it);
         xs.or_all(it);
+        xs.first(it);
+        var bad_index: string = xs.last_index(it > 0);
+        objects.sort_by_field(absent);
+        xs.get_indices(objects);
+        xs.resize("bad");
+        xs.resize(3, "bad");
+        xs.resize(3, UNDEF, 1);
     };
 };

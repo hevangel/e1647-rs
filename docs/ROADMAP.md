@@ -116,8 +116,8 @@ not imply full language support or IEEE conformance.
       through the builder API (`max_int_buckets`, the coverage mode);
       runtime configuration enables collection. Per-unit-instance
       groups and group/basic-item `when` filters run; full option type
-      checking, real/enumeral ranges, derived-item ignore/illegal filters and radix
-      remain unfinished.
+      checking, general real predicates, and composite derived-item filters remain
+      unfinished.
       Predefined non-scalar types `file` and `event` are accepted in
       type positions; `for each <type> (v) in list` records the element
       type filter. Simple macros expand (clause 15): `define <name'
@@ -164,9 +164,10 @@ not imply full language support or IEEE conformance.
       an arm is chosen with probability weight/(sum of all weights)
       over the field's current range, and `min`/`max`/`edges`/`others`
       and `normal(center, stddev)` map the choice to a value; choices
-      evaluate constant integer expressions over the recorded tokens
-      (`MAX_UINT`/`MAX_INT` included), and unevaluable choices leave
-      the field unwidened. In action position (`var x = select ...`)
+      evaluate constant integer expressions over the recorded tokens,
+      including `define` names and predefined integers. Weight totals
+      use checked arithmetic and support draws beyond 64 bits.
+      Unevaluable choices leave the field unwidened. In action position (`var x = select ...`)
       the select still reports the honest not-evaluated diagnostic.
       Preprocessor directives (clause 21): `#ifdef` / `#ifndef` /
       `#define` / `#undef` / `#else` in statement, struct-member and
@@ -190,11 +191,12 @@ not imply full language support or IEEE conformance.
       category validation — computed macros evaluate their restricted
       body subset, see M1), the remaining clause 14
       coverage model —
-      real/enumeral ranges and general constant/type resolution,
-      `radix`/`never` and derived-item filters; full option type checking;
+      general real predicates and general constant/type resolution,
+      `never` and remaining derived-item filters;
+      full option type checking;
       runtime configuration categories/options
       beyond coverage mode, `max_int_buckets`, `at_least` and
-      `check_illegal_immediately`, and `set_config_max()` —
+      `check_illegal_immediately` —
       the clause 12/13 temporal
       engine's remaining simulation integration — the scheduler runs
       started TCMs concurrently and waits/sync suspend, `@`-triggered
@@ -329,11 +331,27 @@ not imply full language support or IEEE conformance.
       fields into a solver problem; range membership (`x in [lo..hi]`)
       translates to the two comparisons; unsupported shapes fall back to
       rejection sampling. Disjunctions (item-list membership, `||`) and
-      negation trees translate; bounded polynomial problems of degree
+      negation trees translate. Linear disjunctions nested within
+      conjunctions expand into flat branches for Pumpkin, with a limit
+      of 64 combinations. Bounded polynomial problems of degree
       up to four use feature-independent enumeration with capped domain
-      products. Wide domains, division/modulo and global constraints
+      products. Enumeration selects the seed-indexed satisfying assignment.
+      Coefficient and constant overflows defer to the fallback sampler.
+      Comparisons involving a bounded field divided by a positive
+      literal translate into a range, including signed dividends.
+      Remainder equalities over nonnegative dividends expand into up to
+      64 matching values. Larger sets of
+      matches use a bounded quotient in Pumpkin. Inequality, negation,
+      and ordered comparisons constrain the residual from that quotient.
+      Signed remainder constraints use truncating division and a signed
+      residual. Signed fields also accept negative literal divisors.
+      Wide domains,
+      general division and modulo, and global constraints
       remain unsupported by the solver. `keep bind` and
       `hdl_path()` / `delayed()` constraints do not gate `gen`.
+      `keep` predicates resolve literal defines, integer constant
+      expressions in defines, and predefined integer constants. The solver
+      folds named integer operands before translation.
       Connected field sets (10.3.6-10.3.7) scope generation, v1: `gen <obj>`
       inside a method gates the object with the enclosing instance's
       constraints that reference it — `p.v == select { .. }` rebases to
@@ -354,9 +372,39 @@ not imply full language support or IEEE conformance.
       rejection sampler narrows each field's sampling domain to the
       intersection of the type's constant range/equality constraints
       (without this, a constrained unsized `int` is unhittable in 1000
-      attempts). Data fields are implicitly generated before `run()`
-      (skipping `!` and unit-typed fields; `keep list.size() == N` sets
-      list lengths)
+      attempts). Explicit integer widths above 31 bits use this sampler
+      at the runtime width. Direct scalar field generation also narrows
+      its fallback sampling domain using the owning type's hard bounds.
+      Constant integer item lists constrain the fallback sampler to the
+      exact permitted values, including in wide fields. `select` draws
+      from those values and projects normal draws to the closest one.
+      Constant `not in` intervals and item lists remove excluded integer
+      values from the sampling domain.
+      An `or` unions the integer domains of its alternatives for fields
+      bounded in every branch. Object generation can choose a compatible
+      branch before sampling related fields. Candidate validation checks
+      the full disjunction.
+      Integer `in_table` columns use exact unions of known cell values,
+      intervals and reflected type sets. The generated tuple still has
+      to match one complete row.
+      Object generation samples correlated integer fields from compatible
+      table rows before validating dynamic cells and other constraints.
+      Integer subtype bounds apply through aliases to scalar fields,
+      locals, list elements, and range-generated fields. The solver and
+      `select` distributions use these bounds when choosing values.
+      A `keep` conjunction can combine `select` with hard constraints;
+      the fallback sampler verifies the hard conjuncts for each candidate.
+      Generation tries ordinary `keep soft` predicates and distributions
+      together, then retries with only the hard constraints if the
+      preferred pass finds no solution. Individual soft priorities and
+      selection of compatible subsets remain open.
+      Explicit `gen` on a `chosen_from` target can also relax soft
+      co-constraints using the same evaluated candidate list.
+      Data fields are implicitly generated before `run()`
+      (skipping `!` and unit-typed fields). Constant `list.size()`
+      equalities, comparisons and intervals shape list lengths up to
+      65536 elements. Unconstrained lists keep the default 0–3 slots,
+      and a larger lower-only bound sets the generated length.
 
 ## M3 — Behavioral execution
 - [~] Interpreter and method calling conventions — partial. Shared execution
@@ -463,6 +511,9 @@ not imply full language support or IEEE conformance.
       (14.4/14.5), and `run --coverage` reports instances; the 14.9
       configuration is honored through the builder API
       (`max_int_buckets`, the coverage mode) and runtime `set_config(cover, ...)`.
+      Default integer and Boolean buckets follow owner field types and
+      scalar alias chains. Resolvable integer widths cap the default
+      bucket count.
       Runtime collection starts disabled until enabled explicitly.
       Per-unit scoping follows the nearest requested unit in the field
       tree, including inherited units, flattened lists and unsampled
@@ -477,13 +528,46 @@ not imply full language support or IEEE conformance.
       `count_only` collect; `off` pauses without clearing counts;
       Boolean values also control enablement. `max_int_buckets` accepts
       0–65536 before sampling; after sampling, changes report E0402.
+      `set_config_max(cover, ...)` raises the numeric `max_int_buckets`
+      and `at_least` options and shares the same validation and timing.
+      Coverage callbacks reject requests that would rebuild the schema.
+      Basic `per_instance` flags validate Boolean literals and inherit the
+      composed group default unless explicitly overridden.
+      `per_instance` and `no_collect` accept grouped Boolean literals.
+      Flag and unit-scope assignments require a value after `=`.
       `per_unit_instance [= unit_type]` and `instance_no_collect` with
-      `inst` collect and present per-unit data (14.2.2/14.3.4); structural
-      option/scope errors are E0224. Other runtime configuration
-      categories/options, `set_config_max`, composite-valued predicates,
-      real/enumeral ranges, general constant/type resolution, radix/filter semantics and full option type checking
+      `inst` collect and present per-unit data (14.2.2/14.3.4).
+      Counts follow the physical unit when aliases move it to a new path.
+      Structural option/scope errors are E0224. Other runtime configuration
+      categories/options, composite-valued predicates,
+      general real predicates, general constant/type resolution,
+      remaining filter semantics and full option type checking
       remain gaps. Derived name options and range labels evaluate supported
       literal-string concatenation/grouping and decode runtime string escapes.
+      Basic integer items use `radix = DEC`, `HEX`, or `BIN` for generated
+      bucket labels, while explicit range names stay as written.
+      Items without their own radix inherit the group's composed default.
+      Crosses and transitions can override direct numeric source labels
+      while preserving explicit names and the labels of nested sources.
+      Enumeral items accept explicit ranges in declaration order and
+      contribute ordered buckets to crosses and transitions. The schema
+      follows named alias chains and resolves inline enumeral field types.
+      Basic ignore/illegal predicates classify enumeral buckets by
+      evaluating their declared members.
+      Derived predicates can also classify direct enumeral sources,
+      including previous and current values of a transition.
+      Real items accept finite constant intervals with decimal bounds
+      in reports and use their buckets for grades and derived combinations.
+      Bounds and widths accept pure arithmetic and initialized real
+      const fields, including aliases and qualified static references.
+      Positive widths subdivide real ranges with exclusive upper bounds
+      until the final bucket, which includes the range endpoint.
+      Direct constant comparisons and Boolean combinations classify basic
+      real buckets, including their open endpoints.
+      Cross and transition predicates compare direct real sources using
+      interval proofs, with bounded evaluation for unresolved regions.
+      Basic and derived masks prove finite real arithmetic over intervals
+      and subdivide unresolved regions within their classification budget.
       Invalid derived names report E0224; computed names participate in graph
       lookup and duplicate checking. Supported initialized const fields resolve
       after composition, including inherited fields and qualified static consts,
@@ -529,7 +613,10 @@ not imply full language support or IEEE conformance.
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`
       (5.10.5/5.10.6 — the argument parses as a type) build the
       `Value::Set` of all legal values (5.2.12 canonical intervals:
-      sorted, merged, non-neighboring), the 28.5 set pseudo-methods
+      sorted, merged, non-neighboring). For integer subtypes with
+      constant bounds, `set_of_values` reflects the declared range and
+      `full_set_of_values` reflects the underlying representation.
+      Both forms work in `in_table`. The 28.5 set pseudo-methods
       query and combine (`size`/`uint_size`/`min`/`uint_min`/
       `int_min`/`max`/`uint_max`/`int_max`, the `_is_uint` guards,
       `union`/`intersect`/`diff`), `to_string()` renders scalars and
@@ -544,14 +631,19 @@ not imply full language support or IEEE conformance.
       boolean expression bound to `it`, preserve order and return fresh
       filtered/index lists; implicit index bindings are not modeled.
       `and_all` and `or_all` accept a Boolean item expression and
-      evaluate it for each item (27.5.1/2). Other expression-taking
-      forms, `resize`, the 27.6 CRC family and
-      27.7 keyed lists are documented gaps in `src/interp.rs`). Set literals
-      in expressions, range
-      modifiers on declared types (so `full_set_of_values` can
-      differ), and bare scalar keywords as type arguments
-      (`set_of_values(int)` — needs type objects in expression
-      position) are not modeled
+      evaluate it for each item (27.5.1/2). `first`, `last`, and their
+      index forms short-circuit when a predicate matches. `all_different`
+      accepts an optional key expression, and `unique` returns the first
+      original item for each raw value or key. `sort` returns a stable sorted copy
+      using raw items or one scalar key expression. `sort_by_field` uses a
+      named scalar field on each struct item. `get_indices` selects multiple
+      indexes in argument order and shares individual indexing's bounds checks.
+      The remaining expression-taking forms, the 27.6 CRC family and
+      27.7 keyed lists are documented gaps in `src/interp.rs`).
+      `resize(size)` preserves the prefix and
+      applies the declared element default to newly allocated slots.
+      `resize(size, filler[, keep_old])` evaluates the filler per slot,
+      accepts `UNDEF` for typed defaults and can replace the entire list.
 
 ## M4 — Simulator integration
 - [~] HDL bridge — started: `src/hdl.rs` spawns `xezim` with the VPI

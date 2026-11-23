@@ -28,10 +28,10 @@
 //! CP solve; disjunctions expand into bounded branch combinations) and
 //! unsupported shapes fall back to the
 //! rejection sampler, **not** a general constraint solver: fields are
-//! sampled inside their declared bounds, a candidate is accepted only when
-//! every top-level `keep` constraint of the enclosing type evaluates to
-//! TRUE, and after 1000 failed attempts a diagnostic is reported. Soft
-//! constraints are not enforced; a `when` subtype view's determinant
+//! sampled inside their declared bounds and rejected when a required
+//! predicate is false. Generation tries the soft constraints together
+//! first and can retry with the hard constraints alone if that pass fails.
+//! Rejection sampling tries up to 1000 candidates per pass. A `when` subtype view's determinant
 //! fields are fixed to the view's values (6.7) and never sampled, while
 //! the enclosing type's when-block constraints stay unenforced. Every
 //! run takes an explicit seed and is fully deterministic per backend.
@@ -152,10 +152,12 @@
 //! Pseudo-methods are macros, not struct methods (27.1). The ones whose
 //! semantics take a per-item expression argument cannot pass through the
 //! v1 dispatch (it evaluates arguments to values only), so they report
-//! `E0405` "list method ... is not supported": `apply` (27.4.2),
-//! `sort`/`sort_by_field` (27.4.23/27.4.24), `first`/`last`
-//! (27.4.6/27.4.13), `first_index`/`last_index` (27.4.7/27.4.14),
-//! `all_different` (27.4.1), `unique` (27.4.28), and `split` (27.4.25).
+//! `E0405` "list method ... is not supported": `apply` (27.4.2)
+//! and `split` (27.4.25). `all_different` checks raw or expression keys
+//! for duplicates. `unique` (27.4.28) keeps the first original item
+//! for each raw value or expression key.
+//! `sort` (27.4.23) and `sort_by_field` (27.4.24) return stable sorted
+//! copies for scalar keys.
 //! The 27.4.17/27.4.20/27.5.4-27.5.6 aggregates
 //! (`max_value`, `min_value`, `product`, `sum`, `average`) DO take a
 //! per-item expression — they intercept before the argument evaluation
@@ -173,12 +175,13 @@
 //! evaluation, so mutation during a predicate does not change traversal.
 //! `and_all` and `or_all` (27.5.1/2) also accept an item expression
 //! and reduce all of its Boolean results.
-//! Implicit index bindings are not modeled. Also not
-//! modeled: `resize` (27.3.16 — the
-//! `filler`/`keep_old` parameters are expressions and new items need the
-//! element type's default value), `get_indices` (27.4.9 — the prose does
-//! not state the out-of-range index behavior; element access is the `[i]`
-//! index expression, `E0404`), `flatten` (27.4.8 — no language surface of
+//! `first`/`last` and their index forms stop at the first matching
+//! predicate in the requested direction and report E0402 with no match.
+//! Implicit index bindings are not modeled. `resize(size)` preserves
+//! the existing prefix and fills new slots with element defaults
+//! (27.3.16). An optional filler supplies new values and an optional
+//! keep-old flag selects whether to retain the prefix.
+//! `flatten` (27.4.8 — no language surface of
 //! this subset can produce a nested list: a list argument to a modifying
 //! pseudo-method is the 27.3.2/27.3.4/27.3.14/27.3.15 list form, because e
 //! declares no lists of lists), the CRC family (27.6.1-27.6.3 — the prose
@@ -198,8 +201,8 @@
 //! the one-cycle implicit sync of the stand-alone model.
 
 use crate::ast::{
-    BinaryOp, DeclarationKind, EventDecl, Expr, Field, MethodDecl, OnDecl, ScalarBase, Stmt,
-    TypeExpr, UnaryOp, WhenQualifier,
+    BinaryOp, DeclarationKind, EventDecl, Expr, Field, KeepConstraint, MethodDecl, OnDecl,
+    ScalarBase, Stmt, TypeExpr, UnaryOp, WhenQualifier,
 };
 use crate::diagnostic::Diagnostic;
 use crate::elab::Elaborated;
@@ -806,9 +809,17 @@ impl Rng {
 
     fn below(&mut self, bound: u128) -> u128 {
         if bound == 0 {
-            0
-        } else {
-            u128::from(self.next_u64()) % bound
+            return 0;
+        }
+        if bound <= 1u128 << 64 {
+            return u128::from(self.next_u64()) % bound;
+        }
+        let threshold = bound.wrapping_neg() % bound;
+        loop {
+            let draw = (u128::from(self.next_u64()) << 64) | u128::from(self.next_u64());
+            if draw >= threshold {
+                return draw % bound;
+            }
         }
     }
 
@@ -837,8 +848,25 @@ struct CoverageAxis {
     binding: String,
     source: String,
     prototype: Value,
+    enum_domain: Option<crate::coverage::CoverageEnum>,
     options: crate::coverage::ItemOptions,
     buckets: Vec<(usize, i128, i128)>,
+}
+
+impl CoverageAxis {
+    fn value_at(&self, ordinal: i128) -> Value {
+        if let Some(domain) = &self.enum_domain {
+            domain
+                .value_at(ordinal)
+                .expect("enumeral bucket bounds are validated ordinals")
+        } else if matches!(self.prototype, Value::Bool(_)) {
+            Value::Bool(ordinal != 0)
+        } else if matches!(self.prototype, Value::Real(_)) {
+            Value::Real(crate::coverage::real_from_ordinal(ordinal))
+        } else {
+            Value::Int(ordinal)
+        }
+    }
 }
 
 fn next_coverage_indices(indices: &mut [usize], limits: &[usize]) -> bool {
@@ -855,14 +883,7 @@ fn next_coverage_indices(indices: &mut [usize], limits: &[usize]) -> bool {
 fn coverage_point_bindings(axes: &[CoverageAxis], ranges: &[(i128, i128)]) -> Vec<(String, Value)> {
     axes.iter()
         .zip(ranges)
-        .map(|(axis, (lo, _))| {
-            let value = if matches!(axis.prototype, Value::Bool(_)) {
-                Value::Bool(*lo != 0)
-            } else {
-                Value::Int(*lo)
-            };
-            (axis.binding.clone(), value)
-        })
+        .map(|(axis, (lo, _))| (axis.binding.clone(), axis.value_at(*lo)))
         .collect()
 }
 
@@ -873,8 +894,67 @@ fn coverage_midpoint(lo: i128, hi: i128) -> i128 {
     ((lo + (hi - lo) / 2) ^ sign) as i128
 }
 
+#[derive(Default)]
+struct GenerationDomains {
+    integers: IntegerDomains,
+    list_lengths: BTreeMap<String, (i128, i128)>,
+    integer_alternatives: Vec<Vec<IntegerDomains>>,
+}
+
+type IntegerDomains = BTreeMap<String, Vec<(i128, i128)>>;
+
+const DEFAULT_GENERATED_LIST_MAX: i128 = 3;
+const MAX_GENERATED_LIST_LENGTH: i128 = 65_536;
+
+enum GenerationTarget<'a> {
+    Integer(&'a str),
+    ListLength(&'a str),
+}
+
+impl GenerationDomains {
+    fn narrow(&mut self, target: GenerationTarget<'_>, range: (i128, i128)) {
+        match target {
+            GenerationTarget::Integer(name) => {
+                self.narrow_integers(name, canonical_set(vec![range]))
+            }
+            GenerationTarget::ListLength(name) => {
+                intersect_domain(&mut self.list_lengths, name, range)
+            }
+        }
+    }
+
+    fn narrow_integers(&mut self, name: &str, allowed: Vec<(i128, i128)>) {
+        narrow_integer_domain(&mut self.integers, name, allowed);
+    }
+
+    fn add_integer_alternatives(&mut self, alternatives: Vec<IntegerDomains>) {
+        let Some(first) = alternatives.first() else {
+            return;
+        };
+        for name in first.keys() {
+            let mut ranges = Vec::new();
+            if alternatives.iter().all(|alternative| {
+                let Some(allowed) = alternative.get(name) else {
+                    return false;
+                };
+                ranges.extend_from_slice(allowed);
+                true
+            }) {
+                self.narrow_integers(name, canonical_set(ranges));
+            }
+        }
+        if alternatives
+            .iter()
+            .any(|alternative| alternative.len() >= 2)
+        {
+            self.integer_alternatives.push(alternatives);
+        }
+    }
+}
+
 struct Interp<'a> {
     types: &'a [crate::elab::ElaboratedType],
+    subtype_ranges: &'a BTreeMap<String, Option<(i128, i128)>>,
     instances: Vec<ObjectInstance>,
     rng: Rng,
     /// The run's seed, handed to the constraint-solver backend for `gen`.
@@ -948,6 +1028,7 @@ struct Interp<'a> {
     /// sampling event records item values into the buckets.
     coverage: Vec<crate::coverage::TypeCoverage>,
     coverage_config: crate::coverage::CoverageConfig,
+    evaluating_coverage: bool,
     coverage_was_enabled: bool,
     coverage_illegal_pending: Vec<String>,
     /// Set by `stop_run()`; unwinds the whole run.
@@ -957,6 +1038,8 @@ struct Interp<'a> {
     dut_errors: usize,
     /// `define` constants resolved to values.
     defines: std::collections::BTreeMap<String, Value>,
+    /// Source definitions for constant expressions parsed from select arms.
+    define_expressions: &'a BTreeMap<String, Expr>,
     /// The static field store (T2.1): one shared occurrence per
     /// declaring type, keyed by the canonical type name the static
     /// member is declared in, then by field name. Initialized at
@@ -1280,19 +1363,23 @@ fn run_inner(
     seed: u64,
     hdl: Option<crate::hdl::SignalSource>,
 ) -> RunResult {
-    // Resolve `define` constants (literal values only; non-literals are
-    // skipped — they need the elaboration-time substitution that a macro
-    // pass would provide).
+    // Resolve literal defines and integer constant expressions.
     let defines: std::collections::BTreeMap<String, Value> = elaborated
         .defines
         .iter()
         .filter_map(|(name, expr)| {
             let value = match expr {
-                Expr::IntLiteral { text, .. } => parse_int_literal(text).map(Value::Int),
-                Expr::BitLiteral { text, .. } => parse_int_literal(text).map(Value::Int),
                 Expr::StringLiteral { value, .. } => Some(Value::Str(unescape(value))),
                 Expr::BoolLiteral { value, .. } => Some(Value::Bool(*value)),
-                _ => None,
+                _ => match crate::elab::eval_const_expr(
+                    expr,
+                    &BTreeMap::new(),
+                    &elaborated.defines,
+                    0,
+                ) {
+                    Some(crate::elab::Const::Int(value)) => Some(Value::Int(value)),
+                    _ => None,
+                },
             }?;
             Some((name.clone(), value))
         })
@@ -1335,6 +1422,7 @@ fn run_inner(
         .collect();
     let mut interp = Interp {
         types: elaborated.types.as_slice(),
+        subtype_ranges: &elaborated.subtype_ranges,
         instances: Vec::new(),
         rng: Rng::new(seed),
         seed,
@@ -1372,11 +1460,13 @@ fn run_inner(
             mode: false,
             ..Default::default()
         },
+        evaluating_coverage: false,
         coverage_was_enabled: false,
         coverage_illegal_pending: Vec::new(),
         stop_requested: false,
         dut_errors: 0,
         defines,
+        define_expressions: &elaborated.defines,
         statics: BTreeMap::new(),
         static_fields: &elaborated.static_fields,
         static_methods: &elaborated.static_methods,
@@ -3524,8 +3614,8 @@ impl<'a> Interp<'a> {
                     span,
                 ));
             };
-            let other = self.chosen_from_other_constraints(instance, &remaining);
-            self.gen_chosen_from(instance, &remaining, &list, &other, span)?;
+            let other = self.chosen_from_other_constraints(instance, &remaining, true);
+            self.gen_chosen_from(instance, &remaining, &list, &other, true, span)?;
             return Ok(Flow::Normal);
         }
         // A struct instance is randomized in place, recursively — under
@@ -3534,23 +3624,18 @@ impl<'a> Interp<'a> {
         if let Value::Object(index) = current {
             let obj_type_name = self.instances[me_index].type_name.clone();
             let types: &[crate::elab::ElaboratedType] = self.types;
-            let enclosing: Vec<Expr> = types
+            let enclosing = types
                 .iter()
-                .find(|t| t.name == obj_type_name)
-                .map(|t| {
-                    t.constraints
-                        .iter()
-                        .filter(|c| !c.is_bind)
-                        .map(|c| c.expr.clone())
-                        .collect()
-                })
+                .find(|t| !slot_is_local && t.name == obj_type_name)
+                .map(|t| t.constraints.as_slice())
                 .unwrap_or_default();
-            let rebased = rebase_constraints(&enclosing, name);
+            let rebased =
+                rebase_constraints(enclosing, name, |name| self.is_generation_constant(name));
             self.gen_object(index, &rebased)?;
             return Ok(Flow::Normal);
         }
-        // Scalar, list or enumeral target: sample candidates and accept one
-        // that satisfies every top-level constraint of the enclosing type.
+        // Sample the declared type of a scalar, list or enumeral target.
+        // Instance fields also participate in their owning type's keeps.
         let Some(declared_ty) = self.declared_type_of(name, slot_is_local, frame, me_index) else {
             return Err(self.error(
                 "E0402",
@@ -3560,104 +3645,54 @@ impl<'a> Interp<'a> {
         };
         let obj_type_name = self.instances[me_index].type_name.clone();
         let types: &[crate::elab::ElaboratedType] = self.types;
-        let constraints: Vec<Expr> = types
+        let constraints: Vec<_> = types
             .iter()
-            .find(|t| t.name == obj_type_name)
-            .map(|t| {
-                t.constraints
-                    .iter()
-                    .filter(|c| !c.is_bind)
-                    .map(|c| c.expr.clone())
-                    .collect()
-            })
+            .find(|t| !slot_is_local && t.name == obj_type_name)
+            .map(|t| t.constraints.iter().collect())
             .unwrap_or_default();
-        // Solver-backed path: linear problems go to the backend
-        // conjunction solver (pumpkin with the cargo feature; without it
-        // the outcome is Unsupported and the rejection sampler below
-        // takes over), non-linear problems go to the bounded enumeration
-        // solver in every build (see [`crate::solve::solve`]). A
-        // chosen_from constraint assigns its own target when that is
-        // generated; it is not a predicate over this scalar, so it stays
-        // out of the translated problem.
-        {
-            let bounds: std::collections::BTreeMap<String, (i64, i64)> =
-                crate::solve::int_bounds(&declared_ty)
-                    .map(|b| (name.clone(), b))
-                    .into_iter()
-                    .collect();
-            let solver_constraints: Vec<Expr> = constraints
-                .iter()
-                .filter(|constraint| !matches!(**constraint, Expr::ChosenFrom { .. }))
-                .cloned()
-                .collect();
-            if !bounds.is_empty()
-                && let Ok(problem) = crate::solve::translate(&solver_constraints, &bounds)
-            {
-                match crate::solve::solve(&problem, self.seed) {
-                    crate::solve::SolveOutcome::Solved(mut assignment) => {
-                        let value = assignment.remove(0);
+        let field_types = [(name.clone(), declared_ty)];
+        let declared_ty = &field_types[0].1;
+        let mut passes = generation_constraint_passes(&constraints).peekable();
+        while let Some((_, constraints)) = passes.next() {
+            match self.try_solve_fields(&field_types, &constraints, &obj_type_name, span) {
+                Ok(Some(assignment)) => {
+                    if let [(_, value)] = assignment.as_slice() {
                         self.store(
                             slot_is_local,
                             name,
-                            Value::Int(value),
+                            Value::Int(*value),
                             frame,
                             me_index,
                             span,
                         )?;
                         return Ok(Flow::Normal);
                     }
-                    crate::solve::SolveOutcome::Unsat => {
-                        return Err(self.error(
-                            "E0407",
-                            format!("the constraints of '{obj_type_name}' are unsatisfiable"),
-                            span,
-                        ));
-                    }
-                    crate::solve::SolveOutcome::Unsupported => {}
                 }
-            }
-        }
-        let mut solved = false;
-        for _ in 0..1000 {
-            let candidate = self.sample_type(&declared_ty)?;
-            self.store(slot_is_local, name, candidate, frame, me_index, span)?;
-            let mut pass = true;
-            for constraint in &constraints {
-                // A chosen_from constraint is not a predicate here: it
-                // assigns its own target when that field is generated.
-                if matches!(constraint, Expr::ChosenFrom { .. }) {
+                Ok(None) => {}
+                Err(ExecError::Diagnostic(Diagnostic { code: "E0407", .. }))
+                    if passes.peek().is_some() =>
+                {
                     continue;
                 }
-                match self.eval(constraint, frame, Some(me_index))? {
-                    Value::Bool(true) => {}
-                    Value::Bool(false) => {
-                        pass = false;
-                        break;
-                    }
-                    _ => {
-                        return Err(self.error(
-                            "E0402",
-                            "constraint did not evaluate to a boolean",
-                            span,
-                        ));
-                    }
+                Err(error) => return Err(error),
+            }
+            let domains = self.constraint_domains(&constraints, &field_types)?;
+            let predicates = generation_predicates(&constraints);
+            for _ in 0..1000 {
+                let candidate = self.sample_generation_field(name, declared_ty, &domains)?;
+                self.store(slot_is_local, name, candidate, frame, me_index, span)?;
+                if self.generation_candidate_matches(&predicates, Some(frame), me_index, span)? {
+                    return Ok(Flow::Normal);
                 }
             }
-            if pass {
-                solved = true;
-                break;
-            }
         }
-        if !solved {
-            return Err(self.error(
-                "E0407",
-                format!(
-                    "no solution found for the constraints of '{obj_type_name}' after 1000 attempts"
-                ),
-                span,
-            ));
-        }
-        Ok(Flow::Normal)
+        Err(self.error(
+            "E0407",
+            format!(
+                "no solution found for the constraints of '{obj_type_name}' after 1000 attempts"
+            ),
+            span,
+        ))
     }
 
     /// `gen <path>;` — the target is a simple member path: a bare
@@ -3728,8 +3763,8 @@ impl<'a> Interp<'a> {
         if let Some((instance, remaining, list)) =
             self.find_governing_chosen_from(walk_instance, &walk_remaining)?
         {
-            let other = self.chosen_from_other_constraints(walk_instance, &walk_remaining);
-            self.gen_chosen_from(instance, &remaining, &list, &other, span)?;
+            let other = self.chosen_from_other_constraints(walk_instance, &walk_remaining, true);
+            self.gen_chosen_from(instance, &remaining, &list, &other, true, span)?;
             return Ok(());
         }
         // Plain generation of the final field: single-segment paths only —
@@ -3750,18 +3785,13 @@ impl<'a> Interp<'a> {
         };
         let parent_type_name = self.instances[base].type_name.clone();
         let types: &[crate::elab::ElaboratedType] = self.types;
-        let enclosing: Vec<Expr> = types
+        let enclosing = types
             .iter()
             .find(|t| t.name == parent_type_name)
-            .map(|t| {
-                t.constraints
-                    .iter()
-                    .filter(|c| !c.is_bind)
-                    .map(|c| c.expr.clone())
-                    .collect()
-            })
+            .map(|t| t.constraints.as_slice())
             .unwrap_or_default();
-        let rebased = rebase_constraints(&enclosing, field);
+        let rebased =
+            rebase_constraints(enclosing, field, |name| self.is_generation_constant(name));
         self.gen_object(target_index, &rebased)?;
         Ok(())
     }
@@ -3829,19 +3859,23 @@ impl<'a> Interp<'a> {
         &self,
         start_instance: usize,
         start_remaining: &[String],
-    ) -> Vec<(usize, Expr)> {
-        let mut other: Vec<(usize, Expr)> = Vec::new();
+        include_soft: bool,
+    ) -> Vec<(usize, KeepConstraint)> {
+        let mut other = Vec::new();
         let mut instance = start_instance;
         let mut remaining: Vec<String> = start_remaining.to_vec();
         loop {
             let type_name = self.instances[instance].type_name.clone();
             if let Some(ty) = self.types.iter().find(|t| t.name == type_name) {
                 for constraint in &ty.constraints {
-                    if constraint.is_bind || matches!(constraint.expr, Expr::ChosenFrom { .. }) {
+                    if constraint.is_bind
+                        || (!include_soft && constraint.is_soft)
+                        || matches!(constraint.expr, Expr::ChosenFrom { .. })
+                    {
                         continue;
                     }
                     if expr_extends_path(&constraint.expr, &remaining) {
-                        other.push((instance, constraint.expr.clone()));
+                        other.push((instance, constraint.clone()));
                     }
                 }
             }
@@ -3860,21 +3894,22 @@ impl<'a> Interp<'a> {
     /// Apply one clause 10.5.8 `target chosen_from read_only(list)`
     /// constraint: the list elements are substituted into the target slot
     /// (`slot_instance.slot_remaining`) one by one, the other constraints
-    /// on paths through the target (`(instance, constraint)` pairs, each
-    /// evaluated in its declaring instance's context) must all hold with
-    /// the candidate bound, and one satisfying element is picked uniformly
-    /// with the seeded RNG. An empty list, or no satisfying element, is a
-    /// generation contradiction (`E0417`).
+    /// on paths through the target are evaluated with the candidate bound
+    /// in each declaring instance. Explicit generation can relax soft
+    /// co-constraints here. Whole-object generation manages its own retry.
     fn gen_chosen_from(
         &mut self,
         slot_instance: usize,
         slot_remaining: &[String],
         list_expr: &Expr,
-        other: &[(usize, Expr)],
+        other: &[(usize, KeepConstraint)],
+        retry_without_soft: bool,
         span: crate::ast::Span,
     ) -> Result<(), ExecError> {
         let target_text = slot_remaining.join(".");
-        self.check_chosen_from_target(slot_instance, slot_remaining, &target_text, span)?;
+        let target_instance =
+            self.check_chosen_from_target(slot_instance, slot_remaining, &target_text, span)?;
+        let target_field = slot_remaining.last().expect("validated target path");
         let list_text = expr_text(list_expr);
         let list_value = self.eval(list_expr, &mut Frame::default(), Some(slot_instance))?;
         let Value::List(list) = list_value else {
@@ -3888,8 +3923,8 @@ impl<'a> Interp<'a> {
         // Pointer-equality (and the other whole-object identity and
         // type-narrowing comparisons) on the target are unsupported
         // 10.5.8 shapes — reported instead of silently ignored.
-        for (_, constraint) in other {
-            if let Some(shape) = constraint_compares_target_whole(constraint, slot_remaining) {
+        for (_, keep) in other {
+            if let Some(shape) = constraint_compares_target_whole(&keep.expr, slot_remaining) {
                 return Err(self.error(
                     "E0402",
                     format!(
@@ -3899,48 +3934,52 @@ impl<'a> Interp<'a> {
                 ));
             }
         }
-        let mut satisfying: Vec<Value> = Vec::new();
-        for candidate in &items {
-            if !self.set_field_path(slot_instance, slot_remaining, candidate.clone()) {
-                return Err(self.error("E0401", format!("unknown field '{target_text}'"), span));
-            }
-            let mut pass = true;
-            for (instance, constraint) in other {
-                match self.eval(constraint, &mut Frame::default(), Some(*instance))? {
-                    Value::Bool(true) => {}
-                    Value::Bool(false) => {
-                        pass = false;
-                        break;
+        let original = self.instances[target_instance]
+            .get(target_field)
+            .cloned()
+            .ok_or_else(|| self.error("E0401", format!("unknown field '{target_text}'"), span))?;
+        let can_relax = retry_without_soft && other.iter().any(|(_, keep)| keep.is_soft);
+        let selection = (|| {
+            for include_soft in std::iter::once(true).chain(can_relax.then_some(false)) {
+                let mut satisfying = Vec::new();
+                'candidate: for candidate in &items {
+                    self.instances[target_instance].set(target_field, candidate.clone());
+                    for (instance, keep) in other {
+                        if !include_soft && keep.is_soft {
+                            continue;
+                        }
+                        match self.eval(&keep.expr, &mut Frame::default(), Some(*instance))? {
+                            Value::Bool(true) => {}
+                            Value::Bool(false) => continue 'candidate,
+                            _ => {
+                                return Err(self.error(
+                                    "E0402",
+                                    "constraint did not evaluate to a boolean",
+                                    span,
+                                ));
+                            }
+                        }
                     }
-                    _ => {
-                        return Err(self.error(
-                            "E0402",
-                            "constraint did not evaluate to a boolean",
-                            span,
-                        ));
-                    }
+                    satisfying.push(candidate);
+                }
+                if !satisfying.is_empty() {
+                    let pick = self.rng.below(satisfying.len() as u128) as usize;
+                    return Ok(satisfying[pick].clone());
                 }
             }
-            if pass {
-                satisfying.push(candidate.clone());
-            }
-        }
-        if satisfying.is_empty() {
-            return Err(self.error(
+            Err(self.error(
                 "E0417",
                 format!(
                     "chosen_from: no element of '{list_text}' satisfies the constraints on '{target_text}'"
                 ),
                 span,
-            ));
-        }
-        // 10.5.8: one of the satisfying elements, chosen uniformly.
-        let pick = self.rng.below(satisfying.len() as u128) as usize;
-        let chosen = satisfying[pick].clone();
-        if !self.set_field_path(slot_instance, slot_remaining, chosen) {
-            return Err(self.error("E0401", format!("unknown field '{target_text}'"), span));
-        }
-        Ok(())
+            ))
+        })();
+        self.instances[target_instance].set(
+            target_field,
+            selection.as_ref().unwrap_or(&original).clone(),
+        );
+        selection.map(|_| ())
     }
 
     /// The 10.5.8 target-shape rules checked where the type information
@@ -3954,7 +3993,7 @@ impl<'a> Interp<'a> {
         slot_remaining: &[String],
         target_text: &str,
         span: crate::ast::Span,
-    ) -> Result<(), ExecError> {
+    ) -> Result<usize, ExecError> {
         let mut instance = slot_instance;
         let last = slot_remaining.len() - 1;
         for (position, segment) in slot_remaining.iter().enumerate() {
@@ -4012,24 +4051,7 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        Ok(())
-    }
-
-    /// Assign `value` to the slot named by a dotted field path: every
-    /// segment except the last must currently hold a struct instance.
-    fn set_field_path(&mut self, instance: usize, remaining: &[String], value: Value) -> bool {
-        let mut instance = instance;
-        let last = remaining.len() - 1;
-        for (position, segment) in remaining.iter().enumerate() {
-            if position == last {
-                return self.instances[instance].set(segment, value);
-            }
-            let Some(Value::Object(next)) = self.instances[instance].get(segment).cloned() else {
-                return false;
-            };
-            instance = next;
-        }
-        false
+        Ok(instance)
     }
 
     fn declared_type_of(
@@ -4301,59 +4323,7 @@ impl<'a> Interp<'a> {
         crate::builtins::is_builtin_type(name) && !self.types.iter().any(|t| &t.name == name)
     }
 
-    /// The fixed length demanded by a `keep <field>.size() == N`
-    /// constraint, if any (only the equality form drives lengths here;
-    /// ranges are a later milestone).
-    fn required_list_size<'c>(&self, field: &str, constraints: &'c [Expr]) -> Option<usize> {
-        for constraint in constraints {
-            let Expr::Binary {
-                op: crate::ast::BinaryOp::Eq,
-                lhs,
-                rhs,
-                ..
-            } = constraint
-            else {
-                continue;
-            };
-            let size_call = |expr: &'c Expr| -> Option<(&'c String, &'c Expr)> {
-                let Expr::Call { callee, args, .. } = expr else {
-                    return None;
-                };
-                if !args.is_empty() {
-                    return None;
-                }
-                let Expr::MemberAccess { object, name, .. } = callee.as_ref() else {
-                    return None;
-                };
-                if name != "size" {
-                    return None;
-                }
-                let Expr::Ident { name, .. } = object.as_ref() else {
-                    return None;
-                };
-                Some((name, expr))
-            };
-            let (accessor, size_expr) = if let Some((name, _)) = size_call(lhs) {
-                (name, rhs.as_ref())
-            } else if let Some((name, _)) = size_call(rhs) {
-                (name, lhs.as_ref())
-            } else {
-                continue;
-            };
-            if accessor != field {
-                continue;
-            }
-            if let Expr::IntLiteral { text, .. } = size_expr
-                && let Some(length) = parse_int_literal(text)
-                && let Ok(length) = usize::try_from(length)
-            {
-                return Some(length);
-            }
-        }
-        None
-    }
-
-    fn gen_object(&mut self, index: usize, enclosing: &[Expr]) -> Result<(), ExecError> {
+    fn gen_object(&mut self, index: usize, enclosing: &[KeepConstraint]) -> Result<(), ExecError> {
         let type_name = self.instances[index].type_name.clone();
         let types: &[crate::elab::ElaboratedType] = self.types;
         let Some(ty) = types.iter().find(|t| t.name == type_name) else {
@@ -4363,6 +4333,30 @@ impl<'a> Interp<'a> {
                 origin_span(),
             ));
         };
+        let constraints: Vec<_> = ty.constraints.iter().chain(enclosing).collect();
+        let mut passes = generation_constraint_passes(&constraints).peekable();
+        while let Some((include_soft, constraints)) = passes.next() {
+            match self.gen_object_with_constraints(index, ty, enclosing, &constraints, include_soft)
+            {
+                Err(ExecError::Diagnostic(Diagnostic {
+                    code: "E0407" | "E0417",
+                    ..
+                })) if passes.peek().is_some() => continue,
+                outcome => return outcome,
+            }
+        }
+        unreachable!("generation always attempts its declared constraints")
+    }
+
+    fn gen_object_with_constraints(
+        &mut self,
+        index: usize,
+        ty: &crate::elab::ElaboratedType,
+        enclosing: &[KeepConstraint],
+        constraints: &[Expr],
+        include_soft: bool,
+    ) -> Result<(), ExecError> {
+        let type_name = &ty.name;
         let type_span = ty.span;
         // The range-generated (`~`) fields (clause 6.9.7), declaration
         // order. They are excluded from sampling below exactly like `!`
@@ -4398,13 +4392,6 @@ impl<'a> Interp<'a> {
             })
             .map(|field| (field.name.clone(), field.ty.clone()))
             .collect();
-        let mut constraints: Vec<Expr> = ty
-            .constraints
-            .iter()
-            .filter(|constraint| !constraint.is_bind)
-            .map(|constraint| constraint.expr.clone())
-            .collect();
-        constraints.extend(enclosing.iter().cloned());
         // The clause 10.5.8 chosen_from constraints of this type: each
         // must target one of the type's own generative fields (a deeper
         // target path is applied by generating the field path explicitly,
@@ -4413,7 +4400,7 @@ impl<'a> Interp<'a> {
         // `when` subtype, or with a target that is not a simple field
         // path of this type, is an unsupported shape.
         let mut chosen_specs: Vec<(String, Expr)> = Vec::new();
-        for constraint in &constraints {
+        for constraint in constraints {
             // The bind constraints are filtered out at the collection
             // site; every entry here is a plain constraint expression.
             let Expr::ChosenFrom { target, list, .. } = constraint else {
@@ -4454,7 +4441,7 @@ impl<'a> Interp<'a> {
         // sampling of the non-rgf fields as before.
         let mut rgf_constraints: Vec<Expr> = Vec::new();
         let mut plain_constraints: Vec<Expr> = Vec::new();
-        for constraint in &constraints {
+        for constraint in constraints {
             if rgf_field_refs(constraint, &rgf_names).is_empty() {
                 plain_constraints.push(constraint.clone());
             } else {
@@ -4485,13 +4472,14 @@ impl<'a> Interp<'a> {
         }
         // Simple range/equality constraints narrow the per-field sampling
         // domains; everything else is enforced by the rejection predicate.
-        let domains = self.constraint_domains(&plain_constraints, &field_types);
+        let domains = self.constraint_domains(&plain_constraints, &field_types)?;
+        let predicates = generation_predicates(&plain_constraints);
         // Solver-backed path: linear problems go to the backend
         // conjunction solver (pumpkin with the cargo feature; without it
         // the outcome is Unsupported), non-linear problems to the
         // bounded enumeration solver in every build.
         if let Some(assignment) =
-            self.try_solve_fields(&field_types, &plain_constraints, &type_name, type_span)?
+            self.try_solve_fields(&field_types, &plain_constraints, type_name, type_span)?
         {
             for (name, field_ty) in &field_types {
                 match assignment.iter().find(|(assigned, _)| assigned == name) {
@@ -4504,31 +4492,39 @@ impl<'a> Interp<'a> {
                         if chosen_names.contains(name) {
                             continue;
                         }
-                        let value = self.sample_type(field_ty)?;
+                        let value = self.sample_generation_field(name, field_ty, &domains)?;
                         self.instances[index].set(name, value);
                     }
                 }
             }
             for (field, list_expr) in &chosen_specs {
-                let other = self.chosen_from_other_constraints(index, std::slice::from_ref(field));
+                let other = self.chosen_from_other_constraints(
+                    index,
+                    std::slice::from_ref(field),
+                    include_soft,
+                );
                 let mut other = other;
                 other.extend(
                     enclosing
                         .iter()
-                        .filter(|expr| expr_extends_path(expr, std::slice::from_ref(field)))
-                        .map(|expr| (index, expr.clone())),
+                        .filter(|keep| include_soft || !keep.is_soft)
+                        .filter(|keep| expr_extends_path(&keep.expr, std::slice::from_ref(field)))
+                        .map(|keep| (index, keep.clone())),
                 );
                 self.gen_chosen_from(
                     index,
                     std::slice::from_ref(field),
                     list_expr,
                     &other,
+                    false,
                     type_span,
                 )?;
             }
-            return self.generate_rgf_fields(index, &rgf_fields, &per_field, &type_name, type_span);
+            return self.generate_rgf_fields(index, &rgf_fields, &per_field, type_name, type_span);
         }
         for _ in 0..1000 {
+            let alternative_domains =
+                self.sample_integer_alternatives(&domains.integer_alternatives);
             for (name, field_ty) in &field_types {
                 // A chosen_from target is assigned a list element after
                 // the other fields are sampled (so co-constraints see
@@ -4536,105 +4532,45 @@ impl<'a> Interp<'a> {
                 if chosen_names.contains(name) {
                     continue;
                 }
-                let value = match domains.get(name) {
-                    Some(domain) => self.sample_int_in(field_ty, *domain),
-                    None => self.sample_type(field_ty)?,
+                let value = match alternative_domains.get(name) {
+                    Some(allowed) => self.sample_int_in(field_ty, allowed)?,
+                    None => self.sample_generation_field(name, field_ty, &domains)?,
                 };
                 self.instances[index].set(name, value);
-                // A `keep list.size() == N` constraint drives the list
-                // length: fill the sampled (empty) list with generated
-                // elements so the constraint can pass.
-                if let Some(length) = self.required_list_size(name, &plain_constraints)
-                    && let Value::List(list) = self.instances[index]
-                        .get(name)
-                        .cloned()
-                        .unwrap_or(Value::Void)
-                {
-                    let mut filled = list.items.borrow().clone();
-                    filled.resize(length, Value::Void);
-                    for slot in filled.iter_mut() {
-                        let element_ty = list_element_type(field_ty);
-                        let element = self.sample_type(&element_ty)?;
-                        *slot = element;
-                        if let Value::Object(element_index) = *slot {
-                            self.gen_object(element_index, &[])?;
-                        }
-                    }
-                    // Replace the shared storage contents in one short
-                    // borrow (the sampling above must not run inside it).
-                    *list.items.borrow_mut() = filled;
-                }
             }
             // Clause 10.5.8: assign each chosen_from target now — the
             // other fields carry their sampled values, so the constraints
             // co-constraining paths through the target and another field
             // evaluate meaningfully.
             for (field, list_expr) in &chosen_specs {
-                let other = self.chosen_from_other_constraints(index, std::slice::from_ref(field));
+                let other = self.chosen_from_other_constraints(
+                    index,
+                    std::slice::from_ref(field),
+                    include_soft,
+                );
                 let mut other = other;
                 other.extend(
                     enclosing
                         .iter()
-                        .filter(|expr| expr_extends_path(expr, std::slice::from_ref(field)))
-                        .map(|expr| (index, expr.clone())),
+                        .filter(|keep| include_soft || !keep.is_soft)
+                        .filter(|keep| expr_extends_path(&keep.expr, std::slice::from_ref(field)))
+                        .map(|keep| (index, keep.clone())),
                 );
                 self.gen_chosen_from(
                     index,
                     std::slice::from_ref(field),
                     list_expr,
                     &other,
+                    false,
                     type_span,
                 )?;
             }
-            let mut pass = true;
-            for constraint in &plain_constraints {
-                // HDL-binding constraints (`keep x.hdl_path() == "…"`,
-                // `keep x.delayed() == FALSE`, the event-port
-                // `keep x.edge() == …` attribute of 9.7.3) and the unit
-                // attribute constraints (7.3.4 `pack_options()`, 7.3.5
-                // `per_inst_cover()` — recorded by elaboration) record
-                // simulator/tool facts, not data constraints; they never
-                // gate gen.
-                if expr_calls_any(
-                    constraint,
-                    &[
-                        "hdl_path",
-                        "delayed",
-                        "soft",
-                        "select",
-                        "edge",
-                        "pack_options",
-                        "per_inst_cover",
-                    ],
-                ) {
-                    continue;
-                }
-                // A chosen_from constraint assigns its target above; it
-                // is not itself a predicate.
-                if matches!(constraint, Expr::ChosenFrom { .. }) {
-                    continue;
-                }
-                match self.eval(constraint, &mut Frame::default(), Some(index))? {
-                    Value::Bool(true) => {}
-                    Value::Bool(false) => {
-                        pass = false;
-                        break;
-                    }
-                    _ => {
-                        return Err(self.error(
-                            "E0402",
-                            "constraint did not evaluate to a boolean",
-                            type_span,
-                        ));
-                    }
-                }
-            }
-            if pass {
+            if self.generation_candidate_matches(&predicates, None, index, type_span)? {
                 return self.generate_rgf_fields(
                     index,
                     &rgf_fields,
                     &per_field,
-                    &type_name,
+                    type_name,
                     type_span,
                 );
             }
@@ -4644,6 +4580,31 @@ impl<'a> Interp<'a> {
             format!("no solution found for the constraints of '{type_name}' after 1000 attempts"),
             type_span,
         ))
+    }
+
+    fn generation_candidate_matches(
+        &mut self,
+        predicates: &[&Expr],
+        mut frame: Option<&mut Frame>,
+        index: usize,
+        span: crate::ast::Span,
+    ) -> Result<bool, ExecError> {
+        for predicate in predicates {
+            let mut empty_frame = Frame::default();
+            let frame = frame.as_deref_mut().unwrap_or(&mut empty_frame);
+            match self.eval(predicate, frame, Some(index))? {
+                Value::Bool(true) => {}
+                Value::Bool(false) => return Ok(false),
+                _ => {
+                    return Err(self.error(
+                        "E0402",
+                        "constraint did not evaluate to a boolean",
+                        span,
+                    ));
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// The reduced-set pass (10.3.13) over one generated instance's `~`
@@ -4675,7 +4636,7 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
     ) -> Result<(), ExecError> {
         for (name, field_ty) in rgf_fields {
-            let Some(full_range) = self.type_value_range(field_ty) else {
+            let Some(full_range) = self.type_value_range_at(field_ty, false, 0) else {
                 return Err(self.error(
                     "E0402",
                     format!("range-generated field '{name}' has no representable value range"),
@@ -4993,21 +4954,35 @@ impl<'a> Interp<'a> {
         type_name: &str,
         span: crate::ast::Span,
     ) -> Result<Option<Vec<(String, i128)>>, ExecError> {
-        let bounds: std::collections::BTreeMap<String, (i64, i64)> = field_types
-            .iter()
-            .filter_map(|(name, ty)| crate::solve::int_bounds(ty).map(|b| (name.clone(), b)))
-            .collect();
+        let mut bounds = BTreeMap::new();
+        for (name, ty) in field_types {
+            if self.is_generation_constant(name) {
+                continue;
+            }
+            let integer_bounds = if matches!(ty, TypeExpr::Named { .. }) {
+                self.generation_int_range(ty)?
+                    .and_then(|(low, high)| Some((low.try_into().ok()?, high.try_into().ok()?)))
+            } else {
+                crate::solve::int_bounds(ty)
+            };
+            if let Some(range) = integer_bounds {
+                bounds.insert(name.clone(), range);
+            }
+        }
         if bounds.is_empty() {
             return Ok(None);
         }
         // A chosen_from constraint assigns its own target when that is
         // generated; it is not a linear predicate, and its presence must
         // not push the type's other fields off the solver.
-        let solver_constraints: Vec<Expr> = constraints
+        let mut solver_constraints: Vec<Expr> = constraints
             .iter()
             .filter(|constraint| !matches!(**constraint, Expr::ChosenFrom { .. }))
             .cloned()
             .collect();
+        for constraint in &mut solver_constraints {
+            self.fold_solver_integer_constants(constraint);
+        }
         let problem = match crate::solve::translate(&solver_constraints, &bounds) {
             Ok(problem) => problem,
             Err(_) => return Ok(None),
@@ -5030,11 +5005,57 @@ impl<'a> Interp<'a> {
         }
     }
 
+    fn is_generation_constant(&self, name: &str) -> bool {
+        self.defines.contains_key(name) || predefined_constant(name).is_some()
+    }
+
+    fn fold_solver_integer_constants(&self, expr: &mut Expr) {
+        match expr {
+            Expr::Ident { name, span } => {
+                let constant = match self.defines.get(name) {
+                    Some(Value::Int(value)) => Some(*value),
+                    Some(_) => None,
+                    None => predefined_constant(name),
+                };
+                if let Some(value) = constant {
+                    *expr = Expr::IntLiteral {
+                        text: value.to_string(),
+                        span: *span,
+                    };
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.fold_solver_integer_constants(lhs);
+                self.fold_solver_integer_constants(rhs);
+            }
+            Expr::Unary { expr, .. } | Expr::Paren { expr, .. } => {
+                self.fold_solver_integer_constants(expr)
+            }
+            Expr::InSet { element, set, .. } => {
+                self.fold_solver_integer_constants(element);
+                match set {
+                    crate::ast::InSetExpr::Range(low, high) => {
+                        self.fold_solver_integer_constants(low);
+                        self.fold_solver_integer_constants(high);
+                    }
+                    crate::ast::InSetExpr::Items(items) => {
+                        for item in items {
+                            self.fold_solver_integer_constants(item);
+                        }
+                    }
+                    crate::ast::InSetExpr::Expr(_) => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Per-field sampling domains implied by the constraint list's simple
     /// shapes: `f in [lo..hi]`, `f == c`, and a constant comparison
     /// `f < c` / `f <= c` / `f > c` / `f >= c` (either orientation), where
     /// the bounds evaluate to integer constants without an instance
-    /// context. Conjuncts contribute independently; everything else —
+    /// context. List size calls can appear in the same positions as scalar
+    /// fields. Conjuncts contribute independently; everything else —
     /// soft shapes included, which the rejection predicate enforces
     /// as written — leaves the field's domain untouched. An empty
     /// intersection is left as-is: sampling then uses the declared
@@ -5046,8 +5067,8 @@ impl<'a> Interp<'a> {
         &mut self,
         constraints: &[Expr],
         field_types: &[(String, TypeExpr)],
-    ) -> BTreeMap<String, (i128, i128)> {
-        let mut domains = BTreeMap::new();
+    ) -> Result<GenerationDomains, ExecError> {
+        let mut domains = GenerationDomains::default();
         for constraint in constraints {
             self.collect_domain_leaves(constraint, &mut domains);
         }
@@ -5060,24 +5081,83 @@ impl<'a> Interp<'a> {
         // bias draws over the field type's natural range.
         for constraint in constraints {
             for (field, arms) in select_leaves(constraint) {
-                let base = domains.get(&field).copied().or_else(|| {
-                    field_types
-                        .iter()
-                        .find(|(name, _)| *name == field)
-                        .and_then(|(_, ty)| natural_range(ty))
-                });
-                let Some(base) = base else { continue };
-                let Some(value) = self.sample_select(arms, base) else {
+                if self.is_generation_constant(&field) {
+                    continue;
+                }
+                let Some((_, ty)) = field_types.iter().find(|(name, _)| *name == field) else {
                     continue;
                 };
-                intersect_domain(&mut domains, &field, (value, value));
+                let Some(range) = self.generation_int_range(ty)? else {
+                    continue;
+                };
+                let declared = [range];
+                let narrowed = domains
+                    .integers
+                    .get(&field)
+                    .map(|allowed| intersect_interval_sets(&declared, allowed));
+                let Some(value) =
+                    self.sample_select(arms, narrowed.as_deref().unwrap_or(&declared))
+                else {
+                    continue;
+                };
+                domains.narrow_integers(&field, vec![(value, value)]);
             }
         }
-        domains
+        if !domains.integer_alternatives.is_empty() {
+            let mut declared = BTreeMap::new();
+            for (name, ty) in field_types {
+                if let Some(range) = self.generation_int_range(ty)? {
+                    declared.insert(name.as_str(), range);
+                }
+            }
+            for alternatives in &mut domains.integer_alternatives {
+                for alternative in alternatives.iter_mut() {
+                    alternative.retain(|name, allowed| {
+                        let Some(range) = declared.get(name.as_str()) else {
+                            return false;
+                        };
+                        *allowed = intersect_interval_sets(allowed, &[*range]);
+                        if let Some(bounds) = domains.integers.get(name) {
+                            *allowed = intersect_interval_sets(allowed, bounds);
+                        }
+                        true
+                    });
+                }
+                alternatives
+                    .retain(|alternative| alternative.values().all(|allowed| !allowed.is_empty()));
+            }
+            domains.integer_alternatives.retain(|alternatives| {
+                alternatives
+                    .iter()
+                    .any(|alternative| alternative.len() >= 2)
+            });
+        }
+        Ok(domains)
     }
 
-    fn collect_domain_leaves(&mut self, expr: &Expr, domains: &mut BTreeMap<String, (i128, i128)>) {
+    fn collect_domain_leaves(&mut self, mut expr: &Expr, domains: &mut GenerationDomains) {
+        let mut negated = false;
+        loop {
+            match expr {
+                Expr::Paren { expr: inner, .. } => expr = inner,
+                Expr::Unary {
+                    op: UnaryOp::Not,
+                    expr: inner,
+                    ..
+                } => {
+                    negated = !negated;
+                    expr = inner;
+                }
+                _ => break,
+            }
+        }
         match expr {
+            Expr::InSet { element, set, .. } => {
+                self.narrow_membership_domain(element, set, negated, domains);
+            }
+            // A negated compound expression can allow values from either
+            // branch. Its individual leaves cannot narrow the domain.
+            _ if negated => {}
             Expr::Binary {
                 op: BinaryOp::LogicalAnd,
                 lhs,
@@ -5087,18 +5167,32 @@ impl<'a> Interp<'a> {
                 self.collect_domain_leaves(lhs, domains);
                 self.collect_domain_leaves(rhs, domains);
             }
-            Expr::Paren { expr: inner, .. } => self.collect_domain_leaves(inner, domains),
-            Expr::InSet {
-                element,
-                set: crate::ast::InSetExpr::Range(low, high),
+            Expr::Binary {
+                op: BinaryOp::LogicalOr,
                 ..
-            } => {
-                if let Expr::Ident { name, .. } = element.as_ref()
-                    && let (Some(low), Some(high)) =
-                        (self.const_int_eval(low), self.const_int_eval(high))
-                {
-                    intersect_domain(domains, name, (low, high));
+            } if !generation_metadata(expr) => {
+                let mut pending = vec![expr];
+                let mut alternatives = Vec::new();
+                while let Some(branch) = pending.pop() {
+                    match branch {
+                        Expr::Binary {
+                            op: BinaryOp::LogicalOr,
+                            lhs,
+                            rhs,
+                            ..
+                        } => {
+                            pending.push(rhs);
+                            pending.push(lhs);
+                        }
+                        Expr::Paren { expr, .. } => pending.push(expr),
+                        _ => {
+                            let mut projected = GenerationDomains::default();
+                            self.collect_domain_leaves(branch, &mut projected);
+                            alternatives.push(projected.integers);
+                        }
+                    }
                 }
+                domains.add_integer_alternatives(alternatives);
             }
             Expr::Binary {
                 op: BinaryOp::Eq,
@@ -5107,10 +5201,10 @@ impl<'a> Interp<'a> {
                 ..
             } => {
                 for (side, other) in [(lhs, rhs), (rhs, lhs)] {
-                    if let Expr::Ident { name, .. } = side.as_ref()
+                    if let Some(target) = self.generation_target(side)
                         && let Some(value) = self.const_int_eval(other)
                     {
-                        intersect_domain(domains, name, (value, value));
+                        domains.narrow(target, (value, value));
                     }
                 }
             }
@@ -5125,6 +5219,9 @@ impl<'a> Interp<'a> {
                 ) =>
             {
                 for (side, other, direct) in [(lhs, rhs, true), (rhs, lhs, false)] {
+                    let Some(target) = self.generation_target(side) else {
+                        continue;
+                    };
                     let Some(value) = self.const_int_eval(other) else {
                         continue;
                     };
@@ -5151,97 +5248,147 @@ impl<'a> Interp<'a> {
                         };
                         (bound, i128::MAX)
                     };
-                    if let Expr::Ident { name, .. } = side.as_ref() {
-                        intersect_domain(domains, name, (lower, high));
-                    }
+                    domains.narrow(target, (lower, high));
                 }
             }
-            Expr::InTable { tuple, rows, .. } => {
-                // 4.11.8 in a `keep`: the disjunction of the rows, enforced
-                // as written by the rejection predicate. For the sampling
-                // domains, the projection of a disjunction onto one tuple
-                // element is the union of the rows' projections, so a
-                // bare-identifier element narrows to that union — sound
-                // (every row-satisfying assignment stays inside it) and
-                // necessary in practice: the rejection sampler alone does
-                // not target the rows, so a wide scalar field would make
-                // the disjunction practically unsampleable. A row whose
-                // element for the position is not a constant (an enumerand
-                // included) leaves the projection unknown — the narrowing
-                // for that field is dropped entirely, because that row
-                // could match with any value of the field.
+            Expr::InTable {
+                tuple,
+                rows,
+                negated: false,
+                ..
+            } => {
+                // 4.11.8: each integer column can use the union of its
+                // rows when all cells are known. Candidate validation
+                // still checks that the complete tuple matches one row.
                 if rows.is_empty() {
                     return;
                 }
-                let mut projections: Vec<Vec<(i128, i128)>> = vec![Vec::new(); tuple.len()];
-                for row in rows {
-                    for (position, element) in row.iter().enumerate() {
-                        let Some(Expr::Ident { .. }) = tuple.get(position) else {
-                            continue;
-                        };
-                        if let Some(domain) = self.table_row_element_domain(element) {
-                            projections[position].push(domain);
-                        }
-                    }
-                }
-                for (position, element_domains) in projections.into_iter().enumerate() {
-                    if element_domains.len() != rows.len() {
+                let mut row_domains = vec![IntegerDomains::new(); rows.len()];
+                for (position, element) in tuple.iter().enumerate() {
+                    let Some(GenerationTarget::Integer(name)) = self.generation_target(element)
+                    else {
                         continue;
-                    }
-                    if let Expr::Ident { name, .. } = &tuple[position] {
-                        let low = element_domains
-                            .iter()
-                            .map(|d| d.0)
-                            .min()
-                            .unwrap_or(i128::MIN);
-                        let high = element_domains
-                            .iter()
-                            .map(|d| d.1)
-                            .max()
-                            .unwrap_or(i128::MAX);
-                        intersect_domain(domains, name, (low, high));
+                    };
+                    let Some(cells) = rows
+                        .iter()
+                        .map(|row| self.table_row_element_domain(row.get(position)?))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        continue;
+                    };
+                    for (row, cell) in row_domains.iter_mut().zip(cells) {
+                        narrow_integer_domain(row, name, canonical_set(cell));
                     }
                 }
+                domains.add_integer_alternatives(row_domains);
             }
             _ => {}
         }
     }
 
-    /// The constant integer domain one `in_table` row element constrains
-    /// its tuple element to, when computable: a scalar element by
-    /// constant evaluation, a set literal from its bounds, a type set
-    /// from the type's value range. `None` for anything non-constant
-    /// (enumerands included — those fields keep their full natural
-    /// range). An item list's span `[min, max]` is a superset of its
-    /// points, which keeps the narrowing sound.
+    fn narrow_membership_domain(
+        &mut self,
+        element: &Expr,
+        set: &crate::ast::InSetExpr,
+        negated: bool,
+        domains: &mut GenerationDomains,
+    ) {
+        use crate::ast::InSetExpr;
+        let Some(target) = self.generation_target(element) else {
+            return;
+        };
+        if let GenerationTarget::ListLength(_) = target {
+            if !negated
+                && let InSetExpr::Range(low, high) = set
+                && let (Some(low), Some(high)) =
+                    (self.const_int_eval(low), self.const_int_eval(high))
+            {
+                domains.narrow(target, (low, high));
+            }
+            return;
+        }
+        let GenerationTarget::Integer(name) = target else {
+            return;
+        };
+        if let Some(ranges) = self.constant_integer_set_intervals(set) {
+            let allowed = canonical_set(ranges);
+            let allowed = if negated {
+                complement_interval_set(&allowed, (i128::MIN, i128::MAX))
+            } else {
+                allowed
+            };
+            domains.narrow_integers(name, allowed);
+        }
+    }
+
+    fn constant_integer_set_intervals(
+        &mut self,
+        set: &crate::ast::InSetExpr,
+    ) -> Option<Vec<(i128, i128)>> {
+        use crate::ast::InSetExpr;
+        match set {
+            InSetExpr::Range(low, high) => self
+                .const_int_eval(low)
+                .zip(self.const_int_eval(high))
+                .map(|range| vec![range]),
+            InSetExpr::Items(items) => items
+                .iter()
+                .map(|item| self.const_int_eval(item).map(|value| (value, value)))
+                .collect(),
+            InSetExpr::Expr(_) => None,
+        }
+    }
+
+    fn generation_target<'e>(&self, expr: &'e Expr) -> Option<GenerationTarget<'e>> {
+        match generation_target(expr) {
+            Some(GenerationTarget::Integer(name)) if self.is_generation_constant(name) => None,
+            target => target,
+        }
+    }
+
+    /// Integer values a table cell can match. Unknown and non-integer
+    /// cells leave the whole column unrestricted by the sampler.
     fn table_row_element_domain(
         &mut self,
         element: &crate::ast::TableElem,
-    ) -> Option<(i128, i128)> {
+    ) -> Option<Vec<(i128, i128)>> {
         match element {
             crate::ast::TableElem::Scalar(expr) => {
                 let value = self.const_int_eval(expr)?;
-                Some((value, value))
+                Some(vec![(value, value)])
             }
-            crate::ast::TableElem::Set(crate::ast::InSetExpr::Range(low, high)) => {
-                Some((self.const_int_eval(low)?, self.const_int_eval(high)?))
-            }
-            crate::ast::TableElem::Set(crate::ast::InSetExpr::Items(items)) => {
-                let mut low = i128::MAX;
-                let mut high = i128::MIN;
-                for item in items {
-                    let value = self.const_int_eval(item)?;
-                    low = low.min(value);
-                    high = high.max(value);
-                }
-                Some((low, high))
-            }
-            // A general set expression's span is not statically known
-            // here; the row keeps its full projection (the narrowing for
-            // this position is dropped, like a non-constant element's).
-            crate::ast::TableElem::Set(crate::ast::InSetExpr::Expr(_)) => None,
-            crate::ast::TableElem::TypeSet { ty, .. } => self.type_value_range(ty),
+            crate::ast::TableElem::Set(set) => self.constant_integer_set_intervals(set),
+            crate::ast::TableElem::TypeSet { ty, full } => self
+                .type_value_range_at(ty, *full, 0)
+                .map(|range| vec![range]),
         }
+    }
+
+    /// Bias a candidate toward compatible branches and table rows. Full
+    /// predicate evaluation checks conditions outside these integer bounds.
+    fn sample_integer_alternatives(&mut self, groups: &[Vec<IntegerDomains>]) -> IntegerDomains {
+        let mut selected = IntegerDomains::new();
+        for alternatives in groups {
+            let compatible: Vec<_> = alternatives
+                .iter()
+                .filter(|row| {
+                    row.iter().all(|(name, allowed)| {
+                        selected.get(name).is_none_or(|previous| {
+                            !intersect_interval_sets(previous, allowed).is_empty()
+                        })
+                    })
+                })
+                .collect();
+            let alternative = match compatible.as_slice() {
+                [] => continue,
+                [alternative] => *alternative,
+                choices => choices[self.rng.below(choices.len() as u128) as usize],
+            };
+            for (name, allowed) in alternative {
+                narrow_integer_domain(&mut selected, name, allowed.clone());
+            }
+        }
+        selected
     }
 
     /// Evaluate an expression expected to be an instance-independent
@@ -5266,22 +5413,21 @@ impl<'a> Interp<'a> {
     fn sample_select(
         &mut self,
         arms: &[crate::ast::SelectArm],
-        range: (i128, i128),
+        domain: &[(i128, i128)],
     ) -> Option<i128> {
+        let lo = domain.first()?.0;
+        let hi = domain.last()?.1;
         let mut weights = Vec::new();
-        let mut total: i128 = 0;
+        let mut total = 0u128;
         for arm in arms {
-            let weight = self.const_int_eval(&arm.weight)?;
-            if weight < 0 {
-                return None;
-            }
-            total += weight;
+            let weight = u128::try_from(self.const_int_eval(&arm.weight)?).ok()?;
+            total = total.checked_add(weight)?;
             weights.push(weight);
         }
-        if total <= 0 {
+        if total == 0 {
             return None;
         }
-        let mut pick = self.rng.below(total as u128) as i128;
+        let mut pick = self.rng.below(total);
         let mut chosen = arms.len() - 1;
         for (index, weight) in weights.iter().enumerate() {
             if pick < *weight {
@@ -5290,8 +5436,7 @@ impl<'a> Interp<'a> {
             }
             pick -= weight;
         }
-        let (lo, hi) = range;
-        let (kind, args) = select_choice(&arms[chosen].choice)?;
+        let (kind, args) = select_choice(&arms[chosen].choice, self.define_expressions)?;
         let drawn = match kind {
             "min" => lo,
             "max" => hi,
@@ -5302,47 +5447,151 @@ impl<'a> Interp<'a> {
                     hi
                 }
             }
-            "others" => {
-                if hi > lo + 1 {
-                    lo + 1 + self.rng.below((hi - lo - 1) as u128) as i128
-                } else {
-                    lo
-                }
-            }
+            "others" => self
+                .draw_integer_domain(&intersect_interval_sets(domain, &[(lo + 1, hi - 1)]))
+                .unwrap_or(lo),
             "normal" => {
                 let (center, stddev) = args?;
-                // Box–Muller from the seeded RNG; the draw is clamped
-                // into the range so the bias always lands somewhere
-                // legal.
+                // Box–Muller from the seeded RNG, projected onto the
+                // closest allowed value, including at gaps in the domain.
                 let u1 = self.rng.unit_f64().max(f64::EPSILON);
                 let u2 = self.rng.unit_f64();
                 let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
                 let value = center as f64 + stddev as f64 * z;
                 let rounded = value.round() as i128;
-                rounded.clamp(lo, hi)
+                domain
+                    .iter()
+                    .map(|&(low, high)| rounded.clamp(low, high))
+                    .min_by_key(|value| rounded.abs_diff(*value))?
             }
             _ => return None,
         };
-        Some(drawn.clamp(lo, hi))
+        Some(drawn)
     }
 
     /// Sample an integer-valued scalar inside the declared bounds
     /// intersected with `domain`. A contradictory domain falls back to
     /// the natural sampling (the rejection predicate then fails the
     /// attempt); booleans, reals, strings and time are not domain-sampled.
-    fn sample_int_in(&mut self, ty: &TypeExpr, domain: (i128, i128)) -> Value {
-        let Some((natural_low, natural_high)) = natural_range(ty) else {
-            return self.sample_type(ty).unwrap_or(Value::Void);
+    fn sample_int_in(
+        &mut self,
+        ty: &TypeExpr,
+        domain: &[(i128, i128)],
+    ) -> Result<Value, ExecError> {
+        let Some(range) = self.generation_int_range(ty)? else {
+            return self.sample_type(ty);
         };
-        let low = natural_low.max(domain.0);
-        let high = natural_high.min(domain.1);
-        if low > high {
-            return self.sample_type(ty).unwrap_or(Value::Void);
+        let allowed = intersect_interval_sets(&[range], domain);
+        match allowed.as_slice() {
+            [(low, high)] => Ok(self.sample_integer_range(*low, *high)),
+            _ => match self.draw_integer_domain(&allowed) {
+                Some(value) => Ok(Value::Int(value)),
+                None => self.sample_type(ty),
+            },
         }
+    }
+
+    /// Draw by rank from canonical intervals within a declared integer
+    /// range, so each eligible value has one rank regardless of gaps.
+    fn draw_integer_domain(&mut self, domain: &[(i128, i128)]) -> Option<i128> {
+        if domain.is_empty() {
+            return None;
+        }
+        let mut rank = self.rng.below(
+            domain
+                .iter()
+                .map(|&(low, high)| (high - low + 1) as u128)
+                .sum(),
+        );
+        for &(low, high) in domain {
+            let count = (high - low + 1) as u128;
+            if rank < count {
+                return Some(low + rank as i128);
+            }
+            rank -= count;
+        }
+        None
+    }
+
+    fn sample_integer_range(&mut self, low: i128, high: i128) -> Value {
         if low == high {
             return Value::Int(low);
         }
         Value::Int(low + self.rng.below((high - low + 1) as u128) as i128)
+    }
+
+    fn generation_int_range(&self, ty: &TypeExpr) -> Result<Option<(i128, i128)>, ExecError> {
+        if !matches!(ty, TypeExpr::Named { .. }) {
+            return Ok(natural_range(ty));
+        }
+        if self
+            .resolved_hint_type(ty, 0)
+            .as_ref()
+            .and_then(natural_range)
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.type_value_range_at(ty, false, 0)
+            .map(Some)
+            .ok_or_else(|| {
+                self.error(
+                    "E0402",
+                    format!("cannot generate the integer range of '{}'", ty.render()),
+                    ty.span(),
+                )
+            })
+    }
+
+    fn sample_generation_field(
+        &mut self,
+        field: &str,
+        ty: &TypeExpr,
+        domains: &GenerationDomains,
+    ) -> Result<Value, ExecError> {
+        if let Some(&(minimum, maximum)) = domains.list_lengths.get(field)
+            && let Some(TypeExpr::List { element, .. }) = self.resolved_hint_type(ty, 0)
+        {
+            let low = minimum.max(0);
+            let high = if minimum == i128::MIN {
+                maximum.min(DEFAULT_GENERATED_LIST_MAX)
+            } else if maximum == i128::MAX {
+                low.max(DEFAULT_GENERATED_LIST_MAX)
+            } else {
+                maximum
+            }
+            .min(MAX_GENERATED_LIST_LENGTH);
+            // A contradictory length leaves an empty candidate for the
+            // usual constraint validation and soft-constraint retry.
+            let length = match low.cmp(&high) {
+                std::cmp::Ordering::Less => low + self.rng.below((high - low + 1) as u128) as i128,
+                std::cmp::Ordering::Equal => low,
+                std::cmp::Ordering::Greater => 0,
+            };
+            return self.sample_list(&element, length as usize);
+        }
+        if let Some(range) = domains.integers.get(field) {
+            return self.sample_int_in(ty, range);
+        }
+        self.sample_type(ty)
+    }
+
+    fn sample_list(&mut self, element: &TypeExpr, length: usize) -> Result<Value, ExecError> {
+        let mut items = Vec::new();
+        items.try_reserve_exact(length).map_err(|_| {
+            self.error(
+                "E0402",
+                "could not allocate generated list items",
+                element.span(),
+            )
+        })?;
+        for _ in 0..length {
+            items.push(self.sample_type(element)?);
+        }
+        Ok(Value::List(ListValue {
+            items: Rc::new(RefCell::new(items)),
+            element: Some(element.render()),
+        }))
     }
 
     /// Sample one value of the declared type within its bounds. Struct
@@ -5376,17 +5625,16 @@ impl<'a> Interp<'a> {
                 ScalarBase::Time => Value::Int(0),
             }),
             TypeExpr::List { element, .. } => {
-                let len = self.rng.below(4) as usize;
-                let mut items = Vec::with_capacity(len);
-                for _ in 0..len {
-                    items.push(self.sample_type(element)?);
-                }
-                Ok(Value::List(ListValue {
-                    items: Rc::new(RefCell::new(items)),
-                    element: Some(element.render()),
-                }))
+                let length = self.rng.below((DEFAULT_GENERATED_LIST_MAX + 1) as u128) as usize;
+                self.sample_list(element, length)
             }
             TypeExpr::Named { name, .. } => {
+                if let Some((low, high)) = self.generation_int_range(ty)? {
+                    return Ok(self.sample_integer_range(low, high));
+                }
+                if let Some(list @ TypeExpr::List { .. }) = self.resolved_hint_type(ty, 0) {
+                    return self.sample_type(&list);
+                }
                 let types: &[crate::elab::ElaboratedType] = self.types;
                 if let Some(t) = types.iter().find(|t| t.name == name.as_str()) {
                     // Clause 5.2.9: no object is of an interface type — a
@@ -6787,34 +7035,51 @@ impl<'a> Interp<'a> {
     /// Configuration changes commit together after validation.
     fn set_runtime_config(
         &mut self,
+        routine: &str,
         args: &[Expr],
         span: crate::ast::Span,
         frame: &mut Frame,
         me: Option<usize>,
     ) -> Result<Value, ExecError> {
+        let maximum = routine == "set_config_max";
         if args.len() < 3 || args.len().is_multiple_of(2) {
             return Err(self.error(
                 "E0402",
-                "set_config expects a category and one or more option/value pairs (29.9)",
+                format!("{routine} expects a category and one or more option/value pairs (29.9)"),
                 span,
             ));
         }
         let Expr::Ident { name: category, .. } = &args[0] else {
-            return Err(self.error("E0402", "set_config category must be a keyword", span));
+            return Err(self.error(
+                "E0402",
+                format!("{routine} category must be a keyword"),
+                span,
+            ));
         };
         if category != "cover" {
             return Err(self.error(
                 "E0419",
-                format!("set_config category '{category}' is not implemented (29.9)"),
+                format!("{routine} category '{category}' is not implemented (29.9)"),
                 span,
             ));
         }
         let mut config = self.coverage_config.clone();
         for pair in args[1..].as_chunks::<2>().0 {
             let Expr::Ident { name: option, .. } = &pair[0] else {
-                return Err(self.error("E0402", "set_config option must be a keyword", span));
+                return Err(self.error(
+                    "E0402",
+                    format!("{routine} option must be a keyword"),
+                    span,
+                ));
             };
             match option.as_str() {
+                "mode" | "check_illegal_immediately" if maximum => {
+                    return Err(self.error(
+                        "E0402",
+                        format!("set_config_max expects a numeric option, got '{option}'"),
+                        pair[0].span(),
+                    ));
+                }
                 "mode" => {
                     // Values are implementation-defined (29.9). Off
                     // pauses collection; both collecting modes retain
@@ -6853,7 +7118,12 @@ impl<'a> Interp<'a> {
                             pair[1].span(),
                         ));
                     }
-                    config.max_int_buckets = count as u64;
+                    let count = count as u64;
+                    config.max_int_buckets = if maximum {
+                        config.max_int_buckets.max(count)
+                    } else {
+                        count
+                    };
                 }
                 "check_illegal_immediately" => {
                     let Value::Bool(enabled) = self.eval(&pair[1], frame, me)? else {
@@ -6873,13 +7143,18 @@ impl<'a> Interp<'a> {
                             pair[1].span(),
                         ));
                     };
-                    config.at_least = u64::try_from(goal).map_err(|_| {
+                    let goal = u64::try_from(goal).map_err(|_| {
                         self.error(
                             "E0402",
                             "at_least must be a nonnegative u64 value",
                             pair[1].span(),
                         )
                     })?;
+                    config.at_least = if maximum {
+                        config.at_least.max(goal)
+                    } else {
+                        goal
+                    };
                 }
                 _ => {
                     return Err(self.error(
@@ -6893,6 +7168,13 @@ impl<'a> Interp<'a> {
         if config.max_int_buckets != self.coverage_config.max_int_buckets
             || config.at_least != self.coverage_config.at_least
         {
+            if self.evaluating_coverage {
+                return Err(self.error(
+                    "E0402",
+                    "coverage schema options cannot change during coverage expression evaluation",
+                    span,
+                ));
+            }
             if self
                 .coverage
                 .iter()
@@ -9486,9 +9768,15 @@ impl<'a> Interp<'a> {
         };
         let items = list.items.borrow().clone();
         let item_count = items.len() as i128;
+        let from_end = matches!(name, "last" | "last_index");
         let mut matches = Vec::new();
         let mut count = 0;
-        for (index, item) in items.into_iter().enumerate() {
+        let mut entries = items.into_iter().enumerate();
+        while let Some((index, item)) = if from_end {
+            entries.next_back()
+        } else {
+            entries.next()
+        } {
             let saved_hint = self.expected_type.replace(TypeExpr::Scalar {
                 base: ScalarBase::Bool,
                 width: None,
@@ -9504,14 +9792,13 @@ impl<'a> Interp<'a> {
                 ));
             };
             if selected {
-                if name == "has" {
-                    return Ok(Value::Bool(true));
-                }
-                count += 1;
                 match name {
+                    "has" => return Ok(Value::Bool(true)),
+                    "first" | "last" => return Ok(item),
+                    "first_index" | "last_index" => return Ok(Value::Int(index as i128)),
                     "all" => matches.push(item),
                     "all_indices" => matches.push(Value::Int(index as i128)),
-                    _ => {}
+                    _ => count += 1,
                 }
             }
         }
@@ -9520,6 +9807,9 @@ impl<'a> Interp<'a> {
             "count" => Value::Int(count),
             "and_all" => Value::Bool(count == item_count),
             "or_all" => Value::Bool(count != 0),
+            "first" | "last" | "first_index" | "last_index" => {
+                return Err(self.error("E0402", format!("{name}() found no matching item"), span));
+            }
             _ => Value::List(ListValue {
                 items: Rc::new(RefCell::new(matches)),
                 element: if name == "all_indices" {
@@ -9529,6 +9819,231 @@ impl<'a> Interp<'a> {
                 },
             }),
         })
+    }
+
+    fn call_list_resize(
+        &mut self,
+        list: &ListValue,
+        object: &Expr,
+        args: &[Expr],
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<Value, ExecError> {
+        let (size, filler, keep_old) = match args {
+            [size] => (size, None, None),
+            [size, filler] => (size, Some(filler), None),
+            [size, filler, keep_old] => (size, Some(filler), Some(keep_old)),
+            _ => {
+                return Err(self.error(
+                    "E0402",
+                    "resize() expects size, optional filler and optional keep_old",
+                    span,
+                ));
+            }
+        };
+        let size_value = self.eval(size, frame, me)?;
+        let Value::Int(size_value) = size_value else {
+            return Err(self.error("E0402", "resize() expects an integer size", size.span()));
+        };
+        let size_value = usize::try_from(size_value).map_err(|_| {
+            self.error(
+                "E0402",
+                "resize() size is outside the supported range",
+                size.span(),
+            )
+        })?;
+        let keep_old = match keep_old {
+            Some(expr) => {
+                let Value::Bool(keep) = self.eval(expr, frame, me)? else {
+                    return Err(self.error(
+                        "E0402",
+                        "resize() keep_old expects a Boolean",
+                        expr.span(),
+                    ));
+                };
+                keep
+            }
+            None => true,
+        };
+        let old_size = if keep_old {
+            list.items.borrow().len()
+        } else {
+            0
+        };
+        if size_value <= old_size {
+            list.items.borrow_mut().truncate(size_value);
+            return Ok(Value::Void);
+        }
+        if size_value - old_size > 65_536 {
+            return Err(self.error(
+                "E0402",
+                "resize() can add at most 65536 items per call",
+                size.span(),
+            ));
+        }
+        let filler =
+            filler.filter(|expr| !matches!(expr, Expr::Ident { name, .. } if name == "UNDEF"));
+        let element_type = match self.contextual_type_of(object, frame, me) {
+            Some(TypeExpr::List { element, .. }) => Some(*element),
+            _ => list
+                .element
+                .as_deref()
+                .and_then(crate::parser::parse_type_text),
+        };
+        if element_type.is_none() && filler.is_none() {
+            return Err(self.error(
+                "E0402",
+                "resize() needs a known list element type to grow",
+                span,
+            ));
+        }
+        let mut resized = Vec::new();
+        resized.try_reserve_exact(size_value).map_err(|_| {
+            self.error(
+                "E0402",
+                "resize() could not allocate the new slots",
+                size.span(),
+            )
+        })?;
+        if keep_old {
+            resized.extend_from_slice(&list.items.borrow());
+        }
+        for _ in old_size..size_value {
+            let value = match filler {
+                Some(expr) => self.eval_with_hint(element_type.clone(), expr, frame, me)?,
+                None => self.default_for(
+                    element_type
+                        .as_ref()
+                        .expect("default filler has an element type"),
+                ),
+            };
+            resized.push(value);
+        }
+        *list.items.borrow_mut() = resized;
+        Ok(Value::Void)
+    }
+
+    /// Check distinct raw or projected values, or keep the first
+    /// original item for each distinct key.
+    fn call_list_distinct(
+        &mut self,
+        list: &ListValue,
+        name: &str,
+        args: &[Expr],
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<Value, ExecError> {
+        let unique = name == "unique";
+        if args.len() > 1 {
+            return Err(self.error(
+                "E0402",
+                format!("{name}() expects at most one item expression"),
+                span,
+            ));
+        }
+        let items = list.items.borrow().clone();
+        let mut distinct: Vec<(Value, Option<Value>)> = Vec::new();
+        for item in items {
+            let (key, original) = match args.first() {
+                Some(expr) => {
+                    let key = self.eval_list_item(expr, &item, frame, me)?;
+                    (key, unique.then_some(item))
+                }
+                None => (item, None),
+            };
+            if distinct.iter().any(|(seen, _)| values_equal(seen, &key)) {
+                if !unique {
+                    return Ok(Value::Bool(false));
+                }
+            } else {
+                distinct.push((key, original));
+            }
+        }
+        Ok(if unique {
+            Value::List(ListValue {
+                items: Rc::new(RefCell::new(
+                    distinct
+                        .into_iter()
+                        .map(|(key, original)| original.unwrap_or(key))
+                        .collect(),
+                )),
+                element: list.element.clone(),
+            })
+        } else {
+            Value::Bool(true)
+        })
+    }
+
+    /// Evaluate each key once in input order and keep the original values.
+    fn call_list_sort(
+        &mut self,
+        list: &ListValue,
+        routine: &str,
+        args: &[Expr],
+        frame: &mut Frame,
+        me: Option<usize>,
+        span: crate::ast::Span,
+    ) -> Result<Value, ExecError> {
+        let field_access;
+        let key_expr = if routine == "sort_by_field" {
+            let [field] = args else {
+                return Err(self.error("E0402", "sort_by_field() expects one field name", span));
+            };
+            let name = crate::builtins::sort_field_name(field).ok_or_else(|| {
+                self.error(
+                    "E0402",
+                    "sort_by_field() expects a field name",
+                    field.span(),
+                )
+            })?;
+            let span = field.span();
+            field_access = Expr::MemberAccess {
+                object: Box::new(Expr::Ident {
+                    name: "it".to_owned(),
+                    span,
+                }),
+                name: name.to_owned(),
+                name_span: span,
+                span,
+            };
+            Some(&field_access)
+        } else if args.len() > 1 {
+            return Err(self.error("E0402", "sort() expects at most one item expression", span));
+        } else {
+            args.first()
+        };
+        let items = list.items.borrow().clone();
+        let mut keyed = Vec::with_capacity(items.len());
+        let mut key_kind = None;
+        for item in items {
+            let key = match key_expr {
+                Some(expr) => self.eval_list_item(expr, &item, frame, me)?,
+                None => item.clone(),
+            };
+            let kind = std::mem::discriminant(&key);
+            // Mixed int/real keys can compare inconsistently after f64
+            // rounding. Require a single orderable representation.
+            if compare_values(&key, &key).is_none() || key_kind.is_some_and(|first| first != kind) {
+                return Err(self.error(
+                    "E0402",
+                    format!("{routine}() expects orderable keys of a single kind"),
+                    key_expr.map_or(span, Expr::span),
+                ));
+            }
+            key_kind = Some(kind);
+            keyed.push((key, item));
+        }
+        keyed.sort_by(|(left, _), (right, _)| {
+            compare_values(left, right).expect("validated homogeneous sort keys")
+        });
+        Ok(Value::List(ListValue {
+            items: Rc::new(RefCell::new(
+                keyed.into_iter().map(|(_, item)| item).collect(),
+            )),
+            element: list.element.clone(),
+        }))
     }
 
     /// The 27.4.17/27.4.20/27.5.4-27.5.6 aggregate pseudo-methods with
@@ -10555,7 +11070,7 @@ impl<'a> Interp<'a> {
         if let Some(unit) = unit {
             frame.locals.insert("inst".to_owned(), Value::Object(unit));
         }
-        match self.atomic_value(|this| this.eval(expr, &mut frame, Some(owner)))? {
+        match self.eval_coverage_expression(expr, &mut frame, Some(owner))? {
             Value::Bool(value) => Ok(value),
             _ => Err(self.error(
                 "E0402",
@@ -10577,6 +11092,7 @@ impl<'a> Interp<'a> {
         let value = match (value, candidate) {
             (Value::Int(_), Some(value)) => Value::Int(value),
             (Value::Bool(_), Some(value)) => Value::Bool(value != 0),
+            (Value::Real(_), Some(value)) => Value::Real(crate::coverage::real_from_ordinal(value)),
             (_, None) => value.clone(),
             _ => {
                 return Err(self.error(
@@ -10590,7 +11106,7 @@ impl<'a> Interp<'a> {
         if let Some(unit) = unit {
             frame.locals.insert("inst".to_owned(), Value::Object(unit));
         }
-        self.atomic_value(|this| this.eval(expr, &mut frame, None))
+        self.eval_coverage_expression(expr, &mut frame, None)
     }
 
     fn coverage_effect_matches(
@@ -10652,7 +11168,7 @@ impl<'a> Interp<'a> {
             if let Some(unit) = unit {
                 frame.locals.insert("inst".to_owned(), Value::Object(unit));
             }
-            match self.atomic_value(|this| this.eval(expr, &mut frame, None))? {
+            match self.eval_coverage_expression(expr, &mut frame, None)? {
                 Value::Bool(true) => return Ok(true),
                 Value::Bool(false) => {}
                 _ => {
@@ -10725,11 +11241,7 @@ impl<'a> Interp<'a> {
             } else {
                 BTreeMap::new()
             };
-            let value = if matches!(axis.prototype, Value::Bool(_)) {
-                Value::Bool(bounds.0 != 0)
-            } else {
-                Value::Int(bounds.0)
-            };
+            let value = axis.value_at(bounds.0);
             for expr in [
                 &axis.options.ignore,
                 &axis.options.instance_ignore,
@@ -10769,7 +11281,7 @@ impl<'a> Interp<'a> {
                 if let Some(unit) = unit {
                     frame.locals.insert("inst".to_owned(), Value::Object(unit));
                 }
-                self.atomic_value(|this| this.eval(expr, &mut frame, None))
+                self.eval_coverage_expression(expr, &mut frame, None)
                     .map_err(ExecError::into_diagnostic)
             };
             match crate::coverage::prove_predicate(expr, &domains, &mut evaluate)? {
@@ -10946,10 +11458,15 @@ impl<'a> Interp<'a> {
             if item.buckets.is_empty() {
                 return Ok(None);
             } // ungradeable: point filtering only
-            let Some(prototype) = self.coverage_basic_prototype(entry, group, &source) else {
+            let prototype = match &item.enum_domain {
+                Some(domain) => domain.value_at(0),
+                None if item.buckets[0].real_bounds().is_some() => Some(Value::Real(0.0)),
+                None => self.coverage_basic_prototype(entry, group, &source),
+            };
+            let Some(prototype) = prototype else {
                 return Err(self.error(
                     "E0402",
-                    "derived predicate buckets require integral or Boolean sources (14.4-14.5)",
+                    "derived predicate buckets require known scalar source types (14.4-14.5)",
                     span,
                 ));
             };
@@ -10963,12 +11480,16 @@ impl<'a> Interp<'a> {
                         .copied()
                         .unwrap_or(data.excluded)
                 })
-                .map(|(bucket, data)| (bucket, data.lo, data.hi))
+                .map(|(bucket, data)| {
+                    let (lo, hi) = data.effect_bounds();
+                    (bucket, lo, hi)
+                })
                 .collect();
             axes.push(CoverageAxis {
                 binding,
                 source,
                 prototype,
+                enum_domain: item.enum_domain.clone(),
                 options: item.options.clone(),
                 buckets,
             });
@@ -11042,7 +11563,7 @@ impl<'a> Interp<'a> {
                     item.options.clone(),
                     item.buckets
                         .iter()
-                        .map(|bucket| (bucket.lo, bucket.hi))
+                        .map(crate::coverage::CoverBucket::effect_bounds)
                         .collect::<Vec<_>>(),
                 )
             })
@@ -11063,14 +11584,49 @@ impl<'a> Interp<'a> {
             let span = self
                 .coverage_basic_declaration(entry, group, &name)
                 .map_or(origin_span(), |item| item.span);
-            let Some(prototype) = self.coverage_basic_prototype(entry, group, &name) else {
+            let mut budget = 65_536usize;
+            if let Some(enum_domain) = self.coverage[entry].groups[group].items[item_index]
+                .enum_domain
+                .clone()
+            {
+                for (bucket, (low, high)) in domains.into_iter().enumerate() {
+                    let mut excluded = true;
+                    for ordinal in low..=high {
+                        budget = budget.checked_sub(1).ok_or_else(|| {
+                            self.error(
+                            "E0402",
+                            "enumeral coverage classification exceeds the 65536 value limit (14.3)",
+                            span,
+                        )
+                        })?;
+                        let value = enum_domain.value_at(ordinal).ok_or_else(|| {
+                            self.error(
+                                "E0402",
+                                "enumeral coverage ordinal out of range (14.3)",
+                                span,
+                            )
+                        })?;
+                        excluded &= self.coverage_effect_matches(&effects, &name, &value, unit)?;
+                    }
+                    masks.push((item_index, bucket, excluded));
+                }
+                continue;
+            }
+            let is_real = self.coverage[entry].groups[group].items[item_index].buckets[0]
+                .real_bounds()
+                .is_some();
+            let prototype = if is_real {
+                Some(Value::Real(0.0))
+            } else {
+                self.coverage_basic_prototype(entry, group, &name)
+            };
+            let Some(prototype) = prototype else {
                 return Err(self.error(
                     "E0402",
                     "coverage bucket effects require a known integral or Boolean item type (14.3)",
                     span,
                 ));
             };
-            let mut budget = 65_536usize;
             for (bucket, domain) in domains.into_iter().enumerate() {
                 let mut excluded = Vec::new();
                 for expr in effects.iter().flatten() {
@@ -11211,10 +11767,12 @@ impl<'a> Interp<'a> {
             } else {
                 let mut group = self.coverage[entry].groups[base].clone();
                 group.unit_owner = Some(unit);
-                group.unit_instance = Some(path);
                 self.coverage[entry].groups.push(group);
                 self.coverage[entry].groups.len() - 1
             };
+            // Counts follow the physical unit. The path is its current
+            // display label and may change after rebinding an alias.
+            self.coverage[entry].groups[index].unit_instance = Some(path);
             if !refresh_visibility {
                 continue;
             }
@@ -11417,11 +11975,17 @@ impl<'a> Interp<'a> {
         let items: Vec<_> = self.coverage[entry_index].groups[group_index]
             .items
             .iter()
-            .map(|item| (item.name.clone(), item.options.clone()))
+            .map(|item| {
+                let real = item
+                    .buckets
+                    .first()
+                    .is_some_and(|bucket| bucket.real_bounds().is_some());
+                (item.name.clone(), item.options.clone(), real)
+            })
             .collect();
         self.coverage[entry_index].groups[group_index].begin_sample();
         let mut frame = Frame::default();
-        for (name, options) in items {
+        for (name, options, real) in items {
             if let Some(expr) = &options.when {
                 match self.coverage_boolean(expr, owner, None) {
                     Ok(true) => {}
@@ -11436,13 +12000,17 @@ impl<'a> Interp<'a> {
                 continue;
             };
             let value = match expr {
-                Some(expr) => self.atomic_value(|this| this.eval(expr, &mut frame, Some(owner))),
+                Some(expr) => self.eval_coverage_expression(expr, &mut frame, Some(owner)),
                 None => self.instances[owner].get(&name).cloned().ok_or_else(|| {
                     self.error("E0401", format!("unknown coverage field '{name}'"), span)
                 }),
             };
             match value {
                 Ok(value) => {
+                    let value = match value {
+                        Value::Int(number) if real => Value::Real(number as f64),
+                        value => value,
+                    };
                     match self.coverage_effect_matches(
                         &[options.ignore, options.instance_ignore],
                         &name,
@@ -11699,26 +12267,25 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Build the set of all legal values of a type (5.10.5): scalars
-    /// from their width and signedness, clause-5 `type` declarations
-    /// from their underlying representation, enumeral types as
-    /// `[0..count-1]`.
-    fn set_of_type(&self, ty: &TypeExpr) -> Result<Value, ExecError> {
-        let Some(range) = self.type_value_range(ty) else {
-            return Err(self.error(
+    /// 5.10.5 and 5.10.6 reflect the legal interval or the complete
+    /// interval of the underlying representation, respectively.
+    fn reflected_type_range(&self, ty: &TypeExpr, full: bool) -> Result<(i128, i128), ExecError> {
+        self.type_value_range_at(ty, full, 0).ok_or_else(|| {
+            self.error(
                 "E0402",
                 format!(
-                    "set_of_values expects a numeric or enumeral type; '{}' has none",
+                    "set_of_values cannot reflect the value range of '{}'",
                     ty.render()
                 ),
                 ty.span(),
-            ));
-        };
-        Ok(Value::Set(vec![range]))
+            )
+        })
     }
 
-    /// The inclusive value range of a type, when it has one.
-    fn type_value_range(&self, ty: &TypeExpr) -> Option<(i128, i128)> {
+    fn type_value_range_at(&self, ty: &TypeExpr, full: bool, depth: usize) -> Option<(i128, i128)> {
+        if depth > 64 {
+            return None;
+        }
         match ty {
             TypeExpr::Scalar { base, width, .. } => scalar_range(*base, width),
             TypeExpr::Named { name, .. } => {
@@ -11729,10 +12296,14 @@ impl<'a> Interp<'a> {
                     // enumerands' indices.
                     return Some((0, declared.enumerals.len() as i128 - 1));
                 }
-                declared
-                    .underlying
-                    .as_ref()
-                    .and_then(|u| self.type_value_range(u))
+                let range =
+                    self.type_value_range_at(declared.underlying.as_ref()?, full, depth + 1)?;
+                if !full && let Some(bounds) = self.subtype_ranges.get(name) {
+                    let (low, high) = (*bounds)?;
+                    return (range.0 <= low && low <= high && high <= range.1)
+                        .then_some((low, high));
+                }
+                Some(range)
             }
             TypeExpr::InlineEnum { names, .. } => {
                 if names.is_empty() {
@@ -11852,6 +12423,32 @@ impl<'a> Interp<'a> {
                 Ok(Value::Bool((0..items.len() as i128).contains(index)))
             }
             ("exists", _) => Err(self.error("E0402", "exists() expects an integer index", span)),
+            // 27.4.9: select each requested index in argument order.
+            ("get_indices", [Value::List(indexes)]) => indexes
+                .items
+                .borrow()
+                .iter()
+                .map(|index| {
+                    let Value::Int(index) = index else {
+                        return Err(self.error(
+                            "E0402",
+                            "get_indices() expects integer indexes",
+                            span,
+                        ));
+                    };
+                    self.list_index_position(items, *index, span)
+                        .map(|position| items[position].clone())
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|selected| {
+                    Value::List(ListValue {
+                        items: Rc::new(RefCell::new(selected)),
+                        element: list.element.clone(),
+                    })
+                }),
+            ("get_indices", _) => {
+                Err(self.error("E0402", "get_indices() expects one list of indexes", span))
+            }
             // 27.4.3 copy(): a copy of the list — the list case of
             // exp.copy() (28.5.1). A fresh list object mints a new handle
             // (a `list_ptr==` mismatch, 4.11.4); struct items stay shared
@@ -12623,6 +13220,19 @@ impl<'a> Interp<'a> {
         result
     }
 
+    /// Coverage callbacks can run while the caller retains schema indexes.
+    fn eval_coverage_expression(
+        &mut self,
+        expr: &Expr,
+        frame: &mut Frame,
+        owner: Option<usize>,
+    ) -> Result<Value, ExecError> {
+        let previous = std::mem::replace(&mut self.evaluating_coverage, true);
+        let result = self.atomic_value(|this| this.eval(expr, frame, owner));
+        self.evaluating_coverage = previous;
+        result
+    }
+
     fn atomic_value(
         &mut self,
         execute: impl FnOnce(&mut Self) -> Result<Value, ExecError>,
@@ -12967,8 +13577,10 @@ impl<'a> Interp<'a> {
             Expr::Call { callee, args, span } => {
                 let saved_hint = self.expected_type.take();
                 let result = (|| {
-                if matches!(callee.as_ref(), Expr::Ident { name, .. } if name == "set_config") {
-                    return self.set_runtime_config(args, *span, frame, me);
+                if let Expr::Ident { name, .. } = callee.as_ref()
+                    && matches!(name.as_str(), "set_config" | "set_config_max")
+                {
+                    return self.set_runtime_config(name, args, *span, frame, me);
                 }
                 // The clause 29.13 rgf routines read their field argument
                 // as a path (its instance and field name), not as a
@@ -12984,8 +13596,17 @@ impl<'a> Interp<'a> {
                 // non-list receiver for same-named struct methods.
                 let mut extreme_receiver = None;
                 if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
-                    && (matches!(name.as_str(), "has" | "count" | "all" | "all_indices")
-                        || (!args.is_empty() && matches!(name.as_str(), "and_all" | "or_all")))
+                    && name == "resize"
+                {
+                    let receiver = self.eval(object, frame, me)?;
+                    if let Value::List(list) = receiver {
+                        return self.atomic_value(|this| this.call_list_resize(&list, object, args, frame, me, *span));
+                    }
+                    extreme_receiver = Some(receiver);
+                }
+                if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
+                    && crate::builtins::is_list_predicate(name)
+                    && (!args.is_empty() || !matches!(name.as_str(), "and_all" | "or_all"))
                 {
                     let receiver = self.eval(object, frame, me)?;
                     if let Value::List(list) = receiver {
@@ -12994,10 +13615,16 @@ impl<'a> Interp<'a> {
                     extreme_receiver = Some(receiver);
                 }
                 if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
-                    && matches!(name.as_str(), "min" | "max" | "min_index" | "max_index")
+                    && matches!(name.as_str(), "min" | "max" | "min_index" | "max_index" | "all_different" | "unique" | "sort" | "sort_by_field")
                 {
                     let receiver = self.eval(object, frame, me)?;
                     if let Value::List(list) = receiver {
+                        if matches!(name.as_str(), "all_different" | "unique") {
+                            return self.atomic_value(|this| this.call_list_distinct(&list, name, args, frame, me, *span));
+                        }
+                        if matches!(name.as_str(), "sort" | "sort_by_field") {
+                            return self.atomic_value(|this| this.call_list_sort(&list, name, args, frame, me, *span));
+                        }
                         return self.atomic_value(|this| this.call_list_extreme(&list, name, args, frame, me, *span));
                     }
                     extreme_receiver = Some(receiver);
@@ -13462,13 +14089,7 @@ impl<'a> Interp<'a> {
                 Ok(value)
             }
             Expr::SetOfValues { ty, full, .. } => {
-                // 5.10.5/5.10.6: the set of all legal (or possible)
-                // values of the type. No range restrictions are
-                // recorded on declared types yet, so both forms build
-                // the same set (the honest reading of 5.10.6's "for
-                // types that have no range restrictions...").
-                let _ = full;
-                self.set_of_type(ty)
+                Ok(Value::Set(vec![self.reflected_type_range(ty, *full)?]))
             }
             Expr::BitSlice {
                 base,
@@ -14544,7 +15165,9 @@ impl<'a> Interp<'a> {
                 };
                 Ok(intervals.iter().any(|(lo, hi)| lo <= v && v <= hi))
             }
-            crate::ast::TableElem::TypeSet { ty, .. } => self.type_set_contains(ty, value, span),
+            crate::ast::TableElem::TypeSet { ty, full } => {
+                self.type_set_contains(ty, *full, value, span)
+            }
         }
     }
 
@@ -14556,19 +15179,11 @@ impl<'a> Interp<'a> {
     fn type_set_contains(
         &self,
         ty: &TypeExpr,
+        full: bool,
         value: &Value,
         span: crate::ast::Span,
     ) -> Result<bool, ExecError> {
-        let Some(range) = self.type_value_range(ty) else {
-            return Err(self.error(
-                "E0402",
-                format!(
-                    "set_of_values expects a numeric or enumeral type; '{}' has none",
-                    ty.render()
-                ),
-                ty.span(),
-            ));
-        };
+        let range = self.reflected_type_range(ty, full)?;
         let index = match value {
             Value::Int(v) => {
                 return Ok(range.0 <= *v && *v <= range.1);
@@ -15010,50 +15625,39 @@ impl<'a> Interp<'a> {
         self.instances[index]
             .fields
             .push((field.to_owned(), default));
-        let constraints: Vec<Expr> = view
-            .constraints
-            .iter()
-            .filter(|constraint| !constraint.is_bind)
-            .map(|constraint| constraint.expr.clone())
-            .collect();
+        let constraints: Vec<_> = view.constraints.iter().collect();
         // The same domain narrowing gen uses: a `keep x == 5` shapes the
         // sampling domain before the rejection loop.
-        let domains = self.constraint_domains(&constraints, &[(field.to_owned(), ty.clone())]);
-        for _ in 0..1000 {
-            let value = match domains.get(field) {
-                Some(domain) => self.sample_int_in(&ty, *domain),
-                None => self.sample_type(&ty)?,
-            };
-            self.instances[index].set(field, value);
-            let mut pass = true;
-            for constraint in &constraints {
-                // The same shapes gen skips (HDL bindings, soft and
-                // select constraints) do not gate a materialization.
-                if expr_calls_any(
-                    constraint,
-                    &["hdl_path", "delayed", "soft", "select", "edge"],
-                ) {
-                    continue;
-                }
-                match self.eval(constraint, &mut Frame::default(), Some(index)) {
-                    Ok(Value::Bool(true)) => {}
-                    Ok(Value::Bool(false)) => {
-                        pass = false;
-                        break;
+        let field_types = [(field.to_owned(), ty)];
+        let ty = &field_types[0].1;
+        for (_, constraints) in generation_constraint_passes(&constraints) {
+            let domains = self.constraint_domains(&constraints, &field_types)?;
+            let predicates = generation_predicates(&constraints);
+            for _ in 0..1000 {
+                let value = self.sample_generation_field(field, ty, &domains)?;
+                self.instances[index].set(field, value);
+                let mut pass = true;
+                for constraint in &predicates {
+                    match self.eval(constraint, &mut Frame::default(), Some(index)) {
+                        Ok(Value::Bool(true)) => {}
+                        Ok(Value::Bool(false)) => {
+                            pass = false;
+                            break;
+                        }
+                        Ok(_) => {
+                            return Err(self.error(
+                                "E0402",
+                                "constraint did not evaluate to a boolean",
+                                span,
+                            ));
+                        }
+                        // Unverifiable here (a missing sibling field): skip.
+                        Err(_) => {}
                     }
-                    Ok(_) => {
-                        return Err(self.error(
-                            "E0402",
-                            "constraint did not evaluate to a boolean",
-                            span,
-                        ));
-                    }
-                    // Unverifiable here (a missing sibling field): skip.
-                    Err(_) => {}
                 }
-            }
-            if pass {
-                return Ok(());
+                if pass {
+                    return Ok(());
+                }
             }
         }
         Err(self.error(
@@ -15588,10 +16192,47 @@ fn intersect_domain(
     entry.1 = entry.1.min(bounds.1);
 }
 
+fn narrow_integer_domain(domains: &mut IntegerDomains, name: &str, allowed: Vec<(i128, i128)>) {
+    use std::collections::btree_map::Entry;
+    match domains.entry(name.to_owned()) {
+        Entry::Occupied(mut entry) => {
+            let intersection = intersect_interval_sets(entry.get(), &allowed);
+            entry.insert(intersection);
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(allowed);
+        }
+    }
+}
+
+fn generation_target(expr: &Expr) -> Option<GenerationTarget<'_>> {
+    match expr {
+        Expr::Ident { name, .. } => return Some(GenerationTarget::Integer(name)),
+        Expr::Paren { expr, .. } => return generation_target(expr),
+        _ => {}
+    }
+    let Expr::Call { callee, args, .. } = expr else {
+        return None;
+    };
+    let Expr::MemberAccess { object, name, .. } = callee.as_ref() else {
+        return None;
+    };
+    if name != "size" || !args.is_empty() {
+        return None;
+    }
+    match object.as_ref() {
+        Expr::Ident { name, .. } => Some(GenerationTarget::ListLength(name)),
+        Expr::MemberAccess { object, name, .. } if matches!(object.as_ref(), Expr::Ident { name, .. } if name == "me" || name == "self") => {
+            Some(GenerationTarget::ListLength(name))
+        }
+        _ => None,
+    }
+}
+
 /// Integer view of a value for the `hdl_*` routines: integers pass
 /// through, booleans become 0/1 (handy for clock and reset pins).
 /// Stable type key for an inline enumeral list.
-fn inline_enum_key(names: &[String]) -> String {
+pub(crate) fn inline_enum_key(names: &[String]) -> String {
     format!("[{}]", names.join(","))
 }
 
@@ -15716,7 +16357,7 @@ const MAX_UINT_VALUE: i128 = (1i128 << 32) - 1;
 /// expression identifiers: MAX_UINT (2^32-1), MAX_INT (2^31-1) and
 /// MIN_INT (-2^31). The select-choice evaluator resolves the same names
 /// over its recorded tokens.
-fn predefined_constant(name: &str) -> Option<i128> {
+pub(crate) fn predefined_constant(name: &str) -> Option<i128> {
     match name {
         "MAX_UINT" => Some((1i128 << 32) - 1),
         "MAX_INT" => Some((1i128 << 31) - 1),
@@ -16647,28 +17288,39 @@ fn expr_text(expr: &Expr) -> String {
 /// (other roots, deeper paths, whole-object equalities) drops, because
 /// it cannot evaluate against the generated instance's frame. Full
 /// CFS scoping is a later milestone.
-fn rebase_constraints(constraints: &[Expr], prefix: &str) -> Vec<Expr> {
+fn rebase_constraints(
+    constraints: &[KeepConstraint],
+    prefix: &str,
+    is_constant: impl Fn(&str) -> bool,
+) -> Vec<KeepConstraint> {
+    let path = [prefix.to_owned()];
     constraints
         .iter()
-        .filter_map(|constraint| rebase_expr(constraint, prefix))
+        .filter(|constraint| !constraint.is_bind && expr_extends_path(&constraint.expr, &path))
+        .filter_map(|constraint| {
+            Some(KeepConstraint {
+                expr: rebase_expr(&constraint.expr, prefix, &is_constant)?,
+                ..constraint.clone()
+            })
+        })
         .collect()
 }
 
-fn rebase_expr(expr: &Expr, prefix: &str) -> Option<Expr> {
+fn rebase_expr(expr: &Expr, prefix: &str, is_constant: &impl Fn(&str) -> bool) -> Option<Expr> {
     match expr {
         Expr::Binary { op, lhs, rhs, span } => Some(Expr::Binary {
             op: *op,
-            lhs: Box::new(rebase_expr(lhs, prefix)?),
-            rhs: Box::new(rebase_expr(rhs, prefix)?),
+            lhs: Box::new(rebase_expr(lhs, prefix, is_constant)?),
+            rhs: Box::new(rebase_expr(rhs, prefix, is_constant)?),
             span: *span,
         }),
         Expr::Unary { op, expr, span } => Some(Expr::Unary {
             op: *op,
-            expr: Box::new(rebase_expr(expr, prefix)?),
+            expr: Box::new(rebase_expr(expr, prefix, is_constant)?),
             span: *span,
         }),
         Expr::Paren { expr, span } => Some(Expr::Paren {
-            expr: Box::new(rebase_expr(expr, prefix)?),
+            expr: Box::new(rebase_expr(expr, prefix, is_constant)?),
             span: *span,
         }),
         // `prefix.field` — depth two: the rebase target.
@@ -16682,11 +17334,22 @@ fn rebase_expr(expr: &Expr, prefix: &str) -> Option<Expr> {
                 return None;
             };
             if root == prefix {
-                let _ = name_span;
-                Some(Expr::Ident {
-                    name: name.clone(),
-                    span: *span,
-                })
+                if is_constant(name) {
+                    Some(Expr::MemberAccess {
+                        object: Box::new(Expr::Ident {
+                            name: "me".to_owned(),
+                            span: *span,
+                        }),
+                        name: name.clone(),
+                        name_span: *name_span,
+                        span: *span,
+                    })
+                } else {
+                    Some(Expr::Ident {
+                        name: name.clone(),
+                        span: *span,
+                    })
+                }
             } else {
                 None
             }
@@ -16698,6 +17361,12 @@ fn rebase_expr(expr: &Expr, prefix: &str) -> Option<Expr> {
             arms: arms.clone(),
             span: *span,
         }),
+        Expr::IntLiteral { .. }
+        | Expr::RealLiteral { .. }
+        | Expr::BitLiteral { .. }
+        | Expr::BoolLiteral { .. }
+        | Expr::StringLiteral { .. } => Some(expr.clone()),
+        Expr::Ident { name, .. } if is_constant(name) => Some(expr.clone()),
         // A bare identifier is either the whole generated object (an
         // object equality — needs full CFS) or an unrelated name; both
         // drop.
@@ -16711,23 +17380,72 @@ fn natural_range(ty: &TypeExpr) -> Option<(i128, i128)> {
     let TypeExpr::Scalar { base, width, .. } = ty else {
         return None;
     };
-    match base {
-        ScalarBase::Uint => {
-            let bits = width_bits(width, 32);
-            Some((0i128, (1i128 << bits) - 1))
-        }
-        ScalarBase::Int => {
-            let bits = width_bits(width, 32);
-            Some((-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1))
-        }
-        // The long bases are 64-bit wide (Table 17, clause 5.2.3.1).
-        ScalarBase::Longuint => Some((0, (1i128 << 64) - 1)),
-        ScalarBase::Longint => Some((-(1i128 << 63), (1i128 << 63) - 1)),
-        ScalarBase::Bit => Some((0, 1)),
-        ScalarBase::Byte => Some((0, 255)),
-        ScalarBase::Nibble => Some((0, 15)),
-        ScalarBase::Bool | ScalarBase::Real | ScalarBase::String | ScalarBase::Time => None,
+    if *base == ScalarBase::Bool {
+        return None;
     }
+    scalar_range(*base, width)
+}
+
+/// Try the preferences together first. If that pass finds no solution,
+/// generation can retry with the required constraints alone.
+fn generation_constraint_passes<'a>(
+    constraints: &'a [&KeepConstraint],
+) -> impl Iterator<Item = (bool, Vec<Expr>)> + 'a {
+    let has_soft = constraints.iter().any(|keep| keep.is_soft && !keep.is_bind);
+    std::iter::once(true)
+        .chain(has_soft.then_some(false))
+        .map(|include_soft| {
+            let expressions = constraints
+                .iter()
+                .filter(|keep| !keep.is_bind && (include_soft || !keep.is_soft))
+                .map(|keep| keep.expr.clone())
+                .collect();
+            (include_soft, expressions)
+        })
+}
+
+/// Keep value predicates in source order. Distributions and binding
+/// attributes contribute through other paths, so only their own conjuncts
+/// are skipped during candidate verification.
+fn generation_predicates(constraints: &[Expr]) -> Vec<&Expr> {
+    fn collect<'a>(expr: &'a Expr, predicates: &mut Vec<&'a Expr>) {
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::LogicalAnd,
+                lhs,
+                rhs,
+                ..
+            } => {
+                collect(lhs, predicates);
+                collect(rhs, predicates);
+            }
+            Expr::Paren { expr, .. } => collect(expr, predicates),
+            Expr::ChosenFrom { .. } => {}
+            _ if generation_metadata(expr) => {}
+            _ => predicates.push(expr),
+        }
+    }
+
+    let mut predicates = Vec::new();
+    for constraint in constraints {
+        collect(constraint, &mut predicates);
+    }
+    predicates
+}
+
+fn generation_metadata(expr: &Expr) -> bool {
+    expr_calls_any(
+        expr,
+        &[
+            "hdl_path",
+            "delayed",
+            "soft",
+            "select",
+            "edge",
+            "pack_options",
+            "per_inst_cover",
+        ],
+    )
 }
 
 /// The `field == select { .. }` leaves of a constraint conjunction, as
@@ -16766,7 +17484,10 @@ fn select_leaves(expr: &Expr) -> Vec<(String, &[crate::ast::SelectArm])> {
 
 /// The choice keyword of a select arm's recorded tokens and, for
 /// `normal(center, stddev)`, its two evaluated arguments.
-fn select_choice(tokens: &[Token]) -> Option<(&'static str, Option<(i128, i128)>)> {
+fn select_choice(
+    tokens: &[Token],
+    defines: &BTreeMap<String, Expr>,
+) -> Option<(&'static str, Option<(i128, i128)>)> {
     let word = match &tokens.first()?.kind {
         TokenKind::Identifier(word) | TokenKind::Keyword(word) => word.as_str(),
         _ => return None,
@@ -16806,141 +17527,17 @@ fn select_choice(tokens: &[Token]) -> Option<(&'static str, Option<(i128, i128)>
     if parts.len() != 2 {
         return None;
     }
-    let center = eval_choice_int(parts[0])?;
-    let stddev = eval_choice_int(parts[1])?;
+    let center = eval_choice_int(parts[0], defines)?;
+    let stddev = eval_choice_int(parts[1], defines)?;
     Some((kind, Some((center, stddev))))
 }
 
-/// Evaluate a constant integer expression over the recorded choice
-/// tokens: decimal/based literals, the `MAX_UINT`/`MAX_INT` predefined
-/// constants, `+`/`-`/`*`/`/` with precedence, and parentheses. `None`
-/// on anything else (the arm is then skipped, honestly).
-/// Evaluate a constant integer expression over recorded tokens
-/// (literals, the predefined `MAX_UINT`/`MAX_INT`, `+`/`-`/`*`/`/`
-/// with precedence, parentheses); `None` on anything else.
-pub(crate) fn eval_choice_int(tokens: &[Token]) -> Option<i128> {
-    if tokens.is_empty() {
-        return None;
-    }
-    // Split the top-level additive terms.
-    let mut terms: Vec<(bool, &[Token])> = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    let mut negate = false;
-    for (index, token) in tokens.iter().enumerate() {
-        match &token.kind {
-            TokenKind::Punctuation(p) if p == "(" => depth += 1,
-            TokenKind::Punctuation(p) if p == ")" => depth = depth.saturating_sub(1),
-            TokenKind::Punctuation(p) if p == "+" && depth == 0 => {
-                terms.push((negate, &tokens[start..index]));
-                negate = false;
-                start = index + 1;
-            }
-            TokenKind::Punctuation(p) if p == "-" && depth == 0 => {
-                terms.push((negate, &tokens[start..index]));
-                negate = true;
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    terms.push((negate, &tokens[start..]));
-    let mut total: Option<i128> = None;
-    for (negative, term) in terms {
-        if term.is_empty() {
-            return None;
-        }
-        let value = eval_choice_product(term)?;
-        total = Some(match total {
-            None => {
-                if negative {
-                    -value
-                } else {
-                    value
-                }
-            }
-            Some(current) => {
-                if negative {
-                    current - value
-                } else {
-                    current + value
-                }
-            }
-        });
-    }
-    total
-}
-
-/// The multiplicative level of the choice-expression evaluator.
-fn eval_choice_product(tokens: &[Token]) -> Option<i128> {
-    let mut total: Option<i128> = None;
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    let mut operation = "*";
-    for (index, token) in tokens.iter().enumerate() {
-        match &token.kind {
-            TokenKind::Punctuation(p) if p == "(" => depth += 1,
-            TokenKind::Punctuation(p) if p == ")" => depth = depth.saturating_sub(1),
-            TokenKind::Punctuation(p) if (p == "*" || p == "/") && depth == 0 => {
-                let value = eval_choice_atom(&tokens[start..index])?;
-                total = Some(apply_choice_op(total, operation, value)?);
-                operation = p.as_str();
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    let value = eval_choice_atom(&tokens[start..])?;
-    apply_choice_op(total, operation, value)
-}
-
-fn apply_choice_op(total: Option<i128>, operation: &str, value: i128) -> Option<i128> {
-    match (total, operation) {
-        (None, "*") => Some(value),
-        (None, "/") => Some(value),
-        (Some(current), "*") => current.checked_mul(value),
-        (Some(current), "/") => {
-            if value == 0 {
-                None
-            } else {
-                Some(current / value)
-            }
-        }
-        _ => None,
-    }
-}
-
-fn eval_choice_atom(tokens: &[Token]) -> Option<i128> {
-    let first = tokens.first()?;
-    match &first.kind {
-        TokenKind::Number(text) => {
-            if tokens.len() != 1 {
-                return None;
-            }
-            crate::interp::parse_int_literal(text)
-        }
-        TokenKind::Identifier(word) | TokenKind::Keyword(word) => {
-            if tokens.len() != 1 {
-                return None;
-            }
-            match word.as_str() {
-                "MAX_UINT" => Some((1i128 << 32) - 1),
-                "MAX_INT" => Some((1i128 << 31) - 1),
-                _ => None,
-            }
-        }
-        TokenKind::Punctuation(p) if p == "(" => {
-            if tokens.len() < 3 || !token_kind_is_punct(tokens.last(), ")") {
-                return None;
-            }
-            eval_choice_int(&tokens[1..tokens.len() - 1])
-        }
-        TokenKind::Punctuation(p) if p == "-" => {
-            if tokens.len() < 2 {
-                return None;
-            }
-            Some(0i128.wrapping_sub(eval_choice_int(&tokens[1..])?))
-        }
+/// Evaluate a select argument using the language's expression precedence
+/// and the same checked constant arithmetic as declaration bounds.
+fn eval_choice_int(tokens: &[Token], defines: &BTreeMap<String, Expr>) -> Option<i128> {
+    let expr = crate::parser::parse_expression_tokens(tokens).ok()?;
+    match crate::elab::eval_const_expr(&expr, &BTreeMap::new(), defines, 0)? {
+        crate::elab::Const::Int(value) => Some(value),
         _ => None,
     }
 }
@@ -17281,14 +17878,6 @@ fn lists_equal(a: &ListValue, b: &ListValue, depth: usize) -> bool {
             .iter()
             .zip(b_items.iter())
             .all(|(x, y)| values_equal_bounded(x, y, depth + 1))
-}
-
-/// The element type of a list type expression (identity for non-lists).
-fn list_element_type(ty: &TypeExpr) -> TypeExpr {
-    match ty {
-        TypeExpr::List { element, .. } => (**element).clone(),
-        other => other.clone(),
-    }
 }
 
 /// The bit width of a scalar type declaration (`uint(bits: 3)` → 3);

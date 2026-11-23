@@ -20,6 +20,7 @@ pub const BUILTIN_ROUTINES: &[&str] = &[
     // Clause 29.9: keyword category/options are handled before value
     // dispatch. The implemented category is coverage.
     "set_config",
+    "set_config_max",
     "out",
     "outf",
     "hdl_load",
@@ -249,6 +250,30 @@ pub fn is_builtin_interface(name: &str) -> bool {
 /// plain print radix; the enum's default value is its first member,
 /// `none`).
 pub const NUMERIC_FORMAT_KIND: &[&str] = &["none", "dec", "hex", "bin", "oct", "udec", "float"];
+
+pub(crate) fn is_list_predicate(name: &str) -> bool {
+    matches!(
+        name,
+        "has"
+            | "count"
+            | "all"
+            | "all_indices"
+            | "first"
+            | "last"
+            | "first_index"
+            | "last_index"
+            | "and_all"
+            | "or_all"
+    )
+}
+
+pub(crate) fn sort_field_name(expr: &crate::ast::Expr) -> Option<&str> {
+    match expr {
+        crate::ast::Expr::Ident { name, .. } => Some(name),
+        crate::ast::Expr::StringLiteral { value, .. } => Some(value),
+        _ => None,
+    }
+}
 
 pub fn is_builtin_routine(name: &str) -> bool {
     BUILTIN_ROUTINES.contains(&name)

@@ -1340,28 +1340,64 @@ impl<'a> TypeChecker<'a> {
                 ..
             } => {
                 let object_ty = self.infer(object);
+                if name == "resize"
+                    && let Ty::List(element) = &object_ty
+                {
+                    for (index, arg) in args.iter().enumerate() {
+                        let (expected, purpose) = match index {
+                            0 => (Ty::Int, "resize size"),
+                            1 if matches!(arg, Expr::Ident { name, .. } if name == "UNDEF") => {
+                                continue;
+                            }
+                            1 => (element.as_ref().clone(), "resize filler"),
+                            2 => (Ty::Bool, "resize keep_old"),
+                            _ => break,
+                        };
+                        let actual = self.infer_with_hint(Some(expected.clone()), arg);
+                        self.check_assignable(&actual, &expected, arg.span(), purpose);
+                    }
+                    return Ty::Void;
+                }
+                if name == "get_indices" && matches!(object_ty, Ty::List(_)) {
+                    let index_list = Ty::List(Box::new(Ty::Int));
+                    for arg in args {
+                        let actual = self.infer_with_hint(Some(index_list.clone()), arg);
+                        self.check_assignable(
+                            &actual,
+                            &index_list,
+                            arg.span(),
+                            "get_indices argument",
+                        );
+                    }
+                    return object_ty;
+                }
+                if name == "sort_by_field"
+                    && let Ty::List(element) = &object_ty
+                {
+                    if let [arg] = args
+                        && let Some(field) = crate::builtins::sort_field_name(arg)
+                    {
+                        self.infer_member(element, field, arg.span());
+                    }
+                    return object_ty;
+                }
+                let predicate = crate::builtins::is_list_predicate(name);
                 if let Ty::List(element) = &object_ty
-                    && matches!(
-                        name.as_str(),
-                        "min"
-                            | "max"
-                            | "min_index"
-                            | "max_index"
-                            | "has"
-                            | "count"
-                            | "all"
-                            | "all_indices"
-                            | "and_all"
-                            | "or_all"
-                    )
+                    && (predicate
+                        || matches!(
+                            name.as_str(),
+                            "min"
+                                | "max"
+                                | "min_index"
+                                | "max_index"
+                                | "all_different"
+                                | "unique"
+                                | "sort"
+                        ))
                 {
                     self.push_scope();
                     self.bind_local("it", element.as_ref().clone());
                     for arg in args {
-                        let predicate = matches!(
-                            name.as_str(),
-                            "has" | "count" | "all" | "all_indices" | "and_all" | "or_all"
-                        );
                         let argument_ty = self.infer_with_hint(predicate.then_some(Ty::Bool), arg);
                         if predicate {
                             self.check_assignable(
@@ -1374,10 +1410,12 @@ impl<'a> TypeChecker<'a> {
                     }
                     self.pop_scope();
                     return match name.as_str() {
-                        "min_index" | "max_index" | "count" => Ty::Int,
-                        "has" | "and_all" | "or_all" => Ty::Bool,
+                        "min_index" | "max_index" | "first_index" | "last_index" | "count" => {
+                            Ty::Int
+                        }
+                        "has" | "and_all" | "or_all" | "all_different" => Ty::Bool,
                         "all_indices" => Ty::List(Box::new(Ty::Int)),
-                        "all" => object_ty,
+                        "all" | "unique" | "sort" => object_ty,
                         _ => element.as_ref().clone(),
                     };
                 }

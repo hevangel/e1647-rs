@@ -66,6 +66,27 @@ fn browser_sources_share_native_pipeline_results() {
 }
 
 #[test]
+fn coverage_json_preserves_real_bucket_bounds() {
+    let source = include_str!("fixtures/coverage-ranges/real.e");
+    let result = evaluate(source, Operation::Run, 1);
+    assert!(result.ok(), "{:?}", result.diagnostics);
+    assert!(
+        result
+            .to_json()
+            .contains(r#""lo":"-0.5","hi":"0.25","label":"-0.5..0.25","hits":"2""#)
+    );
+    let subdivided = evaluate(
+        include_str!("fixtures/coverage-ranges/real-subdivision.e"),
+        Operation::Run,
+        1,
+    );
+    assert!(subdivided.ok(), "{:?}", subdivided.diagnostics);
+    let json = subdivided.to_json();
+    assert!(json.contains(r#""lo":"0","hi":"0.25","label":"0..<0.25","hits":"1","goal":"2","excluded":false,"upperInclusive":false"#));
+    assert!(json.contains(r#""lo":"0.5","hi":"0.6","label":"0.5..0.6","hits":"2","goal":"2","excluded":false,"upperInclusive":true"#));
+}
+
+#[test]
 fn derived_coverage_json_preserves_native_report_data() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     for name in [

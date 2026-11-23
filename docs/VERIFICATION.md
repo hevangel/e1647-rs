@@ -5607,3 +5607,685 @@ copying, and the E0404 diagnostic for an out-of-range table index.
 Formatting, default and all-feature Clippy, and the wasm32 all-target
 compilation check passed. All-target tests passed with 528 default-feature
 tests and 537 all-feature tests.
+
+## 2026-11-19 — Nested linear solver branches
+
+Pumpkin receives flat conjunctions when a linear keep expression mixes
+conjunctions and disjunctions. Expansion checks the 64-branch limit
+before allocating a union or cross product. Branch selection reduces the
+full 64-bit seed before converting the result to a host index.
+
+Regressions cover nested branches, offset seeds above 32 bits, and
+fallback after exceeding the branch limit. Formatting, all-feature
+Clippy, and WebAssembly all-target compilation passed. Native all-target
+tests passed with 528 default-feature tests and 539 all-feature tests.
+
+## 2026-11-19 — Explicit wide integer generation
+
+Explicit int and uint widths above 31 bits bypass the solver's narrow
+domain. The object generator's range-aware sampler uses the runtime
+width. A regression generates signed and unsigned 40-bit fields
+constrained to values beyond 32-bit bounds.
+
+Formatting, default and all-feature Clippy, and WebAssembly compilation
+passed. All-target runs passed with 529 default-feature tests and 540
+all-feature tests.
+
+## 2026-11-19 — Direct scalar field sampling bounds
+
+Direct scalar field generation uses the owning type's hard bounds to
+narrow its fallback sampling domain. A regression resets a 40-bit
+field before regenerating it under two comparisons that fix its value
+beyond the 32-bit range.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 530 default-feature
+tests and 541 all-feature tests.
+
+## 2026-11-19 — Solver arithmetic and enumeration seed selection
+
+Constraint translation checks arithmetic while normalizing coefficients
+and constants. Unrepresentable IR values defer to fallback sampling.
+Enumeration widens domain-size and RHS arithmetic before subtracting
+and counts every satisfying assignment before selecting by seed.
+Regressions cover coefficient overflow, an i64 minimum RHS, an
+oversized enumeration domain, and a three-solution seed cycle.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target test runs passed with 532 default-feature
+tests and 543 all-feature tests.
+
+## 2026-11-19 — Positive literal quotient constraints
+
+The solver translates an equality between a nonnegative integer
+quotient and a decimal literal into an inclusive range. The dividend
+must be a bounded nonnegative field and the divisor a positive decimal
+literal. Tests cover reversed equality, range clipping, impossible
+quotients, unsupported operands, and native generation with Pumpkin.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 533 default-feature
+tests and 546 all-feature tests.
+
+## 2026-11-19 — Bounded integer remainder constraints
+
+For a bounded nonnegative field and positive decimal divisor, the
+solver translates remainder equality into a disjunction of matching
+values in the declared domain. More than 64 matches defer to the
+sampler before expansion. Tests verify reversed equality, a nonzero
+lower bound, the 64-branch limit, impossible remainders, signed-domain
+fallback, and a remainder combined with a second constraint in Pumpkin.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 534 default-feature
+tests and 548 all-feature tests.
+
+## 2026-11-19 — Remainders with more than 64 matches
+
+Pumpkin posts large positive-literal remainder equalities as a linear
+equation over the field and a bounded auxiliary quotient. The auxiliary
+variable stays internal to the backend. The bounded enumerator evaluates
+the remainder directly if a polynomial constraint selects that path.
+Tests cover both paths and retain the 64-branch boundary for small sets.
+Negating a large remainder equality still defers to fallback sampling.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 535 default-feature
+tests and 550 all-feature tests.
+
+## 2026-11-19 — Negated bounded remainders
+
+Both explicit inequality and logical negation exclude a fixed remainder
+from a bounded nonnegative field. Pumpkin represents a large negated
+remainder with a bounded quotient and residual, then excludes the
+requested residual. The bounded enumerator checks the predicate directly
+when a polynomial selects that path. Tests include a domain with one
+remaining solution and the unsatisfiable remainder inequality modulo one.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 535 default-feature
+tests and 551 all-feature tests.
+
+## 2026-11-19 — Ordered integer quotient constraints
+
+Ordered comparisons between a nonnegative bounded field's quotient
+and a nonnegative decimal literal translate to ranges. Tests compare
+the satisfying assignments at both ends of each range, including
+reversed operands, impossible bounds, and a clipping bound at i32::MAX.
+Pumpkin and the bounded enumerator both exercise the translated ranges.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 536 default-feature
+tests and 553 all-feature tests.
+
+## 2026-11-19 — Ordered bounded remainders
+
+The constraint solver supports ordered comparisons on remainders over
+nonnegative bounded fields with positive literal divisors. Pumpkin
+narrows its auxiliary residual before posting the decomposition.
+Enumeration checks the same comparison directly. Tests verify reversed
+operands, negation, impossible residuals, and a unique solution in a
+large domain.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 537 default-feature
+tests and 555 all-feature tests.
+
+## 2026-11-19 — Signed bounded quotients
+
+The solver translates signed bounded dividends divided by a positive
+literal using the interpreter's truncation toward zero. Negative
+quotients extend their input interval downward, and the zero interval
+includes both signs. Solver regressions check the exact satisfying
+ranges. A runtime regression generates both signed and unsigned fields
+under tight quotient constraints.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 538 default-feature
+tests and 557 all-feature tests.
+
+## 2026-11-19 — Signed bounded remainders
+
+The solver accepts signed bounded fields modulo a positive literal.
+Pumpkin uses its truncating division constraint and a linear residual
+equation to match the interpreter's dividend-sign behavior. The
+enumerator uses signed integer remainder directly. Tests cover
+negative, zero, and positive residuals, reversed comparisons, and
+rejection of a positive residual on a fixed negative dividend.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 539 default-feature
+tests and 559 all-feature tests.
+
+## 2026-11-19 — Negative literal divisors
+
+For signed bounded fields, a negative literal divisor reverses quotient
+order and leaves remainder sign tied to the dividend. Solver tests cover
+ordered and reversed comparisons, grouped literals, and the signed
+32-bit minimum divided by minus one, which defers to runtime evaluation.
+A generation regression verifies the native signed quotient path.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 539 default-feature
+tests and 559 all-feature tests.
+
+## 2026-11-19 — Numeric coverage configuration maxima
+
+The coverage subset of `set_config_max` takes the larger of the current
+and requested values for `max_int_buckets` and `at_least`. It validates
+the requests before applying them and shares the schema rebuild rules
+with `set_config`. Lower requests after sampling leave the schema intact.
+Tests verify expression arguments, both numeric options, rejection of
+non-numeric options, and the error for an increase after sampling.
+This is local regression evidence for the maximum-update interpretation.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 541 default-feature
+tests and 561 all-feature tests.
+
+## 2026-11-19 — Coverage callback schema stability
+
+A coverage expression can run while the interpreter holds indexes into
+the current schema. Calls from those expressions now reject effective
+schema changes with E0402 before the rebuild. A per-unit sampling
+regression checks that a no-op maximum request is accepted, a subsequent
+rebuild is rejected, and the prepared group's original buckets survive.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 542 default-feature
+tests and 562 all-feature tests.
+
+## 2026-11-19 — Per-unit coverage after rebinding
+
+Per-unit coverage retains the physical unit as its storage key.
+Preparing live groups refreshes their displayed path after alias
+rebinding. A regression samples a moved unit on both sides of rebinding,
+checks its combined counts at the new path, and checks that a detached
+sampled unit remains in the report under its last path.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 543 default-feature
+tests and 563 all-feature tests.
+
+## 2026-11-19 — Basic coverage item radix
+
+Basic integral coverage items accept DEC, HEX, and BIN for generated
+bucket labels. Hexadecimal and binary labels use signed magnitude with
+a base prefix. Explicit range names are retained. A regression checks
+binary defaults, a negative hexadecimal range, decimal defaults,
+bucket hits, and an unsupported radix diagnostic. The display format
+was verified in local tests.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 545 default-feature
+tests and 565 all-feature tests.
+
+## 2026-11-19 — Coverage group radix defaults
+
+A group's composed radix supplies the default for basic integer items.
+A radix declared by a group extension applies to base and added items.
+Explicit item radix takes precedence. Tests cover extension defaults,
+an explicit decimal override, recorded hits, and a group radix diagnostic.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 546 default-feature
+tests and 566 all-feature tests.
+
+## 2026-11-19 — Derived coverage radix
+
+Crosses and transitions can override the radix of their direct numeric
+source labels. Numeric bucket bounds are stored separately from display
+text, preserving explicit names and bucket identities. Nested derived
+sources keep their rendered labels. Tests check cross and transition
+labels, a named source bucket, combination totals and hits, and an
+unsupported derived radix diagnostic.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 547 default-feature
+tests and 567 all-feature tests.
+
+## 2026-11-19 — Explicit coverage ranges for named enumerals
+
+Named enumeral coverage items can define explicit buckets bounded by
+members of their declared type. Bucket order follows declaration order;
+automatic labels use enumeral names and explicit labels stay intact.
+Regression tests check hits, grade, transition totals, and rejection
+of a bound from a different type. Bucket-level effects over these
+ranges and implicit enumeral buckets remain open.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 549 default-feature
+tests and 569 all-feature tests.
+
+## 2026-11-19 — Basic enumeral bucket effects
+
+Basic enumeral bucket masks evaluate ignore and illegal predicates over
+the declared members, with a 65536-member classification limit per
+item refresh. A partially masked bucket remains gradeable. A regression
+covers ignore precedence, one illegal observation, retained hits for a
+partially masked bucket, and the resulting transition denominator.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 550 default-feature
+tests and 570 all-feature tests.
+
+## 2026-11-19 — Derived enumeral bucket effects
+
+Cross and transition masks classify direct enumeral source buckets
+using typed values, including the previous value of a transition.
+Range splitting uses ordinal indexes internally, then evaluates
+enumeral expressions with concrete values. A regression covers mixed
+Boolean and enumeral sources, a partly filtered bucket, a previous
+enumeral predicate, and the observed and possible combination counts.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 551 default-feature
+tests and 571 all-feature tests.
+
+## 2026-11-19 — Coverage ranges through enumeral aliases
+
+Explicit enumeral ranges resolve aliases with a bounded walk and use
+the runtime type identity for inline enumerals. An untyped coverage
+item can take its enum type from the matching field. A regression
+checks bucket hits through a two-link alias and an inline field.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 552 default-feature
+tests and 572 all-feature tests.
+
+## 2026-11-19 — Explicit real literal coverage intervals
+
+Real items accept finite literal intervals and singleton buckets.
+The native CLI and browser JSON serializer report their decimal bounds.
+The fixture checks inclusive endpoints, a named singleton with a hit
+goal, and transition counts. Regression tests cover non-finite and
+reversed endpoints, unsupported subdivision, and JSON serialization.
+Real subdivision and predicate-based bucket masks remain open.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 554 default-feature
+tests and 574 all-feature tests.
+
+## 2026-11-19 — Real coverage range subdivision
+
+A positive width subdivides a finite real range. Boundaries are computed
+from the original lower bound. Each bucket includes its lower endpoint,
+and only the final bucket includes its upper endpoint. The fixture
+checks two shared endpoints, a clipped final bucket, and its hit goal.
+Invalid widths, sub-widths that do not advance at binary64 precision,
+and named subdivisions report E0224. The CLI displays open endpoints
+and the browser JSON includes the real bucket's upper-bound policy.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 554 default-feature
+tests and 574 all-feature tests.
+
+## 2026-11-19 — Basic real coverage masks
+
+Basic real bucket masks classify constant comparisons and Boolean
+combinations over ordered binary64 values. Half-open buckets exclude
+their upper endpoint, and the two signed zeros compare as one value.
+A regression checks fully and partially masked buckets, one illegal
+observation, and the transition denominator. Derived real masks and
+general real predicates remain open.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 555 default-feature
+tests and 575 all-feature tests.
+
+## 2026-11-19 — Derived real coverage masks
+
+Crosses and transitions classify comparisons over direct real sources
+using interval proofs and bounded concrete witnesses. Real ranges
+preserve both signed zeros for arithmetic witnesses while numeric
+comparisons treat them as equal. Tests exercise open endpoints,
+previous real values, mixed Boolean and real sources, and the two
+signed zeros in a singleton bucket.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 556 default-feature
+tests and 576 all-feature tests.
+
+## 2026-11-19 — Real coverage constants and aliases
+
+Real coverage bounds and widths can use finite arithmetic results and
+initialized const fields. Real aliases retain their representation,
+and qualified static const references resolve during schema construction.
+The subdivision fixture exercises both local and qualified constants.
+Division producing a non-finite result is rejected as a range bound.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 556 default-feature
+tests and 576 all-feature tests.
+
+## 2026-11-19 — Real arithmetic in coverage masks
+
+The interval proof engine handles finite real addition, subtraction,
+multiplication and division while the divisor interval excludes zero.
+Basic real masks split unresolved regions within the existing work
+budget. Derived masks reuse the same proofs. A regression exercises
+wide buckets filtered by multiplication and addition, and a cross
+filtered by division at the retained boundary.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 557 default-feature
+tests and 577 all-feature tests.
+
+## 2026-11-19 — Per-instance grading flag validation
+
+Basic coverage items inherit the composed group per_instance setting.
+An explicit item FALSE overrides the group default. A group extension
+can replace an earlier default. Malformed or non-Boolean flag values
+report E0224. Regressions exercise extension defaults, explicit FALSE,
+the reported per-bucket instances, and invalid group and item flags.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 559 default-feature
+tests and 579 all-feature tests.
+
+## 2026-11-19 — Coverage flag assignment validation
+
+`no_collect` and `per_instance` accept grouped Boolean literals.
+Assignment forms of those flags and `per_unit_instance` require a
+value after the equals sign. Tests verify missing-value diagnostics
+and that hiding an item leaves its observations available to crosses.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 561 default-feature
+tests and 581 all-feature tests.
+
+## 2026-11-19 — Predicate-based list selection
+
+The first/last pseudo-methods and their index forms evaluate Boolean
+expressions against a snapshot in the selected direction. They stop
+at the first matching item and restore the caller's item binding.
+A no-match result reports E0402 in this interpreter. Regressions cover
+evaluation order, zero-based indexes, and type diagnostics.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 563 default-feature
+tests and 583 all-feature tests.
+
+## 2026-11-19 — List distinctness and uniqueness
+
+`all_different` checks raw items or one projected item expression and
+stops when a key repeats. `unique()` copies the first occurrence of
+each value in input order. A regression covers empty receivers,
+duplicate projected keys, short-circuit evaluation, and output order.
+The expression-taking form of `unique` remains open.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 564 default-feature
+tests and 584 all-feature tests.
+
+## 2026-11-19 — Stable list sort
+
+`sort()` and `sort(expr)` produce a fresh list. Key expressions run
+once per item in input order. Equal keys retain that order. A single
+orderable key kind is required to keep comparisons consistent.
+Regressions cover stable ties, key evaluation order, receiver
+preservation, string ordering, and an invalid singleton key.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 566 default-feature
+tests and 586 all-feature tests.
+
+## 2026-11-19 — List sort by field
+
+`sort_by_field(field)` accepts a bare or quoted field name and uses
+normal member reads as stable sort keys. Tests cover equal-key order,
+receiver preservation, invalid arguments, and a known missing field
+in the type checker. This implementation supports one scalar field.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 568 default-feature
+tests and 588 all-feature tests.
+
+## 2026-11-19 — Keyed list uniqueness
+
+`unique(expr)` evaluates one key per item in input order, preserving
+the first original item for each distinct key. The fresh list retains
+its element metadata and object identity. A regression checks the
+retained references, original list length, and evaluation of duplicate
+keys. Raw `unique()` and `all_different` remain covered.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 569 default-feature
+tests and 589 all-feature tests.
+
+## Multiple-index list selection
+
+`get_indices(indexes)` returns a fresh list in argument order with
+duplicate indexes preserved. It uses the same E0404 bounds policy as
+individual indexing and retains the receiver's element type. Tests
+exercise a list used as its own index list, an empty index list,
+negative and oversized indexes, and a non-integer list type.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 571 default-feature
+tests and 591 all-feature tests.
+
+## List resize with element defaults
+
+`resize(size)` truncates or grows the shared list object. Growth
+preserves the original prefix and uses each new slot's declared
+element default. A call can add at most 65536 slots. Regressions
+check shared aliases, Boolean defaults, a list alias with enumeral
+defaults, zero length, and invalid sizes. Optional arguments remain open.
+
+Formatting, default and all-feature Clippy, and WebAssembly all-target
+compilation passed. All-target tests passed with 573 default-feature
+tests and 593 all-feature tests.
+
+## List resize filler and prefix policy
+
+`resize(size[, filler[, keep_old]])` evaluates the filler once per new
+slot. `FALSE` replaces the prefix, and `UNDEF` selects typed defaults.
+Tests cover truncation without a filler invocation, replacement even at
+the original length, the original list length during a failing filler,
+and type diagnostics for all three arguments.
+
+Formatting, default and all-feature Clippy, WebAssembly all-target
+compilation, and `git diff --check` passed. All-target tests passed with
+575 default-feature tests and 595 all-feature tests.
+
+## Integer subtype range reflection
+
+`set_of_values` reflects constant integer bounds, including through
+aliases. `full_set_of_values` reports the underlying representation
+range. The interpreter and CLI fixture exercise both forms as set values
+and in `in_table`. Reversed, out-of-representation and unresolved bounds
+report `E0402` when reflected with `set_of_values`.
+
+Formatting, default and all-feature Clippy, WebAssembly all-target
+compilation, and `git diff --check` passed. All-target tests passed with
+577 default-feature tests and 597 all-feature tests.
+
+## Integer subtype generation domains
+
+Generation uses constant integer subtype bounds through aliases. A CLI
+fixture checks `select` with an additional hard bound, a fixed-length
+list of subtype values, and the minimum of a reduced set. Interpreter
+tests cover a polynomial constraint, direct field generation, a local
+that shadows a constrained field, and a constraint outside the subtype
+range. The latter reports `E0407` with either backend.
+
+Formatting, default and all-feature Clippy, the CLI fixture,
+WebAssembly all-target compilation, and `git diff --check` passed.
+All-target tests passed with 580 default-feature tests and 600
+all-feature tests.
+
+## Hard constraints alongside select distributions
+
+Candidate validation preserves hard conjuncts in `keep` expressions
+that contain a `select` distribution. The CLI fixture exercises object
+and direct scalar generation with a distribution and a polynomial
+predicate on a neighboring field. An impossible conjunct reports
+`E0407`.
+
+Formatting, default and all-feature Clippy, the CLI fixture,
+WebAssembly all-target compilation, and `git diff --check` passed.
+All-target tests passed with 582 default-feature tests and 602
+all-feature tests.
+
+## Soft preference fallback during generation
+
+Object and direct scalar generation try the hard and soft keeps together
+before retrying with the hard keeps alone. Rebasing an enclosing keep
+onto a generated object preserves its soft flag. The CLI fixture checks
+a satisfiable preference, conflicting local and enclosing preferences,
+and a `select` whose chosen maximum fails a hard remainder constraint.
+A separate test confirms conflicting hard keeps still report `E0407`.
+The retry drops the soft keeps as a group.
+
+Formatting, default and all-feature Clippy, the CLI fixture,
+WebAssembly all-target compilation, and `git diff --check` passed.
+All-target tests passed with 584 default-feature tests and 604
+all-feature tests.
+
+## Soft co-constraints on explicit chosen_from generation
+
+Explicit `gen field` and `gen object.field` prefer list elements that
+satisfy all co-constraints. If no element meets the soft preferences,
+the search reuses the same evaluated source list with the hard
+constraints alone. The fixture checks object identity and counts source
+evaluations. A failed generation reports `E0417` and restores the
+original target, which the test inspects in `finalize`.
+
+Formatting, default and all-feature Clippy, the CLI fixture,
+WebAssembly all-target compilation, and `git diff --check` passed.
+All-target tests passed with 586 default-feature tests and 606
+all-feature tests.
+
+## Bounded list lengths during generation
+
+Constant comparisons and inclusive intervals over `list.size()` narrow
+the generated list length. The CLI fixture combines an interval with a
+reversed comparison, exercises a list alias with constrained elements
+and regenerates the field directly. It also checks one-sided bounds and
+a fixed length expressed as arithmetic. Contradictory bounds and a
+required length beyond the 65536-element generation limit report `E0407`.
+
+Formatting, default and all-feature Clippy, the CLI fixture,
+WebAssembly all-target compilation, and `git diff --check` passed.
+All-target tests passed with 588 default-feature tests and 608
+all-feature tests.
+
+## Named constants in keep constraints
+
+The checker accepts declared `define` names and predefined integer
+constants in `keep` predicates. Integer constant expressions in defines
+resolve at runtime and are folded for solver translation. The fixture
+covers a named divisor, a computed list-length bound, and a nested
+generation constraint rebased with a named bound. A separate regression
+checks a constant that shares a name with an explicit member access.
+
+Formatting, default and all-feature Clippy, the CLI fixture,
+WebAssembly all-target compilation, and `git diff --check` passed.
+All-target tests passed with 590 default-feature tests and 610
+all-feature tests.
+
+## Named select arguments and wide weights
+
+`normal(...)` parses its arguments with the expression parser and
+evaluates them using checked constant arithmetic. The CLI fixture
+covers defines, predefined constants, unary arithmetic, and an
+overflowing expression that leaves the hard bounds in effect. A
+seeded regression reaches both arms when the total weight exceeds
+64 bits. Totals that exceed `u128` leave the distribution unapplied.
+
+Formatting, default and all-feature Clippy, the CLI fixture,
+WebAssembly all-target compilation, and `git diff --check` passed.
+All-target tests passed with 592 default-feature tests and 612
+all-feature tests.
+
+## Sparse integer sampling domains
+
+The fallback sampler intersects constant membership lists with other
+integer bounds and samples the resulting values across gaps. The CLI
+fixture covers duplicate values, intersecting keeps, and `select others`
+and `normal` over sparse 40-bit fields. Normal draws project to the
+nearest allowed value. Disjoint lists report `E0407`.
+
+Formatting, default and all-feature Clippy, the CLI fixture,
+WebAssembly all-target compilation, and `git diff --check` passed.
+All-target tests passed with 594 default-feature tests and 614
+all-feature tests.
+
+## Integer membership exclusions during generation
+
+The fallback sampler subtracts constant `not in` intervals and item
+lists from the integer sampling domain. The CLI fixture checks both
+endpoints of a 40-bit domain, intersecting exclusions, and `select`
+over a signed domain. A negated `in_table` is checked as a predicate
+without projecting its forbidden rows into the sampling domain. An
+exclusion covering the entire declared range reports `E0407`.
+
+Formatting, default and all-feature Clippy, the CLI fixture,
+WebAssembly all-target compilation, and `git diff --check` passed.
+All-target tests passed with 596 default-feature tests and 616
+all-feature tests.
+
+## Disjunctive integer sampling domains
+
+The fallback sampler unions a field's candidate domains when both
+branches of `or` bound it. Candidate validation still checks the
+entire expression. A 40-bit fixture reaches both valid field pairs
+and exercises an alternative that leaves a field unbounded.
+
+Formatting, default and all-feature Clippy, the CLI fixture,
+WebAssembly all-target compilation, and `git diff --check` passed.
+All-target tests passed with 597 default-feature tests and 617
+all-feature tests.
+
+## Sparse integer table projections
+
+For positive `in_table`, the fallback sampler builds exact integer
+column domains from scalar cells, item lists, intervals and reflected
+type sets. A dynamic cell leaves its column unrestricted by the table
+projection. The CLI fixture reaches all four valid pairs across fixed
+seeds and checks that every generated tuple matches one complete row.
+
+Formatting, default and all-feature Clippy, the CLI fixture,
+WebAssembly all-target compilation, and `git diff --check` passed.
+All-target tests passed with 598 default-feature tests and 618
+all-feature tests.
+
+## Correlated integer table sampling
+
+Whole-object fallback generation samples from compatible rows of
+mandatory `in_table` constraints. Row choices intersect the declared
+and narrowed integer domains. Runtime evaluation still checks each
+complete tuple. The regression generates from two overlapping 256-row
+tables and checks correlated triples across eight seeds.
+
+Formatting, default and all-feature Clippy, the sparse-table CLI
+fixture, WebAssembly all-target compilation, and `git diff --check`
+passed. All-target tests passed with 599 default-feature tests and 619
+all-feature tests.
+
+## Correlated integer disjunction sampling
+
+Whole-object fallback generation uses the same compatible-alternative
+sampling for `or` branches and integer table rows. The regression
+checks three correlated 40-bit fields across 256 branches and eight
+seeds, with an additional hard bound excluding the first 64 branches.
+Full predicate evaluation checks each candidate.
+
+Formatting, default and all-feature Clippy, the disjunction CLI
+fixture, WebAssembly all-target compilation, and `git diff --check`
+passed. All-target tests passed with 600 default-feature tests and 620
+all-feature tests.
+
+## Default coverage buckets through scalar aliases
+
+Basic items use the resolved scalar type of their declaration or
+backing field for default buckets. The CLI fixture checks an implicit
+two-bit integer through an alias chain and a Boolean alias, including
+inherited hexadecimal radix and a configured maximum above the width
+limit. Explicit ranges on a string alias report `E0224`.
+
+Formatting, default and all-feature Clippy, the coverage CLI fixture,
+WebAssembly all-target compilation, and `git diff --check` passed.
+All-target tests passed with 601 default-feature tests and 621
+all-feature tests.

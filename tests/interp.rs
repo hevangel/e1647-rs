@@ -319,6 +319,72 @@ extend sys {
 }
 
 #[test]
+fn generates_explicitly_wide_fields_at_their_declared_width() {
+    let output = clean_output(
+        r#"
+struct wide_s {
+    positive: uint(bits: 40);
+    negative: int(bits: 40);
+    keep positive == 4294967297;
+    keep negative == -4294967297;
+};
+extend sys {
+    run() is also {
+        var value: wide_s;
+        gen value;
+        out(value.positive, " ", value.negative);
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(output, "4294967297 -4294967297");
+}
+
+#[test]
+fn directly_generates_a_wide_field_with_tight_bounds() {
+    let output = clean_output(
+        r#"
+extend sys {
+    value: uint(bits: 40);
+    keep (value >= 4294967297 && 4294967297 >= value);
+    run() is also {
+        value = 0;
+        gen value;
+        out(value);
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(output, "4294967297");
+}
+
+#[test]
+#[cfg(feature = "solver-pumpkin")]
+fn generates_fields_from_signed_and_unsigned_quotient_constraints() {
+    let output = clean_output(
+        r#"
+struct quotient_s {
+    value: uint(bits: 24);
+    negative: int(bits: 25);
+    keep value / 10 == 1000000;
+    keep negative / -10 == 1000000;
+};
+extend sys {
+    run() is also {
+        var candidate: quotient_s;
+        gen candidate;
+        out(candidate.value / 10, " ", candidate.negative / 10);
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(output, "1000000 -1000000");
+}
+
+#[test]
 fn list_min_max_prefer_the_latest_on_ties() {
     // 27.4.15 max()/27.4.18 min(): the item with the largest/smallest
     // value. 27.4.16 max_index()/27.4.19 min_index(): the same scan as an
@@ -354,6 +420,316 @@ fn list_sum_product_and_all_or_all_with_empty_results() {
         1,
     );
     assert_eq!(output, "9 24\n0 1\nFALSE TRUE\nTRUE FALSE\n");
+}
+
+#[test]
+fn list_resize_preserves_the_prefix_and_fills_typed_defaults() {
+    let output = clean_output(
+        r#"
+type mode_e: [IDLE, ACTIVE];
+type modes_t: list of mode_e;
+extend sys {
+    run() is also {
+        var flags: list of bool;
+        var alias: list of bool = flags;
+        alias.push(TRUE);
+        flags.resize(3);
+        print alias.copy();
+        alias.resize(1);
+        print flags.copy();
+        var modes: modes_t;
+        modes.push(ACTIVE);
+        modes.resize(3);
+        print modes.copy();
+        modes.resize(0);
+        print modes.size();
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(
+        output,
+        "[TRUE, FALSE, FALSE]\n[TRUE]\n[ACTIVE, IDLE, IDLE]\n0\n"
+    );
+}
+
+#[test]
+fn list_resize_evaluates_fillers_only_for_new_or_replaced_slots() {
+    let output = clean_output(
+        r#"
+extend sys {
+    !xs: list of int;
+    !counter: int = 0;
+    filler(): int is {
+        out(xs.size());
+        counter = counter + 1;
+        return counter;
+    };
+    run() is also {
+        xs.push(8);
+        xs.resize(3, filler());
+        print xs.copy();
+        xs.resize(2, filler());
+        print xs.copy();
+        xs.resize(2, filler(), FALSE);
+        print xs.copy();
+        xs.resize(2, UNDEF, FALSE);
+        print xs.copy();
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(output, "11[8, 1, 2]\n[8, 1]\n22[3, 4]\n[0, 0]\n");
+}
+
+#[test]
+fn list_resize_keeps_original_length_during_a_failing_filler() {
+    let result = run_source(
+        r#"
+extend sys {
+    !xs: list of int;
+    !counter: int = 0;
+    filler(): int is {
+        out(xs.size());
+        counter = counter + 1;
+        return 1 / (2 - counter);
+    };
+    run() is also {
+        xs.push(8);
+        xs.resize(3, filler());
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(result.output, "11");
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].code, "E0403");
+}
+
+#[test]
+fn list_resize_rejects_negative_and_oversized_requests() {
+    for size in ["-1", "65537", "18446744073709551616"] {
+        let source = format!(
+            "extend sys {{ run() is also {{ var xs: list of int; xs.resize({size}); }}; }};"
+        );
+        let result = run_source(&source, 1);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code, "E0402");
+        assert!(result.diagnostics[0].message.contains("resize()"));
+    }
+}
+
+#[test]
+fn list_get_indices_preserves_order_duplicates_and_element_type() {
+    let output = clean_output(
+        r#"
+extend sys {
+    run() is also {
+        var words: list of string;
+        words.push("a"); words.push("b"); words.push("c");
+        var indexes: list of uint;
+        indexes.push(2); indexes.push(0); indexes.push(2);
+        var selected: list of string = words.get_indices(indexes);
+        print selected.copy();
+        selected.push("extra");
+        print words.copy();
+        var self_indexes: list of int;
+        self_indexes.push(1); self_indexes.push(0); self_indexes.push(1);
+        print self_indexes.get_indices(self_indexes);
+        indexes.clear();
+        print words.get_indices(indexes).size();
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(output, "[c, a, c]\n[a, b, c]\n[0, 1, 0]\n0\n");
+}
+
+#[test]
+fn list_get_indices_rejects_out_of_range_indexes() {
+    for index in ["-1", "1", "18446744073709551616"] {
+        let source = format!(
+            "extend sys {{ run() is also {{ var xs: list of int; xs.push(8); var indexes: list of int; indexes.push({index}); xs.get_indices(indexes); }}; }};"
+        );
+        let result = run_source(&source, 1);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code, "E0404");
+        assert!(result.diagnostics[0].message.contains(index));
+    }
+}
+
+#[test]
+fn list_sort_is_stable_and_evaluates_each_key_once() {
+    let output = clean_output(
+        r#"
+extend sys {
+    key(value: int): int is { out(value); return value % 2; };
+    run() is also {
+        var raw: list of int;
+        raw.push(3); raw.push(1); raw.push(2); raw.push(4);
+        var grouped: list of int = raw.sort(key(it));
+        out("\n");
+        print grouped.copy();
+        print raw.sort();
+        grouped.push(8);
+        print raw.copy();
+        var words: list of string;
+        words.push("b"); words.push("a");
+        print words.sort();
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(
+        output,
+        "3124\n[2, 4, 3, 1]\n[1, 2, 3, 4]\n[3, 1, 2, 4]\n[a, b]\n"
+    );
+}
+
+#[test]
+fn list_sort_by_field_uses_stable_member_order() {
+    let output = clean_output(
+        r#"
+struct entry_s { rank: int; mark: string; };
+extend sys {
+    run() is also {
+        var a: entry_s = new;
+        var b: entry_s = new;
+        var c: entry_s = new;
+        a.rank = 5; a.mark = "a";
+        b.rank = 1; b.mark = "b";
+        c.rank = 5; c.mark = "c";
+        var entries: list of entry_s;
+        entries.push(a); entries.push(b); entries.push(c);
+        var sorted: list of entry_s = entries.sort_by_field(rank);
+        var quoted: list of entry_s = entries.sort_by_field("rank");
+        out(sorted[0].mark, sorted[1].mark, sorted[2].mark, "\n");
+        out(quoted[0].mark, entries[0].mark);
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(output, "bac\nba");
+}
+
+#[test]
+fn list_sort_by_field_checks_the_argument_and_field() {
+    let result = run_source(
+        "extend sys { run() is also { var xs: list of int; xs.sort_by_field(1); }; };",
+        1,
+    );
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].code, "E0402");
+    assert!(
+        result.diagnostics[0]
+            .message
+            .contains("expects a field name")
+    );
+}
+
+#[test]
+fn list_sort_rejects_unorderable_keys_even_for_one_item() {
+    let result = run_source(
+        "extend sys { run() is also { var xs: list of int; xs.push(1); xs.sort(it > 0); }; };",
+        1,
+    );
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].code, "E0402");
+    assert!(result.diagnostics[0].message.contains("orderable keys"));
+}
+
+#[test]
+fn list_distinct_methods_preserve_order_and_short_circuit_duplicate_keys() {
+    let output = clean_output(
+        r#"
+extend sys {
+    key(value: int): int is { out(value); return value % 2; };
+    run() is also {
+        var raw: list of int;
+        raw.push(3); raw.push(1); raw.push(3); raw.push(2);
+        var distinct: list of int = raw.unique();
+        print raw.all_different(), distinct.all_different();
+        print distinct.copy();
+        print distinct.all_different(key(it));
+        print distinct.all_different(it + 10);
+        var no_items: list of int;
+        print no_items.all_different(), no_items.unique().size();
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(output, "FALSE TRUE\n[3, 1, 2]\n31FALSE\nTRUE\nTRUE 0\n");
+}
+
+#[test]
+fn keyed_list_unique_keeps_the_first_original_item_for_each_key() {
+    let output = clean_output(
+        r#"
+struct entry_s { rank: int; mark: string; };
+extend sys {
+    project(entry: entry_s): int is { out(entry.mark); return entry.rank; };
+    run() is also {
+        var a: entry_s = new;
+        var b: entry_s = new;
+        var c: entry_s = new;
+        a.rank = 5; a.mark = "a";
+        b.rank = 5; b.mark = "b";
+        c.rank = 1; c.mark = "c";
+        var raw: list of entry_s;
+        raw.push(a); raw.push(b); raw.push(c);
+        var selected: list of entry_s = raw.unique(project(it));
+        out("\n", selected.size(), " ", raw.size(), "\n");
+        print selected[0] == a, selected[1] == c;
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(output, "abc\n2 3\nTRUE TRUE\n");
+}
+
+#[test]
+fn list_first_and_last_short_circuit_in_their_search_direction() {
+    let output = clean_output(
+        r#"
+extend sys {
+    note(value: int): bool is { out(value); return value > 0; };
+    run() is also {
+        var samples: list of int;
+        samples.push(0); samples.push(2); samples.push(3); samples.push(0);
+        print samples.first(note(it));
+        print samples.last(note(it));
+        print samples.first_index(it > 0), samples.last_index(it > 0);
+    };
+};
+"#,
+        1,
+    );
+    assert_eq!(output, "022\n033\n1 2\n");
+}
+
+#[test]
+fn list_selection_without_a_match_reports_e0402() {
+    for name in ["first", "last", "first_index", "last_index"] {
+        let source = format!(
+            "extend sys {{ run() is also {{ var xs: list of int; print xs.{name}(it > 0); }}; }};"
+        );
+        let result = run_source(&source, 1);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code, "E0402");
+        assert!(
+            result.diagnostics[0]
+                .message
+                .contains("found no matching item")
+        );
+    }
 }
 
 #[test]
@@ -589,9 +965,8 @@ fn list_aggregates_reject_wrong_item_types() {
 
 #[test]
 fn unsupported_list_methods_report_e0405() {
-    // The expression-taking pseudo-methods (apply 27.4.2, sort 27.4.23 —
-    // documented gaps) and unknown names stay E0405.
-    for call in ["xs.apply(1);", "xs.sort();", "xs.foo();"] {
+    // The documented apply gap and unknown names stay E0405.
+    for call in ["xs.apply(1);", "xs.foo();"] {
         let source = format!(
             "extend sys {{\n    run() is also {{\n        var xs: list of int;\n        \
              xs.push(1);\n        {call}\n    }};\n}};\n"
@@ -638,6 +1013,185 @@ fn gen_enforces_a_disjunctive_keep_constraint() {
         seen.contains(&1) && seen.contains(&200),
         "both branches must stay reachable: {seen:?}"
     );
+}
+
+#[test]
+fn gen_samples_sparse_integer_domains_beyond_solver_width() {
+    let source = include_str!("fixtures/generated_sparse_integer_domains.e");
+    let mut reached = std::collections::BTreeSet::new();
+    for seed in 0..16 {
+        let output = clean_output(source, seed);
+        let (code, derived) = output.split_once(' ').expect("fixture prints three fields");
+        assert_eq!(derived, "34359738368 100\n");
+        reached.insert(code.parse::<u64>().expect("generated integer"));
+    }
+    assert_eq!(reached, [34_359_738_368, 549_755_813_888].into());
+}
+
+#[test]
+fn gen_projects_disjunctions_without_losing_field_correlations() {
+    let source = include_str!("fixtures/generated_disjunctive_domains.e");
+    let mut outputs = std::collections::BTreeSet::new();
+    for seed in 0..16 {
+        outputs.insert(clean_output(source, seed));
+    }
+    assert_eq!(
+        outputs,
+        [
+            "34359738368 549755813888 549755813888\n".to_owned(),
+            "549755813888 34359738368 549755813888\n".to_owned(),
+        ]
+        .into()
+    );
+}
+
+#[test]
+fn gen_samples_wide_fields_from_the_same_disjunction_branch() {
+    let first = 1u64 << 35;
+    let second = 1u64 << 36;
+    let third = 1u64 << 37;
+    let mut branches: Vec<_> = (0..256u64)
+        .map(|offset| {
+            format!(
+                "(first_value == {} && second_value == {} && third_value == {})",
+                first + offset,
+                second + offset,
+                third + offset
+            )
+        })
+        .collect();
+    while branches.len() > 1 {
+        branches = branches
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[left, right]| format!("({left} or {right})"))
+            .collect();
+    }
+    let source = format!(
+        "struct sample_s {{ first_value: uint(bits: 40); second_value: uint(bits: 40); \
+         third_value: uint(bits: 40); keep first_value >= {}; keep {}; }};\n\
+         extend sys {{ run() is also {{ var sample: sample_s; gen sample; \
+         print sample.first_value, sample.second_value, sample.third_value; }}; }};",
+        first + 64,
+        branches[0]
+    );
+    let mut reached = std::collections::BTreeSet::new();
+    for seed in 0..8 {
+        let output = clean_output(&source, seed);
+        let values: Vec<u64> = output
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        let branch = values[0] - first;
+        assert!((64..256).contains(&branch));
+        assert_eq!(values, [first + branch, second + branch, third + branch]);
+        reached.insert(branch);
+    }
+    assert!(reached.len() > 1);
+}
+
+#[test]
+fn gen_samples_exact_integer_sets_from_sparse_table_rows() {
+    let source = include_str!("fixtures/generated_sparse_table_rows.e");
+    let mut assignments = std::collections::BTreeSet::new();
+    for seed in 0..24 {
+        assignments.insert(clean_output(source, seed));
+    }
+    assert_eq!(
+        assignments,
+        [
+            "34359738368 34359738368 549755813888\n".to_owned(),
+            "274877906944 549755813888 549755813888\n".to_owned(),
+            "274877906945 549755813888 549755813888\n".to_owned(),
+            "549755813888 34359738368 549755813888\n".to_owned(),
+        ]
+        .into()
+    );
+}
+
+#[test]
+fn gen_draws_compatible_rows_from_large_overlapping_tables() {
+    use std::fmt::Write;
+
+    let mut source = String::from(
+        "struct sample_s { first_value: uint(bits: 40); second_value: uint(bits: 40); \
+         third_value: uint(bits: 40); keep (first_value, second_value) in_table {\n",
+    );
+    let first = 1u64 << 35;
+    let second = 1u64 << 36;
+    let third = 1u64 << 37;
+    for row in 0..256u64 {
+        writeln!(source, "{}, {};", first + row, second + row).unwrap();
+    }
+    source.push_str("}; keep (second_value, third_value) in_table {\n");
+    for row in 128..384u64 {
+        writeln!(source, "{}, {};", second + row, third + row).unwrap();
+    }
+    source.push_str(
+        "}; }; extend sys { run() is also { var sample: sample_s; gen sample; \
+         print sample.first_value, sample.second_value, sample.third_value; }; };",
+    );
+
+    let mut reached = std::collections::BTreeSet::new();
+    for seed in 0..8 {
+        let output = clean_output(&source, seed);
+        let values: Vec<u64> = output
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        let row = values[0] - first;
+        assert!((128..256).contains(&row));
+        assert_eq!(values, [first + row, second + row, third + row]);
+        reached.insert(row);
+    }
+    assert!(reached.len() > 1);
+}
+
+#[test]
+fn gen_rejects_disjoint_sparse_integer_domains() {
+    let result = run_source(
+        r#"
+struct sample_s {
+    code: uint(bits: 40);
+    keep code in [34359738368, 549755813888];
+    keep code in [1, 2];
+};
+extend sys { run() is also { var sample: sample_s; gen sample; }; };
+"#,
+        1,
+    );
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].code, "E0407");
+}
+
+#[test]
+fn gen_samples_wide_integer_domains_after_membership_exclusions() {
+    let source = include_str!("fixtures/generated_excluded_integer_domains.e");
+    let mut reached = std::collections::BTreeSet::new();
+    for seed in 0..16 {
+        let output = clean_output(source, seed);
+        let (edge, remaining) = output.split_once(' ').expect("fixture prints four fields");
+        assert_eq!(remaining, "1099511627775 -549755813888 1099511627775\n");
+        reached.insert(edge.parse::<u64>().expect("generated integer"));
+    }
+    assert_eq!(reached, [0, 1_099_511_627_775].into());
+}
+
+#[test]
+fn gen_reports_when_an_exclusion_covers_the_complete_field_domain() {
+    let result = run_source(
+        r#"
+struct sample_s {
+    code: uint(bits: 40);
+    keep code not in [0 .. 1099511627775];
+};
+extend sys { run() is also { var sample: sample_s; gen sample; }; };
+"#,
+        1,
+    );
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].code, "E0407");
 }
 
 #[test]
@@ -1490,6 +2044,173 @@ fn emit_of_event_without_on_blocks_is_silent() {
 }
 
 #[test]
+fn gen_uses_integer_subtype_bounds_for_select_lists_and_reduced_sets() {
+    let source = include_str!("fixtures/generated_integer_subtypes.e");
+    for seed in 0..8 {
+        assert_eq!(clean_output(source, seed), "-5 -4 -6\n2 2\n");
+    }
+}
+
+#[test]
+fn gen_uses_integer_subtype_bounds_for_direct_fields_and_locals() {
+    let source = r#"
+type field_t: int [10..14];
+type local_t: int [19..19];
+struct sample_s {
+    code: field_t;
+    keep code * code == 144;
+    regenerate(): int is {
+        code = 10;
+        gen code;
+        return code;
+    };
+    regenerate_local(): int is {
+        var code: local_t;
+        gen code;
+        return code;
+    };
+};
+extend sys {
+    run() is also {
+        var sample: sample_s;
+        gen sample;
+        print sample.code, sample.regenerate(), sample.regenerate_local();
+    };
+};
+"#;
+    assert_eq!(clean_output(source, 1), "12 12 19\n");
+}
+
+#[test]
+fn gen_rejects_a_value_outside_an_integer_subtype_domain() {
+    let result = run_source(
+        r#"
+type bounded_t: uint [10..14];
+struct sample_s { code: bounded_t; keep code == 15; };
+extend sys { run() is also { var sample: sample_s; gen sample; }; };
+"#,
+        1,
+    );
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].code, "E0407");
+}
+
+#[test]
+fn gen_enforces_hard_conjuncts_next_to_select() {
+    let source = include_str!("fixtures/select_with_hard_conjunct.e");
+    for seed in 0..8 {
+        assert_eq!(clean_output(source, seed), "0 3 0\n");
+    }
+}
+
+#[test]
+fn gen_rejects_an_unsatisfiable_hard_conjunct_next_to_select() {
+    let result = run_source(
+        r#"
+struct sample_s {
+    preferred: uint(bits: 4);
+    keep (preferred == select { 100 : min; }) && FALSE;
+};
+extend sys { run() is also { var sample: sample_s; gen sample; }; };
+"#,
+        1,
+    );
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].code, "E0407");
+}
+
+#[test]
+fn gen_retries_with_hard_constraints_when_soft_preferences_conflict() {
+    let source = include_str!("fixtures/generation_soft_preferences.e");
+    assert_eq!(clean_output(source, 1), "3 3 7 14\n");
+}
+
+#[test]
+fn gen_reports_unsatisfiable_hard_constraints_after_dropping_soft_preferences() {
+    let result = run_source(
+        r#"
+struct sample_s {
+    code: uint(bits: 4);
+    keep code == 2;
+    keep code == 3;
+    keep soft code == 4;
+};
+extend sys { run() is also { var sample: sample_s; gen sample; }; };
+"#,
+        1,
+    );
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].code, "E0407");
+}
+
+#[test]
+fn gen_narrows_list_lengths_from_constant_constraints() {
+    let source = include_str!("fixtures/generated_list_lengths.e");
+    let mut lengths = std::collections::BTreeSet::new();
+    for seed in 0..12 {
+        let output = clean_output(source, seed);
+        assert_eq!(clean_output(source, seed), output);
+        let values: Vec<usize> = output
+            .split_whitespace()
+            .map(|item| item.parse().expect("fixture prints integers"))
+            .collect();
+        let [first, lower, upper, fixed, regenerated, legal_rows] = values.as_slice() else {
+            panic!("unexpected output {output:?}");
+        };
+        assert!((9..=10).contains(first) && (9..=10).contains(regenerated));
+        assert_eq!((*lower, *fixed), (5, 5));
+        assert!(*upper < 3);
+        assert_eq!(regenerated, legal_rows);
+        lengths.insert(*first);
+    }
+    assert_eq!(lengths, [9, 10].into());
+}
+
+#[test]
+fn gen_reports_an_empty_list_length_domain() {
+    for bounds in [
+        "items.size() >= 5 && items.size() < 3",
+        "items.size() == 65537",
+    ] {
+        let source = format!(
+            "struct sample_s {{ items: list of int; keep {bounds}; }};\n\
+             extend sys {{ run() is also {{ var sample: sample_s; gen sample; }}; }};"
+        );
+        let result = run_source(&source, 1);
+        assert_eq!(result.diagnostics.len(), 1, "{bounds}");
+        assert_eq!(result.diagnostics[0].code, "E0407", "{bounds}");
+    }
+}
+
+#[test]
+fn gen_uses_named_constants_in_keep_constraints() {
+    let source = include_str!("fixtures/keep_named_constants.e");
+    assert_eq!(clean_output(source, 1), "9 TRUE TRUE\n7 7\n");
+}
+
+#[test]
+fn named_constant_precedence_reaches_the_solver_without_shadowing_member_access() {
+    let source = r#"
+define shared 7;
+define SQUARE 81;
+struct sample_s {
+    shared: bit;
+    code: uint(bits: 4);
+    keep shared == 7;
+    keep code * code == SQUARE;
+};
+extend sys {
+    run() is also {
+        var sample: sample_s;
+        gen sample;
+        print sample.code, sample.shared <= 1;
+    };
+};
+"#;
+    assert_eq!(clean_output(source, 1), "9 TRUE\n");
+}
+
+#[test]
 fn gen_respects_in_range_constraints_on_unsized_int() {
     // Without domain narrowing, an unsized `int` samples the full 32-bit
     // domain and rejection sampling never hits `in [1..100]` (E0407);
@@ -2181,6 +2902,33 @@ fn select_normal_accepts_max_uint_expressions_like_the_corpus() {
 }
 
 #[test]
+fn select_normal_resolves_named_integer_arguments_and_checks_overflow() {
+    let source = include_str!("fixtures/select_named_integer_arguments.e");
+    assert_eq!(clean_output(source, 1), "-14 -1 7\n");
+}
+
+#[test]
+fn select_draws_across_weights_wider_than_a_machine_word() {
+    let source = r#"
+define WEIGHT 170141183460469231731687303715884105727;
+struct sample_s {
+    code: bit;
+    keep soft code == select { WEIGHT : min; WEIGHT : max; };
+};
+extend sys {
+    run() is also {
+        var sample: sample_s;
+        gen sample;
+        print sample.code;
+    };
+};
+"#;
+    let values: std::collections::BTreeSet<_> =
+        (0..16).map(|seed| clean_output(source, seed)).collect();
+    assert_eq!(values, ["0\n".to_owned(), "1\n".to_owned()].into());
+}
+
+#[test]
 fn select_choice_on_either_operand_side_biases() {
     // `select { .. } == v` biases the same field.
     let output = clean_output(
@@ -2576,6 +3324,29 @@ fn set_of_values_builds_the_legal_value_set() {
 }
 
 #[test]
+fn set_of_values_preserves_declared_integer_subtype_ranges() {
+    let output = clean_output(include_str!("fixtures/reflected_subtype_range.e"), 1);
+    assert_eq!(
+        output,
+        "[-2..4] [-128..127]\n[-2..4] [-128..127]\nFALSE\nTRUE\nTRUE\n"
+    );
+}
+
+#[test]
+fn set_of_values_diagnoses_unsupported_subtype_ranges() {
+    for bounds in ["3..1", "0..16", "1..missing"] {
+        let source = format!(
+            "type ranged_t: uint(bits: 4) [{bounds}];\n\
+             extend sys {{ run() is also {{ print set_of_values(ranged_t); }}; }};"
+        );
+        let result = run_source(&source, 1);
+        assert_eq!(result.diagnostics.len(), 1, "{bounds}");
+        assert_eq!(result.diagnostics[0].code, "E0402", "{bounds}");
+        assert!(result.diagnostics[0].message.contains("'ranged_t'"));
+    }
+}
+
+#[test]
 fn set_pseudo_methods_query_and_combine() {
     // 28.5: size/uint_size/min/uint_min/max/uint_max on sets, and the
     // union/intersect/diff algebra.
@@ -2815,6 +3586,525 @@ fn coverage_mode_off_collects_nothing() {
 }
 
 #[test]
+fn coverage_per_instance_defaults_preserve_explicit_false() {
+    let result = run_source(
+        r#"
+extend sys {
+    event cg;
+    cover cg using per_instance = FALSE is {
+        item inherited: bool = TRUE;
+        item excluded: bool = TRUE using per_instance = FALSE;
+    };
+    cover cg using per_instance is also {
+        item added: bool = TRUE;
+    };
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also { emit cg; };
+};
+"#,
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let group = &result.coverage[0].groups[0];
+    assert_eq!(
+        group
+            .items
+            .iter()
+            .map(|item| item.per_instance)
+            .collect::<Vec<_>>(),
+        vec![true, false, true]
+    );
+    assert_eq!(group.instances().len(), 4);
+}
+
+#[test]
+fn coverage_per_instance_rejects_malformed_known_options() {
+    for source in [
+        "extend sys { event cg; cover cg is { item n: bool = TRUE using per_instance = 1; }; };",
+        "extend sys { event cg; cover cg using per_instance = is { item n: bool = TRUE; }; };",
+    ] {
+        let parsed = parse(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = elaborate(&parsed.declarations);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0224"
+                && diagnostic
+                    .message
+                    .contains("per_instance expects a flag or Boolean literal")
+        }));
+    }
+}
+
+#[test]
+fn coverage_flags_accept_grouped_boolean_literals() {
+    let result = run_source(
+        r#"
+extend sys {
+    event cg;
+    event concealed;
+    cover cg is {
+        item hidden: bool = TRUE using no_collect = (TRUE);
+        item shown: bool = FALSE using per_instance = (TRUE);
+        cross hidden, shown;
+    };
+    cover concealed using no_collect = (TRUE) is { item n: bool = TRUE; };
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also { emit cg; emit concealed; };
+};
+"#,
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let groups = &result.coverage[0].groups;
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].items.len(), 1);
+    assert_eq!(groups[0].items[0].name, "shown");
+    assert!(groups[0].items[0].per_instance);
+    assert_eq!(
+        groups[0].derived[0].combos,
+        vec![("(TRUE, FALSE)".to_owned(), 1)]
+    );
+}
+
+#[test]
+fn coverage_flags_reject_assignments_with_missing_values() {
+    for (source, message) in [
+        (
+            "extend sys { event cg; cover cg is { item n: bool = TRUE using no_collect =; }; };",
+            "no_collect expects a flag or Boolean literal",
+        ),
+        (
+            "extend sys { event cg; cover cg using per_unit_instance = is { item n: bool = TRUE; }; };",
+            "per_unit_instance expects a unit type name",
+        ),
+    ] {
+        let parsed = parse(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = elaborate(&parsed.declarations);
+        assert!(
+            result.diagnostics.iter().any(
+                |diagnostic| diagnostic.code == "E0224" && diagnostic.message.contains(message)
+            )
+        );
+    }
+}
+
+#[test]
+fn coverage_radix_formats_generated_labels_and_retains_custom_names() {
+    let result = run_source(
+        r#"
+extend sys {
+    event cg;
+    cover cg is {
+        item h: int = -10 using radix = HEX, ranges = {
+            range([-10..-9]);
+            range([15], "custom");
+        };
+        item b: uint(bits: 2) = 2 using radix = BIN;
+        item d: uint(bits: 2) = 3 using radix = DEC;
+    };
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also { emit cg; };
+};
+"#,
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let items = &result.coverage[0].groups[0].items;
+    assert_eq!(items[0].buckets[0].label, "-0xa..-0x9");
+    assert_eq!(items[0].buckets[0].hits, 1);
+    assert_eq!(items[0].buckets[1].label, "custom");
+    assert_eq!(items[1].buckets[2].label, "0b10");
+    assert_eq!(items[1].buckets[2].hits, 1);
+    assert_eq!(items[2].buckets[3].label, "3");
+    assert_eq!(items[2].buckets[3].hits, 1);
+}
+
+#[test]
+fn coverage_group_radix_applies_to_base_and_extension_items() {
+    let result = run_source(
+        r#"
+extend sys {
+    event cg;
+    cover cg using radix = BIN is {
+        item inherited: uint(bits: 4) = 10;
+        item explicit: uint(bits: 4) = 10 using radix = DEC;
+    };
+    cover cg using radix = HEX is also {
+        item added: uint(bits: 4) = 10;
+    };
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also { emit cg; };
+};
+"#,
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let items = &result.coverage[0].groups[0].items;
+    assert_eq!(items.len(), 3);
+    for (item, label) in items.iter().zip(["0xa", "10", "0xa"]) {
+        assert_eq!(item.buckets[10].label, label);
+        assert_eq!(item.buckets[10].hits, 1);
+    }
+}
+
+#[test]
+fn derived_radix_formats_numeric_sources_and_preserves_named_buckets() {
+    let result = run_source(
+        r#"
+extend sys {
+    event cg;
+    !n: uint = 10;
+    cover cg is {
+        item n: uint using ranges = { range([10..11]); range([12]); };
+        item named: uint = 3 using ranges = { range([3], "literal"); };
+        cross n, named using radix = HEX;
+        transition n using radix = BIN;
+    };
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also {
+        emit cg;
+        n = 11; emit cg;
+        n = 12; emit cg;
+    };
+};
+"#,
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let group = &result.coverage[0].groups[0];
+    assert_eq!(group.items[0].buckets[0].label, "10..11");
+    let crosses = &group.derived[0];
+    assert_eq!(crosses.total_combos, Some(2));
+    assert_eq!(
+        crosses.combos,
+        vec![
+            ("(0xa..0xb, literal)".to_owned(), 2),
+            ("(0xc, literal)".to_owned(), 1)
+        ]
+    );
+    let transitions = &group.derived[1];
+    assert_eq!(transitions.total_combos, Some(4));
+    assert_eq!(
+        transitions.combos,
+        vec![
+            ("0b1010..0b1011→0b1010..0b1011".to_owned(), 1),
+            ("0b1010..0b1011→0b1100".to_owned(), 1)
+        ]
+    );
+}
+
+#[test]
+fn coverage_radix_rejects_unknown_values() {
+    for source in [
+        "extend sys { event cg; cover cg is { item n: uint = 1 using radix = OCT; }; };",
+        "extend sys { event cg; cover cg using radix = OCT is { item n: uint = 1; }; };",
+        "extend sys { event cg; cover cg is { item n: uint = 1; transition n using radix = OCT; }; };",
+    ] {
+        let parsed = parse(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = elaborate(&parsed.declarations);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0224"
+                    && diagnostic.message.contains("coverage radix"))
+        );
+    }
+}
+
+#[test]
+fn named_enumeral_coverage_ranges_grade_in_declaration_order() {
+    let result = run_source(
+        r#"
+type light_e: [RED, YELLOW, GREEN, FLASHING];
+extend sys {
+    event cg;
+    !phase: light_e = RED;
+    cover cg is {
+        item phase: light_e using ranges = { range([RED..GREEN]); range([FLASHING], "alert"); };
+        transition phase;
+    };
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also {
+        emit cg;
+        phase = GREEN; emit cg;
+        phase = FLASHING; emit cg;
+    };
+};
+"#,
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let group = &result.coverage[0].groups[0];
+    let buckets = &group.items[0].buckets;
+    assert_eq!(buckets.len(), 2);
+    assert_eq!(
+        (buckets[0].label.as_str(), buckets[0].hits),
+        ("RED..GREEN", 2)
+    );
+    assert_eq!((buckets[1].label.as_str(), buckets[1].hits), ("alert", 1));
+    assert_eq!(group.items[0].grade(), Some(1.0));
+    assert_eq!(group.derived[0].total_combos, Some(4));
+    assert!(
+        group.derived[0]
+            .combos
+            .iter()
+            .any(|(label, hits)| label == "RED..GREEN→alert" && *hits == 1)
+    );
+}
+
+#[test]
+fn enumeral_coverage_effects_exclude_only_fully_masked_buckets() {
+    let result = run_source(
+        r#"
+type phase_e: [RED, YELLOW, GREEN, FLASHING];
+extend sys {
+    event cg;
+    !phase: phase_e = RED;
+    cover cg is {
+        item phase: phase_e using ranges = {
+            range([RED]);
+            range([YELLOW..GREEN]);
+            range([FLASHING]);
+        }, ignore = phase == RED, illegal = phase == RED or phase == YELLOW;
+        transition phase;
+    };
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also {
+        emit cg;
+        phase = YELLOW; emit cg;
+        phase = GREEN; emit cg;
+    };
+};
+"#,
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(result.dut_errors, 1);
+    let group = &result.coverage[0].groups[0];
+    let item = &group.items[0];
+    assert_eq!(
+        item.buckets
+            .iter()
+            .map(|bucket| (bucket.label.as_str(), bucket.hits))
+            .collect::<Vec<_>>(),
+        vec![("YELLOW..GREEN", 1), ("FLASHING", 0)]
+    );
+    assert_eq!(item.grade(), Some(0.5));
+    assert_eq!(group.derived[0].total_combos, Some(4));
+}
+
+#[test]
+fn derived_enumeral_effects_use_current_and_previous_typed_values() {
+    let result = run_source(
+        r#"
+type phase_e: [RED, YELLOW, GREEN];
+extend sys {
+    event cg;
+    !phase: phase_e = RED;
+    !flag: bool = FALSE;
+    cover cg is {
+        item phase: phase_e using ranges = { range([RED..YELLOW]); range([GREEN]); };
+        item flag: bool;
+        cross phase, flag using ignore = phase == RED or flag;
+        transition phase using ignore = prev_phase == RED or phase == GREEN;
+    };
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also {
+        emit cg;
+        phase = YELLOW; emit cg;
+        phase = GREEN; emit cg;
+        phase = YELLOW; flag = TRUE; emit cg;
+    };
+};
+"#,
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let derived = &result.coverage[0].groups[0].derived;
+    assert_eq!(derived[0].total_combos, Some(2));
+    assert_eq!(derived[0].samples, 2);
+    assert_eq!(derived[1].total_combos, Some(2));
+    assert_eq!(derived[1].combos, vec![("GREEN→RED..YELLOW".to_owned(), 1)]);
+}
+
+#[test]
+fn enumeral_coverage_resolves_aliases_and_inline_field_types() {
+    let result = run_source(
+        r#"
+type phase_e: [RED, GREEN];
+type phase_alias_e: phase_e;
+type phase_view_e: phase_alias_e;
+extend sys {
+    event cg;
+    !phase: phase_view_e = GREEN;
+    !door: [OPEN, SEALED] = OPEN;
+    cover cg is {
+        item phase: phase_view_e using ranges = { range([GREEN]); };
+        item door using ranges = { range([OPEN]); range([SEALED]); };
+    };
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also {
+        emit cg;
+        door = SEALED; emit cg;
+    };
+};
+"#,
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let items = &result.coverage[0].groups[0].items;
+    assert_eq!(
+        (items[0].buckets[0].label.as_str(), items[0].buckets[0].hits),
+        ("GREEN", 2)
+    );
+    assert_eq!(
+        items[1]
+            .buckets
+            .iter()
+            .map(|bucket| (bucket.label.as_str(), bucket.hits))
+            .collect::<Vec<_>>(),
+        vec![("OPEN", 1), ("SEALED", 1)],
+    );
+}
+
+#[test]
+fn real_coverage_masks_respect_open_bounds_and_partial_exclusions() {
+    let result = run_source(
+        r#"
+extend sys {
+    event cg;
+    !n: real = -1.0;
+    cover cg is {
+        item n: real using ranges = {
+            range([-1.0..1.0], "", 1.0);
+            range([2.0]);
+        }, ignore = n < 0 or 2.0 <= n, illegal = n == 0.5;
+        transition n;
+    };
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also {
+        emit cg;
+        n = -0.0; emit cg;
+        n = 0.5; emit cg;
+        n = 1.0; emit cg;
+        n = 2.0; emit cg;
+    };
+};
+"#,
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(result.dut_errors, 1);
+    let group = &result.coverage[0].groups[0];
+    let item = &group.items[0];
+    assert_eq!(item.buckets.len(), 1);
+    assert_eq!(item.buckets[0].real_bounds(), Some((0.0, 1.0)));
+    assert_eq!(item.buckets[0].hits, 2);
+    assert_eq!(group.derived[0].total_combos, Some(1));
+}
+
+#[test]
+fn derived_real_masks_classify_ranges_and_signed_zero_witnesses() {
+    let result = run_source(
+        r#"
+extend sys {
+    event cg;
+    event zeros;
+    !n: real = -1.0;
+    !z: real = 0.0;
+    !flag: bool = FALSE;
+    cover cg is {
+        item n: real using ranges = { range([-1.0..1.0], "", 1.0); };
+        item flag: bool;
+        cross n, flag using ignore = n < 0 or flag;
+        transition n using ignore = prev_n < 0 or n == 0;
+    };
+    cover zeros is {
+        item z: real using ranges = { range([0.0]); };
+        item flag: bool;
+        cross z, flag using ignore = 1.0 / z > 0;
+    };
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also {
+        emit cg;
+        n = 0.0; emit cg;
+        n = 1.0; emit cg;
+        emit zeros;
+        z = -0.0; emit zeros;
+    };
+};
+"#,
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let groups = &result.coverage[0].groups;
+    assert_eq!(groups[0].derived[0].total_combos, Some(1));
+    assert_eq!(groups[0].derived[0].samples, 2);
+    assert_eq!(groups[0].derived[1].total_combos, Some(2));
+    assert_eq!(groups[0].derived[1].samples, 1);
+    assert_eq!(groups[1].derived[0].total_combos, Some(2));
+    assert_eq!(groups[1].derived[0].samples, 1);
+}
+
+#[test]
+fn real_arithmetic_masks_split_wide_buckets_at_rounded_boundaries() {
+    let result = run_source(
+        r#"
+extend sys {
+    event cg;
+    !n: real = -1.0;
+    !flag: bool = FALSE;
+    cover cg is {
+        item n: real using ranges = { range([-1.0..1.0], "", 1.0); },
+            ignore = n * 2.0 < 0 or n + 0.25 > 0.75;
+        item flag: bool;
+        cross n, flag using ignore = flag or n / 2.0 < 0.25;
+    };
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also {
+        emit cg;
+        n = 0.25; emit cg;
+        n = 0.5; emit cg;
+        n = 0.75; emit cg;
+    };
+};
+"#,
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let group = &result.coverage[0].groups[0];
+    assert_eq!(group.items[0].buckets.len(), 1);
+    assert_eq!(group.items[0].buckets[0].hits, 2);
+    assert_eq!(group.derived[0].total_combos, Some(1));
+    assert_eq!(group.derived[0].samples, 1);
+}
+
+#[test]
+fn enumeral_coverage_rejects_bounds_from_other_types() {
+    let parsed = parse(
+        r#"
+type state_e: [IDLE, WAITING];
+type other_e: [DONE];
+extend sys {
+    event cg;
+    cover cg is { item state: state_e = IDLE using ranges = { range([IDLE..DONE]); }; };
+};
+"#,
+    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let result = elaborate(&parsed.declarations);
+    assert!(result.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0224"
+            && diagnostic
+                .message
+                .contains("member of the item's enumeral type")
+    }));
+}
+
+#[test]
 fn max_int_buckets_configuration_sets_the_default_bucket_count() {
     // 14.3: "If ranges is not specified, the default number of buckets
     // is 16 [set by the max_int_buckets coverage configuration option
@@ -2848,6 +4138,144 @@ fn max_int_buckets_configuration_sets_the_default_bucket_count() {
     assert!(item.buckets.is_empty());
     assert_eq!(item.grade(), None);
     assert!(item.note.is_some(), "the honest note is recorded");
+}
+
+#[test]
+fn set_config_max_only_raises_numeric_coverage_options() {
+    let result = run_source(
+        r#"
+extend sys {
+    event cg;
+    !n: uint = 0;
+    cover cg is { item n: uint; };
+    setup() is also {
+        set_config(cover, mode, normal, max_int_buckets, 2, at_least, 1);
+        var requested: uint = 4;
+        set_config_max(cover, max_int_buckets, requested, at_least, 3);
+    };
+    run() is also {
+        emit cg;
+        set_config_max(cover, max_int_buckets, 2, at_least, 1);
+        set_config_max(cover, max_int_buckets, 6);
+    };
+};
+"#,
+        1,
+    );
+    let [diagnostic] = result.diagnostics.as_slice() else {
+        panic!("expected one diagnostic for the late increase");
+    };
+    assert_eq!(diagnostic.code, "E0402");
+    assert!(
+        diagnostic
+            .message
+            .contains("cannot change after coverage sampling starts")
+    );
+    let group = &result.coverage[0].groups[0];
+    assert_eq!(group.samples, 1);
+    assert_eq!(group.items[0].buckets.len(), 4);
+    assert!(group.items[0].buckets.iter().all(|bucket| bucket.goal == 3));
+}
+
+#[test]
+fn coverage_callback_cannot_rebuild_a_per_unit_schema() {
+    let result = run_source(
+        r#"
+unit probe_u {
+    event cg;
+    !n: uint = 0;
+    allow_sample(): bool is {
+        set_config_max(cover, max_int_buckets, 1);
+        set_config(cover, max_int_buckets, 3);
+        return TRUE;
+    };
+    cover cg using per_unit_instance, when = allow_sample() is { item n: uint; };
+    observe() is { emit cg; };
+};
+extend sys {
+    probe: probe_u is instance;
+    setup() is also { set_config(cover, mode, normal, max_int_buckets, 2); };
+    run() is also { probe.observe(); };
+};
+"#,
+        1,
+    );
+    assert_eq!(result.diagnostics.len(), 1);
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.code, "E0402");
+    assert!(
+        diagnostic
+            .message
+            .contains("during coverage expression evaluation")
+    );
+    let group = &result.coverage[0].groups[0];
+    assert_eq!(group.samples, 0);
+    assert_eq!(group.items[0].buckets.len(), 2);
+}
+
+#[test]
+fn per_unit_coverage_relabels_moved_units_and_retains_detached_data() {
+    let result = run_source(
+        r#"
+unit probe_u {
+    event cg;
+    !n: bool = FALSE;
+    cover cg using per_unit_instance is { item n: bool; };
+    observe(v: bool) is { n = v; emit cg; };
+};
+extend sys {
+    original: probe_u is instance;
+    detached: probe_u is instance;
+    !destination: probe_u = NULL;
+    setup() is also { set_config(cover, mode, normal); };
+    run() is also {
+        original.observe(FALSE);
+        detached.observe(TRUE);
+        destination = original;
+        original = NULL;
+        detached = NULL;
+        destination.observe(TRUE);
+    };
+};
+"#,
+        1,
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let groups = &result.coverage[0].groups;
+    assert_eq!(groups.len(), 2);
+    let moved = groups
+        .iter()
+        .find(|group| group.unit_instance.as_deref() == Some("sys.destination"))
+        .unwrap();
+    assert_eq!(moved.samples, 2);
+    assert_eq!(
+        moved.items[0]
+            .buckets
+            .iter()
+            .map(|bucket| bucket.hits)
+            .collect::<Vec<_>>(),
+        vec![1, 1]
+    );
+    let detached = groups
+        .iter()
+        .find(|group| group.unit_instance.as_deref() == Some("sys.detached"))
+        .unwrap();
+    assert_eq!(detached.samples, 1);
+}
+
+#[test]
+fn set_config_max_rejects_nonnumeric_coverage_options() {
+    let result = run_source(
+        "extend sys { setup() is also { set_config_max(cover, mode, normal); }; };",
+        1,
+    );
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].code, "E0402");
+    assert!(
+        result.diagnostics[0]
+            .message
+            .contains("expects a numeric option")
+    );
 }
 
 #[test]
@@ -4636,6 +6064,23 @@ fn gen_chosen_from_target_is_an_alias_of_one_list_element() {
         1,
     );
     assert_eq!(output, "TRUE\nTRUE\n");
+}
+
+#[test]
+fn gen_chosen_from_prefers_soft_constraints_and_can_fall_back_once() {
+    let source = include_str!("fixtures/chosen_from_soft_preferences.e");
+    assert_eq!(clean_output(source, 1), "5 TRUE\n3 TRUE\n2\n");
+}
+
+#[test]
+fn gen_chosen_from_preserves_the_target_if_hard_constraints_fail() {
+    let source = include_str!("fixtures/chosen_from_soft_preferences.e")
+        .replace("keep target.code >= 3", "keep target.code >= 6")
+        + "extend sys { finalize() is also { print chooser.target.code, chooser.source_reads; }; };";
+    let result = run_source(&source, 1);
+    assert_eq!(result.diagnostics.len(), 1);
+    assert_eq!(result.diagnostics[0].code, "E0417");
+    assert_eq!(result.output, "42 1\n");
 }
 
 #[test]

@@ -445,7 +445,8 @@ single-source browser sandbox API runs in disposable workers (see
   unit. Crosses require current-round source values, and transitions keep
   previous sampled values separately. The returned report view removes
   hidden items/groups and per-unit schema placeholders. Full option type
-  checking, derived-item ignore/illegal filters and radix remain unfinished.
+  checking and remaining derived-item filters remain
+  unfinished.
   Basic-item ignore/illegal predicates run in fresh frames with only their
   item, constants, and (for instance variants) the associated `inst`. Calls
   and owner/local access are rejected with E0224. Non-Boolean results and
@@ -473,8 +474,15 @@ single-source browser sandbox API runs in disposable workers (see
   global defaults. Zero-goal buckets retain counts but leave the bucket-grade
   denominator; they do not report holes. Checked i128 constant arithmetic
   rejects overflow/division errors, and construction is capped at 65536
-  buckets per item. General constant-name/type resolution, real/enumeral
-  bounds and item-domain width proofs remain unfinished.
+  buckets per item. Named enumeral ranges use declaration order and
+  concrete enumeral evaluation for bucket masks. Real intervals retain
+  floating-point endpoints and accept supported constant arithmetic.
+  Positive widths subdivide them into
+  upper-exclusive buckets with an inclusive final endpoint. Basic real
+  masks classify comparisons over ordered binary64 values. Basic and
+  derived masks prove finite arithmetic corners and split unresolved
+  intervals within a classification budget. General real predicates and
+  constant-name/type resolution and item-domain width proofs remain unfinished.
 - `src/interp.rs` — interpreter for the statement subset (codes
   `E0401`–`E0413`). List values (clause 4.11.4's `list_ptr==`) carry
   reference identity: a `Value::List` holds its items behind a shared
@@ -628,6 +636,10 @@ single-source browser sandbox API runs in disposable workers (see
   to the element kind and infers the query result kind. The expression
   forms of `and_all` and `or_all` share this traversal and return Boolean
   results. With an empty receiver they return TRUE and FALSE, respectively.
+  `first`, `last`, `first_index`, and `last_index` search the same snapshot
+  and stop at the first qualifying item in the selected direction.
+  `all_different` stops on a repeated item or key. `unique` copies
+  the first original item for each distinct value or key.
 - `src/solve.rs` — constraint IR and the pluggable solver seam: the
   top-level `keep` constraints of one type translate (conservatively) into
   bounded-integer variables plus a boolean tree of comparisons;
@@ -727,8 +739,11 @@ Remaining boundaries (the detailed behavior inventory is in STATUS.md):
   paths and rebinding event references during active attempts remain gaps.
   Precise e/HDL event ordering remains unfinished.
 - The remaining coverage semantics: composite-valued predicates, mixed
-  composite classification, real/enumeral ranges, full option/domain typing,
-  general constant/type resolution and radix/never behavior. Derived names and
+  composite classification, general real predicates, full option/domain typing,
+  general constant/type resolution and never behavior.
+  Basic integral bucket labels use the item radix or the composed group
+  default. Derived items can override the radix of direct numeric labels.
+  Derived names and
   range labels evaluate literal-string concatenation/grouping with the same
   escape decoder as runtime strings. Name validation consumes the whole option
   expression; computed names share collection and graph lookup, and invalid
@@ -754,8 +769,9 @@ Remaining boundaries (the detailed behavior inventory is in STATUS.md):
   E0224 explicitly rather than silently selecting the predefined value.
   Basic and derived
   scalar effects, source graphs, filters, goals and bounded domain proofs run
-  as described above; the coverage subset of set_config is wired. Other
-  configuration categories/options and set_config_max remain gaps.
+  as described above. `set_config` updates the coverage subset, and
+  `set_config_max` raises its numeric options. Other configuration
+  categories and options remain gaps.
 - Numeric widths beyond the implemented static precision contexts, wider
   storage than the i128 model and evaluation of MVL literals. Real-valued set
   membership and full set-domain validation also remain unsupported.

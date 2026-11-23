@@ -49,7 +49,7 @@ fn parse_exprs(source: &str) -> Vec<Expr> {
 #[test]
 fn int_bounds_cover_integer_scalars_only() {
     let parsed = e1647::parser::parse(
-        "struct t {\n    a: uint(bits: 8);\n    b: int;\n    c: byte;\n    d: nibble;\n    e: bool;\n    f: list of uint;\n};\n",
+        "struct t {\n    a: uint(bits: 8);\n    b: int;\n    c: byte;\n    d: nibble;\n    e: bool;\n    f: list of uint;\n    g: uint(bits: 40);\n    h: int(bits: 40);\n};\n",
     );
     assert!(parsed.diagnostics.is_empty());
     let fields: Vec<(String, Option<(i64, i64)>)> = parsed.declarations[0]
@@ -69,6 +69,48 @@ fn int_bounds_cover_integer_scalars_only() {
     assert_eq!(fields[3], ("d".to_string(), Some((0, 15))));
     assert_eq!(fields[4], ("e".to_string(), None));
     assert_eq!(fields[5], ("f".to_string(), None));
+    assert_eq!(fields[6], ("g".to_string(), None));
+    assert_eq!(fields[7], ("h".to_string(), None));
+}
+
+#[test]
+fn solver_translation_declines_overflowing_coefficients_and_constants() {
+    let bounds = bounds_from(&[("a", (0, 10)), ("b", (0, 10))]);
+    for source in [
+        "a + 9223372036854775807 + 1 == 0",
+        "9223372036854775807 * a + a == 0",
+        "9223372036854775807 * a == -a",
+        "a + 9223372036854775807 == -2",
+        "9223372036854775807 * a * a == -a * a",
+        "(3037000499 * a + 3037000499 * b) * (3037000499 * a + 3037000499 * b) == 0",
+        "-(-9223372036854775807 * a * a - a * a) == 0",
+    ] {
+        assert!(
+            matches!(
+                translate(&parse_exprs(source), &bounds),
+                Err(TranslationError::Unsupported(_))
+            ),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn enumeration_handles_minimum_rhs_and_declines_full_width_domains() {
+    let exprs = parse_exprs("a * a >= (-9223372036854775807 - 1)");
+    let small = translate(&exprs, &bounds_from(&[("a", (0, 2))])).unwrap();
+    for seed in 0..6 {
+        assert_eq!(
+            solve(&small, seed),
+            SolveOutcome::Solved(vec![i128::from(seed % 3)])
+        );
+    }
+
+    let exprs = parse_exprs("a * a == 0");
+    let mut wide = translate(&exprs, &bounds_from(&[("a", (0, 2))])).unwrap();
+    wide.vars[0].lower = i64::MIN;
+    wide.vars[0].upper = i64::MAX;
+    assert_eq!(solve(&wide, 1), SolveOutcome::Unsupported);
 }
 
 #[test]
@@ -269,12 +311,20 @@ fn translate_range_with_expression_bounds() {
 #[test]
 fn translate_rejects_unsupported_shapes() {
     let bounds = bounds_from(&[("a", (0, 10))]);
-    // Non-arithmetic division (no polynomial shape).
-    let exprs = parse_exprs("a / 2 == 4");
-    assert!(matches!(
-        translate(&exprs, &bounds),
-        Err(TranslationError::Unsupported(_))
-    ));
+    for source in [
+        "a / a == 4",
+        "a / 0 == 4",
+        "a / 2 == -1",
+        "a / -5 == 2",
+        "a % 0 == 1",
+    ] {
+        assert!(matches!(
+            translate(&parse_exprs(source), &bounds),
+            Err(TranslationError::Unsupported(_))
+        ));
+    }
+    let signed_boundary = bounds_from(&[("a", (i64::from(i32::MIN), -1))]);
+    assert!(translate(&parse_exprs("a / -1 == 0"), &signed_boundary).is_err());
     // Unknown identifier.
     let exprs = parse_exprs("zz == 1");
     assert!(matches!(
@@ -290,6 +340,195 @@ fn translate_rejects_unsupported_shapes() {
             "constraint is not a comparison"
         ))
     );
+}
+
+#[test]
+fn translates_remainders_within_the_branch_budget() {
+    use e1647::solve::{BoolNode, Cmp, Linear};
+
+    let bounds = bounds_from(&[("a", (7, 19))]);
+    let expected = vec![BoolNode::Any(
+        [8, 13, 18]
+            .into_iter()
+            .map(|rhs| {
+                BoolNode::Atom(Linear {
+                    terms: vec![("a".to_owned(), 1)],
+                    rhs,
+                    cmp: Cmp::Eq,
+                })
+            })
+            .collect(),
+    )];
+    assert_eq!(
+        translate(&parse_exprs("3 == a % 5"), &bounds)
+            .unwrap()
+            .constraints,
+        expected
+    );
+    let boundary = translate(&parse_exprs("a % 2 == 1"), &bounds_from(&[("a", (0, 127))])).unwrap();
+    assert!(matches!(&boundary.constraints[..], [BoolNode::Any(branches)] if branches.len() == 64));
+    let wider = translate(&parse_exprs("a % 2 == 1"), &bounds_from(&[("a", (0, 129))])).unwrap();
+    assert!(matches!(
+        &wider.constraints[..],
+        [BoolNode::Remainder {
+            divisor: 2,
+            remainder: 1,
+            ..
+        }]
+    ));
+    let impossible = translate(&parse_exprs("a % 5 == 5"), &bounds).unwrap();
+    assert_eq!(solve(&impossible, 0), SolveOutcome::Unsat);
+}
+
+#[test]
+fn enumerates_a_large_remainder_with_a_polynomial_constraint() {
+    let bounds = bounds_from(&[("a", (0, 200))]);
+    for (source, expected) in [
+        ("a % 2 == 1 && a * a == 9", 3),
+        ("a % 2 != 0 && a * a == 9", 3),
+        ("not (a % 2 == 1) && a * a == 16", 4),
+    ] {
+        let problem = translate(&parse_exprs(source), &bounds).unwrap();
+        assert_eq!(solve(&problem, 7), SolveOutcome::Solved(vec![expected]));
+    }
+}
+
+#[test]
+fn quotient_comparisons_match_truncating_integer_division() {
+    let bounds = bounds_from(&[("a", (17, 33))]);
+    for (comparison, low, high) in [
+        ("a / 10 < 2", 17, 19),
+        ("2 > a / 10", 17, 19),
+        ("a / 10 <= 2", 17, 29),
+        ("2 >= a / 10", 17, 29),
+        ("a / 10 > 2", 30, 33),
+        ("2 < a / 10", 30, 33),
+        ("a / 10 >= 2", 20, 33),
+        ("2 <= a / 10", 20, 33),
+        ("a / 10 <= 2147483647", 17, 33),
+    ] {
+        let source = format!("{comparison} && a * a >= 0");
+        let problem = translate(&parse_exprs(&source), &bounds).unwrap();
+        for (seed, value) in (low..=high).chain([low]).enumerate() {
+            assert_eq!(
+                solve(&problem, seed as u64),
+                SolveOutcome::Solved(vec![value]),
+                "{comparison}, seed {seed}"
+            );
+        }
+    }
+    for source in ["a / 10 < 0", "a / 10 > 2147483647"] {
+        let impossible = translate(&parse_exprs(source), &bounds).unwrap();
+        assert_eq!(solve(&impossible, 0), SolveOutcome::Unsat);
+    }
+}
+
+#[test]
+fn ordered_remainder_comparisons_match_integer_remainders() {
+    let bounds = bounds_from(&[("a", (7, 17))]);
+    for (source, expected) in [
+        ("a % 5 < 2", vec![10, 11, 15, 16]),
+        ("2 >= a % 5", vec![7, 10, 11, 12, 15, 16, 17]),
+        ("a % 5 > 2", vec![8, 9, 13, 14]),
+        ("2 <= a % 5", vec![7, 8, 9, 12, 13, 14, 17]),
+        ("not (a % 5 < 2)", vec![7, 8, 9, 12, 13, 14, 17]),
+    ] {
+        let source = format!("({source}) && a * a >= 0");
+        let problem = translate(&parse_exprs(&source), &bounds).unwrap();
+        for (seed, value) in expected.iter().copied().chain([expected[0]]).enumerate() {
+            assert_eq!(
+                solve(&problem, seed as u64),
+                SolveOutcome::Solved(vec![value])
+            );
+        }
+    }
+    for source in ["a % 5 < 0", "a % 5 >= 5"] {
+        let impossible = translate(&parse_exprs(source), &bounds).unwrap();
+        assert_eq!(solve(&impossible, 0), SolveOutcome::Unsat);
+    }
+}
+
+#[test]
+fn signed_remainder_matches_truncation_toward_zero() {
+    let bounds = bounds_from(&[("a", (-11, 11))]);
+    for (constraint, expected) in [
+        ("a % 5 == -2", vec![-7, -2]),
+        ("a % 5 == 0", vec![-10, -5, 0, 5, 10]),
+        ("-4 >= a % 5", vec![-9, -4]),
+        ("a % 5 > 3", vec![4, 9]),
+        ("a % -5 == -2", vec![-7, -2]),
+        ("a % (-5) == 2", vec![2, 7]),
+    ] {
+        let source = format!("{constraint} && a * a >= 0");
+        let problem = translate(&parse_exprs(&source), &bounds).unwrap();
+        for (seed, value) in expected.iter().copied().chain([expected[0]]).enumerate() {
+            assert_eq!(
+                solve(&problem, seed as u64),
+                SolveOutcome::Solved(vec![value])
+            );
+        }
+    }
+    let impossible = translate(&parse_exprs("a % 5 == -5"), &bounds).unwrap();
+    assert_eq!(solve(&impossible, 0), SolveOutcome::Unsat);
+}
+
+#[test]
+fn translates_nonnegative_quotient_equalities_as_ranges() {
+    use e1647::solve::{BoolNode, Cmp, Linear};
+
+    let bounds = bounds_from(&[("a", (0, 25))]);
+    let expected = vec![BoolNode::All(vec![
+        BoolNode::Atom(Linear {
+            terms: vec![("a".to_owned(), 1)],
+            rhs: 20,
+            cmp: Cmp::Ge,
+        }),
+        BoolNode::Atom(Linear {
+            terms: vec![("a".to_owned(), 1)],
+            rhs: 25,
+            cmp: Cmp::Le,
+        }),
+    ])];
+    for source in ["a / 10 == 2", "2 == a / 10"] {
+        assert_eq!(
+            translate(&parse_exprs(source), &bounds)
+                .unwrap()
+                .constraints,
+            expected
+        );
+    }
+    let impossible = translate(&parse_exprs("a / 10 == 3"), &bounds).unwrap();
+    assert_eq!(solve(&impossible, 0), SolveOutcome::Unsat);
+}
+
+#[test]
+fn signed_quotients_truncate_toward_zero() {
+    let bounds = bounds_from(&[("a", (-15, 15))]);
+    for (comparison, low, high) in [
+        ("a / 5 == -2", -14, -10),
+        ("-2 == a / 5", -14, -10),
+        ("a / 5 == 0", -4, 4),
+        ("a / 5 == 2", 10, 14),
+        ("a / 5 < -2", -15, -15),
+        ("-2 >= a / 5", -15, -10),
+        ("a / 5 > -2", -9, 15),
+        ("a / 5 >= -2", -14, 15),
+        ("(a / (-5)) == 2", -14, -10),
+        ("-2 == a / -5", 10, 14),
+        ("a / -5 <= -2", 10, 15),
+        ("a / -5 < 2", -9, 15),
+        ("-2 >= a / -5", 10, 15),
+    ] {
+        let source = format!("{comparison} && a * a >= 0");
+        let problem = translate(&parse_exprs(&source), &bounds).unwrap();
+        for (seed, value) in (low..=high).chain([low]).enumerate() {
+            assert_eq!(
+                solve(&problem, seed as u64),
+                SolveOutcome::Solved(vec![value]),
+                "{comparison}, seed {seed}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -507,6 +746,106 @@ mod pumpkin {
             first == vec![1] || first == vec![2],
             "the assignment must satisfy one branch: {first:?}"
         );
+    }
+
+    #[test]
+    fn solves_nonnegative_quotient_equality() {
+        let values = solved_values("a / 10 == 2", bounds_from(&[("a", (0, 100))]), 7);
+        assert!((20..=29).contains(&values[0]));
+    }
+
+    #[test]
+    fn solves_ordered_quotient_constraints_with_pumpkin() {
+        let values = solved_values(
+            "2 <= a / 10 && a / 10 < 3 && a > 28",
+            bounds_from(&[("a", (0, 100))]),
+            7,
+        );
+        assert_eq!(values, vec![29]);
+    }
+
+    #[test]
+    fn solves_signed_quotient_constraints_with_pumpkin() {
+        let values = solved_values(
+            "a / 5 == -2 && a < -13",
+            bounds_from(&[("a", (-20, 20))]),
+            7,
+        );
+        assert_eq!(values, vec![-14]);
+        let values = solved_values(
+            "a / -5 == 2 && a < -13",
+            bounds_from(&[("a", (-20, 20))]),
+            7,
+        );
+        assert_eq!(values, vec![-14]);
+    }
+
+    #[test]
+    fn solves_remainder_equality_with_other_constraints() {
+        let values = solved_values("a % 5 == 3 && a > 14", bounds_from(&[("a", (7, 19))]), 1);
+        assert_eq!(values, vec![18]);
+    }
+
+    #[test]
+    fn solves_large_remainder_without_expanding_value_branches() {
+        let values = solved_values(
+            "a % 7 == 3 && a >= 6003 && a <= 6010",
+            bounds_from(&[("a", (5000, 20000))]),
+            1,
+        );
+        assert_eq!(values, vec![6009]);
+    }
+
+    #[test]
+    fn excludes_a_large_remainder_without_expanding_value_branches() {
+        let bounds = bounds_from(&[("a", (5000, 20000))]);
+        for source in [
+            "a % 7 != 3 && a >= 6009 && a <= 6010",
+            "not (a % 7 == 3) && a >= 6009 && a <= 6010",
+        ] {
+            assert_eq!(solved_values(source, bounds.clone(), 1), vec![6010]);
+        }
+        let impossible = translate(&parse_exprs("a % 1 != 0"), &bounds).unwrap();
+        assert_eq!(solve(&impossible, 1), SolveOutcome::Unsat);
+    }
+
+    #[test]
+    fn solves_ordered_remainders_without_expanding_value_branches() {
+        let values = solved_values(
+            "a % 7 < 4 && a % 7 >= 3 && a >= 6008 && a <= 6011",
+            bounds_from(&[("a", (5000, 20000))]),
+            1,
+        );
+        assert_eq!(values, vec![6009]);
+    }
+
+    #[test]
+    fn solves_signed_remainders_with_pumpkin() {
+        let bounds = bounds_from(&[("a", (-20000, 20000))]);
+        let values = solved_values("a % 5 == -2 && a <= -6001 && a >= -6003", bounds.clone(), 7);
+        assert_eq!(values, vec![-6002]);
+        let impossible = translate(&parse_exprs("a % 5 == 3 && a == -2"), &bounds).unwrap();
+        assert_eq!(solve(&impossible, 0), SolveOutcome::Unsat);
+    }
+
+    #[test]
+    fn solves_nested_disjunctions_and_uses_the_full_seed() {
+        let source = "(a == 1 || (a == 2 && (b == 3 || b == 4)) || a == 3) && b == 4";
+        let bounds = bounds_from(&[("a", (0, 15)), ("b", (0, 15))]);
+        assert_eq!(solved_values(source, bounds.clone(), 0), vec![1, 4]);
+        assert_eq!(solved_values(source, bounds, 1 << 32), vec![2, 4]);
+    }
+
+    #[test]
+    fn nested_branch_union_respects_the_cap() {
+        let source = format!(
+            "a == 1 && ({})",
+            std::iter::repeat_n("a == 1", 65)
+                .collect::<Vec<_>>()
+                .join(" || ")
+        );
+        let problem = translate(&parse_exprs(&source), &bounds_from(&[("a", (0, 15))])).unwrap();
+        assert_eq!(solve(&problem, 1), SolveOutcome::Unsupported);
     }
 
     #[test]

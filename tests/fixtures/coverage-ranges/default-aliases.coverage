@@ -1,0 +1,9 @@
+sys.cg samples=2 grade=0.750
+count buckets=4 grade=0.500
+0x0 [0..0] goal=1 hits=1
+0x1 [1..1] goal=1 hits=0
+0x2 [2..2] goal=1 hits=0
+0x3 [3..3] goal=1 hits=1
+flag buckets=2 grade=1.000
+FALSE [0..0] goal=1 hits=1
+TRUE [1..1] goal=1 hits=1

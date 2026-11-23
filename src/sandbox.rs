@@ -54,11 +54,19 @@ impl Response {
         )).collect::<Vec<_>>().join(",");
         let coverage = self.coverage.iter().flat_map(|ty| ty.groups.iter().map(|group| {
             let items = group.items.iter().map(|item| {
-                let buckets = item.buckets.iter().map(|bucket| format!(
-                    "{{\"lo\":{},\"hi\":{},\"label\":{},\"hits\":{},\"goal\":{},\"excluded\":{}}}",
-                    json_string(&bucket.lo.to_string()), json_string(&bucket.hi.to_string()), json_string(&bucket.label),
-                    json_string(&bucket.hits.to_string()), json_string(&bucket.goal.to_string()), bucket.excluded,
-                )).collect::<Vec<_>>().join(",");
+                let buckets = item.buckets.iter().map(|bucket| {
+                    let (lo, hi) = bucket.bounds_text();
+                    let upper_bound = if bucket.real_bounds().is_some() {
+                        format!(",\"upperInclusive\":{}", bucket.upper_inclusive())
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "{{\"lo\":{},\"hi\":{},\"label\":{},\"hits\":{},\"goal\":{},\"excluded\":{}{upper_bound}}}",
+                        json_string(&lo), json_string(&hi), json_string(&bucket.label),
+                        json_string(&bucket.hits.to_string()), json_string(&bucket.goal.to_string()), bucket.excluded,
+                    )
+                }).collect::<Vec<_>>().join(",");
                 format!("{{\"name\":{},\"samples\":{},\"ungradeableHits\":{},\"buckets\":[{}]}}",
                     json_string(&item.name), json_string(&item.samples.to_string()), json_string(&item.ungradeable_hits.to_string()), buckets)
             }).collect::<Vec<_>>().join(",");

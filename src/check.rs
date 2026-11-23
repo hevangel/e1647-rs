@@ -387,7 +387,13 @@ pub fn check_declarations(declarations: &[Declaration]) -> Vec<Diagnostic> {
                 field_names.insert(field.name.as_str());
             });
             for_each_constraint(&declaration.members, &mut |constraint| {
-                check_constraint_fields(constraint, &field_names, &enumerals, &mut diagnostics);
+                check_constraint_fields(
+                    constraint,
+                    &field_names,
+                    &enumerals,
+                    &templates.defines,
+                    &mut diagnostics,
+                );
                 check_expr_static_accesses(&constraint.expr, &static_members, &mut diagnostics);
             });
         }
@@ -3416,13 +3422,14 @@ fn for_each_sub_expr<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
 }
 
 /// Report root identifiers of the constraint expression that are neither
-/// fields of the enclosing declaration nor declared enumerals. A call's
+/// fields of the enclosing declaration nor visible constants. A call's
 /// callee names a method rather than a field, so only its arguments
 /// contribute roots.
 fn check_constraint_fields(
     constraint: &KeepConstraint,
     field_names: &BTreeSet<&str>,
     enumerals: &BTreeSet<&str>,
+    defines: &BTreeMap<String, Expr>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     // Bind constraints name HDL-side signals, not e fields; skip them.
@@ -3445,7 +3452,11 @@ fn check_constraint_fields(
         if attribute_constraint && matches!(name.as_str(), "packing" | "DEFAULT" | "YES" | "NO") {
             continue;
         }
-        if !field_names.contains(name.as_str()) && !enumerals.contains(name.as_str()) {
+        if !field_names.contains(name.as_str())
+            && !enumerals.contains(name.as_str())
+            && !defines.contains_key(&name)
+            && crate::interp::predefined_constant(&name).is_none()
+        {
             diagnostics.push(Diagnostic::new(
                 "E0204",
                 format!("unknown identifier '{name}' in keep constraint"),

@@ -9,6 +9,7 @@ pub(super) const MAX_STRING_BYTES: usize = 256 * 1024;
 #[derive(Clone)]
 enum Value {
     Int(i128),
+    Real(f64),
     Str(String),
 }
 
@@ -16,6 +17,7 @@ impl Value {
     fn token_kind(self) -> TokenKind {
         match self {
             Self::Int(value) => TokenKind::Number(value.to_string()),
+            Self::Real(value) => TokenKind::Number(format!("{value:?}")),
             Self::Str(value) => TokenKind::StringLiteral(
                 value
                     .replace('\\', "\\\\")
@@ -28,10 +30,24 @@ impl Value {
         }
     }
     fn expression(self, span: crate::ast::Span) -> Expr {
+        if let Self::Real(value) = self {
+            return Expr::RealLiteral {
+                text: format!("{value:?}"),
+                span,
+            };
+        }
         match self.token_kind() {
             TokenKind::Number(text) => Expr::IntLiteral { text, span },
             TokenKind::StringLiteral(value) => Expr::StringLiteral { value, span },
             _ => unreachable!("constant literal"),
+        }
+    }
+
+    fn as_real(&self) -> Option<f64> {
+        match self {
+            Self::Int(value) => Some(*value as f64),
+            Self::Real(value) => Some(*value),
+            Self::Str(_) => None,
         }
     }
 }
@@ -66,6 +82,7 @@ impl Resolver<'_> {
                         | ScalarBase::Uint
                         | ScalarBase::Longint
                         | ScalarBase::Longuint
+                        | ScalarBase::Real
                         | ScalarBase::String
                 ) =>
             {
@@ -178,6 +195,12 @@ impl Resolver<'_> {
             Expr::IntLiteral { text, .. } | Expr::BitLiteral { text, .. } => {
                 crate::interp::parse_int_literal(text).map(Value::Int)
             }
+            Expr::RealLiteral { text, .. } => text
+                .replace('_', "")
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(Value::Real),
             Expr::StringLiteral { value, .. } => Some(Value::Str(crate::interp::unescape(value))),
             Expr::Ident { name, .. } => self.field(owner, name).or_else(|| {
                 // An owner field shadows a predefined constant even when its
@@ -218,12 +241,11 @@ impl Resolver<'_> {
             }
             Expr::Paren { expr, .. } => self.evaluate(owner, expr, depth + 1),
             Expr::Unary { op, expr, .. } => {
-                let Value::Int(value) = self.evaluate(owner, expr, depth + 1)? else {
-                    return None;
-                };
-                match op {
-                    crate::ast::UnaryOp::Plus => Some(Value::Int(value)),
-                    crate::ast::UnaryOp::Negate => value.checked_neg().map(Value::Int),
+                use crate::ast::UnaryOp;
+                match (op, self.evaluate(owner, expr, depth + 1)?) {
+                    (UnaryOp::Plus, value @ (Value::Int(_) | Value::Real(_))) => Some(value),
+                    (UnaryOp::Negate, Value::Int(value)) => value.checked_neg().map(Value::Int),
+                    (UnaryOp::Negate, Value::Real(value)) => Some(Value::Real(-value)),
                     _ => None,
                 }
             }
@@ -265,7 +287,18 @@ impl Resolver<'_> {
                         }?;
                         Some(Value::Int(precision.cast_operand(result)))
                     }
-                    _ => None,
+                    (lhs, rhs) => {
+                        let (lhs, rhs) = (lhs.as_real()?, rhs.as_real()?);
+                        let result = match op {
+                            BinaryOp::Add => lhs + rhs,
+                            BinaryOp::Sub => lhs - rhs,
+                            BinaryOp::Mul => lhs * rhs,
+                            BinaryOp::Div => lhs / rhs,
+                            BinaryOp::Mod => lhs % rhs,
+                            _ => return None,
+                        };
+                        result.is_finite().then_some(Value::Real(result))
+                    }
                 }
             }
             _ => None,
