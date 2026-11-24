@@ -6289,3 +6289,16 @@ Formatting, default and all-feature Clippy, the coverage CLI fixture,
 WebAssembly all-target compilation, and `git diff --check` passed.
 All-target tests passed with 601 default-feature tests and 621
 all-feature tests.
+
+## Reproducible seeded object generation
+
+The native CLI regression compares complete rendered objects across
+fresh processes for seeds 0, 1, 42 and the maximum `u64`. It covers
+implicit generation, two explicit regenerations, a nested struct,
+fixed-length lists of scalars and structs, and a narrow linear constraint.
+Each tested seed gives a distinct sequence of three object snapshots.
+Comparisons run within the default build and within the Pumpkin build.
+
+Formatting, default and all-feature Clippy, WebAssembly all-target
+compilation, and `git diff --check` passed. All-target tests passed with
+602 default-feature tests and 622 all-feature tests.

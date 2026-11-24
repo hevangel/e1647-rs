@@ -365,11 +365,13 @@ not imply full language support or IEEE conformance.
       the native Z3 library), oxiz (young pure-Rust SMT), rustsat (SAT
       toolkit). Note: the crates.io `pcp` is an unrelated Post
       Correspondence Problem searcher, not a CP solver
-- [~] Reproducible seeded randomized objects — started: `gen` is a seeded
+- [x] Reproducible seeded randomized objects — `gen` is a seeded
       rejection sampler by default and, with `solver-pumpkin`, a seeded
       Pumpkin solve; values may differ between backends for the same seed
-      (different algorithms), but runs are deterministic per backend. The
-      rejection sampler narrows each field's sampling domain to the
+      (different algorithms), but runs are deterministic per backend.
+      The CLI regression compares complete nested objects and lists
+      across fresh processes, covering both implicit generation and `gen`.
+      The rejection sampler narrows each field's sampling domain to the
       intersection of the type's constant range/equality constraints
       (without this, a constrained unsized `int` is unhittable in 1000
       attempts). Explicit integer widths above 31 bits use this sampler
