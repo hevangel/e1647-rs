@@ -53,6 +53,65 @@ fn integrated_execution_fixtures_pass_typing_and_native_cli() {
 }
 
 #[test]
+fn cli_reproduces_complete_generated_objects_for_the_same_seed() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/execution-integration/seeded-objects.e");
+    let run = |seed: u64| {
+        let result = Command::new(env!("CARGO_BIN_EXE_e1647"))
+            .arg("run")
+            .arg(&path)
+            .args(["--seed", &seed.to_string()])
+            .output()
+            .expect("CLI starts");
+        assert!(result.status.success(), "seed {seed}: {result:?}");
+        assert!(result.stderr.is_empty(), "seed {seed}: {result:?}");
+        String::from_utf8(result.stdout).unwrap()
+    };
+
+    use std::collections::BTreeSet;
+    let mut snapshots = BTreeSet::new();
+    for seed in [0, 1, 42, u64::MAX] {
+        let output = run(seed);
+        assert_eq!(output, run(seed), "seed {seed}");
+        let objects: Vec<_> = output.lines().collect();
+        assert_eq!(objects.len(), 3, "seed {seed}: {output}");
+        assert_eq!(
+            objects.iter().copied().collect::<BTreeSet<_>>().len(),
+            3,
+            "seed {seed}: {output}"
+        );
+        for object in objects {
+            assert!(
+                object.starts_with("seeded_sample_s{serial_number: "),
+                "{object}"
+            );
+            assert!(object.contains("nested: seeded_nested_s{"), "{object}");
+            let (_, digits) = object
+                .split_once("digits: [")
+                .expect("generated scalar list");
+            let (digits, _) = digits.split_once(']').expect("complete scalar list");
+            assert_eq!(digits.split(", ").count(), 3, "{object}");
+            let (_, batch) = object
+                .split_once("batch: [")
+                .expect("generated struct list");
+            assert_eq!(batch.matches("seeded_leaf_s{").count(), 2, "{object}");
+            let codes: Vec<_> = object.split("seeded_leaf_s{code: ").skip(1).collect();
+            assert_eq!(codes.len(), 3, "{object}");
+            for leaf in codes {
+                let (code, _) = leaf.split_once('}').expect("complete leaf struct");
+                assert!((12..=19).contains(&code.parse::<u8>().unwrap()), "{object}");
+            }
+        }
+        snapshots.insert(output);
+    }
+    assert_eq!(
+        snapshots.len(),
+        4,
+        "each tested seed should vary the generated data"
+    );
+}
+
+#[test]
 fn suspended_helpers_preserve_coverage_unit_owners() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/execution-integration/coverage-owners.e");

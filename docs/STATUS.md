@@ -148,7 +148,9 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   (`a * b == c`, squares) through a feature-independent bounded
   enumeration solver — disjunctive shapes (`||`, `not`, item-set
   membership) translate in both paths, and every run is deterministic
-  per seed. `select` distributions
+  per seed within each backend. The CLI regression verifies complete
+  nested objects and lists across separate processes for both implicit
+  generation and explicit `gen`. `select` distributions
   (weights/min/max/edges/others/normal) bias the sampler.
 - **Observability.** Coverage groups (clause 14) collect basic-item
   buckets and grades on their sampling event after
