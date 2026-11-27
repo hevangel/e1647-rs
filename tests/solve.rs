@@ -114,6 +114,80 @@ fn enumeration_declines_unrepresentable_arithmetic() {
 }
 
 #[test]
+fn bounded_constraint_ir_matches_interpreter() {
+    let bounds = bounds_from(&[("a", (-8, 8)), ("b", (-3, 3))]);
+    for predicate in [
+        "not (a in [-3 .. 2] && b not in [-1, 2]) || a + b == 3",
+        "(a / -3 == 1 || 1 < a / 3) && a / 3 != 0",
+        "not (a % -3 < 0 || a % 3 == 2) && b >= -1",
+        "(a % -3 != -1 && a % 3 <= 0) || (a / -3 >= -1 && b == 3)",
+        "a / 3 > 8 || a % 3 < -3",
+        "a * b + a * a == 4 || a in [-1, 1]",
+    ] {
+        let problem = translate(&parse_exprs(predicate), &bounds)
+            .unwrap_or_else(|error| panic!("{predicate}: {error:?}"));
+        let source = format!(
+            r#"extend sys {{
+                run() is also {{
+                    var a: int(bits: 5);
+                    var b: int(bits: 3);
+                    for row from -8 to 8 {{
+                        a = row;
+                        for column from -3 to 3 {{
+                            b = column;
+                            if {predicate} {{ out(a, " ", b, "\n"); }};
+                        }};
+                    }};
+                }};
+            }};"#
+        );
+        let parsed = e1647::parser::parse(&source);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{predicate}: {:?}",
+            parsed.diagnostics
+        );
+        let elaborated = e1647::elab::elaborate(&parsed.declarations);
+        assert!(
+            elaborated.diagnostics.is_empty(),
+            "{predicate}: {:?}",
+            elaborated.diagnostics
+        );
+        let result = e1647::interp::run(&elaborated, 0);
+        assert!(
+            result.diagnostics.is_empty(),
+            "{predicate}: {:?}",
+            result.diagnostics
+        );
+        let expected: Vec<_> = result
+            .output
+            .lines()
+            .map(|line| {
+                let (a, b) = line.split_once(' ').expect("two output fields");
+                vec![a.parse::<i128>().unwrap(), b.parse::<i128>().unwrap()]
+            })
+            .collect();
+
+        if expected.is_empty() {
+            assert_eq!(
+                Solver::Enumerate.solve(&problem, 0),
+                SolveOutcome::Unsat,
+                "{predicate}"
+            );
+            continue;
+        }
+        // Check the entire ordered set and wraparound, which catches extra solutions at the end.
+        for (seed, assignment) in expected.iter().chain(expected.first()).enumerate() {
+            assert_eq!(
+                Solver::Enumerate.solve(&problem, seed as u64),
+                SolveOutcome::Solved(assignment.clone()),
+                "{predicate}, seed {seed}"
+            );
+        }
+    }
+}
+
+#[test]
 fn int_bounds_cover_integer_scalars_only() {
     let parsed = e1647::parser::parse(
         "struct t {\n    a: uint(bits: 8);\n    b: int;\n    c: byte;\n    d: nibble;\n    e: bool;\n    f: list of uint;\n    g: uint(bits: 40);\n    h: int(bits: 40);\n};\n",

@@ -326,7 +326,7 @@ not imply full language support or IEEE conformance.
       combined view, budget-capped); `is a` checks walk the view's
       base chain. Base-typed instances do not dynamically match
       subtypes yet; the conservative type pass checks composed views
-- [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
+- [x] Constraint IR for bounded-integer `keep` expressions. `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer
       fields into a solver problem; range membership (`x in [lo..hi]`)
       translates to the two comparisons; unsupported shapes fall back to
@@ -345,9 +345,10 @@ not imply full language support or IEEE conformance.
       and ordered comparisons constrain the residual from that quotient.
       Signed remainder constraints use truncating division and a signed
       residual. Signed fields also accept negative literal divisors.
-      Wide domains,
-      general division and modulo, and global constraints
-      remain unsupported by the solver. `keep bind` and
+      Implication uses runtime evaluation. The IR models mathematical
+      integers. Matching every interpreter precision and signedness rule
+      remains open, along with wide domains, general division and modulo,
+      and global constraints. `keep bind` and
       `hdl_path()` / `delayed()` constraints do not gate `gen`.
       `keep` predicates resolve literal defines, integer constant
       expressions in defines, and predefined integer constants. The solver
@@ -357,7 +358,10 @@ not imply full language support or IEEE conformance.
       constraints that reference it — `p.v == select { .. }` rebases to
       `v == select { .. }` (depth-two paths; other shapes drop until
       full CFS lands), so when-view distribution policies drive field
-      generation
+      generation. Exhaustive small-domain tests compare the translated
+      solution sets with the interpreter. An execution fixture verifies that
+      a mixed supported and unsupported constraint uses runtime sampling
+      and enforces the full predicate.
 - [x] Pluggable constraint solver for the bounded integer IR. Built-in
       `enumerate` and optional `pumpkin` backends share the `SolverBackend`
       interface. `run --solver` selects a built-in backend, and library

@@ -648,8 +648,8 @@ single-source browser sandbox API runs in disposable workers (see
   and negation trees translate. Linear problems use Pumpkin behind the
   `solver-pumpkin` feature; polynomial problems of degree up to four use
   feature-independent enumeration with capped domain products. Both
-  paths are deterministic per seed; unsupported problems fall back to
-  rejection sampling.
+  paths are deterministic per seed. An unsupported construct causes the
+  interpreter to enforce the full predicate through rejection sampling.
   `SolverBackend` accepts the shared IR and a seed. The CLI selects the
   built-in enumerator or Pumpkin, and the interpreter accepts a borrowed
   backend through `run_with_solver`.
