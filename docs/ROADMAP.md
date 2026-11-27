@@ -668,17 +668,14 @@ not imply full language support or IEEE conformance.
       transfers. The pinned Linux profile verifies explicit and default
       backend selection, signal I/O, explicit stepping, shutdown, and
       optional waveform instrumentation. See [HDL qualification](HDL_QUALIFICATION.md).
-- [~] SystemVerilog integration tests and event ordering — started: the
-      compose `mixed` service runs `examples/mixed_counter.e` against
-      `examples/mixed/counter.sv`. Event ordering between e and the HDL
-      simulator is not implemented. The separate scripts/qualify_hdl.py
-      runner checks the pinned xezim profile's exact outputs/diagnostics,
-      VCD transitions and HDL code coverage, including both mixed examples;
-      see [HDL_QUALIFICATION.md](HDL_QUALIFICATION.md). This is explicit
-      hdl_run/READY qualification, not general scheduler integration.
-      The Dockerfile build and actual qualify-hdl/verify services passed
-      locally; a separate CI job builds the image, runs the real profile
-      and retains owned artifact evidence
+- [x] SystemVerilog integration tests and event ordering at the explicit
+      xezim step boundary. `hdl_run` returns at the target tick's writable
+      post-NBA checkpoint. The mixed-language regression checks immediate
+      reads, zero-tick and one-tick steps, and delayed nonblocking updates.
+      CI runs it on the pinned simulator alongside both mixed examples,
+      VCD transitions, and HDL code coverage. Automatic coordination of
+      the e and HDL schedulers remains future work. See
+      [HDL_QUALIFICATION.md](HDL_QUALIFICATION.md).
 - [x] Experimental single-source WASM build and browser sandbox API:
       versioned parse/check/run ABI, spanned diagnostics, console text,
       DUT failure counts and basic/derived coverage summaries. Disposable workers

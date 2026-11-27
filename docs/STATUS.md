@@ -278,8 +278,8 @@ transfers, both mixed counter examples, error diagnostics, VCD transitions
 and HDL code coverage. The native session
 has bounded startup/command/finish handshakes and reaps its owned child on
 failure. Wider/MVL transfers are rejected; E1647_XEZIM_WAVE enables optional
-wave instrumentation. This qualifies explicit hdl_run/READY observations,
-not general e/HDL event ordering. Default cargo tests cover transport and
+wave instrumentation. Explicit `hdl_run` resumes at the target tick's
+writable post-NBA checkpoint. Default cargo tests cover transport and
 frontend mechanics. A separate CI job builds the current Dockerfile and runs
 the real profile, retaining owned evidence and image identity. The Dockerfile
 image and both qualify-hdl/verify Compose services have also passed locally,
@@ -335,8 +335,8 @@ reading, nothing else.
   total degree ≤ 4 over capped domain products; wide domains, division
   and modulo still defer to rejection sampling; `chosen_from` and the
   rgf reduced sets are the sampling-side exceptions).
-- General testbench execution (sequences run inline; the e↔HDL event
-  ordering is not implemented; the VHDL backend is unwritten).
+- General testbench execution, including scheduled sequences, automatic
+  coordination of the e and HDL schedulers, and a VHDL backend.
 - The remaining out-of-scope list of the 2019 migration plan (TLM
   sockets, Excel readers, coverage-database files, message-manager
   tables, encryption, the full reflection model) — semaphores moved out

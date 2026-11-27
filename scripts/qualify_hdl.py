@@ -143,8 +143,13 @@ def qualify(native: Path, report_path: Path) -> dict:
     cases = []
     artifacts = {}
     for source in sorted(FIXTURES.glob("*.e")):
+        case_design = source.with_suffix(".sv")
+        staged_design = design
+        if case_design.is_file():
+            staged_design = work / case_design.name
+            shutil.copyfile(case_design, staged_design)
         staged = work / source.name
-        staged.write_text(source.read_text().replace("PROFILE_DESIGN", str(design)))
+        staged.write_text(source.read_text().replace("PROFILE_DESIGN", str(staged_design)))
         code, stdout, stderr = run([str(native), "run", "--seed", "1", str(staged)], env, work)
         expected = source.with_suffix(".run.expected").read_text()
         prefix = str(staged) + ":"

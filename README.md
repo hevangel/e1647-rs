@@ -217,7 +217,8 @@ The native HDL bridge has an [explicit xezim qualification profile](docs/HDL_QUA
 covering signed 32-bit transfers, counter edges, errors, VCD and HDL code
 coverage. Startup and command waits are bounded; wider/MVL transfers are
 rejected. A separate CI job builds the image and runs the real profile.
-This does not qualify general e/HDL event ordering.
+Explicit `hdl_run` returns after due SystemVerilog nonblocking updates at the
+target tick. The e scheduler advances independently.
 
 ## From Slopman to Rustman
 
