@@ -358,13 +358,14 @@ not imply full language support or IEEE conformance.
       `v == select { .. }` (depth-two paths; other shapes drop until
       full CFS lands), so when-view distribution policies drive field
       generation
-- [~] Pluggable SMT/constraint solver — started: the Pumpkin CP solver
-      (pure Rust, consol-lab) is integrated behind the `solver-pumpkin`
-      cargo feature and is deterministic per seed; CI verifies the feature
-      on ubuntu. Candidates for further/alternative backends: z3.rs (needs
-      the native Z3 library), oxiz (young pure-Rust SMT), rustsat (SAT
-      toolkit). Note: the crates.io `pcp` is an unrelated Post
-      Correspondence Problem searcher, not a CP solver
+- [x] Pluggable constraint solver for the bounded integer IR. Built-in
+      `enumerate` and optional `pumpkin` backends share the `SolverBackend`
+      interface. `run --solver` selects a built-in backend, and library
+      callers can provide their own implementation with `run_with_solver`.
+      `auto` preserves the existing policy: enumeration for polynomial
+      problems and Pumpkin for supported linear problems when compiled in.
+      An unsupported result defers to runtime sampling. Tests exercise
+      satisfiable, unsatisfiable, and unsupported problems on both backends.
 - [x] Reproducible seeded randomized objects — `gen` is a seeded
       rejection sampler by default and, with `solver-pumpkin`, a seeded
       Pumpkin solve; values may differ between backends for the same seed

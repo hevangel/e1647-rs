@@ -650,6 +650,9 @@ single-source browser sandbox API runs in disposable workers (see
   feature-independent enumeration with capped domain products. Both
   paths are deterministic per seed; unsupported problems fall back to
   rejection sampling.
+  `SolverBackend` accepts the shared IR and a seed. The CLI selects the
+  built-in enumerator or Pumpkin, and the interpreter accepts a borrowed
+  backend through `run_with_solver`.
 - `src/hdl.rs` — the simulator seam: the `Simulator` trait
   (`load`/`name`/`set`/`get`/`run`/`finish`), a small explicit registry
   (`registered_backends`, `default_backend`, `load_backend`, `load`),

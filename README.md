@@ -288,6 +288,12 @@ feature-independent bounded enumeration solver — and everything else
 falls back to rejection sampling (see `src/interp.rs` for the exact
 semantics and its honest limits).
 
+Use `e1647 run --solver enumerate <source.e>` to select bounded integer
+enumeration, including for linear problems. `--solver pumpkin` selects
+the Pumpkin backend in builds with `solver-pumpkin`. `auto` is the
+default. Unsupported problems fall back to seeded runtime sampling.
+Rust callers can supply a `SolverBackend` to `interp::run_with_solver`.
+
 ## Repository layout
 
 | Path | Contents |

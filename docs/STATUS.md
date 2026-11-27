@@ -152,6 +152,8 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   nested objects and lists across separate processes for both implicit
   generation and explicit `gen`. `select` distributions
   (weights/min/max/edges/others/normal) bias the sampler.
+  The CLI can select `enumerate` or `pumpkin` through `--solver`.
+  Library callers can supply a `SolverBackend` to `run_with_solver`.
 - **Observability.** Coverage groups (clause 14) collect basic-item
   buckets and grades on their sampling event after
   `set_config(cover, mode, normal)` enables collection. Collection

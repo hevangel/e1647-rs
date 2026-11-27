@@ -6302,3 +6302,16 @@ Comparisons run within the default build and within the Pumpkin build.
 Formatting, default and all-feature Clippy, WebAssembly all-target
 compilation, and `git diff --check` passed. All-target tests passed with
 602 default-feature tests and 622 all-feature tests.
+
+## Pluggable bounded integer solvers
+
+The shared backend tests exercise seeded solutions, unsatisfiable
+constraints, and unsupported domains with enumeration and Pumpkin.
+Enumeration declines arithmetic it cannot represent. Native CLI tests
+check explicit selection, availability diagnostics, and equivalence
+between default and explicit `auto`. The library test runs generation
+with a caller-supplied backend through `run_with_solver`.
+
+Formatting, default and all-feature Clippy, and `git diff --check`
+passed. All-target tests passed with 606 default-feature tests and 626
+all-feature tests.
