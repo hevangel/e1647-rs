@@ -4886,6 +4886,24 @@ fn qualified_field_access_reads_when_subtype_fields() {
 }
 
 #[test]
+fn qualified_field_pairs_keep_their_determinant() {
+    let result = run_source(
+        include_str!("fixtures/qualified-fields/mismatched-pairs.e"),
+        1,
+    );
+    assert!(result.output.is_empty(), "{}", result.output);
+    let diagnostics: String = result
+        .diagnostics
+        .iter()
+        .map(|diagnostic| format!("{}\n", diagnostic.render()))
+        .collect();
+    assert_eq!(
+        diagnostics,
+        include_str!("fixtures/qualified-fields/mismatched-pairs.expected")
+    );
+}
+
+#[test]
 fn qualified_field_access_on_non_matching_subtype_reports_e0413() {
     // 4.17.3 at run time: p2's color is green (its keep), so it is not a
     // `red good packet` and the field x is not present — E0413 names the

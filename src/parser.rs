@@ -3785,10 +3785,9 @@ impl Parser {
                 // accessed field (`p.red'good'x`, `p.TRUE'good'red'x`,
                 // `p.red'color'x`). The `'`-joined spellings of a full
                 // qualifier (`red'color`) and of two short qualifiers
-                // (`red`, `color`) are identical token runs, so every
-                // qualifier is recorded value-only and the resolution
-                // matches each word against the when view's (field id,
-                // value) pairs.
+                // (`red`, `color`) have the same token shape. Keep the
+                // words so resolution can group them against the chosen
+                // view's determinants.
                 if self.at_punct("'") {
                     let mut qualifiers = Vec::new();
                     let mut current = (member, member_span);

@@ -15512,8 +15512,8 @@ impl<'a> Interp<'a> {
 
     /// The elaborated subtype view a subtype-qualified access (4.17.3)
     /// resolves against: a view derived from the instance's root base
-    /// type whose when-of set contains every qualifier word and whose
-    /// fields include the accessed one. A qualifier word matches a
+    /// type whose when-of set satisfies the qualifiers and whose fields
+    /// include the accessed one. A short qualifier matches a
     /// (field id, value) pair by value (`red` for `red'color`) or, for a
     /// Boolean determinant's short form, by field id (`good` for
     /// `TRUE'good`). Prefer a view whose determinants currently hold, then
@@ -15525,7 +15525,6 @@ impl<'a> Interp<'a> {
         qualifiers: &[WhenQualifier],
         field: &str,
     ) -> Option<&'a crate::elab::ElaboratedType> {
-        let words: Vec<&str> = qualifiers.iter().map(|q| q.value.as_str()).collect();
         let mut best = None;
         let mut best_rank = None;
         for view in self.types {
@@ -15535,7 +15534,7 @@ impl<'a> Interp<'a> {
             if !view.fields.iter().any(|f| f.name == field) {
                 continue;
             }
-            if !view_contains_words(view, &words) {
+            if !view_matches_qualifiers(view, qualifiers) {
                 continue;
             }
             if !self.instance_in_view_family(index, view) {
@@ -16347,21 +16346,39 @@ fn when_view_base(base: &TypeExpr) -> Option<String> {
     }
 }
 
-/// Whether a view's when-of set contains every qualifier word (4.17.3's
-/// legality reading): each word denotes a (field id, value) determinant
-/// of the view — by value (`red` for `red'color`, `TRUE` for
-/// `TRUE'good`) or by field id (a determinant's full or short spelling,
-/// `color` for `red'color`, `good` for `TRUE'good`). Several words may
-/// denote the same determinant (the full `TRUE'good` spelling of the
-/// short `good`), and qualifiers already implied by the static type are
-/// simply absent — so the words only need to cover a subset of the
-/// view's determinants; the subtype check below verifies the rest.
-fn view_contains_words(view: &crate::elab::ElaboratedType, words: &[&str]) -> bool {
-    words.iter().all(|word| {
-        view.when_of
-            .iter()
-            .any(|(id, value)| value == word || id == word)
-    })
+/// Resolve the flattened qualifier tokens as short qualifiers or full
+/// determinant pairs (4.17.3). Both readings of a prefix can be viable.
+fn view_matches_qualifiers(
+    view: &crate::elab::ElaboratedType,
+    qualifiers: &[WhenQualifier],
+) -> bool {
+    let mut matched_prefix = vec![false; qualifiers.len() + 1];
+    matched_prefix[0] = true;
+    for (index, qualifier) in qualifiers.iter().enumerate() {
+        if !matched_prefix[index] {
+            continue;
+        }
+        let matches_pair = |field: &str| {
+            view.when_of
+                .iter()
+                .any(|(id, value)| id == field && *value == qualifier.value)
+        };
+        if let Some((field, _)) = &qualifier.id {
+            matched_prefix[index + 1] |= matches_pair(field);
+            continue;
+        }
+        matched_prefix[index + 1] |= view.when_of.iter().any(|(id, value)| {
+            *value == qualifier.value
+                || (*id == qualifier.value && value.eq_ignore_ascii_case("true"))
+        });
+        if let Some(next) = qualifiers.get(index + 1)
+            && next.id.is_none()
+            && matches_pair(&next.value)
+        {
+            matched_prefix[index + 2] = true;
+        }
+    }
+    matched_prefix[qualifiers.len()]
 }
 
 /// Whether a determinant value word holds on a field value: an

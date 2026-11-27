@@ -6097,6 +6097,8 @@ It checks non-generative initializers, a constrained generative field,
 and a write retained across the switch. A separate regression retries a
 field with an unsatisfiable constraint in `run()` and `check()`. Both
 attempts report `E0407` without exposing a provisional field value.
+Qualified reads and writes report `E0401` when the value and field names
+are present in the same view but paired with different determinants.
 
 The `live-when-types` fixture checks `is a` on base-typed, explicitly
 qualified, `like`-derived, and unrelated instances. It changes two
