@@ -6277,6 +6277,20 @@ fixture, WebAssembly all-target compilation, and `git diff --check`
 passed. All-target tests passed with 600 default-feature tests and 620
 all-feature tests.
 
+## Coverage configuration and per-unit options
+
+Elaboration reports `E0224` for unknown declarative options and for
+options placed on a group or item kind that cannot apply them. The native
+`elab` and `run` entry points reject those declarations.
+
+The `configured-policy` fixture sets the coverage mode, integer bucket
+limit, default hit goal, and illegal-value timing in one call. Two unit
+instances exercise a per-unit ignore rule overlapping an illegal value.
+The ignored overlap emits no error, and the other unit's illegal value is
+reported after `check()` and before `finalize()`. Exact callback counts,
+bucket hits, and grades verify that pausing skips callbacks and resuming
+in `count_only` retains the existing counts.
+
 ## Default coverage buckets through scalar aliases
 
 Basic items use the resolved scalar type of their declaration or

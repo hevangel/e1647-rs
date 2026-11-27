@@ -525,8 +525,8 @@ not imply full language support or IEEE conformance.
       sources, and filtered transitions in the native CLI and browser API.
       The next milestone tracks remaining coverage option semantics and
       type checking.
-- [~] Coverage configuration options (14.9) and per-unit-instance options (14.2.2) —
-      started: the configuration record (`CoverageConfig`: the
+- [x] Coverage configuration (14.9) and per-unit-instance options (14.2.2)
+      for the supported sampler. The configuration record (`CoverageConfig`: the
       coverage mode per 14.2's NOTE, `max_int_buckets` per 14.3's
       bracket) is honored through the `build_with_config` builder API,
       and through `set_config(cover, ...)` (29.9). Modes `normal` and
@@ -543,7 +543,9 @@ not imply full language support or IEEE conformance.
       `per_unit_instance [= unit_type]` and `instance_no_collect` with
       `inst` collect and present per-unit data (14.2.2/14.3.4).
       Counts follow the physical unit when aliases move it to a new path.
-      Structural option/scope errors are E0224. Other runtime configuration
+      Structural option/scope errors are E0224. Unknown or unsupported option
+      names are diagnosed at their declaration, including options placed on a
+      group or item kind that cannot apply them. Other runtime configuration
       categories/options, composite-valued predicates,
       general real predicates, general constant/type resolution,
       remaining filter semantics and full option type checking
@@ -613,7 +615,9 @@ not imply full language support or IEEE conformance.
       gaps; constant predicates work over nested sources. Unit scope freezes
       after all instance-dependent coverage options. Source-kind-aware metadata
       lookup resolves aliased items despite physically earlier extensions.
-      Exact overlap/phase/filter-side-effect behavior needs qualification
+      A mixed per-unit regression checks ignore/illegal overlap, deferred
+      diagnostics, callback evaluation counts, and count retention across a
+      pause and resume. Broader filter-side-effect behavior remains open.
 - [~] Part 2 predefined routine library — started with the reflection
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`
       (5.10.5/5.10.6 — the argument parses as a type) build the
