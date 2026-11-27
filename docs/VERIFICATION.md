@@ -6089,6 +6089,15 @@ Formatting, default and all-feature Clippy, WebAssembly all-target
 compilation, and `git diff --check` passed. All-target tests passed with
 575 default-feature tests and 595 all-feature tests.
 
+## Qualified `when` fields
+
+The mixed nested-subtype fixture reads an inherited field while the
+inner determinant is false, then switches the determinant on and off.
+It checks non-generative initializers, a constrained generative field,
+and a write retained across the switch. A separate regression retries a
+field with an unsatisfiable constraint in `run()` and `check()`. Both
+attempts report `E0407` without exposing a provisional field value.
+
 ## Integer subtype range reflection
 
 `set_of_values` reflects constant integer bounds, including through

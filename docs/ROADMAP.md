@@ -324,8 +324,11 @@ not imply full language support or IEEE conformance.
       blocks) apply for those instances; a `when` member nested inside
       a when block applies on top of the enclosing view (a further
       combined view, budget-capped); `is a` checks walk the view's
-      base chain. Base-typed instances do not dynamically match
-      subtypes yet; the conservative type pass checks composed views
+      base chain. Qualified field access prefers views whose determinants
+      hold, initializes non-generative fields from their declarations, and
+      discards a field candidate when generation fails. General dynamic
+      subtype dispatch on base-typed receivers remains open. The conservative
+      type pass checks composed views.
 - [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer
       fields into a solver problem; range membership (`x in [lo..hi]`)
