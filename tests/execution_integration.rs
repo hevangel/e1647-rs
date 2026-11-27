@@ -6,6 +6,7 @@ fn integrated_execution_fixtures_pass_typing_and_native_cli() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/execution-integration");
     for name in [
         "qualified-when-fields",
+        "live-when-types",
         "nested-edges",
         "entry-alias",
         "coverage-owners",

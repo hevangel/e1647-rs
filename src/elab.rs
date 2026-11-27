@@ -3337,7 +3337,14 @@ fn collect_type_spellings(ty: &crate::ast::TypeExpr, out: &mut Vec<(String, Vec<
 /// spelled when-qualified views from method bodies.
 fn collect_statement_spellings(statement: &crate::ast::Stmt, out: &mut Vec<(String, Vec<String>)>) {
     match statement {
-        crate::ast::Stmt::VarDecl { ty: Some(ty), .. } => collect_type_spellings(ty, out),
+        crate::ast::Stmt::VarDecl { ty, init, .. } => {
+            if let Some(ty) = ty {
+                collect_type_spellings(ty, out);
+            }
+            if let Some(init) = init {
+                collect_expression_spellings(init, out);
+            }
+        }
         crate::ast::Stmt::Assign { target, value, .. } => {
             collect_expression_spellings(target, out);
             collect_expression_spellings(value, out);

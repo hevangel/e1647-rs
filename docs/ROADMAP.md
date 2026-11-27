@@ -326,8 +326,8 @@ not imply full language support or IEEE conformance.
       (fields, constraints including select distributions, methods, on
       blocks) apply for those instances; a `when` member nested inside
       a when block applies on top of the enclosing view (a further
-      combined view, budget-capped); `is a` checks walk the view's
-      base chain. Base-typed instances do not dynamically match
+      combined view, budget-capped). `is a` checks use live determinants
+      on base and `like` instances. Method dispatch does not select dynamic
       subtypes yet; the conservative type pass checks composed views
 - [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer
