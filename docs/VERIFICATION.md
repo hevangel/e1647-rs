@@ -6277,6 +6277,16 @@ fixture, WebAssembly all-target compilation, and `git diff --check`
 passed. All-target tests passed with 600 default-feature tests and 620
 all-feature tests.
 
+## Numeric list aggregate dispatch
+
+The native CLI fixture checks real products for raw values and item
+expressions, real-valued minimum and maximum results, and a struct
+method named `sum` whose receiver increments a counter. The single
+increment verifies that ordinary method dispatch reuses the receiver
+evaluated during list dispatch. Runtime regressions also check that
+`min_value` and `max_value` reject nonnumeric inputs, including a
+singleton Boolean.
+
 ## Default coverage buckets through scalar aliases
 
 Basic items use the resolved scalar type of their declaration or

@@ -9,6 +9,7 @@ fn integrated_execution_fixtures_pass_typing_and_native_cli() {
         "entry-alias",
         "coverage-owners",
         "root-events",
+        "list-aggregates",
     ] {
         let path = directory.join(format!("{name}.e"));
         let source = fs::read_to_string(&path).unwrap();

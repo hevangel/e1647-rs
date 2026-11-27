@@ -941,6 +941,8 @@ fn list_aggregates_reject_wrong_item_types() {
             "var xs: list of string; xs.push(\"a\"); print xs.product();",
             "product()",
         ),
+        ("print {TRUE}.min_value();", "min_value()"),
+        ("print {\"a\"; \"b\"}.max_value(it);", "max_value()"),
         (
             "var xs: list of int; xs.push(1); print xs.and_all();",
             "and_all()",

@@ -10079,7 +10079,7 @@ impl<'a> Interp<'a> {
             "product" => 1,
             _ => 0,
         };
-        let mut real_result = 0.0f64;
+        let mut real_result = int_result as f64;
         let mut is_real = false;
         let mut count = 0usize;
         // The extreme trackers (max_value/min_value) start at nothing.
@@ -10092,6 +10092,13 @@ impl<'a> Interp<'a> {
             };
             count += 1;
             if matches!(name, "max_value" | "min_value") {
+                if !matches!(value, Value::Int(_) | Value::Real(_)) {
+                    return Err(self.error(
+                        "E0402",
+                        format!("{name}() expects a numeric item expression"),
+                        span,
+                    ));
+                }
                 let takes_over = match &extreme {
                     None => true,
                     Some(best) => {
@@ -13629,17 +13636,20 @@ impl<'a> Interp<'a> {
                     }
                     extreme_receiver = Some(receiver);
                 }
-                // Numeric aggregates also evaluate per-item expressions;
-                // their existing non-list fallback uses ordinary dispatch.
+                // Numeric aggregates evaluate per-item expressions. A non-list
+                // with the same method name still uses ordinary dispatch.
                 if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
                     && matches!(
                         name.as_str(),
                         "sum" | "product" | "average" | "max_value" | "min_value"
                     )
-                    && let Value::List(list) = self.eval(object, frame, me)?
                 {
-                    let items = list.items.borrow().clone();
-                    return self.atomic_value(|this| this.call_list_aggregate(&items, name, args, frame, me, *span));
+                    let receiver = self.eval(object, frame, me)?;
+                    if let Value::List(list) = receiver {
+                        let items = list.items.borrow().clone();
+                        return self.atomic_value(|this| this.call_list_aggregate(&items, name, args, frame, me, *span));
+                    }
+                    extreme_receiver = Some(receiver);
                 }
                 // A call argument's parameter type is the inference
                 // context for an untyped `evaluate { ... }` in the

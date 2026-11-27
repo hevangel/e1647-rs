@@ -640,6 +640,10 @@ not imply full language support or IEEE conformance.
       using raw items or one scalar key expression. `sort_by_field` uses a
       named scalar field on each struct item. `get_indices` selects multiple
       indexes in argument order and shares individual indexing's bounds checks.
+      Real `product()` uses the multiplicative identity. The numeric
+      `min_value` and `max_value` methods reject nonnumeric results, including
+      singleton lists. A struct method sharing an aggregate name evaluates
+      its receiver once before dispatch.
       The remaining expression-taking forms, the 27.6 CRC family and
       27.7 keyed lists are documented gaps in `src/interp.rs`).
       `resize(size)` preserves the prefix and
