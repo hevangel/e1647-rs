@@ -185,8 +185,9 @@
 //! this subset can produce a nested list: a list argument to a modifying
 //! pseudo-method is the 27.3.2/27.3.4/27.3.14/27.3.15 list form, because e
 //! declares no lists of lists), the CRC family (27.6.1-27.6.3 — the prose
-//! notes the polynomials but not the full algorithm parameters), and keyed
-//! lists (27.7).
+//! notes the polynomials but not the full algorithm parameters). Declared
+//! keyed lists support `key_exists` for scalar whole-item and field keys
+//! (27.7). Other keyed-list routines remain unsupported.
 //!
 //! `emit` records the firing and immediately executes the event's `on`
 //! action blocks (clause 11.2), in composition order, on the instance
@@ -12399,6 +12400,89 @@ impl<'a> Interp<'a> {
         Some(result)
     }
 
+    /// Clause 27.7 membership for a declared keyed list with scalar keys.
+    fn keyed_list_contains(
+        &self,
+        receiver_type: Option<TypeExpr>,
+        items: &[Value],
+        args: &[Value],
+        span: crate::ast::Span,
+    ) -> Result<Value, ExecError> {
+        let [searched] = args else {
+            return Err(self.error("E0402", "key_exists() expects one key", span));
+        };
+        let Some(TypeExpr::List { key: Some(key), .. }) =
+            receiver_type.and_then(|ty| self.resolved_hint_type(&ty, 0))
+        else {
+            return Err(self.error("E0402", "key_exists() requires a declared keyed list", span));
+        };
+
+        let mut fields = Vec::new();
+        let mut part = key.as_ref();
+        loop {
+            match part {
+                Expr::Paren { expr, .. } => part = expr,
+                Expr::MemberAccess { object, name, .. } => {
+                    fields.push(name.as_str());
+                    part = object;
+                }
+                Expr::Ident { name, .. } => {
+                    if name != "it" {
+                        fields.push(name);
+                    }
+                    break;
+                }
+                _ => {
+                    return Err(self.error(
+                        "E0402",
+                        "key_exists() requires an item or field key",
+                        key.span(),
+                    ));
+                }
+            }
+        }
+
+        let is_scalar_key = |value: &Value| {
+            matches!(
+                value,
+                Value::Bool(_)
+                    | Value::Int(_)
+                    | Value::Real(_)
+                    | Value::Str(_)
+                    | Value::Enum { .. }
+            )
+        };
+        if !is_scalar_key(searched) {
+            return Err(self.error("E0402", "key_exists() expects a scalar key", span));
+        }
+        for item in items {
+            let mut candidate = item;
+            for field in fields.iter().rev() {
+                let Value::Object(index) = candidate else {
+                    return Err(self.error(
+                        "E0402",
+                        "key field requires a struct item",
+                        key.span(),
+                    ));
+                };
+                candidate = self.instances[*index].get(field).ok_or_else(|| {
+                    self.error("E0401", format!("unknown key field '{field}'"), key.span())
+                })?;
+            }
+            if !is_scalar_key(candidate) {
+                return Err(self.error(
+                    "E0402",
+                    "key_exists() requires scalar list keys",
+                    key.span(),
+                ));
+            }
+            if values_equal(candidate, searched) {
+                return Ok(Value::Bool(true));
+            }
+        }
+        Ok(Value::Bool(false))
+    }
+
     /// The clause 27 list pseudo-methods, dispatched on a `Value::List`
     /// receiver. Pseudo-methods are macros, not struct methods (27.1) —
     /// they attach to any list expression. A modifying one mutates the
@@ -13781,6 +13865,12 @@ impl<'a> Interp<'a> {
                                 name: port_name,
                             } => self.call_port_method(owner, &port_name, name, values, *span),
                             Value::List(list) => {
+                                if name == "key_exists" {
+                                    return self.keyed_list_contains(
+                                        self.contextual_type_of(object, frame, me),
+                                        &list.items.borrow(), &values, *span,
+                                    );
+                                }
                                 // The modifying pseudo-methods mutate the
                                 // shared storage through the handle; the
                                 // dispatch reads a snapshot of the items.

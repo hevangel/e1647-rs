@@ -6287,6 +6287,15 @@ evaluated during list dispatch. Runtime regressions also check that
 `min_value` and `max_value` reject nonnumeric inputs, including a
 singleton Boolean.
 
+## Scalar keyed-list membership
+
+The CLI fixture tests `key_exists` on an empty list, duplicate scalar
+keys, a declared list alias, a typed method parameter, and a method
+return. The receiver is evaluated once. A list keyed by a struct field
+finds a changed key immediately after the stored item's field changes.
+The interpreter regressions check diagnostics for an unkeyed list,
+wrong arity, and a nonscalar argument.
+
 ## Default coverage buckets through scalar aliases
 
 Basic items use the resolved scalar type of their declaration or

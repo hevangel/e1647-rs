@@ -966,6 +966,29 @@ fn list_aggregates_reject_wrong_item_types() {
 }
 
 #[test]
+fn keyed_list_membership_checks_receiver_and_argument() {
+    for (source, message) in [
+        (
+            "var xs: list of int; xs.key_exists(1);",
+            "requires a declared keyed list",
+        ),
+        (
+            "var xs: list (key: it) of int; xs.key_exists();",
+            "expects one key",
+        ),
+        (
+            "var xs: list (key: it) of int; xs.key_exists({1});",
+            "expects a scalar key",
+        ),
+    ] {
+        let diagnostics = run_error(&format!("extend sys {{ run() is also {{ {source} }}; }};"));
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+        assert!(diagnostics[0].contains("E0402"), "{diagnostics:?}");
+        assert!(diagnostics[0].contains(message), "{diagnostics:?}");
+    }
+}
+
+#[test]
 fn unsupported_list_methods_report_e0405() {
     // The documented apply gap and unknown names stay E0405.
     for call in ["xs.apply(1);", "xs.foo();"] {

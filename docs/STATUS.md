@@ -141,6 +141,8 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   handles overlapping mixed numeric comparisons; operands are evaluated once
   and comparisons use snapshots. Set membership tests each left item without
   consuming set entries. Real-valued set membership remains unsupported.
+  Declared keyed lists support `key_exists` for scalar items and scalar
+  field keys (27.7). The lookup reads the current value of each key.
 - **Randomization.** `gen` is a seeded rejection sampler by default;
   for translatable `keep` constraints it solves instead: linear
   problems through the backend conjunction solver (the
