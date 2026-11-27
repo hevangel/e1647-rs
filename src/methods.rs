@@ -30,6 +30,7 @@ pub(crate) enum Step<'a> {
 }
 
 pub(crate) struct Program<'a> {
+    pub owner: Option<&'a str>,
     pub prototype: &'a MethodDecl,
     pub steps: Vec<Step<'a>>,
 }
@@ -86,12 +87,14 @@ impl<'a> Program<'a> {
         let ranges = layers
             .get(owner)
             .map_or(std::slice::from_ref(&fallback), Vec::as_slice);
-        Self::compile(ranges.iter().map(|range| {
+        let mut program = Self::compile(ranges.iter().map(|range| {
             ty.methods[range.clone()]
                 .iter()
                 .filter(|method| method.name == name)
                 .collect()
-        }))
+        }));
+        program.owner = Some(&ty.name);
+        program
     }
 
     pub fn static_method(blocks: &[&'a MethodDecl]) -> Self {
@@ -185,6 +188,10 @@ impl<'a> Program<'a> {
                 }
             }
         }
-        Self { prototype, steps }
+        Self {
+            owner: None,
+            prototype,
+            steps,
+        }
     }
 }
