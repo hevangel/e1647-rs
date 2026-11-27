@@ -473,6 +473,8 @@ struct ObjectInstance {
     type_name: String,
     /// Declaration order preserved; `gen` and formatting rely on it.
     fields: Vec<(String, Value)>,
+    /// Lazy non-generative fields, keyed by their declaring type and slot.
+    subtype_fields: BTreeMap<(usize, usize), Value>,
     /// `simple_port` members: port name → HDL location for the bridge.
     ports: Vec<(String, String)>,
     /// Range-generated (`~`) field metadata (clause 6.9.7, 10.3.13):
@@ -570,6 +572,8 @@ struct Frame {
     local_types: std::collections::HashMap<String, TypeExpr>,
     /// Kept with the frame across suspension, independently of caller hints.
     return_type: Option<TypeExpr>,
+    /// The selected view remains available to a suspended method.
+    method_owner: Option<String>,
 }
 
 struct InstanceRule {
@@ -777,10 +781,9 @@ enum CoroutineKind {
         instance: usize,
         progress: crate::methods::Progress,
     },
-    /// A started TCM: instance, method name (resolved per turn, so
-    /// `is also` chains compose), evaluated arguments.
+    /// A started TCM with its method owner selected before entry synchronization.
     Tcm {
-        instance: usize,
+        method_owner: String,
         method: String,
         progress: crate::methods::Progress,
     },
@@ -2083,14 +2086,6 @@ fn resolve_method_blocks<'a>(
     Ok(blocks)
 }
 
-fn method_prototype<'a>(blocks: &[&'a MethodDecl]) -> Option<&'a MethodDecl> {
-    blocks
-        .iter()
-        .copied()
-        .find(|block| block.modifier.is_none())
-        .or_else(|| blocks.first().copied())
-}
-
 /// Select the recorded expression values for one rule or wait. Missing
 /// historical samples do not fall back to present-day field values.
 fn historical_temporal_callbacks(context: u64) -> crate::temporal::EvalCallbacks<'static> {
@@ -2163,6 +2158,7 @@ impl<'a> Interp<'a> {
         self.instances.push(ObjectInstance {
             type_name: type_name.to_owned(),
             fields,
+            subtype_fields: BTreeMap::new(),
             ports,
             rgf: BTreeMap::new(),
         });
@@ -3374,16 +3370,22 @@ impl<'a> Interp<'a> {
                     }
                     _ => return Err(self.error("E0402", "start target not supported", *span)),
                 };
-                let blocks = self.resolve_method(instance, &name, *span)?;
-                if blocks
-                    .first()
-                    .is_some_and(|block| values.len() != block.params.len())
-                {
+                let method_owner = self
+                    .explicit_method_owner(instance, &name, *span)?
+                    .to_owned();
+                resolve_method_blocks(self.types, &method_owner, &name, *span)?;
+                let program = crate::methods::Program::instance(
+                    self.types,
+                    self.method_layers,
+                    &method_owner,
+                    &name,
+                );
+                if values.len() != program.prototype.params.len() {
                     return Err(self.error(
                         "E0402",
                         format!(
                             "method '{name}' expects {} argument(s), got {}",
-                            blocks.first().map_or(0, |block| block.params.len()),
+                            program.prototype.params.len(),
                             values.len()
                         ),
                         *span,
@@ -3403,7 +3405,7 @@ impl<'a> Interp<'a> {
                 // immediately if the sampling event has already been
                 // emitted for the current tick" — it still runs only
                 // after the starter's turn yields, 17.2.2).
-                let event = self.entry_event_key(&blocks, &values, instance)?;
+                let event = self.entry_event_key(&program, &values, instance)?;
                 let (wake_event, eligible_at_cycle) = match event {
                     Some(path) if !is_every_cycle_event(&path) => {
                         if self.event_occurred_this_cycle(&path) {
@@ -3416,7 +3418,7 @@ impl<'a> Interp<'a> {
                 };
                 self.coroutines.push(Coroutine {
                     kind: CoroutineKind::Tcm {
-                        instance,
+                        method_owner,
                         method: name,
                         progress: crate::methods::Progress::new(values),
                     },
@@ -4053,6 +4055,9 @@ impl<'a> Interp<'a> {
     ) -> Option<TypeExpr> {
         if slot_is_local {
             return frame.local_types.get(name).cloned();
+        }
+        if let Some((_, field)) = self.subtype_field_slot(me, frame.method_owner.as_deref(), name) {
+            return Some(field.ty.clone());
         }
         let obj_type = self.instances[me].type_name.clone();
         let types: &[crate::elab::ElaboratedType] = self.types;
@@ -5727,19 +5732,8 @@ impl<'a> Interp<'a> {
         self.rng.below(1u128 << width_bits(width, default_bits)) as i128
     }
 
-    /// Resolve a method's `is also` blocks on an instance's type.
-    fn resolve_method(
-        &self,
-        object_index: usize,
-        name: &str,
-        span: crate::ast::Span,
-    ) -> Result<Vec<&MethodDecl>, ExecError> {
-        let type_name = self.instances[object_index].type_name.clone();
-        resolve_method_blocks(self.types, &type_name, name, span)
-    }
-
-    /// Select an ordinary method from a when view that can use the receiver's
-    /// existing fields, constraints, and event registrations.
+    /// Select a method from a view that can use existing constraints and
+    /// event registrations, with lazy slots for non-generative scalar fields.
     fn explicit_method_owner(
         &self,
         receiver: usize,
@@ -5761,7 +5755,12 @@ impl<'a> Interp<'a> {
                         .iter()
                         .any(|method| method.name == name && !method.is_static)
                 })
-                && view.fields == base.fields
+                && view
+                    .fields
+                    .strip_prefix(base.fields.as_slice())
+                    .is_some_and(|added| {
+                        added.iter().all(|field| self.is_lazy_subtype_field(field))
+                    })
                 && view.constraints == base.constraints
                 && view.ports == base.ports
                 && view.events == base.events
@@ -5770,10 +5769,6 @@ impl<'a> Interp<'a> {
                 && view.expects == base.expects
                 && self.when_root_base(view).as_deref() == Some(nominal)
                 && self.instance_matches_view(receiver, view, false)
-                && !view
-                    .methods
-                    .iter()
-                    .any(|method| method.name == name && method.tcm_event.is_some())
         }) {
             if self.type_is_a(&view.name, selected) {
                 selected = &view.name;
@@ -6022,12 +6017,13 @@ impl<'a> Interp<'a> {
     fn method_execution_frame(
         &mut self,
         block: &MethodDecl,
-        prototype: &MethodDecl,
+        program: &crate::methods::Program<'a>,
         progress: &crate::methods::Progress,
         kind: crate::methods::BodyKind,
         span: crate::ast::Span,
     ) -> Result<Frame, ExecError> {
-        let mut frame = self.method_frame(block, prototype, &progress.args, span)?;
+        let mut frame = self.method_frame(block, program.prototype, &progress.args, span)?;
+        frame.method_owner = program.owner.map(str::to_owned);
         if let Some(ty) = frame.return_type.clone()
             && !block.params.iter().any(|p| p.name == "result")
         {
@@ -6098,8 +6094,7 @@ impl<'a> Interp<'a> {
                 progress.pc += 1;
                 continue;
             };
-            let mut frame =
-                self.method_execution_frame(method, program.prototype, &progress, kind, span)?;
+            let mut frame = self.method_execution_frame(method, program, &progress, kind, span)?;
             if let Some(locals) = locals {
                 for (name, value) in locals {
                     frame
@@ -6167,7 +6162,7 @@ impl<'a> Interp<'a> {
         self.depth += 1;
         let result = (|| {
             let types = self.types;
-            let blocks = resolve_method_blocks(types, &call.method_owner, &call.name, call.span)?;
+            resolve_method_blocks(types, &call.method_owner, &call.name, call.span)?;
             let program = crate::methods::Program::instance(
                 types,
                 self.method_layers,
@@ -6195,7 +6190,7 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 if let Some(event) =
-                    self.entry_event_key(&blocks, &call.progress.args, call.receiver)?
+                    self.entry_event_key(&program, &call.progress.args, call.receiver)?
                     && !is_every_cycle_event(&event)
                     && !self.event_occurred_this_cycle(&event)
                 {
@@ -6233,13 +6228,7 @@ impl<'a> Interp<'a> {
                 let mut frame = if resume.is_some() {
                     call.frame.clone()
                 } else {
-                    self.method_execution_frame(
-                        method,
-                        program.prototype,
-                        &call.progress,
-                        kind,
-                        call.span,
-                    )?
+                    self.method_execution_frame(method, &program, &call.progress, kind, call.span)?
                 };
                 call.frame = frame.clone();
                 self.exec_context[call_level].child = Some(Child::Call(Box::new(call.clone())));
@@ -9045,6 +9034,8 @@ impl<'a> Interp<'a> {
                     let copied = self.deep_copy_value(&field_value, depth + 1, span)?;
                     self.instances[new_index].set(&field_name, copied);
                 }
+                self.instances[new_index].subtype_fields =
+                    self.instances[index].subtype_fields.clone();
                 if resolve_method_blocks(self.types, &type_name, "copy", span).is_ok() {
                     self.call_method(new_index, "copy", Vec::new(), span)?;
                 }
@@ -10507,12 +10498,25 @@ impl<'a> Interp<'a> {
 
     fn entry_event_key(
         &self,
-        blocks: &[&MethodDecl],
+        program: &crate::methods::Program<'_>,
         args: &[Value],
         owner: usize,
     ) -> Result<Option<String>, ExecError> {
-        let Some(prototype) = method_prototype(blocks) else {
-            return Ok(None);
+        let prototype = if program.owner != Some(self.instances[owner].type_name.as_str()) {
+            program
+                .steps
+                .iter()
+                .find_map(|step| match step {
+                    crate::methods::Step::Body {
+                        method,
+                        kind: crate::methods::BodyKind::Core,
+                        ..
+                    } if method.tcm_event.is_some() => Some(*method),
+                    _ => None,
+                })
+                .unwrap_or(program.prototype)
+        } else {
+            program.prototype
         };
         let Some(event) = &prototype.tcm_event else {
             return Ok(None);
@@ -13478,9 +13482,9 @@ impl<'a> Interp<'a> {
                     return Ok(value.clone());
                 }
                 if let Some(index) = me
-                    && let Some(value) = self.instances[index].get(name)
+                    && let Some(value) = self.read_instance_field(index, frame.method_owner.as_deref(), name)?
                 {
-                    return Ok(value.clone());
+                    return Ok(value);
                 }
                 // A static field named bare (T2.1): inside the type (or
                 // its children — the shared occurrence), or inside a
@@ -13590,8 +13594,9 @@ impl<'a> Interp<'a> {
                             let port = port.to_owned();
                             return self.read_port_value(&port, Some(index), *span);
                         }
-                        if let Some(value) = self.instances[index].get(name) {
-                            return Ok(value.clone());
+                        let view = frame.method_owner.as_deref().filter(|_| me == Some(index));
+                        if let Some(value) = self.read_instance_field(index, view, name)? {
+                            return Ok(value);
                         }
                         // `unit.port` — the port handle (clause 9).
                         if self.instance_has_port(index, name) {
@@ -14918,6 +14923,11 @@ impl<'a> Interp<'a> {
                     return Some(resolve(owner, ty));
                 }
                 if let Some(index) = me {
+                    if let Some((_, field)) =
+                        self.subtype_field_slot(index, frame.method_owner.as_deref(), name)
+                    {
+                        return Some(resolve(owner, &field.ty));
+                    }
                     let type_name = &self.instances[index].type_name;
                     let types: &[crate::elab::ElaboratedType] = self.types;
                     return types
@@ -14929,6 +14939,13 @@ impl<'a> Interp<'a> {
                 None
             }
             Expr::MemberAccess { object, name, .. } => {
+                if let Some(index) = me
+                    && self.peek_statement_receiver(object, frame, me) == Some(index)
+                    && let Some((_, field)) =
+                        self.subtype_field_slot(index, frame.method_owner.as_deref(), name)
+                {
+                    return Some(resolve(owner, &field.ty));
+                }
                 let base = self.static_type_of(object, frame, me)?;
                 let type_name = match base {
                     TypeExpr::Named { name, .. } => name,
@@ -14971,7 +14988,10 @@ impl<'a> Interp<'a> {
             Expr::Ident { name, span } => {
                 if name == "me" || name == "self" {
                     return Some(TypeExpr::Named {
-                        name: self.instances.get(me?)?.type_name.clone(),
+                        name: frame
+                            .method_owner
+                            .clone()
+                            .unwrap_or(self.instances.get(me?)?.type_name.clone()),
                         span: *span,
                     });
                 }
@@ -14984,6 +15004,11 @@ impl<'a> Interp<'a> {
                     return self.value_type_hint(value, 0);
                 }
                 if let Some(index) = me {
+                    if let Some((_, field)) =
+                        self.subtype_field_slot(index, frame.method_owner.as_deref(), name)
+                    {
+                        return Some(field.ty.clone());
+                    }
                     let owner = &self.instances[index].type_name;
                     if let Some(field) = self
                         .types
@@ -15537,6 +15562,109 @@ impl<'a> Interp<'a> {
         }
     }
 
+    fn is_lazy_subtype_field(&self, field: &crate::ast::Field) -> bool {
+        if field.is_static || !(field.no_gen || field.is_const) {
+            return false;
+        }
+        match self.resolved_hint_type(&field.ty, 0) {
+            Some(TypeExpr::Scalar { .. } | TypeExpr::InlineEnum { .. }) => true,
+            Some(TypeExpr::Named { name, .. }) => self.types.iter().any(|ty| {
+                ty.name == name && ty.kind == DeclarationKind::Type && !ty.enumerals.is_empty()
+            }),
+            _ => false,
+        }
+    }
+
+    fn subtype_field_slot(
+        &self,
+        instance: usize,
+        view: Option<&str>,
+        name: &str,
+    ) -> Option<((usize, usize), &'a crate::ast::Field)> {
+        let view = view?;
+        let nominal = &self.instances[instance].type_name;
+        if view == nominal {
+            return None;
+        }
+        let types = self.types;
+        let mut owner = types.iter().position(|ty| ty.name == view)?;
+        let mut slot = types[owner]
+            .fields
+            .iter()
+            .position(|field| field.name == name)?;
+        let declaration = &types[owner].fields[slot];
+        if !self.is_lazy_subtype_field(declaration) {
+            return None;
+        }
+        if types
+            .iter()
+            .find(|ty| ty.name == *nominal)
+            .is_some_and(|ty| {
+                ty.fields
+                    .iter()
+                    .any(|field| field.name == name && field.name_span == declaration.name_span)
+            })
+        {
+            return None;
+        }
+        // Inherited copies of one declaration share a slot. Sibling views
+        // that introduce the same name each keep their own slot.
+        for _ in 0..types.len() {
+            let Some(parent) = types[owner]
+                .base
+                .as_deref()
+                .and_then(|base| types.iter().position(|ty| ty.name == base))
+            else {
+                break;
+            };
+            let Some(parent_slot) = types[parent]
+                .fields
+                .iter()
+                .position(|field| field.name == name && field.name_span == declaration.name_span)
+            else {
+                break;
+            };
+            owner = parent;
+            slot = parent_slot;
+        }
+        Some(((owner, slot), declaration))
+    }
+
+    fn read_instance_field(
+        &mut self,
+        index: usize,
+        view: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Value>, ExecError> {
+        let Some((slot, field)) = self.subtype_field_slot(index, view, name) else {
+            return Ok(self.instances[index].get(name).cloned());
+        };
+        if let Some(value) = self.instances[index].subtype_fields.get(&slot) {
+            return Ok(Some(value.clone()));
+        }
+        let value = self.initial_field_value(field)?;
+        self.instances[index]
+            .subtype_fields
+            .insert(slot, value.clone());
+        Ok(Some(value))
+    }
+
+    fn store_subtype_field(
+        &mut self,
+        index: usize,
+        view: Option<&str>,
+        name: &str,
+        value: &Value,
+        span: crate::ast::Span,
+    ) -> Result<bool, ExecError> {
+        let Some((slot, field)) = self.subtype_field_slot(index, view, name) else {
+            return Ok(false);
+        };
+        let value = self.bind_slot_value(value.clone(), Some(&field.ty), span)?;
+        self.instances[index].subtype_fields.insert(slot, value);
+        Ok(true)
+    }
+
     /// Read a subtype-qualified field (4.17.3): the accessed field must
     /// be provided by a when-subtype view of the instance's type whose
     /// when-of set contains every qualifier word, and the instance must
@@ -15569,9 +15697,10 @@ impl<'a> Interp<'a> {
                 span,
             ));
         }
-        if self.instances[index].get(field).is_none() {
-            self.materialize_qualified_field(index, view, field, field_span)?;
+        if let Some(value) = self.read_instance_field(index, Some(&view.name), field)? {
+            return Ok(value);
         }
+        self.materialize_qualified_field(index, view, field, field_span)?;
         Ok(self.instances[index]
             .get(field)
             .cloned()
@@ -15777,9 +15906,10 @@ impl<'a> Interp<'a> {
                     return Ok(value.clone());
                 }
                 if let Some(index) = me
-                    && let Some(value) = self.instances[index].get(name)
+                    && let Some(value) =
+                        self.read_instance_field(index, frame.method_owner.as_deref(), name)?
                 {
-                    return Ok(value.clone());
+                    return Ok(value);
                 }
                 // A static field named bare (T2.1) — the read side of
                 // the bare-name resolution (see [`Interp::eval`]'s
@@ -15815,7 +15945,8 @@ impl<'a> Interp<'a> {
                         target.span(),
                     ));
                 };
-                self.instances[index].get(name).cloned().ok_or_else(|| {
+                let view = frame.method_owner.as_deref().filter(|_| me == Some(index));
+                self.read_instance_field(index, view, name)?.ok_or_else(|| {
                     self.error("E0401", format!("unknown field '{name}'"), target.span())
                 })
             }
@@ -15858,6 +15989,17 @@ impl<'a> Interp<'a> {
                     let declared = frame.local_types.get(name).cloned();
                     let value = self.bind_slot_value(value, declared.as_ref(), span)?;
                     frame.locals.insert(name.clone(), value);
+                    return Ok(());
+                }
+                if let Some(index) = me
+                    && self.store_subtype_field(
+                        index,
+                        frame.method_owner.as_deref(),
+                        name,
+                        &value,
+                        span,
+                    )?
+                {
                     return Ok(());
                 }
                 if let Some(index) = me
@@ -15912,6 +16054,10 @@ impl<'a> Interp<'a> {
                 let Value::Object(index) = object_value else {
                     return Err(self.error("E0402", "member assignment requires an object", span));
                 };
+                let view = frame.method_owner.as_deref().filter(|_| me == Some(index));
+                if self.store_subtype_field(index, view, name, &value, span)? {
+                    return Ok(());
+                }
                 let owner_type = self.instances[index].type_name.clone();
                 let declared: Option<TypeExpr> = self
                     .types
@@ -15962,6 +16108,9 @@ impl<'a> Interp<'a> {
                         ),
                         span,
                     ));
+                }
+                if self.store_subtype_field(index, Some(&view.name), field, &value, span)? {
+                    return Ok(());
                 }
                 if self.instances[index].get(field).is_none() {
                     let field_span = *field_span;
@@ -18123,17 +18272,24 @@ impl<'a> Interp<'a> {
     /// from its resume point until it completes, suspends at a
     /// synchronization action, or errors.
     fn run_coroutine_turn(&mut self, co: &mut Coroutine) -> TurnOutcome {
-        let (instance, name, mut progress, main) = match &co.kind {
-            CoroutineKind::Main { instance, progress } => {
-                (*instance, "run".to_owned(), progress.clone(), true)
-            }
+        let (type_name, name, mut progress, main) = match &co.kind {
+            CoroutineKind::Main { instance, progress } => (
+                self.instances[*instance].type_name.clone(),
+                "run".to_owned(),
+                progress.clone(),
+                true,
+            ),
             CoroutineKind::Tcm {
-                instance,
+                method_owner,
                 method,
                 progress,
-            } => (*instance, method.clone(), progress.clone(), false),
+            } => (
+                method_owner.clone(),
+                method.clone(),
+                progress.clone(),
+                false,
+            ),
         };
-        let type_name = self.instances[instance].type_name.clone();
         if resolve_method_blocks(self.types, &type_name, &name, co.span).is_err() {
             return if main {
                 TurnOutcome::Complete
@@ -18163,16 +18319,11 @@ impl<'a> Interp<'a> {
                 continue;
             };
             if co.path.is_empty() {
-                co.frame = match self.method_execution_frame(
-                    method,
-                    program.prototype,
-                    &progress,
-                    kind,
-                    co.span,
-                ) {
-                    Ok(frame) => frame,
-                    Err(error) => return TurnOutcome::Error(error),
-                };
+                co.frame =
+                    match self.method_execution_frame(method, &program, &progress, kind, co.span) {
+                        Ok(frame) => frame,
+                        Err(error) => return TurnOutcome::Error(error),
+                    };
             }
             match self.run_body(&method.body, co) {
                 Ok(Flow::Suspend) => {

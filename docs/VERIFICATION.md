@@ -6106,12 +6106,20 @@ gets an elaborated view. A legacy view with no determinant field uses
 declared ancestry.
 
 The `live-when-methods` fixture checks ordinary method selection on base
-and `like` instances with active, layout-compatible views. It verifies
+and `like` instances with active views. It verifies
 ancestor wrappers, nested replacements, statement calls, and a suspended
 call that resumes its selected body after another coroutine changes the
 determinant. The next call uses the new determinant. Views that change
-fields or constraints use declared dispatch. Two competing eligible
-branches report `E0402`.
+constraints use declared dispatch. Two competing eligible branches report
+`E0402`.
+
+The fixture also switches between sibling views that declare the same
+scalar field and checks that each declaration retains its own value.
+Qualified access and ordinary methods share that field's storage.
+`deep_copy` preserves both values and gives the copy independent storage. A
+started TCM selects its subtype entry event before the determinant
+changes and resumes its original body after a wait. `compute` also uses
+the subtype event and updates the same field.
 
 ## Integer subtype range reflection
 
