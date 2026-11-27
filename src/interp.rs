@@ -186,8 +186,8 @@
 //! pseudo-method is the 27.3.2/27.3.4/27.3.14/27.3.15 list form, because e
 //! declares no lists of lists), the CRC family (27.6.1-27.6.3 — the prose
 //! notes the polynomials but not the full algorithm parameters). Declared
-//! keyed lists support `key_exists` for scalar whole-item and field keys
-//! (27.7). Other keyed-list routines remain unsupported.
+//! keyed lists support `key_exists` and unique scalar `key_index` lookups
+//! over whole items and fields (27.7). Other keyed-list routines remain open.
 //!
 //! `emit` records the firing and immediately executes the event's `on`
 //! action blocks (clause 11.2), in composition order, on the instance
@@ -12400,21 +12400,26 @@ impl<'a> Interp<'a> {
         Some(result)
     }
 
-    /// Clause 27.7 membership for a declared keyed list with scalar keys.
-    fn keyed_list_contains(
+    /// Clause 27.7 queries for a declared keyed list with scalar keys.
+    fn query_keyed_list(
         &self,
+        name: &str,
         receiver_type: Option<TypeExpr>,
         items: &[Value],
         args: &[Value],
         span: crate::ast::Span,
     ) -> Result<Value, ExecError> {
         let [searched] = args else {
-            return Err(self.error("E0402", "key_exists() expects one key", span));
+            return Err(self.error("E0402", format!("{name}() expects one key"), span));
         };
         let Some(TypeExpr::List { key: Some(key), .. }) =
             receiver_type.and_then(|ty| self.resolved_hint_type(&ty, 0))
         else {
-            return Err(self.error("E0402", "key_exists() requires a declared keyed list", span));
+            return Err(self.error(
+                "E0402",
+                format!("{name}() requires a declared keyed list"),
+                span,
+            ));
         };
 
         let mut fields = Vec::new();
@@ -12435,7 +12440,7 @@ impl<'a> Interp<'a> {
                 _ => {
                     return Err(self.error(
                         "E0402",
-                        "key_exists() requires an item or field key",
+                        format!("{name}() requires an item or field key"),
                         key.span(),
                     ));
                 }
@@ -12453,9 +12458,10 @@ impl<'a> Interp<'a> {
             )
         };
         if !is_scalar_key(searched) {
-            return Err(self.error("E0402", "key_exists() expects a scalar key", span));
+            return Err(self.error("E0402", format!("{name}() expects a scalar key"), span));
         }
-        for item in items {
+        let mut matched_index = None;
+        for (position, item) in items.iter().enumerate() {
             let mut candidate = item;
             for field in fields.iter().rev() {
                 let Value::Object(index) = candidate else {
@@ -12472,15 +12478,35 @@ impl<'a> Interp<'a> {
             if !is_scalar_key(candidate) {
                 return Err(self.error(
                     "E0402",
-                    "key_exists() requires scalar list keys",
+                    format!("{name}() requires scalar list keys"),
                     key.span(),
                 ));
             }
             if values_equal(candidate, searched) {
-                return Ok(Value::Bool(true));
+                if name == "key_exists" {
+                    return Ok(Value::Bool(true));
+                }
+                if matched_index.replace(position).is_some() {
+                    return Err(self.error(
+                        "E0402",
+                        "key_index() requires a unique matching key",
+                        span,
+                    ));
+                }
             }
         }
-        Ok(Value::Bool(false))
+        if name == "key_exists" {
+            return Ok(Value::Bool(false));
+        }
+        matched_index
+            .map(|position| Value::Int(position as i128))
+            .ok_or_else(|| {
+                self.error(
+                    "E0402",
+                    "key_index() found no matching key (UNDEF is not modeled)",
+                    span,
+                )
+            })
     }
 
     /// The clause 27 list pseudo-methods, dispatched on a `Value::List`
@@ -13865,8 +13891,9 @@ impl<'a> Interp<'a> {
                                 name: port_name,
                             } => self.call_port_method(owner, &port_name, name, values, *span),
                             Value::List(list) => {
-                                if name == "key_exists" {
-                                    return self.keyed_list_contains(
+                                if matches!(name.as_str(), "key_exists" | "key_index") {
+                                    return self.query_keyed_list(
+                                        name,
                                         self.contextual_type_of(object, frame, me),
                                         &list.items.borrow(), &values, *span,
                                     );

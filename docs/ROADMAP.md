@@ -644,11 +644,13 @@ not imply full language support or IEEE conformance.
       `min_value` and `max_value` methods reject nonnumeric results, including
       singleton lists. A struct method sharing an aggregate name evaluates
       its receiver once before dispatch.
-      Declared keyed lists support `key_exists` (27.7) for scalar keys
-      drawn from the item itself or a named field. Lookups read current
-      field values, including changes through aliases. The remaining
-      expression-taking forms, CRC routines, other keyed-list methods
-      and struct-valued keys remain open.
+      Declared keyed lists support `key_exists` and `key_index` (27.7) for
+      scalar keys drawn from the item itself or a named field. Lookups read
+      current field values and positions. `key_index` returns a zero-based
+      position for a unique match. Multiple matches and missing keys report
+      E0402 in this profile. The `UNDEF` result, duplicate-key selection,
+      remaining expression-taking forms, CRC routines, and struct-valued
+      keys remain open.
       `resize(size)` preserves the prefix and
       applies the declared element default to newly allocated slots.
       `resize(size, filler[, keep_old])` evaluates the filler per slot,

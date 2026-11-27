@@ -142,7 +142,8 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   and comparisons use snapshots. Set membership tests each left item without
   consuming set entries. Real-valued set membership remains unsupported.
   Declared keyed lists support `key_exists` for scalar items and scalar
-  field keys (27.7). The lookup reads the current value of each key.
+  field keys (27.7). `key_index` resolves the current position of a unique
+  key and reports E0402 on a missing or ambiguous key.
 - **Randomization.** `gen` is a seeded rejection sampler by default;
   for translatable `keep` constraints it solves instead: linear
   problems through the backend conjunction solver (the
