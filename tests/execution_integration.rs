@@ -5,11 +5,11 @@ fn integrated_execution_fixtures_pass_typing_and_native_cli() {
     let directory =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/execution-integration");
     for name in [
+        "qualified-when-fields",
         "nested-edges",
         "entry-alias",
         "coverage-owners",
         "root-events",
-        "qualified-when-fields",
     ] {
         let path = directory.join(format!("{name}.e"));
         let source = fs::read_to_string(&path).unwrap();
