@@ -2993,6 +2993,33 @@ fn when_views_carry_methods_and_base_membership() {
 }
 
 #[test]
+fn competing_active_when_methods_report_ambiguity() {
+    let result = run_source(
+        r#"type mode_t: [idle, active];
+        type size_t: [small, large];
+        struct packet_s {
+            !mode: mode_t = active;
+            !size_mode: size_t = large;
+            choose(): uint is { return 1; };
+            when active'mode { choose(): uint is only { return 2; }; };
+            when large'size_mode { choose(): uint is only { return 3; }; };
+        };
+        extend sys {
+            run() is also { var packet: packet_s; out(packet.choose()); };
+        };"#,
+        1,
+    );
+    assert!(result.output.is_empty());
+    assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+    assert_eq!(result.diagnostics[0].code, "E0402");
+    assert!(
+        result.diagnostics[0]
+            .message
+            .contains("multiple active when subtypes")
+    );
+}
+
+#[test]
 fn chained_when_views_compose_both_levels_constraints() {
     // 6.7 chained: a chained-qualified field (`LO HI pkt`) carries the
     // combined view — the outer when's constraint and the when-in-when

@@ -7,6 +7,7 @@ fn integrated_execution_fixtures_pass_typing_and_native_cli() {
     for name in [
         "qualified-when-fields",
         "live-when-types",
+        "live-when-methods",
         "nested-edges",
         "entry-alias",
         "coverage-owners",
