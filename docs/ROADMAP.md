@@ -304,10 +304,10 @@ not imply full language support or IEEE conformance.
       member list per type (`src/elab.rs`, `e1647 elab`), with
       inheritance-cycle, cross-declaration duplicate-field and
       unmodified-method-redefinition diagnostics. Qualified `when` field
-      access prefers views whose determinants hold, initializes
-      non-generative fields from their declarations, and discards rejected
-      generation candidates. `simple_port` members
-      carry HDL paths taken from `hdl_path()` constraints, and
+      access preserves full value/field pairs and prefers views whose
+      determinants hold. It initializes non-generative fields from their
+      declarations and discards rejected generation candidates.
+      `simple_port` members carry HDL paths taken from `hdl_path()` constraints, and
       `sequence` declarations are recovered into `Elaborated.sequences`.
       `on` members compose through the same fold, base types first and
       extends in declaration order — `on <port>$` members (clause
