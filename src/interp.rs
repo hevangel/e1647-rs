@@ -14605,16 +14605,20 @@ impl<'a> Interp<'a> {
                 base,
                 ..
             } => {
-                // The instance must carry the synthesized subtype view
-                // (or a descendant of it — the view's base chain reaches
-                // the base type, and a nested view's chain walks through
-                // the outer view it was applied on top of).
                 let Some(view_name) = when_view_name(modifier, base) else {
                     return Ok(false);
                 };
                 Ok(match value {
                     Value::Object(index) => {
-                        self.type_is_a(&self.instances[*index].type_name, &view_name)
+                        let declared_view =
+                            self.type_is_a(&self.instances[*index].type_name, &view_name);
+                        self.types.iter().find(|ty| ty.name == view_name).map_or(
+                            declared_view,
+                            |view| {
+                                self.instance_in_view_family(*index, view)
+                                    && self.instance_matches_view(*index, view, declared_view)
+                            },
+                        )
                     }
                     _ => false,
                 })
@@ -15487,7 +15491,7 @@ impl<'a> Interp<'a> {
                 span,
             ));
         };
-        if !self.instance_matches_view(index, view) {
+        if !self.instance_matches_view(index, view, true) {
             return Err(self.error(
                 "E0413",
                 format!(
@@ -15537,7 +15541,10 @@ impl<'a> Interp<'a> {
             if !self.instance_in_view_family(index, view) {
                 continue;
             }
-            let rank = (self.instance_matches_view(index, view), view.when_of.len());
+            let rank = (
+                self.instance_matches_view(index, view, true),
+                view.when_of.len(),
+            );
             if best_rank.is_none_or(|best| rank > best) {
                 best = Some(view);
                 best_rank = Some(rank);
@@ -15578,19 +15585,21 @@ impl<'a> Interp<'a> {
         None
     }
 
-    /// Whether the instance currently satisfies a view's subtype
-    /// (4.17.3): every determinant pair whose field id names a field of
-    /// the instance holds on its value. Pairs whose id names no field
-    /// (the corpus's space form keeps the struct name as the pair's id)
-    /// cannot be verified and are skipped.
-    fn instance_matches_view(&self, index: usize, view: &crate::elab::ElaboratedType) -> bool {
+    /// Each resolvable determinant must hold on the current field value.
+    /// The legacy space form can have a synthetic determinant without a
+    /// field. A dynamic type check needs actual fields to discover a new view.
+    fn instance_matches_view(
+        &self,
+        index: usize,
+        view: &crate::elab::ElaboratedType,
+        allow_unresolved: bool,
+    ) -> bool {
         view.when_of.iter().all(|(id, value)| {
-            match self.instances[index].get(id) {
-                Some(field_value) => value_holds(field_value, value),
-                // No such field on the instance: the pair is
-                // unverifiable here, not violated.
-                None => true,
-            }
+            self.instances[index]
+                .get(id)
+                .map_or(allow_unresolved, |field_value| {
+                    value_holds(field_value, value)
+                })
         })
     }
 
@@ -15876,7 +15885,7 @@ impl<'a> Interp<'a> {
                         span,
                     ));
                 };
-                if !self.instance_matches_view(index, view) {
+                if !self.instance_matches_view(index, view, true) {
                     return Err(self.error(
                         "E0413",
                         format!(

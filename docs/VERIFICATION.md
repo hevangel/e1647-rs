@@ -6098,6 +6098,13 @@ and a write retained across the switch. A separate regression retries a
 field with an unsatisfiable constraint in `run()` and `check()`. Both
 attempts report `E0407` without exposing a provisional field value.
 
+The `live-when-types` fixture checks `is a` on base-typed, explicitly
+qualified, `like`-derived, and unrelated instances. It changes two
+determinants, checks a nested view, and accesses a qualified field through
+a successful binding. A spelling used only in a local initializer now
+gets an elaborated view. A legacy view with no determinant field uses
+declared ancestry.
+
 ## Integer subtype range reflection
 
 `set_of_values` reflects constant integer bounds, including through
