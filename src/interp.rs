@@ -5738,9 +5738,8 @@ impl<'a> Interp<'a> {
         resolve_method_blocks(self.types, &type_name, name, span)
     }
 
-    /// Select an ordinary method from an active, layout-compatible when view.
-    /// Subtype declarations with extra storage and TCM entry events use their
-    /// declared instance types in this profile.
+    /// Select an ordinary method from a when view that can use the receiver's
+    /// existing fields, constraints, and event registrations.
     fn explicit_method_owner(
         &self,
         receiver: usize,
@@ -5763,6 +5762,12 @@ impl<'a> Interp<'a> {
                         .any(|method| method.name == name && !method.is_static)
                 })
                 && view.fields == base.fields
+                && view.constraints == base.constraints
+                && view.ports == base.ports
+                && view.events == base.events
+                && view.ons == base.ons
+                && view.covers == base.covers
+                && view.expects == base.expects
                 && self.when_root_base(view).as_deref() == Some(nominal)
                 && self.instance_matches_view(receiver, view, false)
                 && !view

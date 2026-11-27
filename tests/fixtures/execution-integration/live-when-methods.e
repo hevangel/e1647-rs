@@ -26,6 +26,10 @@ struct packet_s {
         !extra_value: uint = 20;
         sample(): uint is only { return extra_value; };
     };
+    when deep'depth {
+        keep count == 100;
+        sample(): uint is only { return count; };
+    };
 };
 struct child_s like packet_s {};
 extend sys {

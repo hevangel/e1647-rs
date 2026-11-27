@@ -328,8 +328,8 @@ not imply full language support or IEEE conformance.
       a when block applies on top of the enclosing view (a further
       combined view, budget-capped). `is a` checks use live determinants
       on base and `like` instances. Ordinary calls can select an active
-      view with the same field layout and no TCM entry event. General
-      method dispatch does not select storage-changing or time-consuming
+      view with the same instance fields, constraints and event registrations.
+      General method dispatch does not select state-changing or time-consuming
       subtypes yet; the conservative type pass checks composed views
 - [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer
