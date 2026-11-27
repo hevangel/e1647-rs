@@ -2101,6 +2101,17 @@ fn historical_temporal_callbacks(context: u64) -> crate::temporal::EvalCallbacks
 }
 
 impl<'a> Interp<'a> {
+    /// Field initializers are constant and bind through the declared type.
+    fn initial_field_value(&mut self, field: &crate::ast::Field) -> Result<Value, ExecError> {
+        if let Some(init) = &field.init {
+            let value =
+                self.eval_with_hint(Some(field.ty.clone()), init, &mut Frame::default(), None)?;
+            self.bind_slot_value(value, Some(&field.ty), origin_span())
+        } else {
+            Ok(self.default_for(&field.ty))
+        }
+    }
+
     fn instantiate(&mut self, type_name: &str) -> usize {
         let mut fields = Vec::new();
         let mut ports = Vec::new();
@@ -2116,36 +2127,14 @@ impl<'a> Interp<'a> {
                 if field.is_static {
                     continue;
                 }
-                let value = match &field.init {
-                    // Clause 6.9.1/6.9.4: a field's init value is set at
-                    // instance creation, before `init()` runs. Init
-                    // values are constant expressions, so the empty
-                    // frame / no-instance context suffices; an expression
-                    // that cannot evaluate keeps the type default and the
-                    // failure is reported through the run diagnostics.
-                    // The value binds through the field's declared type
-                    // (T7.1: a custom-numeric field converts a scalar
-                    // init via `numeric_from_int`/`numeric_from_real`,
-                    // and a custom value copies).
-                    Some(init) => {
-                        let mut frame = Frame::default();
-                        match self.eval_with_hint(Some(field.ty.clone()), init, &mut frame, None) {
-                            Ok(value) => {
-                                match self.bind_slot_value(value, Some(&field.ty), origin_span()) {
-                                    Ok(value) => value,
-                                    Err(diagnostic) => {
-                                        self.pending_diagnostics.push(diagnostic);
-                                        self.default_for(&field.ty)
-                                    }
-                                }
-                            }
-                            Err(diagnostic) => {
-                                self.pending_diagnostics.push(diagnostic);
-                                self.default_for(&field.ty)
-                            }
-                        }
+                // Clause 6.9.1/6.9.4: initialize before init() and retain
+                // the type default if an initializer fails.
+                let value = match self.initial_field_value(field) {
+                    Ok(value) => value,
+                    Err(diagnostic) => {
+                        self.pending_diagnostics.push(diagnostic);
+                        self.default_for(&field.ty)
                     }
-                    None => self.default_for(&field.ty),
                 };
                 fields.push((field.name.clone(), value));
             }
@@ -15523,8 +15512,9 @@ impl<'a> Interp<'a> {
     /// fields include the accessed one. A qualifier word matches a
     /// (field id, value) pair by value (`red` for `red'color`) or, for a
     /// Boolean determinant's short form, by field id (`good` for
-    /// `TRUE'good`); the most specific matching view (the most pairs)
-    /// wins.
+    /// `TRUE'good`). Prefer a view whose determinants currently hold, then
+    /// the most specific view. A nonmatching view can still name the
+    /// expected subtype for an E0413 diagnostic.
     fn find_qualified_field_view(
         &self,
         index: usize,
@@ -15532,7 +15522,8 @@ impl<'a> Interp<'a> {
         field: &str,
     ) -> Option<&'a crate::elab::ElaboratedType> {
         let words: Vec<&str> = qualifiers.iter().map(|q| q.value.as_str()).collect();
-        let mut best: Option<&'a crate::elab::ElaboratedType> = None;
+        let mut best = None;
+        let mut best_rank = None;
         for view in self.types {
             if view.when_of.is_empty() {
                 continue;
@@ -15546,8 +15537,10 @@ impl<'a> Interp<'a> {
             if !self.instance_in_view_family(index, view) {
                 continue;
             }
-            if best.is_none_or(|best| view.when_of.len() > best.when_of.len()) {
+            let rank = (self.instance_matches_view(index, view), view.when_of.len());
+            if best_rank.is_none_or(|best| rank > best) {
                 best = Some(view);
+                best_rank = Some(rank);
             }
         }
         best
@@ -15620,11 +15613,35 @@ impl<'a> Interp<'a> {
         let Some(declaration) = view.fields.iter().find(|f| f.name == field) else {
             return Err(self.error("E0401", format!("unknown field '{field}'"), span));
         };
+        if declaration.no_gen || declaration.is_const {
+            let initial = self.initial_field_value(declaration)?;
+            self.instances[index]
+                .fields
+                .push((field.to_owned(), initial));
+            return Ok(());
+        }
         let ty = declaration.ty.clone();
         let default = self.default_for(&ty);
         self.instances[index]
             .fields
             .push((field.to_owned(), default));
+        let result = self.generate_qualified_field(index, view, field, ty, span);
+        if result.is_err() {
+            self.instances[index]
+                .fields
+                .retain(|(name, _)| name != field);
+        }
+        result
+    }
+
+    fn generate_qualified_field(
+        &mut self,
+        index: usize,
+        view: &crate::elab::ElaboratedType,
+        field: &str,
+        ty: TypeExpr,
+        span: crate::ast::Span,
+    ) -> Result<(), ExecError> {
         let constraints: Vec<_> = view.constraints.iter().collect();
         // The same domain narrowing gen uses: a `keep x == 5` shapes the
         // sampling domain before the rejection loop.

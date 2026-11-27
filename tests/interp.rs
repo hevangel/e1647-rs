@@ -4927,6 +4927,32 @@ fn qualified_field_access_writes_and_checks_presence() {
 }
 
 #[test]
+fn failed_qualified_field_generation_does_not_cache_the_candidate() {
+    let result = run_source(
+        r#"type state_t: [ready, idle];
+        struct packet_s {
+            !state: state_t = ready;
+            when ready'state {
+                value: uint(bits: 2);
+                keep value != value;
+            };
+        };
+        extend sys {
+            !packet: packet_s;
+            run() is also { out(packet.ready'value); };
+            check() is also { out(packet.ready'value); };
+        };"#,
+        1,
+    );
+    assert!(result.output.is_empty(), "{}", result.output);
+    assert_eq!(result.diagnostics.len(), 2, "{:?}", result.diagnostics);
+    for diagnostic in result.diagnostics {
+        assert_eq!(diagnostic.code, "E0407");
+        assert!(diagnostic.message.contains("constraints of field 'value'"));
+    }
+}
+
+#[test]
 fn table1_phase_order_setup_run_extract_check_finalize() {
     // T8.1 (Table 1, 28.3.3.6-28.3.3.8, 28.3.5.1): the extract, check
     // and finalize phases call the same-named method on every live
