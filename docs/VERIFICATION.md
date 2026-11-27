@@ -6105,6 +6105,14 @@ a successful binding. A spelling used only in a local initializer now
 gets an elaborated view. A legacy view with no determinant field uses
 declared ancestry.
 
+The `live-when-methods` fixture checks ordinary method selection on base
+and `like` instances with active, layout-compatible views. It verifies
+ancestor wrappers, nested replacements, statement calls, and a suspended
+call that resumes its selected body after another coroutine changes the
+determinant. The next call uses the new determinant. Views that change
+fields or constraints use declared dispatch. Two competing eligible
+branches report `E0402`.
+
 ## Integer subtype range reflection
 
 `set_of_values` reflects constant integer bounds, including through

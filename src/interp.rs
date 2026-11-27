@@ -632,6 +632,7 @@ impl StatementEvaluation {
 #[derive(Debug, Clone)]
 struct StatementCall {
     receiver: usize,
+    method_owner: String,
     name: String,
     progress: crate::methods::Progress,
     entry_complete: bool,
@@ -5737,6 +5738,56 @@ impl<'a> Interp<'a> {
         resolve_method_blocks(self.types, &type_name, name, span)
     }
 
+    /// Select an ordinary method from a when view that can use the receiver's
+    /// existing fields, constraints, and event registrations.
+    fn explicit_method_owner(
+        &self,
+        receiver: usize,
+        name: &str,
+        span: crate::ast::Span,
+    ) -> Result<&str, ExecError> {
+        let nominal = self.instances[receiver].type_name.as_str();
+        let Some(base) = self.types.iter().find(|ty| ty.name == nominal) else {
+            return Ok(nominal);
+        };
+        if !base.when_of.is_empty() || base.whens.is_empty() {
+            return Ok(nominal);
+        }
+        let mut selected = nominal;
+        for view in self.types.iter().filter(|view| {
+            !view.when_of.is_empty()
+                && view.methods.get(base.methods.len()..).is_some_and(|added| {
+                    added
+                        .iter()
+                        .any(|method| method.name == name && !method.is_static)
+                })
+                && view.fields == base.fields
+                && view.constraints == base.constraints
+                && view.ports == base.ports
+                && view.events == base.events
+                && view.ons == base.ons
+                && view.covers == base.covers
+                && view.expects == base.expects
+                && self.when_root_base(view).as_deref() == Some(nominal)
+                && self.instance_matches_view(receiver, view, false)
+                && !view
+                    .methods
+                    .iter()
+                    .any(|method| method.name == name && method.tcm_event.is_some())
+        }) {
+            if self.type_is_a(&view.name, selected) {
+                selected = &view.name;
+            } else if !self.type_is_a(selected, &view.name) {
+                return Err(self.error(
+                    "E0402",
+                    format!("method '{name}' matches multiple active when subtypes of '{nominal}'"),
+                    span,
+                ));
+            }
+        }
+        Ok(selected)
+    }
+
     fn peek_statement_receiver(
         &self,
         expr: &Expr,
@@ -6075,16 +6126,17 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
         caller: &Frame,
     ) -> Result<Flow, ExecError> {
-        let declared = self
-            .resolve_method(receiver, name, span)
+        let method_owner = self.explicit_method_owner(receiver, name, span)?.to_owned();
+        let declared = resolve_method_blocks(self.types, &method_owner, name, span)
             .is_ok_and(|blocks| blocks.iter().any(|block| !block.is_static));
         if !declared {
-            self.call_method(receiver, name, args, span)?;
+            self.call_method_on_type(receiver, &method_owner, name, args, span)?;
             return Ok(Flow::Normal);
         }
         self.exec_statement_call(
             StatementCall {
                 receiver,
+                method_owner,
                 name: name.to_owned(),
                 progress: crate::methods::Progress::new(args),
                 entry_complete: false,
@@ -6115,12 +6167,11 @@ impl<'a> Interp<'a> {
         self.depth += 1;
         let result = (|| {
             let types = self.types;
-            let type_name = self.instances[call.receiver].type_name.clone();
-            let blocks = resolve_method_blocks(types, &type_name, &call.name, call.span)?;
+            let blocks = resolve_method_blocks(types, &call.method_owner, &call.name, call.span)?;
             let program = crate::methods::Program::instance(
                 types,
                 self.method_layers,
-                &type_name,
+                &call.method_owner,
                 &call.name,
             );
             let call_level = self.exec_context.len().checked_sub(1).ok_or_else(|| {
@@ -6243,8 +6294,19 @@ impl<'a> Interp<'a> {
         span: crate::ast::Span,
     ) -> Result<Value, ExecError> {
         let type_name = self.instances[object_index].type_name.clone();
+        self.call_method_on_type(object_index, &type_name, name, args, span)
+    }
+
+    fn call_method_on_type(
+        &mut self,
+        object_index: usize,
+        type_name: &str,
+        name: &str,
+        args: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Result<Value, ExecError> {
         let types: &[crate::elab::ElaboratedType] = self.types;
-        let blocks = match resolve_method_blocks(types, &type_name, name, span) {
+        let blocks = match resolve_method_blocks(types, type_name, name, span) {
             Ok(blocks) => blocks,
             Err(diagnostic) => {
                 // No user method of the name: the predefined any_unit
@@ -6291,8 +6353,7 @@ impl<'a> Interp<'a> {
         // Atomic callback/fallback dispatch. Scheduled instance calls use
         // exec_statement_call, including calls in ordinary expressions.
         self.atomic_depth += 1;
-        let program =
-            crate::methods::Program::instance(types, self.method_layers, &type_name, name);
+        let program = crate::methods::Program::instance(types, self.method_layers, type_name, name);
         let outcome = self.execute_atomic_method(&program, args, Some(object_index), span, None);
         self.atomic_depth -= 1;
         self.depth -= 1;
@@ -13263,11 +13324,9 @@ impl<'a> Interp<'a> {
                 .evaluations
                 .last()
                 .is_some_and(|state| state.level + 1 == self.exec_context.len());
-        let declared = self
-            .resolve_method(receiver, name, span)
-            .is_ok_and(|blocks| blocks.iter().any(|block| !block.is_static));
-        if !active || !declared {
-            return self.call_method(receiver, name, args, span);
+        if !active {
+            let owner = self.explicit_method_owner(receiver, name, span)?.to_owned();
+            return self.call_method_on_type(receiver, &owner, name, args, span);
         }
         let state = self.evaluations.last_mut().expect("active evaluation");
         let node = state.cursor.last().expect("call evaluation cursor").0;
@@ -13291,17 +13350,26 @@ impl<'a> Interp<'a> {
                 };
                 (call.as_ref().clone(), Some(path[1..].to_vec()))
             }
-            None => (
-                StatementCall {
-                    receiver,
-                    name: name.to_owned(),
-                    progress: crate::methods::Progress::new(args),
-                    entry_complete: false,
-                    frame: Frame::default(),
-                    span,
-                },
-                None,
-            ),
+            None => {
+                let method_owner = self.explicit_method_owner(receiver, name, span)?.to_owned();
+                if !resolve_method_blocks(self.types, &method_owner, name, span)
+                    .is_ok_and(|blocks| blocks.iter().any(|block| !block.is_static))
+                {
+                    return self.call_method_on_type(receiver, &method_owner, name, args, span);
+                }
+                (
+                    StatementCall {
+                        receiver,
+                        method_owner,
+                        name: name.to_owned(),
+                        progress: crate::methods::Progress::new(args),
+                        entry_complete: false,
+                        frame: Frame::default(),
+                        span,
+                    },
+                    None,
+                )
+            }
         };
         self.exec_context.push(PathLevel {
             index: 0,
