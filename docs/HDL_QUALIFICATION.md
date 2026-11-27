@@ -10,6 +10,8 @@ still advances its own virtual scheduler separately from explicit `hdl_run`.
 The runner checks xezim 0.11.3, revision `058f2bba` (the full source pin is
 `058f2bba58648452e5799d17572356ebcae7d163` in Dockerfile). It checks:
 
+- Explicit `hdl_load(design, top, "xezim")` selection in the positive profile
+  and default backend selection in the two-argument counter examples.
 - Signed 32-bit transfers, quoted paths and direct hdl_get/hdl_set calls.
 - Three driven rising edges, settled counter values after explicit one-tick
   advances, zero-delay completion and repeated finish.

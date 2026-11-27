@@ -6302,3 +6302,17 @@ Comparisons run within the default build and within the Pumpkin build.
 Formatting, default and all-feature Clippy, WebAssembly all-target
 compilation, and `git diff --check` passed. All-target tests passed with
 602 default-feature tests and 622 all-feature tests.
+
+## Native xezim/VPI backend selection
+
+The positive HDL profile selects `xezim` explicitly through `hdl_load`.
+The mixed counter examples exercise default selection. Both use the
+native bridge's signed 32-bit transport and explicit simulation steps.
+The pinned xezim 0.11.3 build at `058f2bba` passed all eight profile cases,
+the raw bridge command checks, exact VCD transitions through tick 9,
+and the HDL code coverage checks. The Docker build used the cloud CA
+bundle as a temporary BuildKit secret to verify dependency downloads.
+
+Formatting, default and all-feature Clippy, and the three Python HDL
+oracle tests passed. All-target test runs passed with 602 default-feature
+tests and 622 all-feature tests. `git diff --check` passed.
