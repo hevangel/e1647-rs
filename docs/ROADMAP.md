@@ -335,7 +335,7 @@ not imply full language support or IEEE conformance.
       retain the selected method and entry event across suspension.
       The solver cannot combine arbitrary constraints across independent active
       subtypes yet; the conservative type pass checks composed views
-- [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
+- [x] Constraint IR for bounded-integer `keep` expressions. `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer
       fields into a solver problem; range membership (`x in [lo..hi]`)
       translates to the two comparisons; unsupported shapes fall back to
@@ -354,9 +354,10 @@ not imply full language support or IEEE conformance.
       and ordered comparisons constrain the residual from that quotient.
       Signed remainder constraints use truncating division and a signed
       residual. Signed fields also accept negative literal divisors.
-      Wide domains,
-      general division and modulo, and global constraints
-      remain unsupported by the solver. `keep bind` and
+      Implication uses runtime evaluation. The IR models mathematical
+      integers. Matching every interpreter precision and signedness rule
+      remains open, along with wide domains, general division and modulo,
+      and global constraints. `keep bind` and
       `hdl_path()` / `delayed()` constraints do not gate `gen`.
       `keep` predicates resolve literal defines, integer constant
       expressions in defines, and predefined integer constants. The solver
@@ -366,14 +367,18 @@ not imply full language support or IEEE conformance.
       constraints that reference it — `p.v == select { .. }` rebases to
       `v == select { .. }` (depth-two paths; other shapes drop until
       full CFS lands), so when-view distribution policies drive field
-      generation
-- [~] Pluggable SMT/constraint solver — started: the Pumpkin CP solver
-      (pure Rust, consol-lab) is integrated behind the `solver-pumpkin`
-      cargo feature and is deterministic per seed; CI verifies the feature
-      on ubuntu. Candidates for further/alternative backends: z3.rs (needs
-      the native Z3 library), oxiz (young pure-Rust SMT), rustsat (SAT
-      toolkit). Note: the crates.io `pcp` is an unrelated Post
-      Correspondence Problem searcher, not a CP solver
+      generation. Exhaustive small-domain tests compare the translated
+      solution sets with the interpreter. An execution fixture verifies that
+      a mixed supported and unsupported constraint uses runtime sampling
+      and enforces the full predicate.
+- [x] Pluggable constraint solver for the bounded integer IR. Built-in
+      `enumerate` and optional `pumpkin` backends share the `SolverBackend`
+      interface. `run --solver` selects a built-in backend, and library
+      callers can provide their own implementation with `run_with_solver`.
+      `auto` preserves the existing policy: enumeration for polynomial
+      problems and Pumpkin for supported linear problems when compiled in.
+      An unsupported result defers to runtime sampling. Tests exercise
+      satisfiable, unsatisfiable, and unsupported problems on both backends.
 - [x] Reproducible seeded randomized objects — `gen` is a seeded
       rejection sampler by default and, with `solver-pumpkin`, a seeded
       Pumpkin solve; values may differ between backends for the same seed
@@ -657,7 +662,7 @@ not imply full language support or IEEE conformance.
       accepts `UNDEF` for typed defaults and can replace the entire list.
 
 ## M4 — Simulator integration
-- [~] HDL bridge — started: `src/hdl.rs` spawns `xezim` with the VPI
+- [x] The native HDL bridge uses xezim and VPI. `src/hdl.rs` spawns `xezim` with the
       control bridge in `c/xezim_bridge.c` and speaks a line protocol
       (`SET`/`GET`/`RUN`/`FINISH`). The interpreter exposes `hdl_load` /
       `hdl_set` / `hdl_get` / `hdl_run` / `hdl_finish` and routes quoted
@@ -674,18 +679,17 @@ not imply full language support or IEEE conformance.
       Session startup/commands/finish now have bounded handshakes,
       strict reply grammar and checked error/exit propagation. The bridge
       explicitly transports signed 32-bit VPI values and rejects wide/MVL
-      transfers. Optional waveform instrumentation is available.
-- [~] SystemVerilog integration tests and event ordering — started: the
-      compose `mixed` service runs `examples/mixed_counter.e` against
-      `examples/mixed/counter.sv`. Event ordering between e and the HDL
-      simulator is not implemented. The separate scripts/qualify_hdl.py
-      runner checks the pinned xezim profile's exact outputs/diagnostics,
-      VCD transitions and HDL code coverage, including both mixed examples;
-      see [HDL_QUALIFICATION.md](HDL_QUALIFICATION.md). This is explicit
-      hdl_run/READY qualification, not general scheduler integration.
-      The Dockerfile build and actual qualify-hdl/verify services passed
-      locally; a separate CI job builds the image, runs the real profile
-      and retains owned artifact evidence
+      transfers. The pinned Linux profile verifies explicit and default
+      backend selection, signal I/O, explicit stepping, shutdown, and
+      optional waveform instrumentation. See [HDL qualification](HDL_QUALIFICATION.md).
+- [x] SystemVerilog integration tests and event ordering at the explicit
+      xezim step boundary. `hdl_run` returns at the target tick's writable
+      post-NBA checkpoint. The mixed-language regression checks immediate
+      reads, zero-tick and one-tick steps, and delayed nonblocking updates.
+      CI runs it on the pinned simulator alongside both mixed examples,
+      VCD transitions, and HDL code coverage. Automatic coordination of
+      the e and HDL schedulers remains future work. See
+      [HDL_QUALIFICATION.md](HDL_QUALIFICATION.md).
 - [x] Experimental single-source WASM build and browser sandbox API:
       versioned parse/check/run ABI, spanned diagnostics, console text,
       DUT failure counts and basic/derived coverage summaries. Disposable workers

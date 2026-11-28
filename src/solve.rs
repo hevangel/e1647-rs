@@ -15,30 +15,12 @@
 //! translate to inclusive ranges. Remainder equalities translate to
 //! bounded disjunctions of matching values or a single congruence.
 //!
-//! Two solving paths sit behind [`solve`]:
-//! - **Linear problems** go to the backend conjunction solver: each `Any`
-//!   expands into its branch combinations (bounded — beyond the cap the
-//!   outcome is [`SolveOutcome::Unsupported`]), every combination is
-//!   solved as a plain conjunction, and one satisfying combination is
-//!   picked seeded, so runs stay deterministic per seed. With the
-//!   `solver-pumpkin` feature this is the Pumpkin CP solver; without it
-//!   the outcome is always [`SolveOutcome::Unsupported`] and the caller
-//!   falls back to the rejection sampler.
-//! - **Problems containing a [`BoolNode::Poly`]** go to the bounded
-//!   enumeration solver (feature-independent): the product of the
-//!   declared domains is capped, the tree is enumerated depth-first with
-//!   partial-assignment pruning, and the `seed`-th satisfying assignment
-//!   in enumeration order is the answer — deterministic per seed. A
-//!   domain product beyond the cap defers to the rejection sampler.
-//!
-//! Backends:
-//! - **pumpkin** (default-off cargo feature `solver-pumpkin`): the
-//!   Pumpkin lazy-clause-generation CP solver (pure Rust,
-//!   <https://github.com/consol-lab/pumpkin>), seeded for deterministic
-//!   runs. Solves constraint shapes rejection sampling cannot (e.g.
-//!   `a + b == 100`).
-//! - **fallback**: without the feature [`solve`] reports
-//!   [`SolveOutcome::Unsupported`] and `gen` uses rejection sampling.
+//! Both built-in backends implement [`SolverBackend`]. [`Solver::Enumerate`]
+//! searches bounded integer assignments in seeded order, including polynomial
+//! constraints. [`Solver::Pumpkin`] solves linear and supported remainder
+//! problems with bounded disjunction expansion and requires `solver-pumpkin`.
+//! The default [`solve`] uses enumeration for polynomial problems and Pumpkin
+//! for other problems. Unsupported problems defer to rejection sampling.
 //!
 //! Diagnostics live in [`crate::interp`] (`E0407` for unsatisfiable
 //! constraints); this module reports outcomes, not diagnostics.
@@ -144,6 +126,54 @@ pub enum SolveOutcome {
     /// The backend gave up or is not compiled in; fall back to rejection
     /// sampling.
     Unsupported,
+}
+
+/// A solver for translated bounded-integer problems. A `Solved` assignment
+/// must satisfy the problem and contain one value per variable in input order.
+/// `Unsupported` allows the interpreter to try its runtime sampler.
+pub trait SolverBackend {
+    fn solve(&self, problem: &Problem, seed: u64) -> SolveOutcome;
+}
+
+/// Built-in solver selection for native and library callers.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Solver {
+    #[default]
+    Auto,
+    Enumerate,
+    Pumpkin,
+}
+
+impl Solver {
+    /// Whether this selection is available in the current build.
+    pub fn is_available(self) -> bool {
+        self != Self::Pumpkin || cfg!(feature = "solver-pumpkin")
+    }
+}
+
+impl std::str::FromStr for Solver {
+    type Err = &'static str;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "auto" => Ok(Self::Auto),
+            "enumerate" => Ok(Self::Enumerate),
+            "pumpkin" => Ok(Self::Pumpkin),
+            _ => Err("expected auto, enumerate, or pumpkin"),
+        }
+    }
+}
+
+impl SolverBackend for Solver {
+    fn solve(&self, problem: &Problem, seed: u64) -> SolveOutcome {
+        let polynomial = problem.constraints.iter().any(BoolNode::has_polynomial);
+        match self {
+            Self::Enumerate => solve_by_enumeration(problem, seed),
+            Self::Auto if polynomial => solve_by_enumeration(problem, seed),
+            Self::Pumpkin if polynomial || !self.is_available() => SolveOutcome::Unsupported,
+            Self::Auto | Self::Pumpkin => solve_with_pumpkin_branches(problem, seed),
+        }
+    }
 }
 
 /// Integer bounds for the solver. Unsized int/uint use the solver's
@@ -1054,23 +1084,16 @@ const MAX_BRANCH_COMBINATIONS: usize = 64;
 /// exploding.
 const MAX_ENUMERATION_STATES: u128 = 1 << 20;
 
-/// Solve a problem with the best available path. A problem containing a
-/// polynomial atom goes to the bounded enumeration solver
-/// (feature-independent): the domain product is capped, the tree is
-/// enumerated depth-first with partial-assignment pruning, and the
-/// `seed`-th satisfying assignment in enumeration order is the answer —
-/// deterministic per seed. Otherwise the IR's disjunctions (`Any`) are
-/// expanded into their branch combinations — capped at
-/// [`MAX_BRANCH_COMBINATIONS`]; every combination is solved as a plain
-/// conjunction by the backend, and one satisfying combination is picked
-/// seeded, so runs stay deterministic per seed. `Unsat` is reported only
-/// when every branch is unsatisfiable; a backend-less build (no
-/// `solver-pumpkin` feature) cannot solve linear problems and reports
-/// `Unsupported` for them, leaving them to the rejection sampler.
+/// Solve a problem using the default [`Solver::Auto`] policy. The
+/// polynomial path uses bounded enumeration. The linear path expands
+/// disjunctions up to the branch limit and passes each conjunction to
+/// Pumpkin when available. Expansion can prove an empty disjunction
+/// unsatisfiable in either build.
 pub fn solve(problem: &Problem, seed: u64) -> SolveOutcome {
-    if problem.constraints.iter().any(BoolNode::has_polynomial) {
-        return solve_by_enumeration(problem, seed);
-    }
+    Solver::Auto.solve(problem, seed)
+}
+
+fn solve_with_pumpkin_branches(problem: &Problem, seed: u64) -> SolveOutcome {
     let Some(combos) = conjunction_alternatives(&problem.constraints) else {
         return SolveOutcome::Unsupported;
     };
@@ -1119,17 +1142,21 @@ pub(crate) fn solve_by_enumeration(problem: &Problem, seed: u64) -> SolveOutcome
     }
     // Pass one: count the satisfying assignments.
     let mut count: u128 = 0;
-    enumerate_solutions(problem, &mut |_, _| {
+    if enumerate_solutions(problem, &mut |_, _| {
         count = count.saturating_add(1);
         true
-    });
+    })
+    .is_err()
+    {
+        return SolveOutcome::Unsupported;
+    }
     if count == 0 {
         return SolveOutcome::Unsat;
     }
     // Pass two: walk to the seed-th solution in enumeration order.
     let target = u128::from(seed) % count;
     let mut picked: Option<Vec<i128>> = None;
-    enumerate_solutions(problem, &mut |index, assignment| {
+    let walked = enumerate_solutions(problem, &mut |index, assignment| {
         if index as u128 == target {
             picked = Some(assignment.to_vec());
             false
@@ -1137,12 +1164,12 @@ pub(crate) fn solve_by_enumeration(problem: &Problem, seed: u64) -> SolveOutcome
             true
         }
     });
-    match picked {
-        Some(assignment) => SolveOutcome::Solved(assignment),
+    match (walked, picked) {
+        (Ok(()), Some(assignment)) => SolveOutcome::Solved(assignment),
         // The count pass found the target; the walk must too. A miss is
         // an internal inconsistency — defer to the rejection sampler
         // rather than report a wrong verdict.
-        None => SolveOutcome::Unsupported,
+        _ => SolveOutcome::Unsupported,
     }
 }
 
@@ -1150,7 +1177,10 @@ pub(crate) fn solve_by_enumeration(problem: &Problem, seed: u64) -> SolveOutcome
 /// `visit` receives each satisfying assignment with its 0-based index in
 /// enumeration order and returns whether to continue; `true` continues,
 /// `false` stops the walk.
-fn enumerate_solutions(problem: &Problem, visit: &mut dyn FnMut(usize, &[i128]) -> bool) {
+fn enumerate_solutions(
+    problem: &Problem,
+    visit: &mut dyn FnMut(usize, &[i128]) -> bool,
+) -> Result<(), ()> {
     let vars = &problem.vars;
     let mut assignment: Vec<i64> = vec![0; vars.len()];
     let mut count: usize = 0;
@@ -1161,7 +1191,8 @@ fn enumerate_solutions(problem: &Problem, visit: &mut dyn FnMut(usize, &[i128]) 
         &mut assignment,
         &mut count,
         visit,
-    );
+    )
+    .map(|_| ())
 }
 
 /// Return true when the visitor requests an early stop.
@@ -1172,7 +1203,7 @@ fn walk(
     assignment: &mut [i64],
     count: &mut usize,
     visit: &mut dyn FnMut(usize, &[i128]) -> bool,
-) -> bool {
+) -> Result<bool, ()> {
     let Some(var) = vars.get(depth) else {
         // Every variable assigned: the tree evaluates to a plain
         // verdict (the partial evaluator resolves every atom now).
@@ -1181,13 +1212,17 @@ fn walk(
             .zip(assignment.iter())
             .map(|(var, value)| (var.name.as_str(), i128::from(*value)))
             .collect();
-        if matches!(eval_partial(constraints, &map), PartialEval::True) {
-            let index = *count;
-            *count += 1;
-            let snapshot: Vec<i128> = assignment.iter().map(|value| i128::from(*value)).collect();
-            return !visit(index, &snapshot);
-        }
-        return false;
+        return match eval_partial(constraints, &map) {
+            PartialEval::True => {
+                let index = *count;
+                *count += 1;
+                let snapshot: Vec<i128> =
+                    assignment.iter().map(|value| i128::from(*value)).collect();
+                Ok(!visit(index, &snapshot))
+            }
+            PartialEval::False => Ok(false),
+            PartialEval::Unknown => Err(()),
+        };
     };
     for value in var.lower..=var.upper {
         assignment[depth] = value;
@@ -1202,11 +1237,11 @@ fn walk(
         if matches!(eval_partial(constraints, &map), PartialEval::False) {
             continue;
         }
-        if walk(depth + 1, vars, constraints, assignment, count, visit) {
-            return true;
+        if walk(depth + 1, vars, constraints, assignment, count, visit)? {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// The three-valued verdict of a constraint tree over a partial
@@ -1431,6 +1466,9 @@ mod pumpkin_backend {
         let mut variables: BTreeMap<&str, DomainId> = BTreeMap::new();
         let mut bounds: BTreeMap<&str, (i64, i64)> = BTreeMap::new();
         for var in &problem.vars {
+            if var.lower > var.upper {
+                return SolveOutcome::Unsat;
+            }
             if var.lower < -I32_LIMIT || var.upper > I32_LIMIT {
                 return SolveOutcome::Unsupported;
             }

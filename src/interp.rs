@@ -981,9 +981,8 @@ struct Interp<'a> {
     instances: Vec<ObjectInstance>,
     rng: Rng,
     /// The run's seed, handed to the constraint-solver backend for `gen`.
-    /// Only read with the `solver-pumpkin` feature.
-    #[cfg_attr(not(feature = "solver-pumpkin"), allow(dead_code))]
     seed: u64,
+    solver: &'a dyn crate::solve::SolverBackend,
     output: String,
     depth: usize,
     /// Where signal values come from: a live simulator session (spawned
@@ -1362,7 +1361,17 @@ const UNIMPLEMENTED_2019: &[(&str, &str, (usize, usize))] = &[
 
 /// Instantiate the built-in `sys` unit and execute its `run()` methods.
 pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
-    run_inner(elaborated, seed, None)
+    run_with_solver(elaborated, seed, &crate::solve::Solver::Auto)
+}
+
+/// Execute with the selected solver for translated generation constraints.
+/// Unsupported problems keep the ordinary runtime sampling fallback.
+pub fn run_with_solver(
+    elaborated: &Elaborated,
+    seed: u64,
+    solver: &dyn crate::solve::SolverBackend,
+) -> RunResult {
+    run_inner(elaborated, seed, solver, None)
 }
 
 /// [`run`] with an injected signal history standing in for the external
@@ -1379,6 +1388,7 @@ pub fn run_with_signals(
     run_inner(
         elaborated,
         seed,
+        &crate::solve::Solver::Auto,
         Some(crate::hdl::SignalSource::Injected(signals)),
     )
 }
@@ -1386,6 +1396,7 @@ pub fn run_with_signals(
 fn run_inner(
     elaborated: &Elaborated,
     seed: u64,
+    solver: &dyn crate::solve::SolverBackend,
     hdl: Option<crate::hdl::SignalSource>,
 ) -> RunResult {
     // Resolve literal defines and integer constant expressions.
@@ -1460,6 +1471,7 @@ fn run_inner(
         instances: Vec::new(),
         rng: Rng::new(seed),
         seed,
+        solver,
         output: String::new(),
         depth: 0,
         hdl,
@@ -5387,9 +5399,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Translate the type's `keep` constraints over its integer scalar
-    /// fields and solve them: linear problems via the backend
-    /// conjunction solver (pumpkin with the cargo feature), non-linear
-    /// problems via the bounded enumeration solver (every build).
+    /// fields and pass them to the selected solver.
     /// `Ok(None)` means the caller must use the rejection sampler:
     /// translation unsupported, backend unavailable, or search unknown.
     fn try_solve_fields(
@@ -5433,28 +5443,36 @@ impl<'a> Interp<'a> {
             Ok(problem) => problem,
             Err(_) => return Ok(None),
         };
-        let outcome = crate::solve::solve(&problem, self.seed);
-        let outcome = match outcome {
+        let outcome = match self.solver.solve(&problem, self.seed) {
             crate::solve::SolveOutcome::Unsupported if enumerate_linear => {
                 crate::solve::solve_by_enumeration(&problem, self.seed)
             }
             outcome => outcome,
         };
         match outcome {
-            crate::solve::SolveOutcome::Solved(assignment) => Ok(Some(
-                problem
-                    .vars
-                    .iter()
-                    .map(|var| var.name.clone())
-                    .zip(assignment)
-                    .collect(),
-            )),
+            crate::solve::SolveOutcome::Solved(assignment)
+                if assignment.len() == problem.vars.len()
+                    && problem.vars.iter().zip(&assignment).all(|(var, value)| {
+                        (i128::from(var.lower)..=i128::from(var.upper)).contains(value)
+                    }) =>
+            {
+                Ok(Some(
+                    problem
+                        .vars
+                        .iter()
+                        .map(|var| var.name.clone())
+                        .zip(assignment)
+                        .collect(),
+                ))
+            }
             crate::solve::SolveOutcome::Unsat => Err(self.error(
                 "E0407",
                 format!("the constraints of '{type_name}' are unsatisfiable"),
                 span,
             )),
-            crate::solve::SolveOutcome::Unsupported => Ok(None),
+            crate::solve::SolveOutcome::Unsupported | crate::solve::SolveOutcome::Solved(_) => {
+                Ok(None)
+            }
         }
     }
 
@@ -19213,6 +19231,7 @@ mod simulator_cleanup_tests {
         let result = run_inner(
             &elaborated,
             1,
+            &crate::solve::Solver::Auto,
             Some(crate::hdl::SignalSource::Real(Box::new(FailingFinish(
                 Rc::clone(&dropped),
             )))),
