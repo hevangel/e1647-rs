@@ -330,10 +330,12 @@ single-source browser sandbox API runs in disposable workers (see
   `f: LO pkt` or chained `f: LO HI pkt` — parsed as nested
   qualifiers) instantiate the view, so those members apply for the
   instance. `is a` also checks live determinants on base-typed instances.
-  Whole-object generation samples each active view after its parent and
-  stores its ordinary fields by declaring view and field slot. The scheduler
-  resolves active event declarations and `on` actions at emission and
-  samples supported subtype `@sim` triggers at cycle boundaries. The
+  Whole-object generation selects a branch before solving constraints that
+  refer to its parent fields. Values and reduced sets use the declaring view
+  and field slot. The scheduler resolves active events, `on` actions, and
+  coverage groups at emission. It samples HDL event ports and supported
+  `@sim` triggers at cycle boundaries. Temporal rule monitors retain the
+  expression scope and log interval of one activation. The
   separate conservative type pass checks composed views.
 - `src/builtins.rs` — predeclared names the executed subset relies on:
   the `sys` unit, sequence bases (`any_sequence_item` and siblings), and
@@ -651,8 +653,11 @@ single-source browser sandbox API runs in disposable workers (see
   and negation trees translate. Linear problems use Pumpkin behind the
   `solver-pumpkin` feature; polynomial problems of degree up to four use
   feature-independent enumeration with capped domain products. Both
-  paths are deterministic per seed; unsupported problems fall back to
-  rejection sampling.
+  paths are deterministic per seed. An unsupported construct causes the
+  interpreter to enforce the full predicate through rejection sampling.
+  `SolverBackend` accepts the shared IR and a seed. The CLI selects the
+  built-in enumerator or Pumpkin, and the interpreter accepts a borrowed
+  backend through `run_with_solver`.
 - `src/hdl.rs` — the simulator seam: the `Simulator` trait
   (`load`/`name`/`set`/`get`/`run`/`finish`), a small explicit registry
   (`registered_backends`, `default_backend`, `load_backend`, `load`),
