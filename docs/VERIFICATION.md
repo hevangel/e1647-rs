@@ -6290,6 +6290,21 @@ WebAssembly all-target compilation, and `git diff --check` passed.
 All-target tests passed with 601 default-feature tests and 621
 all-feature tests.
 
+## Bounded-integer constraint IR
+
+The enumeration backend and the interpreter agree on the complete
+solution sets of six `keep` predicates over 119 signed integer pairs per
+predicate. The cases cover nested conjunction and disjunction, negation,
+range and list membership, signed division and remainder, polynomial
+arithmetic, and an unsatisfiable predicate.
+
+The native fallback fixture repeatedly generates an object whose predicate
+combines a supported sum with division by a variable. It also generates a
+`uint` field under an implication whose comparison casts `-1` to an
+unsigned value. Both cases enforce the complete predicate. The same
+fixture runs with a backend that fails the test if it receives a partial
+translation.
+
 ## SystemVerilog ordering at explicit HDL steps
 
 The `event-ordering` fixture drives two clock edges from e and checks

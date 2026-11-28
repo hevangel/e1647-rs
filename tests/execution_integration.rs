@@ -9,6 +9,7 @@ fn integrated_execution_fixtures_pass_typing_and_native_cli() {
         "entry-alias",
         "coverage-owners",
         "root-events",
+        "constraint-fallback",
     ] {
         let path = directory.join(format!("{name}.e"));
         let source = fs::read_to_string(&path).unwrap();
@@ -166,6 +167,31 @@ fn library_generation_accepts_an_external_solver_backend() {
     let result = e1647::interp::run_with_solver(&elaborated, 3, &FixedSolver);
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     assert_eq!(result.output, "18\n");
+}
+
+#[test]
+fn unsupported_constraint_declines_the_whole_translation() {
+    use e1647::solve::{Problem, SolveOutcome, SolverBackend};
+
+    struct UnexpectedSolver;
+    impl SolverBackend for UnexpectedSolver {
+        fn solve(&self, problem: &Problem, _: u64) -> SolveOutcome {
+            panic!("partially translated constraint reached the solver: {problem:?}");
+        }
+    }
+
+    let parsed = e1647::parser::parse(include_str!(
+        "fixtures/execution-integration/constraint-fallback.e"
+    ));
+    assert!(parsed.diagnostics.is_empty());
+    let elaborated = e1647::elab::elaborate(&parsed.declarations);
+    assert!(elaborated.diagnostics.is_empty());
+    let result = e1647::interp::run_with_solver(&elaborated, 0, &UnexpectedSolver);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(
+        result.output,
+        include_str!("fixtures/execution-integration/constraint-fallback.out")
+    );
 }
 
 #[test]
