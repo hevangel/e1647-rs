@@ -1,9 +1,10 @@
 use e1647::ast::Member;
+use e1647::solve::Solver;
 use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-const USAGE: &str = "Usage: e1647 <command> <source.e> [--seed N] [--coverage]\nCommands:\n  tokens  tokenize the source (does not parse)\n  parse   parse the source and print the AST or diagnostics\n  elab    parse and fold like/extend into elaborated types\n  run     parse, elaborate and run the phases: sys.setup, generate,\n          run/extract/check/finalize over the field tree (Table 1,\n          28.3) and the 9.13 generation sub-phases (--seed N for\n          reproducible gen)\n\n`elab` and `run` check definite type mismatches in methods, field\ninitial values, constraints, on bodies and coverage items/Boolean options. Typed method\nparameters and known local initializer kinds propagate; uncertain types\nstay unchecked. Nested membership, casts, slices, tables, evaluate/new\nbodies, statement values and temporal rule/wait values are traversed.\nKnown list indexes and membership containers/element kinds are checked.\nList containment respects repeated values; set scalar domains remain partial.\nRegistered static fields and qualified call signatures retain declared\nkinds; static bodies are checked in their declaring namespace without me.\nMethod extensions inherit omitted annotations; definite signature mismatches\nreport E0225 after composition and template substitution.\nFirst/also/only bodies share ordering and replacement policies, including\nimplicit result slots and suspended calls; ancestor wrappers are retained.\nBare static method calls remain unsupported; use Type::method(...).\nAliases default through their representation with a 64-alias limit.\nKnown variable/assignment/field/parameter/return contexts type evaluate/new;\nqualified calls and indexed targets supply hints without evaluating paths.\nMethod return metadata persists across TCM suspension. Unresolved contexts\nstill require explicit types. General bidirectional inference remains absent.\n\nList min/max/min_index/max_index accept an optional key expression\nwith it bound to each item; has/count/all/all_indices accept one\nboolean item expression with it bound to each item (clause 27).\nand_all/or_all also accept a Boolean item expression.\nfirst/last and their index forms search for a matching item.\nall_different checks optional keys, unique keeps the first item for each raw or projected key,\nand sort returns a stable copy ordered by scalar values or keys.\nsort_by_field uses a named scalar field on each struct item.\nget_indices selects items in the order of their requested indexes.\nresize(size[, filler[, keep_old]]) changes the list in place.\n\nScheduled instance calls retain frames and completed expression values\nacross suspension, including assignments, conditions, arguments, receivers,\nreturns, print parts and loop headers. Scoped evaluate/constructor actions,\nlist callbacks, generation/coverage observation, static methods, on blocks\nand check failure actions remain atomic.\nCompute arguments receive declared parameter contexts. Instance event keys\nisolate owners across bare/dotted/alias spellings; emission receivers and\nhooks/coverage process once. Rule monitors and failure actions belong to each\ncreated instance, including later allocations. Event paths bind at entry;\nactive rebinding and indexed temporal paths remain gaps.\n\nTemporal rules and waits retain sampled proposition and repeat-bound\nvalues. Temporal change/rise/fall sample Boolean, integer and enumeral\nexpressions; general event-specific timelines remain incomplete.\n\nThe native HDL bridge transports signed 32-bit values; wider/MVL transfers\nare rejected. Startup/commands/finish have bounded handshakes and E0408\nerrors. E1647_XEZIM_TIMEOUT_MS sets the deadline (1..300000; default 30000).\nE1647_XEZIM_WAVE=1 enables optional waveform instrumentation. The explicit\nxezim profile does not qualify general e/HDL event ordering.\n\n`run --coverage` prints the coverage groups' buckets and grades after\nthe run (clause 14). Collection starts disabled: enable it with\nset_config(cover, mode, normal). Mode off pauses collection; count_only\nalso collects counts. max_int_buckets accepts 0..65536 before sampling.\nOther configuration categories/options remain unsupported.\nCover groups support per_unit_instance, group/basic/derived when filters,\nand instance_no_collect with inst bound to the containing unit.\nIntegral ranges accept bucket widths and hit goals; at_least defaults\ncan be configured before sampling. set_config_max raises either numeric\ndefault. Range goals override item/group/global defaults. Zero-goal buckets are ungraded; named enumeral ranges use declaration order. Real ranges accept finite constant bounds.\nBasic-item ignore/illegal predicates exclude values and fully excluded\nbuckets. Instance variants use inst in per-unit groups. Illegal values\nreport after check hooks unless check_illegal_immediately is TRUE.\nCross/transition options run over earlier basic or derived item sources.\nSource order/names/arity are checked; expanded tuples have a 65536 scalar\ncomponent limit. Scalar derived ignore/illegal predicates also bind\nprev_<source> for transitions. Instance variants bind inst. Finite tuple\nclassification uses interval proofs and range splitting, with a 65536\nscalar-domain work limit per item refresh.\nCoverage derived names and range labels accept grouped/concatenated string\nliterals with runtime escape decoding. Supported initialized plain integer/\nstring const fields resolve in names/ranges/goals/weights after composition;\ncyclic or unsupported dependencies report E0224 when used by schemas.\nAliases and known int/uint widths (1..127 or star) resolve when initializers\nalready fit; runtime direct-operand precision shares the representation lookup.\nGeneral storage narrowing, unresolved widths and enums remain gaps.\nInvalid derived names report E0224.\nComposite predicates, general wide classification and full typing remain gaps.\n\n`hdl_load(file, top)` uses the platform default simulator. A third\nstring argument selects a backend by name.\n\n`import x.y;` members resolve to `x/y.e` (or `x.y.e`) next to the source\nfile; imported declarations are spliced before the importing file's own.";
+const USAGE: &str = "Usage: e1647 <command> <source.e> [--seed N] [--coverage]\nCommands:\n  tokens  tokenize the source (does not parse)\n  parse   parse the source and print the AST or diagnostics\n  elab    parse and fold like/extend into elaborated types\n  run     parse, elaborate and run the phases: sys.setup, generate,\n          run/extract/check/finalize over the field tree (Table 1,\n          28.3) and the 9.13 generation sub-phases (--seed N for\n          reproducible gen)\n          --solver auto|enumerate|pumpkin selects a constraint solver.\n          Pumpkin requires the solver-pumpkin build feature.\n\n`elab` and `run` check definite type mismatches in methods, field\ninitial values, constraints, on bodies and coverage items/Boolean options. Typed method\nparameters and known local initializer kinds propagate; uncertain types\nstay unchecked. Nested membership, casts, slices, tables, evaluate/new\nbodies, statement values and temporal rule/wait values are traversed.\nKnown list indexes and membership containers/element kinds are checked.\nList containment respects repeated values; set scalar domains remain partial.\nRegistered static fields and qualified call signatures retain declared\nkinds; static bodies are checked in their declaring namespace without me.\nMethod extensions inherit omitted annotations; definite signature mismatches\nreport E0225 after composition and template substitution.\nFirst/also/only bodies share ordering and replacement policies, including\nimplicit result slots and suspended calls; ancestor wrappers are retained.\nBare static method calls remain unsupported; use Type::method(...).\nAliases default through their representation with a 64-alias limit.\nKnown variable/assignment/field/parameter/return contexts type evaluate/new;\nqualified calls and indexed targets supply hints without evaluating paths.\nMethod return metadata persists across TCM suspension. Unresolved contexts\nstill require explicit types. General bidirectional inference remains absent.\n\nList min/max/min_index/max_index accept an optional key expression\nwith it bound to each item; has/count/all/all_indices accept one\nboolean item expression with it bound to each item (clause 27).\nand_all/or_all also accept a Boolean item expression.\nfirst/last and their index forms search for a matching item.\nall_different checks optional keys, unique keeps the first item for each raw or projected key,\nand sort returns a stable copy ordered by scalar values or keys.\nsort_by_field uses a named scalar field on each struct item.\nget_indices selects items in the order of their requested indexes.\nresize(size[, filler[, keep_old]]) changes the list in place.\n\nScheduled instance calls retain frames and completed expression values\nacross suspension, including assignments, conditions, arguments, receivers,\nreturns, print parts and loop headers. Scoped evaluate/constructor actions,\nlist callbacks, generation/coverage observation, static methods, on blocks\nand check failure actions remain atomic.\nCompute arguments receive declared parameter contexts. Instance event keys\nisolate owners across bare/dotted/alias spellings; emission receivers and\nhooks/coverage process once. Rule monitors and failure actions belong to each\ncreated instance, including later allocations. Event paths bind at entry;\nactive rebinding and indexed temporal paths remain gaps.\n\nTemporal rules and waits retain sampled proposition and repeat-bound\nvalues. Temporal change/rise/fall sample Boolean, integer and enumeral\nexpressions; general event-specific timelines remain incomplete.\n\nThe native HDL bridge transports signed 32-bit values; wider/MVL transfers\nare rejected. Startup/commands/finish have bounded handshakes and E0408\nerrors. E1647_XEZIM_TIMEOUT_MS sets the deadline (1..300000; default 30000).\nE1647_XEZIM_WAVE=1 enables optional waveform instrumentation. The explicit\nxezim profile does not qualify general e/HDL event ordering.\n\n`run --coverage` prints the coverage groups' buckets and grades after\nthe run (clause 14). Collection starts disabled: enable it with\nset_config(cover, mode, normal). Mode off pauses collection; count_only\nalso collects counts. max_int_buckets accepts 0..65536 before sampling.\nOther configuration categories/options remain unsupported.\nCover groups support per_unit_instance, group/basic/derived when filters,\nand instance_no_collect with inst bound to the containing unit.\nIntegral ranges accept bucket widths and hit goals; at_least defaults\ncan be configured before sampling. set_config_max raises either numeric\ndefault. Range goals override item/group/global defaults. Zero-goal buckets are ungraded; named enumeral ranges use declaration order. Real ranges accept finite constant bounds.\nBasic-item ignore/illegal predicates exclude values and fully excluded\nbuckets. Instance variants use inst in per-unit groups. Illegal values\nreport after check hooks unless check_illegal_immediately is TRUE.\nCross/transition options run over earlier basic or derived item sources.\nSource order/names/arity are checked; expanded tuples have a 65536 scalar\ncomponent limit. Scalar derived ignore/illegal predicates also bind\nprev_<source> for transitions. Instance variants bind inst. Finite tuple\nclassification uses interval proofs and range splitting, with a 65536\nscalar-domain work limit per item refresh.\nCoverage derived names and range labels accept grouped/concatenated string\nliterals with runtime escape decoding. Supported initialized plain integer/\nstring const fields resolve in names/ranges/goals/weights after composition;\ncyclic or unsupported dependencies report E0224 when used by schemas.\nAliases and known int/uint widths (1..127 or star) resolve when initializers\nalready fit; runtime direct-operand precision shares the representation lookup.\nGeneral storage narrowing, unresolved widths and enums remain gaps.\nInvalid derived names report E0224.\nComposite predicates, general wide classification and full typing remain gaps.\n\n`hdl_load(file, top)` uses the platform default simulator. A third\nstring argument selects a backend by name.\n\n`import x.y;` members resolve to `x/y.e` (or `x.y.e`) next to the source\nfile; imported declarations are spliced before the importing file's own.";
 
 /// Parse `source` and splice in the files it imports (`import a.b;` →
 /// `a/b.e` or `a.b.e` beside the source), depth-first, one level wide.
@@ -67,7 +68,7 @@ fn parse_with_imports(path: &str, source: &str) -> e1647::parser::ParseResult {
     }
 }
 
-fn run(command: &str, path: &str, seed: u64, coverage_flag: bool) -> ExitCode {
+fn run(command: &str, path: &str, seed: u64, coverage_flag: bool, solver: Solver) -> ExitCode {
     let source = match fs::read_to_string(path) {
         Ok(source) => source,
         Err(err) => {
@@ -159,7 +160,7 @@ fn run(command: &str, path: &str, seed: u64, coverage_flag: bool) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             let show_coverage = coverage_flag;
-            let outcome = e1647::interp::run(&elaborated, seed);
+            let outcome = e1647::interp::run_with_solver(&elaborated, seed, &solver);
             for diagnostic in &outcome.diagnostics {
                 eprintln!("{path}:{}", diagnostic.render());
             }
@@ -191,6 +192,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let mut seed: u64 = 1;
+    let mut solver = Solver::Auto;
     let mut show_coverage = false;
     let mut path: Option<String> = None;
     while let Some(arg) = args.next() {
@@ -216,6 +218,30 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
+        } else if arg == "--solver" || arg.starts_with("--solver=") {
+            if command != "run" {
+                eprintln!("--solver is available only with run");
+                return ExitCode::FAILURE;
+            }
+            let Some(value) = arg
+                .strip_prefix("--solver=")
+                .map(str::to_owned)
+                .or_else(|| args.next())
+            else {
+                eprintln!("--solver requires a value");
+                return ExitCode::FAILURE;
+            };
+            match value.parse::<Solver>() {
+                Ok(parsed) if parsed.is_available() => solver = parsed,
+                Ok(_) => {
+                    eprintln!("the pumpkin solver requires the solver-pumpkin build feature");
+                    return ExitCode::FAILURE;
+                }
+                Err(message) => {
+                    eprintln!("invalid solver '{value}': {message}");
+                    return ExitCode::FAILURE;
+                }
+            }
         } else if path.is_none() {
             path = Some(arg);
         } else {
@@ -227,7 +253,7 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::FAILURE;
     };
-    run(&command, &path, seed, show_coverage)
+    run(&command, &path, seed, show_coverage, solver)
 }
 
 fn render_type(ty: &e1647::ast::TypeExpr) -> String {

@@ -89,6 +89,22 @@ fn coverage_instance_fixtures() {
 }
 
 #[test]
+fn cli_reports_per_unit_coverage_and_derived_grades() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/coverage-instances");
+    let result = Command::new(env!("CARGO_BIN_EXE_e1647"))
+        .args(["run", "--coverage", "--seed", "1"])
+        .arg(fixtures.join("per-unit-reporting.e"))
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    assert!(result.stderr.is_empty(), "{result:?}");
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        include_str!("fixtures/coverage-instances/per-unit-reporting.cli.out")
+    );
+}
+
+#[test]
 fn cli_reports_separate_unit_paths_and_rejects_bad_scopes() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/coverage-instances");
     let result = Command::new(env!("CARGO_BIN_EXE_e1647"))
