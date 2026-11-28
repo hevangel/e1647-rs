@@ -1,6 +1,6 @@
 extend sys {
     run() is also {
-        hdl_load("PROFILE_DESIGN", "profile");
+        hdl_load("PROFILE_DESIGN", "profile", "xezim");
         hdl_run(1);
         hdl_set("profile.word", -2147483648);
         hdl_run(1);
