@@ -653,7 +653,7 @@ not imply full language support or IEEE conformance.
       accepts `UNDEF` for typed defaults and can replace the entire list.
 
 ## M4 — Simulator integration
-- [~] HDL bridge — started: `src/hdl.rs` spawns `xezim` with the VPI
+- [x] The native HDL bridge uses xezim and VPI. `src/hdl.rs` spawns `xezim` with the
       control bridge in `c/xezim_bridge.c` and speaks a line protocol
       (`SET`/`GET`/`RUN`/`FINISH`). The interpreter exposes `hdl_load` /
       `hdl_set` / `hdl_get` / `hdl_run` / `hdl_finish` and routes quoted
@@ -670,18 +670,17 @@ not imply full language support or IEEE conformance.
       Session startup/commands/finish now have bounded handshakes,
       strict reply grammar and checked error/exit propagation. The bridge
       explicitly transports signed 32-bit VPI values and rejects wide/MVL
-      transfers. Optional waveform instrumentation is available.
-- [~] SystemVerilog integration tests and event ordering — started: the
-      compose `mixed` service runs `examples/mixed_counter.e` against
-      `examples/mixed/counter.sv`. Event ordering between e and the HDL
-      simulator is not implemented. The separate scripts/qualify_hdl.py
-      runner checks the pinned xezim profile's exact outputs/diagnostics,
-      VCD transitions and HDL code coverage, including both mixed examples;
-      see [HDL_QUALIFICATION.md](HDL_QUALIFICATION.md). This is explicit
-      hdl_run/READY qualification, not general scheduler integration.
-      The Dockerfile build and actual qualify-hdl/verify services passed
-      locally; a separate CI job builds the image, runs the real profile
-      and retains owned artifact evidence
+      transfers. The pinned Linux profile verifies explicit and default
+      backend selection, signal I/O, explicit stepping, shutdown, and
+      optional waveform instrumentation. See [HDL qualification](HDL_QUALIFICATION.md).
+- [x] SystemVerilog integration tests and event ordering at the explicit
+      xezim step boundary. `hdl_run` returns at the target tick's writable
+      post-NBA checkpoint. The mixed-language regression checks immediate
+      reads, zero-tick and one-tick steps, and delayed nonblocking updates.
+      CI runs it on the pinned simulator alongside both mixed examples,
+      VCD transitions, and HDL code coverage. Automatic coordination of
+      the e and HDL schedulers remains future work. See
+      [HDL_QUALIFICATION.md](HDL_QUALIFICATION.md).
 - [x] Experimental single-source WASM build and browser sandbox API:
       versioned parse/check/run ABI, spanned diagnostics, console text,
       DUT failure counts and basic/derived coverage summaries. Disposable workers

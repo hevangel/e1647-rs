@@ -6305,6 +6305,22 @@ unsigned value. Both cases enforce the complete predicate. The same
 fixture runs with a backend that fails the test if it receives a partial
 translation.
 
+## SystemVerilog ordering at explicit HDL steps
+
+The `event-ordering` fixture drives two clock edges from e and checks
+immediate and delayed nonblocking assignments at the pinned xezim VPI
+boundary. Before stepping, e sees the previous count. A zero-tick step
+exposes the new count while the delayed assignment remains pending. A
+one-tick step exposes both the count and the delayed assignment due at
+its target tick. The recorded edge times verify that zero-tick steps
+preserve simulation time.
+
+The real xezim 0.11.3 profile passed all nine cases with the bridge
+rebuilt under `cc -Wall -Wextra -Werror`. The raw VPI commands, VCD
+transitions through tick 9, HDL coverage checks, and all three Python
+artifact-oracle tests passed. The same runner failed on the new fixture's
+output with the previous `cbAfterDelay` bridge.
+
 ## Reproducible seeded object generation
 
 The native CLI regression compares complete rendered objects across
@@ -6330,3 +6346,17 @@ with a caller-supplied backend through `run_with_solver`.
 Formatting, default and all-feature Clippy, and `git diff --check`
 passed. All-target tests passed with 606 default-feature tests and 626
 all-feature tests.
+
+## Native xezim/VPI backend selection
+
+The positive HDL profile selects `xezim` explicitly through `hdl_load`.
+The mixed counter examples exercise default selection. Both use the
+native bridge's signed 32-bit transport and explicit simulation steps.
+The pinned xezim 0.11.3 build at `058f2bba` passed all eight profile cases,
+the raw bridge command checks, exact VCD transitions through tick 9,
+and the HDL code coverage checks. The Docker build used the cloud CA
+bundle as a temporary BuildKit secret to verify dependency downloads.
+
+Formatting, default and all-feature Clippy, and the three Python HDL
+oracle tests passed. All-target test runs passed with 602 default-feature
+tests and 622 all-feature tests. `git diff --check` passed.
