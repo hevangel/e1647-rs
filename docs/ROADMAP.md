@@ -656,8 +656,11 @@ not imply full language support or IEEE conformance.
       `min_value` and `max_value` methods reject nonnumeric results, including
       singleton lists. A struct method sharing an aggregate name evaluates
       its receiver once before dispatch.
-      The remaining expression-taking forms, the 27.6 CRC family and
-      27.7 keyed lists are documented gaps in `src/interp.rs`).
+      Declared keyed lists support `key_exists` (27.7) for scalar keys
+      drawn from the item itself or a named field. Lookups read current
+      field values, including changes through aliases. The remaining
+      expression-taking forms, CRC routines, other keyed-list methods
+      and struct-valued keys remain open.
       `resize(size)` preserves the prefix and
       applies the declared element default to newly allocated slots.
       `resize(size, filler[, keep_old])` evaluates the filler per slot,

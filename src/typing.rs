@@ -1441,7 +1441,7 @@ impl<'a> TypeChecker<'a> {
                     }
                     Ty::List(_) => match name.as_str() {
                         "size" | "max_index" => Ty::Int,
-                        "is_empty" | "has" | "all_equal" => Ty::Bool,
+                        "is_empty" | "has" | "all_equal" | "key_exists" => Ty::Bool,
                         _ => Ty::Unknown,
                     },
                     Ty::Sync => match name.as_str() {
