@@ -11,7 +11,7 @@ fn hdl_profile_frontend_fixtures() {
         .filter(|path| path.extension().is_some_and(|ext| ext == "e"))
         .collect();
     files.sort();
-    assert_eq!(files.len(), 6);
+    assert_eq!(files.len(), 7);
     for path in files {
         let parsed = e1647::parser::parse(&fs::read_to_string(&path).unwrap());
         let elaborated = e1647::elab::elaborate(&parsed.declarations);

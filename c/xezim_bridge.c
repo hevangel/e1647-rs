@@ -8,9 +8,8 @@
  *
  *   SET <path> <value>   -> OK            (vpi_put_value, vpiNoDelay)
  *   GET <path>           -> VAL <value>   (vpi_get_value, vpiIntVal)
- *   RUN <delay>          -> OK, then READY once the callback re-enters
- *                           the loop after advancing simulation time
- *                           (cbAfterDelay)
+ *   RUN <delay>          -> OK, then READY at the target tick's writable
+ *                           post-NBA checkpoint (cbReadWriteSynch)
  *   FINISH               -> BYE           (vpi_control(vpiFinish))
  *
  * Anything unknown answers `ERR <reason>`. Lines the simulator itself
@@ -54,8 +53,8 @@ static int parse_delay(const char *text, uint64_t *delay)
     return 1;
 }
 
-/* After a RUN the simulation advanced; re-enter the control loop and
- * tell the driver we can accept commands again. */
+/* Resume after the simulator has processed active and nonblocking updates
+ * for this step. The callback must also allow the driver's next SET. */
 static PLI_INT32 reenter_cb(p_cb_data cb_data)
 {
     (void)cb_data;
@@ -161,7 +160,7 @@ static void control_loop(void)
             delay_time.high = (PLI_UINT32)(delay >> 32);
             delay_time.low = (PLI_UINT32)delay;
             memset(&callback_data, 0, sizeof callback_data);
-            callback_data.reason = cbAfterDelay;
+            callback_data.reason = cbReadWriteSynch;
             callback_data.cb_rtn = reenter_cb;
             callback_data.time = &delay_time;
             callback_data.index = 0;
