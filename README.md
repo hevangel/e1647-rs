@@ -140,6 +140,7 @@ extend sys {
 };
 ```
 
+Declarative options outside the supported group or item scope report `E0224`.
 `run --coverage` reports collected data. Mode `off` pauses collection
 without clearing counts; `count_only` also collects counts. Boolean
 values can enable or disable collection. The bucket limit accepts

@@ -321,16 +321,21 @@ fn coverage_options_are_checked_by_the_cli_and_valid_scopes_execute() {
     let directory =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/typing-coverage-options");
     for command in ["elab", "run"] {
-        let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
-            .arg(command)
-            .arg(directory.join("boolean-values.e"))
-            .output()
-            .expect("CLI starts");
-        assert!(
-            !result.status.success(),
-            "{command} accepted non-Boolean options"
-        );
-        assert!(String::from_utf8_lossy(&result.stderr).contains("error[E0220]: coverage when"));
+        for (fixture, diagnostic) in [
+            ("boolean-values.e", "error[E0220]: coverage when"),
+            (
+                "unsupported-options.e",
+                "error[E0224]: unsupported coverage",
+            ),
+        ] {
+            let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
+                .arg(command)
+                .arg(directory.join(fixture))
+                .output()
+                .expect("CLI starts");
+            assert!(!result.status.success(), "{command} accepted {fixture}");
+            assert!(String::from_utf8_lossy(&result.stderr).contains(diagnostic));
+        }
     }
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_e1647"))
         .arg("run")

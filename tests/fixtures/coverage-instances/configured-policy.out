@@ -1,0 +1,5 @@
+probes 3 2
+check
+dut_error: illegal coverage value 1 in 'policy_u.cg.n@sys.b'
+final
+Checking is complete - 1 DUT error(s).
