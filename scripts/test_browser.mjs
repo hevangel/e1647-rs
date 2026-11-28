@@ -135,14 +135,15 @@ try {
   assert.deepEqual(group.items[0].buckets.map(bucket => bucket.hits), ["1", "1"]);
   checks.push("basic coverage summary");
   for (const name of ["coverage-graphs/cross-transition", "coverage-graphs/duplicate-labels",
-    "coverage-graphs/empty-unbounded", "coverage-graphs/all-masked", "wasm-api/derived-unbucketed"]) {
+    "coverage-graphs/empty-unbounded", "coverage-graphs/all-masked",
+    "coverage-instances/per-unit-reporting", "wasm-api/derived-unbucketed"]) {
     const path = resolve(root, "tests/fixtures", name);
     const result = await request(await readFile(`${path}.e`, "utf8"), { operation: "run" });
     assert.equal(result.ok, true, name);
     assert.deepEqual(result.coverage, JSON.parse(await readFile(`${path}.browser.json`, "utf8")), name);
   }
   assert.deepEqual(group.derived, []);
-  checks.push("derived coverage summaries, hidden sources, masks, duplicate labels and exact counters");
+  checks.push("derived coverage summaries, per-unit grades, hidden sources, filters, masks, duplicate labels and exact counters");
   for (const name of ["constant-names", "escaped-range-label"]) {
     const path = resolve(root, "tests/fixtures/coverage-graphs", name);
     const result = await request(await readFile(`${path}.e`, "utf8"), { operation: "run" });

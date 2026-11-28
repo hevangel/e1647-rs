@@ -503,7 +503,7 @@ not imply full language support or IEEE conformance.
       Static temporal event paths parse. Rechecked waits preserve age and new
       waits reset it. Active event-reference rebinding, indexed temporal path
       syntax and complete event-specific timelines remain gaps
-- [~] Coverage data model and reports — started: `src/coverage.rs`
+- [x] Coverage data model and reports — `src/coverage.rs`
       builds buckets and grades from the recorded groups (14.3's
       ranges/defaults, 14.6 merging), the interpreter samples on the
       group's event, derived items collect (14.5 transitions as
@@ -524,9 +524,12 @@ not imply full language support or IEEE conformance.
       Runtime collection starts disabled until enabled explicitly.
       Per-unit scoping follows the nearest requested unit in the field
       tree, including inherited units, flattened lists and unsampled
-      instances. Group/basic-item `when` filters run in the owner context;
-      hidden sources remain available to derived items. Full option type
-      checking and remaining option semantics are unfinished
+      instances. Group/basic-item `when` filters run in the owner context.
+      Hidden sources remain available to derived items. The shared
+      `per-unit-reporting.e` fixture verifies separate unit grades, hidden
+      sources, and filtered transitions in the native CLI and browser API.
+      The next milestone tracks remaining coverage option semantics and
+      type checking.
 - [~] Coverage configuration options (14.9) and per-unit-instance options (14.2.2) —
       started: the configuration record (`CoverageConfig`: the
       coverage mode per 14.2's NOTE, `max_int_buckets` per 14.3's

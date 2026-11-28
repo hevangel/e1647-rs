@@ -6334,6 +6334,21 @@ Formatting, default and all-feature Clippy, WebAssembly all-target
 compilation, and `git diff --check` passed. All-target tests passed with
 602 default-feature tests and 622 all-feature tests.
 
+## Coverage data model and reports
+
+The shared `per-unit-reporting.e` fixture exercises separate counts for
+`sys.a` and `sys.b`. The hidden `state` item contributes to the cross.
+The transition filter skips one observation on `sys.a` while preserving
+the source history for the next transition. The CLI reports group grades
+of 67% and 50%. The browser response reports the underlying grades of
+two-thirds and one-half. Both reports match the expected bucket hits and
+derived combinations.
+
+Formatting, default and all-feature Clippy, the release WebAssembly build,
+and `git diff --check` passed. All-target tests passed with 603 default-feature
+tests and 623 all-feature tests. All 18 browser check groups passed with
+Playwright 1.64.1 and system Chromium 156.0.8078.79.
+
 ## Pluggable bounded integer solvers
 
 The shared backend tests exercise seeded solutions, unsatisfiable
