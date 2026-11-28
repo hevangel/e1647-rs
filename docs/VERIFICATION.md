@@ -6287,6 +6287,20 @@ evaluated during list dispatch. Runtime regressions also check that
 `min_value` and `max_value` reject nonnumeric inputs, including a
 singleton Boolean.
 
+## Coverage configuration and per-unit options
+
+Elaboration reports `E0224` for unknown declarative options and for
+options placed on a group or item kind that cannot apply them. The native
+`elab` and `run` entry points reject those declarations.
+
+The `configured-policy` fixture sets the coverage mode, integer bucket
+limit, default hit goal, and illegal-value timing in one call. Two unit
+instances exercise a per-unit ignore rule overlapping an illegal value.
+The ignored overlap emits no error, and the other unit's illegal value is
+reported after `check()` and before `finalize()`. Exact callback counts,
+bucket hits, and grades verify that pausing skips callbacks and resuming
+in `count_only` retains the existing counts.
+
 ## Default coverage buckets through scalar aliases
 
 Basic items use the resolved scalar type of their declaration or
@@ -6300,6 +6314,37 @@ WebAssembly all-target compilation, and `git diff --check` passed.
 All-target tests passed with 601 default-feature tests and 621
 all-feature tests.
 
+## Bounded-integer constraint IR
+
+The enumeration backend and the interpreter agree on the complete
+solution sets of six `keep` predicates over 119 signed integer pairs per
+predicate. The cases cover nested conjunction and disjunction, negation,
+range and list membership, signed division and remainder, polynomial
+arithmetic, and an unsatisfiable predicate.
+
+The native fallback fixture repeatedly generates an object whose predicate
+combines a supported sum with division by a variable. It also generates a
+`uint` field under an implication whose comparison casts `-1` to an
+unsigned value. Both cases enforce the complete predicate. The same
+fixture runs with a backend that fails the test if it receives a partial
+translation.
+
+## SystemVerilog ordering at explicit HDL steps
+
+The `event-ordering` fixture drives two clock edges from e and checks
+immediate and delayed nonblocking assignments at the pinned xezim VPI
+boundary. Before stepping, e sees the previous count. A zero-tick step
+exposes the new count while the delayed assignment remains pending. A
+one-tick step exposes both the count and the delayed assignment due at
+its target tick. The recorded edge times verify that zero-tick steps
+preserve simulation time.
+
+The real xezim 0.11.3 profile passed all nine cases with the bridge
+rebuilt under `cc -Wall -Wextra -Werror`. The raw VPI commands, VCD
+transitions through tick 9, HDL coverage checks, and all three Python
+artifact-oracle tests passed. The same runner failed on the new fixture's
+output with the previous `cbAfterDelay` bridge.
+
 ## Reproducible seeded object generation
 
 The native CLI regression compares complete rendered objects across
@@ -6312,3 +6357,45 @@ Comparisons run within the default build and within the Pumpkin build.
 Formatting, default and all-feature Clippy, WebAssembly all-target
 compilation, and `git diff --check` passed. All-target tests passed with
 602 default-feature tests and 622 all-feature tests.
+
+## Coverage data model and reports
+
+The shared `per-unit-reporting.e` fixture exercises separate counts for
+`sys.a` and `sys.b`. The hidden `state` item contributes to the cross.
+The transition filter skips one observation on `sys.a` while preserving
+the source history for the next transition. The CLI reports group grades
+of 67% and 50%. The browser response reports the underlying grades of
+two-thirds and one-half. Both reports match the expected bucket hits and
+derived combinations.
+
+Formatting, default and all-feature Clippy, the release WebAssembly build,
+and `git diff --check` passed. All-target tests passed with 603 default-feature
+tests and 623 all-feature tests. All 18 browser check groups passed with
+Playwright 1.64.1 and system Chromium 156.0.8078.79.
+
+## Pluggable bounded integer solvers
+
+The shared backend tests exercise seeded solutions, unsatisfiable
+constraints, and unsupported domains with enumeration and Pumpkin.
+Enumeration declines arithmetic it cannot represent. Native CLI tests
+check explicit selection, availability diagnostics, and equivalence
+between default and explicit `auto`. The library test runs generation
+with a caller-supplied backend through `run_with_solver`.
+
+Formatting, default and all-feature Clippy, and `git diff --check`
+passed. All-target tests passed with 606 default-feature tests and 626
+all-feature tests.
+
+## Native xezim/VPI backend selection
+
+The positive HDL profile selects `xezim` explicitly through `hdl_load`.
+The mixed counter examples exercise default selection. Both use the
+native bridge's signed 32-bit transport and explicit simulation steps.
+The pinned xezim 0.11.3 build at `058f2bba` passed all eight profile cases,
+the raw bridge command checks, exact VCD transitions through tick 9,
+and the HDL code coverage checks. The Docker build used the cloud CA
+bundle as a temporary BuildKit secret to verify dependency downloads.
+
+Formatting, default and all-feature Clippy, and the three Python HDL
+oracle tests passed. All-target test runs passed with 602 default-feature
+tests and 622 all-feature tests. `git diff --check` passed.
