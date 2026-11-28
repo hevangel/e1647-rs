@@ -50,9 +50,12 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   names, and simple numeric-looking quoted HDL paths keep their quotes. This
   does not extend escaped/indexed HDL path parsing or execute MVL numerals.
 - **Elaboration.** The composed types feed the interpreter: `when`
-  subtypes synthesize subtype views whose members apply;
-  `typeof()`/`typeof_item()` type positions resolve; template instances
-  monomorphize (actuals substitute for formals, method bodies included)
+  subtypes synthesize subtype views whose members apply. Whole-object
+  generation samples the base first and then generates ordinary fields
+  of active views under their local constraints. Dynamic event declarations,
+  `on` actions, and supported `@sim` triggers follow the live determinant.
+  Type positions such as `typeof()` and `typeof_item()` resolve. Template
+  instances monomorphize (actuals substitute for formals, method bodies included)
   and `template extend` blocks apply to the instances whose actuals
   match; static members register per type. After composition, the
   conservative type check ([`typing`]) walks every method body, field

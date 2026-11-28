@@ -469,11 +469,12 @@ impl ListValue {
     }
 }
 
+#[derive(Clone)]
 struct ObjectInstance {
     type_name: String,
     /// Declaration order preserved; `gen` and formatting rely on it.
     fields: Vec<(String, Value)>,
-    /// Lazy non-generative fields, keyed by their declaring type and slot.
+    /// Fields scoped to a live when view, keyed by declaration.
     subtype_fields: BTreeMap<(usize, usize), Value>,
     /// `simple_port` members: port name → HDL location for the bridge.
     ports: Vec<(String, String)>,
@@ -846,6 +847,7 @@ struct SimTrigger {
     /// parentheses.
     condition: Expr,
     span: crate::ast::Span,
+    subtype_local: bool,
 }
 
 struct CoverageAxis {
@@ -983,6 +985,7 @@ struct Interp<'a> {
     /// event-or-port path) — the edge detection's baseline. `None` marks
     /// a trigger whose expression has not been sampleable yet.
     sim_prev: BTreeMap<(usize, String), Option<i128>>,
+    sim_trigger_prev: BTreeMap<(usize, String, String), i128>,
     /// The `keep <port>.edge() == <value>` attribute values (9.7.3)
     /// per (type name, port name); the sampling default is `change`.
     port_edges: BTreeMap<(String, String), String>,
@@ -1395,33 +1398,42 @@ fn run_inner(
         .types
         .iter()
         .flat_map(|ty| {
-            ty.events.iter().filter_map(|event| {
-                let trigger = event.trigger.as_ref()?;
-                // Only the single-item edge shapes are wired: multi-item
-                // triggers, `cycle`, grouped guards and `true(exp)`
-                // samples would need the temporal engine at the sampling
-                // point (documented v1 limit).
-                if trigger.cycle || trigger.group_op.is_some() || trigger.items.len() != 1 {
-                    return None;
-                }
-                let item = &trigger.items[0];
-                // `@sim` is the simulation tick the virtual cycles stand
-                // in for; other sampling events are not wired here.
-                if item.path.as_slice() != ["sim"] {
-                    return None;
-                }
-                let routine = item.routine.as_deref()?;
-                if !matches!(routine, "rise" | "fall" | "change") {
-                    return None;
-                }
-                Some(SimTrigger {
-                    type_name: ty.name.clone(),
-                    event_name: event.name.clone(),
-                    routine: routine.to_owned(),
-                    condition: item.condition.clone()?,
-                    span: event.span,
+            let inherited = ty
+                .base
+                .as_deref()
+                .and_then(|name| elaborated.types.iter().find(|parent| parent.name == name))
+                .map_or(0, |parent| parent.events.len());
+            ty.events
+                .iter()
+                .enumerate()
+                .filter_map(move |(position, event)| {
+                    let trigger = event.trigger.as_ref()?;
+                    // Only the single-item edge shapes are wired: multi-item
+                    // triggers, `cycle`, grouped guards and `true(exp)`
+                    // samples would need the temporal engine at the sampling
+                    // point (documented v1 limit).
+                    if trigger.cycle || trigger.group_op.is_some() || trigger.items.len() != 1 {
+                        return None;
+                    }
+                    let item = &trigger.items[0];
+                    // `@sim` is the simulation tick the virtual cycles stand
+                    // in for; other sampling events are not wired here.
+                    if item.path.as_slice() != ["sim"] {
+                        return None;
+                    }
+                    let routine = item.routine.as_deref()?;
+                    if !matches!(routine, "rise" | "fall" | "change") {
+                        return None;
+                    }
+                    Some(SimTrigger {
+                        type_name: ty.name.clone(),
+                        event_name: event.name.clone(),
+                        routine: routine.to_owned(),
+                        condition: item.condition.clone()?,
+                        span: event.span,
+                        subtype_local: !ty.when_of.is_empty() && position >= inherited,
+                    })
                 })
-            })
         })
         .collect();
     let mut interp = Interp {
@@ -1438,6 +1450,7 @@ fn run_inner(
         emitted: std::collections::BTreeSet::new(),
         sim_triggers,
         sim_prev: BTreeMap::new(),
+        sim_trigger_prev: BTreeMap::new(),
         port_edges: collect_port_edge_attributes(elaborated),
         temporal_log: Vec::new(),
         instance_rules: Vec::new(),
@@ -1919,12 +1932,7 @@ impl<'a> Interp<'a> {
         order.push(index);
         // Snapshot the field values: the walk never holds a borrow (a
         // list's shared storage may be mutated inside a deeper visit).
-        let fields: Vec<Value> = self.instances[index]
-            .fields
-            .iter()
-            .map(|(_, value)| value.clone())
-            .collect();
-        for value in fields {
+        for (_, value) in self.active_instance_fields(index) {
             match value {
                 Value::Object(child) => {
                     self.collect_field_tree(child, order, visited, depth + 1);
@@ -3312,6 +3320,9 @@ impl<'a> Interp<'a> {
                     self.fire_static_event(type_name, member, *span, frame)?;
                 } else {
                     let (path, owner) = self.resolve_emitted_event(target, frame, me)?;
+                    if let Some(owner) = owner {
+                        self.check_subtype_event(owner, &path, *span)?;
+                    }
                     self.fire_event(&path, owner, *span, frame)?;
                 }
                 Ok(Flow::Normal)
@@ -3582,7 +3593,7 @@ impl<'a> Interp<'a> {
         let current = if slot_is_local {
             frame.locals.get(name).cloned()
         } else {
-            self.instances[me_index].get(name).cloned()
+            self.read_instance_field(me_index, frame.method_owner.as_deref(), name)?
         };
         let Some(current) = current else {
             return Err(self.error("E0401", format!("unknown variable '{name}' in gen"), span));
@@ -3639,7 +3650,9 @@ impl<'a> Interp<'a> {
         let types: &[crate::elab::ElaboratedType] = self.types;
         let constraints: Vec<_> = types
             .iter()
-            .find(|t| !slot_is_local && t.name == obj_type_name)
+            .find(|t| {
+                !slot_is_local && t.name == frame.method_owner.as_deref().unwrap_or(&obj_type_name)
+            })
             .map(|t| t.constraints.iter().collect())
             .unwrap_or_default();
         let field_types = [(name.clone(), declared_ty)];
@@ -4087,7 +4100,10 @@ impl<'a> Interp<'a> {
             frame.locals.insert(name.to_owned(), value);
             return Ok(());
         }
-        if self.instances[me].set(name, value) {
+        if let Some((slot, _)) = self.subtype_field_slot(me, frame.method_owner.as_deref(), name) {
+            self.instances[me].subtype_fields.insert(slot, value);
+            Ok(())
+        } else if self.instances[me].set(name, value) {
             Ok(())
         } else {
             Err(self.error("E0401", format!("unknown field '{name}'"), span))
@@ -4329,10 +4345,20 @@ impl<'a> Interp<'a> {
             ));
         };
         let constraints: Vec<_> = ty.constraints.iter().chain(enclosing).collect();
+        let checkpoint =
+            (!ty.whens.is_empty()).then(|| (self.instances.len(), self.instances[index].clone()));
         let mut passes = generation_constraint_passes(&constraints).peekable();
         while let Some((include_soft, constraints)) = passes.next() {
-            match self.gen_object_with_constraints(index, ty, enclosing, &constraints, include_soft)
+            let outcome = self
+                .gen_object_with_constraints(index, ty, enclosing, &constraints, include_soft)
+                .and_then(|()| self.gen_active_subtypes(index, &ty.name));
+            if outcome.is_err()
+                && let Some((len, instance)) = &checkpoint
             {
+                self.instances.truncate(*len);
+                self.instances[index] = instance.clone();
+            }
+            match outcome {
                 Err(ExecError::Diagnostic(Diagnostic {
                     code: "E0407" | "E0417",
                     ..
@@ -4341,6 +4367,106 @@ impl<'a> Interp<'a> {
             }
         }
         unreachable!("generation always attempts its declared constraints")
+    }
+
+    fn gen_active_subtypes(&mut self, index: usize, parent: &str) -> Result<(), ExecError> {
+        let types = self.types;
+        let Some(parent) = types.iter().find(|ty| ty.name == parent) else {
+            return Ok(());
+        };
+        if parent.whens.is_empty() {
+            return Ok(());
+        }
+        for view in types.iter().filter(|view| {
+            !view.when_of.is_empty() && view.base.as_deref() == Some(parent.name.as_str())
+        }) {
+            if !self.instance_matches_view(index, view, false) {
+                continue;
+            }
+            let fields = &view.fields[parent.fields.len()..];
+            let constraints = &view.constraints[parent.constraints.len()..];
+            if !fields.is_empty() || !constraints.is_empty() {
+                self.gen_subtype_fields(index, view, fields, constraints, true)?;
+            }
+            self.gen_active_subtypes(index, &view.name)?;
+        }
+        Ok(())
+    }
+
+    fn gen_subtype_fields(
+        &mut self,
+        index: usize,
+        view: &'a crate::elab::ElaboratedType,
+        added: &[crate::ast::Field],
+        constraints: &[KeepConstraint],
+        regenerate: bool,
+    ) -> Result<(), ExecError> {
+        let mut fields = Vec::new();
+        for field in added {
+            let Some((slot, _)) = self.subtype_field_slot(index, Some(&view.name), &field.name)
+            else {
+                continue;
+            };
+            let present = self.instances[index].subtype_fields.contains_key(&slot);
+            let generative = !field.no_gen && !field.is_const;
+            if !present {
+                let value = if generative {
+                    Value::Void
+                } else {
+                    self.initial_field_value(field)?
+                };
+                self.instances[index].subtype_fields.insert(slot, value);
+            }
+            if generative && (regenerate || !present) {
+                fields.push((slot, (field.name.clone(), field.ty.clone())));
+            }
+        }
+        let field_types: Vec<_> = fields.iter().map(|(_, field)| field.clone()).collect();
+        let constraints: Vec<_> = constraints.iter().collect();
+        let mut frame = Frame {
+            method_owner: Some(view.name.clone()),
+            ..Frame::default()
+        };
+        for (_, constraints) in generation_constraint_passes(&constraints) {
+            let domains = self.constraint_domains(&constraints, &field_types)?;
+            let predicates = generation_predicates(&constraints);
+            let attempts = if fields.is_empty() { 1 } else { 1000 };
+            for _ in 0..attempts {
+                let len = self.instances.len();
+                let saved = self.instances[index].subtype_fields.clone();
+                let outcome = (|| {
+                    let alternative_domains =
+                        self.sample_integer_alternatives(&domains.integer_alternatives);
+                    for (slot, (name, ty)) in &fields {
+                        let value = match alternative_domains.get(name) {
+                            Some(allowed) => self.sample_int_in(ty, allowed)?,
+                            None => self.sample_generation_field(name, ty, &domains)?,
+                        };
+                        self.instances[index].subtype_fields.insert(*slot, value);
+                    }
+                    self.generation_candidate_matches(
+                        &predicates,
+                        Some(&mut frame),
+                        index,
+                        view.span,
+                    )
+                })();
+                if matches!(outcome, Ok(true)) {
+                    return Ok(());
+                }
+                self.instances[index].subtype_fields = saved;
+                self.instances.truncate(len);
+                outcome?;
+            }
+        }
+        Err(self.error(
+            "E0407",
+            format!(
+                "no solution found for the constraints of when subtype '{}'",
+                view.name
+            ),
+            view.span,
+        ))
     }
 
     fn gen_object_with_constraints(
@@ -5732,8 +5858,7 @@ impl<'a> Interp<'a> {
         self.rng.below(1u128 << width_bits(width, default_bits)) as i128
     }
 
-    /// Select a method from a view that can use existing constraints and
-    /// event registrations, with lazy slots for non-generative scalar fields.
+    /// Select a method from an active view with a supported instance layout.
     fn explicit_method_owner(
         &self,
         receiver: usize,
@@ -5759,12 +5884,12 @@ impl<'a> Interp<'a> {
                     .fields
                     .strip_prefix(base.fields.as_slice())
                     .is_some_and(|added| {
-                        added.iter().all(|field| self.is_lazy_subtype_field(field))
+                        added
+                            .iter()
+                            .all(|field| self.is_dynamic_subtype_field(field))
                     })
-                && view.constraints == base.constraints
+                && (view.constraints == base.constraints || view.fields.len() > base.fields.len())
                 && view.ports == base.ports
-                && view.events == base.events
-                && view.ons == base.ons
                 && view.covers == base.covers
                 && view.expects == base.expects
                 && self.when_root_base(view).as_deref() == Some(nominal)
@@ -7643,12 +7768,7 @@ impl<'a> Interp<'a> {
         visits.push(path.clone());
         // Snapshot the field values: the walk never holds a borrow (a
         // list's shared storage may be aliased elsewhere).
-        let fields: Vec<(String, Value)> = self.instances[index]
-            .fields
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
-        for (field_name, value) in fields {
+        for (field_name, value) in self.active_instance_fields(index) {
             self.walk_field_value(&path, &field_name, &value, visits, visited, depth);
         }
     }
@@ -9034,8 +9154,12 @@ impl<'a> Interp<'a> {
                     let copied = self.deep_copy_value(&field_value, depth + 1, span)?;
                     self.instances[new_index].set(&field_name, copied);
                 }
-                self.instances[new_index].subtype_fields =
-                    self.instances[index].subtype_fields.clone();
+                for (slot, field_value) in self.instances[index].subtype_fields.clone() {
+                    let copied = self.deep_copy_value(&field_value, depth + 1, span)?;
+                    self.instances[new_index]
+                        .subtype_fields
+                        .insert(slot, copied);
+                }
                 if resolve_method_blocks(self.types, &type_name, "copy", span).is_ok() {
                     self.call_method(new_index, "copy", Vec::new(), span)?;
                 }
@@ -10524,7 +10648,10 @@ impl<'a> Interp<'a> {
         let path = self.event_path(event)?;
         // Entry synchronization precedes the body frame. Object parameters
         // already have evaluated values; binding their names here is pure.
-        let mut frame = Frame::default();
+        let mut frame = Frame {
+            method_owner: program.owner.map(str::to_owned),
+            ..Frame::default()
+        };
         for (parameter, value) in prototype.params.iter().zip(args) {
             frame.locals.insert(parameter.name.clone(), value.clone());
         }
@@ -10541,7 +10668,10 @@ impl<'a> Interp<'a> {
             if path.contains("::") {
                 return path.to_owned();
             }
-            return me.map_or_else(|| path.to_owned(), |owner| instance_event_key(owner, name));
+            return me.map_or_else(
+                || path.to_owned(),
+                |owner| self.registered_event_key(owner, name, frame.method_owner.as_deref()),
+            );
         }
         let mut owner = match segments[0] {
             "sys" => self
@@ -10579,7 +10709,13 @@ impl<'a> Interp<'a> {
                 _ => None,
             });
         }
-        owner.map_or_else(|| path.to_owned(), |owner| instance_event_key(owner, name))
+        owner.map_or_else(
+            || path.to_owned(),
+            |owner| {
+                let view = frame.method_owner.as_deref().filter(|_| me == Some(owner));
+                self.registered_event_key(owner, name, view)
+            },
+        )
     }
 
     fn bind_temporal_events(
@@ -10857,7 +10993,9 @@ impl<'a> Interp<'a> {
         } else {
             owner.map_or_else(
                 || path.to_owned(),
-                |owner| instance_event_key(owner, path.rsplit('.').next().unwrap_or(path)),
+                |owner| {
+                    self.registered_event_key(owner, path.rsplit('.').next().unwrap_or(path), None)
+                },
             )
         };
         self.emitted.insert(key.clone());
@@ -10925,16 +11063,32 @@ impl<'a> Interp<'a> {
             // (11.1.2), and each samples the monitored expression in its
             // own context (a port read resolves through that instance's
             // binding).
+            let Some(view) = self.types.iter().find(|ty| ty.name == trigger.type_name) else {
+                continue;
+            };
             let owners: Vec<usize> = self
                 .instances
                 .iter()
                 .enumerate()
-                .filter(|(_, instance)| instance.type_name == trigger.type_name)
+                .filter(|(owner, instance)| {
+                    instance.type_name == trigger.type_name
+                        || (trigger.subtype_local && self.active_when_view(*owner, view))
+                })
                 .map(|(index, _)| index)
                 .collect();
+            self.sim_trigger_prev.retain(|(owner, ty, event), _| {
+                ty != &trigger.type_name || event != &trigger.event_name || owners.contains(owner)
+            });
             for owner in owners {
                 let sampled = self
-                    .eval(&trigger.condition, &mut Frame::default(), Some(owner))
+                    .eval(
+                        &trigger.condition,
+                        &mut Frame {
+                            method_owner: Some(trigger.type_name.clone()),
+                            ..Frame::default()
+                        },
+                        Some(owner),
+                    )
                     .ok()
                     .and_then(|value| match value {
                         Value::Int(value) => Some(value),
@@ -10945,8 +11099,8 @@ impl<'a> Interp<'a> {
                 let Some(value) = sampled else {
                     continue;
                 };
-                let key = (owner, trigger.event_name.clone());
-                let previous = self.sim_prev.insert(key, Some(value)).flatten();
+                let key = (owner, trigger.type_name.clone(), trigger.event_name.clone());
+                let previous = self.sim_trigger_prev.insert(key, value);
                 if edge_fires(&trigger.routine, previous, value)
                     && let Err(diagnostic) = self.fire_event(
                         &trigger.event_name,
@@ -12957,16 +13111,23 @@ impl<'a> Interp<'a> {
             return Ok(());
         };
         let event_name = path.rsplit('.').next().unwrap_or(path);
-        let type_name = self.instances[owner].type_name.clone();
-        let Some(ty) = self.types.iter().find(|t| t.name == type_name) else {
-            return Ok(());
-        };
-        let blocks: Vec<crate::ast::OnDecl> = ty
-            .ons
-            .iter()
-            .filter(|on| on.path.last().map(String::as_str) == Some(event_name))
-            .cloned()
-            .collect();
+        let nominal = &self.instances[owner].type_name;
+        let mut blocks = Vec::new();
+        for ty in self.types {
+            let start = if &ty.name == nominal {
+                0
+            } else if self.active_when_view(owner, ty) {
+                self.when_parent(ty).map_or(0, |parent| parent.ons.len())
+            } else {
+                continue;
+            };
+            blocks.extend(
+                ty.ons[start..]
+                    .iter()
+                    .filter(|on| on.path.last().map(String::as_str) == Some(event_name))
+                    .map(|on| (&ty.name, on)),
+            );
+        }
         if blocks.is_empty() {
             return Ok(());
         }
@@ -12978,20 +13139,24 @@ impl<'a> Interp<'a> {
         // spin (the v1 limitation — a suspending on-block would strand
         // the emitter's continuation).
         self.atomic_depth += 1;
-        for block in &blocks {
-            let mut frame = Frame::default();
-            match self.exec_block(&block.body, &mut frame, Some(owner))? {
-                Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_) => {}
-                Flow::Stop => {
-                    self.stop_requested = true;
+        let result = (|| {
+            for (view, block) in blocks {
+                let mut frame = Frame {
+                    method_owner: Some(view.clone()),
+                    ..Frame::default()
+                };
+                match self.exec_block(&block.body, &mut frame, Some(owner))? {
+                    Flow::Normal | Flow::Break | Flow::Continue | Flow::Return(_) => {}
+                    Flow::Stop => self.stop_requested = true,
+                    // Suspension is disabled in atomic regions.
+                    Flow::Suspend => {}
                 }
-                // Suspension is disabled in atomic regions.
-                Flow::Suspend => {}
             }
-        }
+            Ok(())
+        })();
         self.atomic_depth -= 1;
         self.depth -= 1;
-        Ok(())
+        result
     }
 
     /// Fire the static event `Type::event` (clause 11.1.4.1/11.2): one
@@ -15562,17 +15727,11 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn is_lazy_subtype_field(&self, field: &crate::ast::Field) -> bool {
-        if field.is_static || !(field.no_gen || field.is_const) {
-            return false;
-        }
-        match self.resolved_hint_type(&field.ty, 0) {
-            Some(TypeExpr::Scalar { .. } | TypeExpr::InlineEnum { .. }) => true,
-            Some(TypeExpr::Named { name, .. }) => self.types.iter().any(|ty| {
-                ty.name == name && ty.kind == DeclarationKind::Type && !ty.enumerals.is_empty()
-            }),
-            _ => false,
-        }
+    fn is_dynamic_subtype_field(&self, field: &crate::ast::Field) -> bool {
+        !field.is_static
+            && !field.range_gen
+            && !self.is_unit_typed(&field.ty)
+            && !self.is_non_generatable_builtin(&field.ty)
     }
 
     fn subtype_field_slot(
@@ -15593,7 +15752,7 @@ impl<'a> Interp<'a> {
             .iter()
             .position(|field| field.name == name)?;
         let declaration = &types[owner].fields[slot];
-        if !self.is_lazy_subtype_field(declaration) {
+        if !self.is_dynamic_subtype_field(declaration) {
             return None;
         }
         if types
@@ -15642,11 +15801,46 @@ impl<'a> Interp<'a> {
         if let Some(value) = self.instances[index].subtype_fields.get(&slot) {
             return Ok(Some(value.clone()));
         }
-        let value = self.initial_field_value(field)?;
-        self.instances[index]
-            .subtype_fields
-            .insert(slot, value.clone());
-        Ok(Some(value))
+        if field.no_gen || field.is_const {
+            let value = self.initial_field_value(field)?;
+            self.instances[index].subtype_fields.insert(slot, value);
+        } else {
+            let declaring_view = &self.types[slot.0];
+            let parent = declaring_view
+                .base
+                .as_deref()
+                .and_then(|base| self.types.iter().find(|ty| ty.name == base));
+            let field_start = parent.map_or(0, |ty| ty.fields.len());
+            let constraint_start = parent.map_or(0, |ty| ty.constraints.len());
+            let len = self.instances.len();
+            let saved = self.instances[index].subtype_fields.clone();
+            let result = self.gen_subtype_fields(
+                index,
+                declaring_view,
+                &declaring_view.fields[field_start..],
+                &declaring_view.constraints[constraint_start..],
+                false,
+            );
+            if let Err(error) = result {
+                self.instances.truncate(len);
+                self.instances[index].subtype_fields = saved;
+                if matches!(
+                    error,
+                    ExecError::Diagnostic(Diagnostic { code: "E0407", .. })
+                ) {
+                    return Err(self.error(
+                        "E0407",
+                        format!(
+                            "no solution found for the constraints of field '{name}' in '{}'",
+                            declaring_view.name
+                        ),
+                        field.name_span,
+                    ));
+                }
+                return Err(error);
+            }
+        }
+        Ok(self.instances[index].subtype_fields.get(&slot).cloned())
     }
 
     fn store_subtype_field(
@@ -15782,6 +15976,95 @@ impl<'a> Interp<'a> {
         None
     }
 
+    fn when_parent(
+        &self,
+        view: &crate::elab::ElaboratedType,
+    ) -> Option<&'a crate::elab::ElaboratedType> {
+        let name = view.base.as_deref()?;
+        self.types.iter().find(|ty| ty.name == name)
+    }
+
+    fn active_when_view(&self, owner: usize, view: &crate::elab::ElaboratedType) -> bool {
+        let nominal = &self.instances[owner].type_name;
+        !view.when_of.is_empty()
+            && &view.name != nominal
+            && self.type_is_a(&view.name, nominal)
+            && self.instance_matches_view(owner, view, false)
+    }
+
+    fn active_instance_fields(&self, owner: usize) -> Vec<(String, Value)> {
+        let instance = &self.instances[owner];
+        let mut fields = instance.fields.clone();
+        fields.extend(
+            instance
+                .subtype_fields
+                .iter()
+                .filter_map(|(&(ty, slot), value)| {
+                    let view = &self.types[ty];
+                    self.active_when_view(owner, view)
+                        .then(|| (view.fields[slot].name.clone(), value.clone()))
+                }),
+        );
+        fields
+    }
+
+    fn check_subtype_event(
+        &self,
+        owner: usize,
+        path: &str,
+        span: crate::ast::Span,
+    ) -> Result<(), ExecError> {
+        let name = path.rsplit('.').next().unwrap_or(path);
+        let nominal = &self.instances[owner].type_name;
+        let has_event = |ty: &crate::elab::ElaboratedType| {
+            ty.events
+                .iter()
+                .any(|event| !event.is_static && event.name == name)
+        };
+        let mut inactive = false;
+        for ty in self.types.iter().filter(|ty| has_event(ty)) {
+            if &ty.name == nominal || self.active_when_view(owner, ty) {
+                return Ok(());
+            }
+            inactive |= !ty.when_of.is_empty() && self.type_is_a(&ty.name, nominal);
+        }
+        if inactive {
+            return Err(self.error(
+                "E0413",
+                format!("event '{name}' is not present on the active subtype"),
+                span,
+            ));
+        }
+        Ok(())
+    }
+
+    fn registered_event_key(&self, owner: usize, name: &str, scope: Option<&str>) -> String {
+        let nominal = &self.instances[owner].type_name;
+        let declares = |event: &crate::ast::EventDecl| !event.is_static && event.name == name;
+        if self
+            .types
+            .iter()
+            .any(|ty| &ty.name == nominal && ty.events.iter().any(declares))
+        {
+            return instance_event_key(owner, name);
+        }
+        let view = self.types.iter().enumerate().find(|(_, ty)| {
+            !ty.when_of.is_empty()
+                && self.type_is_a(&ty.name, nominal)
+                && scope.map_or_else(
+                    || self.active_when_view(owner, ty),
+                    |scope| self.type_is_a(scope, &ty.name) || self.active_when_view(owner, ty),
+                )
+                && self
+                    .when_parent(ty)
+                    .is_some_and(|parent| ty.events[parent.events.len()..].iter().any(declares))
+        });
+        match view {
+            Some((position, _)) => instance_event_key(owner, &format!("{name}@{position}")),
+            None => instance_event_key(owner, name),
+        }
+    }
+
     /// Each resolvable determinant must hold on the current field value.
     /// The legacy space form can have a synthetic determinant without a
     /// field. A dynamic type check needs actual fields to discover a new view.
@@ -15792,11 +16075,14 @@ impl<'a> Interp<'a> {
         allow_unresolved: bool,
     ) -> bool {
         view.when_of.iter().all(|(id, value)| {
-            self.instances[index]
-                .get(id)
-                .map_or(allow_unresolved, |field_value| {
-                    value_holds(field_value, value)
-                })
+            let instance = &self.instances[index];
+            let current = self
+                .subtype_field_slot(index, Some(&view.name), id)
+                .and_then(|(slot, _)| instance.subtype_fields.get(&slot))
+                .or_else(|| instance.get(id));
+            current.map_or(allow_unresolved, |field_value| {
+                value_holds(field_value, value)
+            })
         })
     }
 
