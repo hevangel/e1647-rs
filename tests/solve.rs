@@ -1,5 +1,7 @@
 use e1647::ast::Expr;
-use e1647::solve::{SolveOutcome, TranslationError, int_bounds, solve, translate};
+use e1647::solve::{
+    SolveOutcome, Solver, SolverBackend, TranslationError, int_bounds, solve, translate,
+};
 use std::collections::BTreeMap;
 
 fn bounds_from(pairs: &[(&str, (i64, i64))]) -> BTreeMap<String, (i64, i64)> {
@@ -44,6 +46,71 @@ fn parse_exprs(source: &str) -> Vec<Expr> {
             _ => None,
         })
         .collect()
+}
+
+#[test]
+fn selectable_backends_share_the_same_problem_contract() {
+    let bounds = bounds_from(&[("a", (0, 7)), ("b", (0, 7))]);
+    let possible = translate(&parse_exprs("a + b == 7\na > b"), &bounds).unwrap();
+    let impossible = translate(&parse_exprs("a + b == 15"), &bounds).unwrap();
+    let wide = bounds_from(&[("a", (0, 1 << 31))]);
+    let unsupported = translate(&parse_exprs("a == 1"), &wide).unwrap();
+    for solver in [Solver::Enumerate, Solver::Pumpkin] {
+        if !solver.is_available() {
+            assert_eq!(solver.solve(&possible, 42), SolveOutcome::Unsupported);
+            continue;
+        }
+        let assignment = solver.solve(&possible, 42);
+        assert_eq!(assignment, solver.solve(&possible, 42));
+        let SolveOutcome::Solved(values) = assignment else {
+            panic!("{solver:?} should solve the bounded linear problem");
+        };
+        let [a, b] = values.as_slice() else {
+            panic!("expected two values")
+        };
+        assert_eq!(a + b, 7);
+        assert!(a > b);
+        assert_eq!(solver.solve(&impossible, 42), SolveOutcome::Unsat);
+        assert_eq!(solver.solve(&unsupported, 42), SolveOutcome::Unsupported);
+    }
+    let polynomial = translate(&parse_exprs("a * a == 9"), &bounds).unwrap();
+    assert_eq!(
+        Solver::Pumpkin.solve(&polynomial, 42),
+        SolveOutcome::Unsupported
+    );
+    assert!(matches!(
+        Solver::Enumerate.solve(&polynomial, 42),
+        SolveOutcome::Solved(_)
+    ));
+}
+
+#[test]
+fn enumeration_declines_unrepresentable_arithmetic() {
+    use e1647::solve::{BoolNode, BoundedInt, Cmp, Linear, Problem};
+
+    let vars: Vec<_> = ["a", "b", "c"]
+        .into_iter()
+        .map(|name| BoundedInt {
+            name: name.to_owned(),
+            lower: i64::MAX,
+            upper: i64::MAX,
+        })
+        .collect();
+    let problem = Problem {
+        constraints: vec![BoolNode::Atom(Linear {
+            terms: vars
+                .iter()
+                .map(|var| (var.name.clone(), i64::MAX))
+                .collect(),
+            rhs: 0,
+            cmp: Cmp::Eq,
+        })],
+        vars,
+    };
+    assert_eq!(
+        Solver::Enumerate.solve(&problem, 0),
+        SolveOutcome::Unsupported
+    );
 }
 
 #[test]
