@@ -329,9 +329,12 @@ single-source browser sandbox API runs in disposable workers (see
   views). When-qualified field types (`TypeExpr::WhenQualified`,
   `f: LO pkt` or chained `f: LO HI pkt` — parsed as nested
   qualifiers) instantiate the view, so those members apply for the
-  instance and `is a` walks the view's base chain. **Not** full
-  elaboration: base-typed instances do not dynamically match
-  subtypes; the separate conservative type pass checks composed views.
+  instance. `is a` also checks live determinants on base-typed instances.
+  Whole-object generation samples each active view after its parent and
+  stores its ordinary fields by declaring view and field slot. The scheduler
+  resolves active event declarations and `on` actions at emission and
+  samples supported subtype `@sim` triggers at cycle boundaries. The
+  separate conservative type pass checks composed views.
 - `src/builtins.rs` — predeclared names the executed subset relies on:
   the `sys` unit, sequence bases (`any_sequence_item` and siblings), and
   routines such as `out`, `outf`, `message`, `pack`, `append`,

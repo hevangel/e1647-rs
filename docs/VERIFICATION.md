@@ -6121,6 +6121,16 @@ started TCM selects its subtype entry event before the determinant
 changes and resumes its original body after a wait. `compute` also uses
 the subtype event and updates the same field.
 
+The `dynamic-when-generation-events` fixture checks implicit and explicit
+generation, a generated list of structs, nested determinants, and sibling
+field and event identities. The base handler runs once per emission, with
+handlers from the currently active views. Emitting a sibling's same-named
+event leaves the original subtype's waiter parked. The rollback fixture
+checks that a failed generation preserves the prior scoped value and that
+an inactive subtype event reports `E0413`. The
+injected HDL fixture checks that a dynamic `@sim` trigger samples while
+active and establishes a fresh edge baseline after reactivation.
+
 ## Integer subtype range reflection
 
 `set_of_values` reflects constant integer bounds, including through

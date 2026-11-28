@@ -1129,6 +1129,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                         view.constraints.push(constraint.clone())
                     }
                     crate::ast::Member::Method(method) => view.methods.push(method.clone()),
+                    crate::ast::Member::Event(event) => view.events.push(event.clone()),
                     crate::ast::Member::On(on) => view.ons.push(on.clone()),
                     crate::ast::Member::Cover(cover) => view.covers.push(cover.clone()),
                     crate::ast::Member::Expect(expect) => view.expects.push(expect.clone()),

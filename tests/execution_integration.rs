@@ -8,6 +8,7 @@ fn integrated_execution_fixtures_pass_typing_and_native_cli() {
         "qualified-when-fields",
         "live-when-types",
         "live-when-methods",
+        "dynamic-when-generation-events",
         "nested-edges",
         "entry-alias",
         "coverage-owners",
@@ -53,6 +54,50 @@ fn integrated_execution_fixtures_pass_typing_and_native_cli() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn subtype_hdl_trigger_restarts_its_edge_baseline() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/execution-integration/dynamic-when-hdl.e");
+    let parsed = e1647::parser::parse(&fs::read_to_string(&path).unwrap());
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let elaborated = e1647::elab::elaborate(&parsed.declarations);
+    assert!(
+        elaborated.diagnostics.is_empty(),
+        "{:?}",
+        elaborated.diagnostics
+    );
+    let mut signals = e1647::hdl::InjectedSignals::new();
+    signals
+        .at("top.clock", 0, 0)
+        .at("top.clock", 1, 1)
+        .at("top.clock", 2, 0)
+        .at("top.clock", 3, 1)
+        .at("top.clock", 5, 0)
+        .at("top.clock", 6, 1);
+    let result = e1647::interp::run_with_signals(&elaborated, 1, signals);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(
+        result.output,
+        fs::read_to_string(path.with_extension("out")).unwrap()
+    );
+}
+
+#[test]
+fn failed_subtype_generation_preserves_the_previous_value() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/execution-integration/dynamic-when-rollback.e");
+    let parsed = e1647::parser::parse(&fs::read_to_string(path).unwrap());
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let elaborated = e1647::elab::elaborate(&parsed.declarations);
+    let result = e1647::interp::run(&elaborated, 1);
+    assert_eq!(result.output, "13\n");
+    assert_eq!(result.diagnostics.len(), 2, "{:?}", result.diagnostics);
+    assert_eq!(result.diagnostics[0].code, "E0407");
+    assert!(result.diagnostics[0].message.contains("alpha packet_s"));
+    assert_eq!(result.diagnostics[1].code, "E0413");
+    assert!(result.diagnostics[1].message.contains("alpha_only"));
 }
 
 #[test]
