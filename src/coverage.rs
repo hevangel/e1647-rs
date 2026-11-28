@@ -1951,28 +1951,63 @@ fn option_expression(entry: &[Token]) -> &[Token] {
 }
 
 fn option_entry<'a>(tokens: &'a [Token], name: &str) -> Option<&'a [Token]> {
-    let mut start = 0;
+    option_entries(tokens)
+        .filter(|part| part.first().and_then(token_word) == Some(name))
+        .last()
+}
+
+fn option_entries(tokens: &[Token]) -> impl Iterator<Item = &[Token]> {
     let mut depth = 0usize;
-    let mut found = None;
-    for end in 0..=tokens.len() {
-        let separator = end == tokens.len()
-            || (depth == 0
-                && (token_kind_is(&tokens[end], ",") || token_kind_is(&tokens[end], ";")));
-        if separator {
-            let part = &tokens[start..end];
-            if part.first().and_then(token_word) == Some(name) {
-                found = Some(part);
-            }
-            start = end + 1;
-        } else if let TokenKind::Punctuation(symbol) = &tokens[end].kind {
+    tokens
+        .split(move |token| {
+            let TokenKind::Punctuation(symbol) = &token.kind else {
+                return false;
+            };
             match symbol.as_str() {
+                "," | ";" if depth == 0 => return true,
                 "(" | "[" | "{" => depth += 1,
                 ")" | "]" | "}" => depth = depth.saturating_sub(1),
                 _ => {}
             }
+            false
+        })
+        .filter(|part| !part.is_empty())
+}
+
+fn validate_option_names(
+    tokens: &[Token],
+    kind: Option<CoverItemKind>,
+) -> Result<(), crate::diagnostic::Diagnostic> {
+    let context = match kind {
+        None => "group",
+        Some(CoverItemKind::Item) => "item",
+        Some(CoverItemKind::Cross) => "cross",
+        Some(CoverItemKind::Transition) => "transition",
+    };
+    for entry in option_entries(tokens) {
+        let Some(name) = token_word(&entry[0]) else {
+            return Err(option_error(
+                entry,
+                "expected a coverage option name (14.2-14.5)",
+            ));
+        };
+        let supported = match name {
+            "at_least" | "weight" | "radix" | "when" | "no_collect" | "instance_no_collect" => true,
+            "ignore" | "illegal" | "instance_ignore" | "instance_illegal" => kind.is_some(),
+            "per_unit_instance" => kind.is_none(),
+            "per_instance" => matches!(kind, None | Some(CoverItemKind::Item)),
+            "ranges" => kind == Some(CoverItemKind::Item),
+            "name" => matches!(kind, Some(CoverItemKind::Cross | CoverItemKind::Transition)),
+            _ => false,
+        };
+        if !supported {
+            return Err(option_error(
+                entry,
+                &format!("unsupported coverage {context} option '{name}' (14.2-14.5)"),
+            ));
         }
     }
-    found
+    Ok(())
 }
 
 fn option_error(tokens: &[Token], message: &str) -> crate::diagnostic::Diagnostic {
@@ -2015,6 +2050,7 @@ fn hidden_option(tokens: &[Token]) -> Result<bool, crate::diagnostic::Diagnostic
 pub(crate) fn item_options(
     item: &CoverItemDecl,
 ) -> Result<ItemOptions, crate::diagnostic::Diagnostic> {
+    validate_option_names(&item.using, Some(item.kind))?;
     Ok(ItemOptions {
         ignore: option_expr(&item.using, "ignore")?,
         illegal: option_expr(&item.using, "illegal")?,
@@ -2034,6 +2070,7 @@ pub(crate) fn group_options(
     let mut scope_frozen = false;
     for decl in ty.covers.iter().filter(|decl| decl.name == name) {
         for entry in &decl.options {
+            validate_option_names(entry, None)?;
             if let Some(scope_entry) = option_entry(entry, "per_unit_instance") {
                 let value = option_expression(scope_entry);
                 let scope = if scope_entry.len() == 1 {
