@@ -155,6 +155,8 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   nested objects and lists across separate processes for both implicit
   generation and explicit `gen`. `select` distributions
   (weights/min/max/edges/others/normal) bias the sampler.
+  The CLI can select `enumerate` or `pumpkin` through `--solver`.
+  Library callers can supply a `SolverBackend` to `run_with_solver`.
 - **Observability.** Coverage groups (clause 14) collect basic-item
   buckets and grades on their sampling event after
   `set_config(cover, mode, normal)` enables collection. Collection
@@ -164,6 +166,7 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   ranges and Boolean buckets retain their declared/default shapes.
   `run --coverage` reports collected groups; `print`/`out` and the
   message hooks produce the run log.
+  Unknown or unsupported declarative options report `E0224` during elaboration.
   `per_unit_instance [= unit_type]` collects separate groups for the
   nearest containing unit of that type, including unsampled units.
   Group/basic-item `when` expressions gate sampling in their owning
@@ -180,8 +183,9 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   per-unit groups (14.3/14.3.4). Ignored/illegal values add neither hits nor
   derived samples; wholly excluded buckets leave grade denominators and
   hole lists. Illegal values produce DUT errors after check hooks, or at
-  observation when `check_illegal_immediately` is TRUE (29.9). Ignore wins
-  overlapping matches; that policy and exact reporting phase are unqualified.
+  observation when `check_illegal_immediately` is TRUE (29.9). The per-unit
+  fixture verifies that ignore wins overlapping matches and deferred
+  errors appear after `check()` and before `finalize()`.
   Integral/Boolean bucket masks classify comparisons/membership/Boolean
   compositions symbolically, or enumerate at most 65536 candidate visits
   per item refresh for other pure expressions. Wider arithmetic reports
@@ -276,12 +280,13 @@ yet; native-only reports explicitly record reference-not-run. See
 ## Native HDL profile
 
 The [explicit xezim 0.11.3 profile](HDL_QUALIFICATION.md) runs real VPI
-simulation, checking signed 32-bit transfers, both mixed counter examples,
-error diagnostics, VCD transitions and HDL code coverage. The native session
+simulation, checking named and default backend selection, signed 32-bit
+transfers, both mixed counter examples, error diagnostics, VCD transitions
+and HDL code coverage. The native session
 has bounded startup/command/finish handshakes and reaps its owned child on
 failure. Wider/MVL transfers are rejected; E1647_XEZIM_WAVE enables optional
-wave instrumentation. This qualifies explicit hdl_run/READY observations,
-not general e/HDL event ordering. Default cargo tests cover transport and
+wave instrumentation. Explicit `hdl_run` resumes at the target tick's
+writable post-NBA checkpoint. Default cargo tests cover transport and
 frontend mechanics. A separate CI job builds the current Dockerfile and runs
 the real profile, retaining owned evidence and image identity. The Dockerfile
 image and both qualify-hdl/verify Compose services have also passed locally,
@@ -337,8 +342,8 @@ reading, nothing else.
   total degree ≤ 4 over capped domain products; wide domains, division
   and modulo still defer to rejection sampling; `chosen_from` and the
   rgf reduced sets are the sampling-side exceptions).
-- General testbench execution (sequences run inline; the e↔HDL event
-  ordering is not implemented; the VHDL backend is unwritten).
+- General testbench execution, including scheduled sequences, automatic
+  coordination of the e and HDL schedulers, and a VHDL backend.
 - The remaining out-of-scope list of the 2019 migration plan (TLM
   sockets, Excel readers, coverage-database files, message-manager
   tables, encryption, the full reflection model) — semaphores moved out

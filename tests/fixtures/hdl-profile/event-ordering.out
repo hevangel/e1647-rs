@@ -1,0 +1,8 @@
+initial: count 0, edge tick 0, delayed 0
+first write: count 0, edge tick 0, delayed 0
+first zero step: count 1, edge tick 1, delayed 0
+repeated zero step: count 1, edge tick 1, delayed 0
+first one tick: count 1, edge tick 1, delayed 1
+second write: count 1, edge tick 1, delayed 1
+second one tick: count 2, edge tick 2, delayed 2
+second target zero step: count 2, edge tick 2, delayed 2

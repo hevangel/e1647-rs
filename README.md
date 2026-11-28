@@ -140,6 +140,7 @@ extend sys {
 };
 ```
 
+Declarative options outside the supported group or item scope report `E0224`.
 `run --coverage` reports collected data. Mode `off` pauses collection
 without clearing counts; `count_only` also collects counts. Boolean
 values can enable or disable collection. The bucket limit accepts
@@ -217,7 +218,8 @@ The native HDL bridge has an [explicit xezim qualification profile](docs/HDL_QUA
 covering signed 32-bit transfers, counter edges, errors, VCD and HDL code
 coverage. Startup and command waits are bounded; wider/MVL transfers are
 rejected. A separate CI job builds the image and runs the real profile.
-This does not qualify general e/HDL event ordering.
+Explicit `hdl_run` returns after due SystemVerilog nonblocking updates at the
+target tick. The e scheduler advances independently.
 
 ## From Slopman to Rustman
 
@@ -287,6 +289,12 @@ instead — linear ones through the backend conjunction solver (the
 feature-independent bounded enumeration solver — and everything else
 falls back to rejection sampling (see `src/interp.rs` for the exact
 semantics and its honest limits).
+
+Use `e1647 run --solver enumerate <source.e>` to select bounded integer
+enumeration, including for linear problems. `--solver pumpkin` selects
+the Pumpkin backend in builds with `solver-pumpkin`. `auto` is the
+default. Unsupported problems fall back to seeded runtime sampling.
+Rust callers can supply a `SolverBackend` to `interp::run_with_solver`.
 
 ## Repository layout
 

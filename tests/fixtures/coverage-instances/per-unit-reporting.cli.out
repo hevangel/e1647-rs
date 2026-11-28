@@ -1,0 +1,23 @@
+coverage for channel_u:
+  unit instance sys.a:
+  cover cg (cg): 3 samples, grade 67%
+    item accepted: 2/2 buckets, 3 samples, 0 ungradeable
+      0 "FALSE": 2/1 hits
+      1 "TRUE": 1/1 hits
+    derived paired: 3 samples, 3 combinations, goal=1, weight=1, grade 75%
+      (FALSE, FALSE): 1 hits
+      (TRUE, FALSE): 1 hits
+      (FALSE, TRUE): 1 hits
+    derived changes: 1 samples, 1 combinations, goal=1, weight=1, grade 25%
+      TRUE→FALSE: 1 hits
+  unit instance sys.b:
+  cover cg (cg): 3 samples, grade 50%
+    item accepted: 1/2 buckets, 3 samples, 0 ungradeable
+      0 "FALSE": 3/1 hits
+      1 "TRUE": 0/1 hits
+    derived paired: 3 samples, 2 combinations, goal=1, weight=1, grade 50%
+      (TRUE, FALSE): 2 hits
+      (FALSE, FALSE): 1 hits
+    derived changes: 2 samples, 2 combinations, goal=1, weight=1, grade 50%
+      TRUE→TRUE: 1 hits
+      TRUE→FALSE: 1 hits
