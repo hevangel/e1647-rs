@@ -15,6 +15,10 @@ The runner checks xezim 0.11.3, revision `058f2bba` (the full source pin is
 - Signed 32-bit transfers, quoted paths and direct hdl_get/hdl_set calls.
 - Three driven rising edges, settled counter values after explicit one-tick
   advances, zero-delay completion and repeated finish.
+- Exact observations before and after zero-tick and one-tick steps. A clock
+  edge driven by e triggers both immediate and one-tick-delayed nonblocking
+  assignments in SystemVerilog. The trace checks the edge's simulation tick
+  as well as the values seen by e.
 - Both repository counter examples, including simple_port access, with exact
   five-cycle output. A printed MISMATCH cannot pass just because exit was zero.
 - Missing signals, X/Z reads, wide signals, out-of-range writes and whitespace/
@@ -129,6 +133,15 @@ exchange to 1 MiB, and the reader queue to eight lines. Transport/bridge errors
 close and reap the owned child and preserve the failure for later operations.
 The session does not manage descendant process trees. The qualification runner
 adds process-group cleanup; ordinary standalone sessions do not.
+
+For the pinned xezim backend, RUN acknowledges registration with OK. READY
+comes from `cbReadWriteSynch` at the target tick, after active work and due
+nonblocking assignments (NBA) have settled. e can read those values and
+issue another SET from that writable checkpoint. `hdl_run(0)` settles due
+work at the current tick. `hdl_run(1)` also advances one tick and exposes
+updates due there. A read immediately after driving a clock, before any
+step, can still observe the previous value. The e virtual scheduler advances
+independently.
 
 Signal paths contain 1..511 printable ASCII bytes without whitespace. The
 bridge transports vpiIntVal, explicitly rejecting signals outside 1..32 bits,

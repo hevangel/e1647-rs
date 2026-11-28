@@ -6290,6 +6290,22 @@ WebAssembly all-target compilation, and `git diff --check` passed.
 All-target tests passed with 601 default-feature tests and 621
 all-feature tests.
 
+## SystemVerilog ordering at explicit HDL steps
+
+The `event-ordering` fixture drives two clock edges from e and checks
+immediate and delayed nonblocking assignments at the pinned xezim VPI
+boundary. Before stepping, e sees the previous count. A zero-tick step
+exposes the new count while the delayed assignment remains pending. A
+one-tick step exposes both the count and the delayed assignment due at
+its target tick. The recorded edge times verify that zero-tick steps
+preserve simulation time.
+
+The real xezim 0.11.3 profile passed all nine cases with the bridge
+rebuilt under `cc -Wall -Wextra -Werror`. The raw VPI commands, VCD
+transitions through tick 9, HDL coverage checks, and all three Python
+artifact-oracle tests passed. The same runner failed on the new fixture's
+output with the previous `cbAfterDelay` bridge.
+
 ## Reproducible seeded object generation
 
 The native CLI regression compares complete rendered objects across
