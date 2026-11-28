@@ -966,7 +966,7 @@ fn list_aggregates_reject_wrong_item_types() {
 }
 
 #[test]
-fn keyed_list_membership_checks_receiver_and_argument() {
+fn keyed_list_queries_check_receiver_argument_and_index_ambiguity() {
     for (source, message) in [
         (
             "var xs: list of int; xs.key_exists(1);",
@@ -979,6 +979,14 @@ fn keyed_list_membership_checks_receiver_and_argument() {
         (
             "var xs: list (key: it) of int; xs.key_exists({1});",
             "expects a scalar key",
+        ),
+        (
+            "var xs: list (key: it) of int = {2}; xs.key_index(1);",
+            "found no matching key",
+        ),
+        (
+            "var xs: list (key: it) of int = {1; 2; 1}; xs.key_index(1);",
+            "requires a unique matching key",
         ),
     ] {
         let diagnostics = run_error(&format!("extend sys {{ run() is also {{ {source} }}; }};"));
