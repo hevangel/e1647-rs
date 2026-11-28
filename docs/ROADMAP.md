@@ -326,7 +326,7 @@ not imply full language support or IEEE conformance.
       combined view, budget-capped); `is a` checks walk the view's
       base chain. Base-typed instances do not dynamically match
       subtypes yet; the conservative type pass checks composed views
-- [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
+- [x] Constraint IR for bounded-integer `keep` expressions. `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer
       fields into a solver problem; range membership (`x in [lo..hi]`)
       translates to the two comparisons; unsupported shapes fall back to
@@ -345,9 +345,10 @@ not imply full language support or IEEE conformance.
       and ordered comparisons constrain the residual from that quotient.
       Signed remainder constraints use truncating division and a signed
       residual. Signed fields also accept negative literal divisors.
-      Wide domains,
-      general division and modulo, and global constraints
-      remain unsupported by the solver. `keep bind` and
+      Implication uses runtime evaluation. The IR models mathematical
+      integers. Matching every interpreter precision and signedness rule
+      remains open, along with wide domains, general division and modulo,
+      and global constraints. `keep bind` and
       `hdl_path()` / `delayed()` constraints do not gate `gen`.
       `keep` predicates resolve literal defines, integer constant
       expressions in defines, and predefined integer constants. The solver
@@ -357,14 +358,18 @@ not imply full language support or IEEE conformance.
       constraints that reference it — `p.v == select { .. }` rebases to
       `v == select { .. }` (depth-two paths; other shapes drop until
       full CFS lands), so when-view distribution policies drive field
-      generation
-- [~] Pluggable SMT/constraint solver — started: the Pumpkin CP solver
-      (pure Rust, consol-lab) is integrated behind the `solver-pumpkin`
-      cargo feature and is deterministic per seed; CI verifies the feature
-      on ubuntu. Candidates for further/alternative backends: z3.rs (needs
-      the native Z3 library), oxiz (young pure-Rust SMT), rustsat (SAT
-      toolkit). Note: the crates.io `pcp` is an unrelated Post
-      Correspondence Problem searcher, not a CP solver
+      generation. Exhaustive small-domain tests compare the translated
+      solution sets with the interpreter. An execution fixture verifies that
+      a mixed supported and unsupported constraint uses runtime sampling
+      and enforces the full predicate.
+- [x] Pluggable constraint solver for the bounded integer IR. Built-in
+      `enumerate` and optional `pumpkin` backends share the `SolverBackend`
+      interface. `run --solver` selects a built-in backend, and library
+      callers can provide their own implementation with `run_with_solver`.
+      `auto` preserves the existing policy: enumeration for polynomial
+      problems and Pumpkin for supported linear problems when compiled in.
+      An unsupported result defers to runtime sampling. Tests exercise
+      satisfiable, unsatisfiable, and unsupported problems on both backends.
 - [x] Reproducible seeded randomized objects — `gen` is a seeded
       rejection sampler by default and, with `solver-pumpkin`, a seeded
       Pumpkin solve; values may differ between backends for the same seed
@@ -498,7 +503,7 @@ not imply full language support or IEEE conformance.
       Static temporal event paths parse. Rechecked waits preserve age and new
       waits reset it. Active event-reference rebinding, indexed temporal path
       syntax and complete event-specific timelines remain gaps
-- [~] Coverage data model and reports — started: `src/coverage.rs`
+- [x] Coverage data model and reports — `src/coverage.rs`
       builds buckets and grades from the recorded groups (14.3's
       ranges/defaults, 14.6 merging), the interpreter samples on the
       group's event, derived items collect (14.5 transitions as
@@ -519,11 +524,14 @@ not imply full language support or IEEE conformance.
       Runtime collection starts disabled until enabled explicitly.
       Per-unit scoping follows the nearest requested unit in the field
       tree, including inherited units, flattened lists and unsampled
-      instances. Group/basic-item `when` filters run in the owner context;
-      hidden sources remain available to derived items. Full option type
-      checking and remaining option semantics are unfinished
-- [~] Coverage configuration options (14.9) and per-unit-instance options (14.2.2) —
-      started: the configuration record (`CoverageConfig`: the
+      instances. Group/basic-item `when` filters run in the owner context.
+      Hidden sources remain available to derived items. The shared
+      `per-unit-reporting.e` fixture verifies separate unit grades, hidden
+      sources, and filtered transitions in the native CLI and browser API.
+      The next milestone tracks remaining coverage option semantics and
+      type checking.
+- [x] Coverage configuration (14.9) and per-unit-instance options (14.2.2)
+      for the supported sampler. The configuration record (`CoverageConfig`: the
       coverage mode per 14.2's NOTE, `max_int_buckets` per 14.3's
       bracket) is honored through the `build_with_config` builder API,
       and through `set_config(cover, ...)` (29.9). Modes `normal` and
@@ -540,7 +548,9 @@ not imply full language support or IEEE conformance.
       `per_unit_instance [= unit_type]` and `instance_no_collect` with
       `inst` collect and present per-unit data (14.2.2/14.3.4).
       Counts follow the physical unit when aliases move it to a new path.
-      Structural option/scope errors are E0224. Other runtime configuration
+      Structural option/scope errors are E0224. Unknown or unsupported option
+      names are diagnosed at their declaration, including options placed on a
+      group or item kind that cannot apply them. Other runtime configuration
       categories/options, composite-valued predicates,
       general real predicates, general constant/type resolution,
       remaining filter semantics and full option type checking
@@ -610,7 +620,9 @@ not imply full language support or IEEE conformance.
       gaps; constant predicates work over nested sources. Unit scope freezes
       after all instance-dependent coverage options. Source-kind-aware metadata
       lookup resolves aliased items despite physically earlier extensions.
-      Exact overlap/phase/filter-side-effect behavior needs qualification
+      A mixed per-unit regression checks ignore/illegal overlap, deferred
+      diagnostics, callback evaluation counts, and count retention across a
+      pause and resume. Broader filter-side-effect behavior remains open.
 - [~] Part 2 predefined routine library — started with the reflection
       set: `set_of_values(<type>)`/`full_set_of_values(<type>)`
       (5.10.5/5.10.6 — the argument parses as a type) build the
@@ -640,6 +652,10 @@ not imply full language support or IEEE conformance.
       using raw items or one scalar key expression. `sort_by_field` uses a
       named scalar field on each struct item. `get_indices` selects multiple
       indexes in argument order and shares individual indexing's bounds checks.
+      Real `product()` uses the multiplicative identity. The numeric
+      `min_value` and `max_value` methods reject nonnumeric results, including
+      singleton lists. A struct method sharing an aggregate name evaluates
+      its receiver once before dispatch.
       The remaining expression-taking forms, the 27.6 CRC family and
       27.7 keyed lists are documented gaps in `src/interp.rs`).
       `resize(size)` preserves the prefix and

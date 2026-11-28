@@ -958,9 +958,8 @@ struct Interp<'a> {
     instances: Vec<ObjectInstance>,
     rng: Rng,
     /// The run's seed, handed to the constraint-solver backend for `gen`.
-    /// Only read with the `solver-pumpkin` feature.
-    #[cfg_attr(not(feature = "solver-pumpkin"), allow(dead_code))]
     seed: u64,
+    solver: &'a dyn crate::solve::SolverBackend,
     output: String,
     depth: usize,
     /// Where signal values come from: a live simulator session (spawned
@@ -1337,7 +1336,17 @@ const UNIMPLEMENTED_2019: &[(&str, &str, (usize, usize))] = &[
 
 /// Instantiate the built-in `sys` unit and execute its `run()` methods.
 pub fn run(elaborated: &Elaborated, seed: u64) -> RunResult {
-    run_inner(elaborated, seed, None)
+    run_with_solver(elaborated, seed, &crate::solve::Solver::Auto)
+}
+
+/// Execute with the selected solver for translated generation constraints.
+/// Unsupported problems keep the ordinary runtime sampling fallback.
+pub fn run_with_solver(
+    elaborated: &Elaborated,
+    seed: u64,
+    solver: &dyn crate::solve::SolverBackend,
+) -> RunResult {
+    run_inner(elaborated, seed, solver, None)
 }
 
 /// [`run`] with an injected signal history standing in for the external
@@ -1354,6 +1363,7 @@ pub fn run_with_signals(
     run_inner(
         elaborated,
         seed,
+        &crate::solve::Solver::Auto,
         Some(crate::hdl::SignalSource::Injected(signals)),
     )
 }
@@ -1361,6 +1371,7 @@ pub fn run_with_signals(
 fn run_inner(
     elaborated: &Elaborated,
     seed: u64,
+    solver: &dyn crate::solve::SolverBackend,
     hdl: Option<crate::hdl::SignalSource>,
 ) -> RunResult {
     // Resolve literal defines and integer constant expressions.
@@ -1426,6 +1437,7 @@ fn run_inner(
         instances: Vec::new(),
         rng: Rng::new(seed),
         seed,
+        solver,
         output: String::new(),
         depth: 0,
         hdl,
@@ -4942,9 +4954,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Translate the type's `keep` constraints over its integer scalar
-    /// fields and solve them: linear problems via the backend
-    /// conjunction solver (pumpkin with the cargo feature), non-linear
-    /// problems via the bounded enumeration solver (every build).
+    /// fields and pass them to the selected solver.
     /// `Ok(None)` means the caller must use the rejection sampler:
     /// translation unsupported, backend unavailable, or search unknown.
     fn try_solve_fields(
@@ -4987,21 +4997,30 @@ impl<'a> Interp<'a> {
             Ok(problem) => problem,
             Err(_) => return Ok(None),
         };
-        match crate::solve::solve(&problem, self.seed) {
-            crate::solve::SolveOutcome::Solved(assignment) => Ok(Some(
-                problem
-                    .vars
-                    .iter()
-                    .map(|var| var.name.clone())
-                    .zip(assignment)
-                    .collect(),
-            )),
+        match self.solver.solve(&problem, self.seed) {
+            crate::solve::SolveOutcome::Solved(assignment)
+                if assignment.len() == problem.vars.len()
+                    && problem.vars.iter().zip(&assignment).all(|(var, value)| {
+                        (i128::from(var.lower)..=i128::from(var.upper)).contains(value)
+                    }) =>
+            {
+                Ok(Some(
+                    problem
+                        .vars
+                        .iter()
+                        .map(|var| var.name.clone())
+                        .zip(assignment)
+                        .collect(),
+                ))
+            }
             crate::solve::SolveOutcome::Unsat => Err(self.error(
                 "E0407",
                 format!("the constraints of '{type_name}' are unsatisfiable"),
                 span,
             )),
-            crate::solve::SolveOutcome::Unsupported => Ok(None),
+            crate::solve::SolveOutcome::Unsupported | crate::solve::SolveOutcome::Solved(_) => {
+                Ok(None)
+            }
         }
     }
 
@@ -10079,7 +10098,7 @@ impl<'a> Interp<'a> {
             "product" => 1,
             _ => 0,
         };
-        let mut real_result = 0.0f64;
+        let mut real_result = int_result as f64;
         let mut is_real = false;
         let mut count = 0usize;
         // The extreme trackers (max_value/min_value) start at nothing.
@@ -10092,6 +10111,13 @@ impl<'a> Interp<'a> {
             };
             count += 1;
             if matches!(name, "max_value" | "min_value") {
+                if !matches!(value, Value::Int(_) | Value::Real(_)) {
+                    return Err(self.error(
+                        "E0402",
+                        format!("{name}() expects a numeric item expression"),
+                        span,
+                    ));
+                }
                 let takes_over = match &extreme {
                     None => true,
                     Some(best) => {
@@ -13629,17 +13655,20 @@ impl<'a> Interp<'a> {
                     }
                     extreme_receiver = Some(receiver);
                 }
-                // Numeric aggregates also evaluate per-item expressions;
-                // their existing non-list fallback uses ordinary dispatch.
+                // Numeric aggregates evaluate per-item expressions. A non-list
+                // with the same method name still uses ordinary dispatch.
                 if let Expr::MemberAccess { object, name, .. } = callee.as_ref()
                     && matches!(
                         name.as_str(),
                         "sum" | "product" | "average" | "max_value" | "min_value"
                     )
-                    && let Value::List(list) = self.eval(object, frame, me)?
                 {
-                    let items = list.items.borrow().clone();
-                    return self.atomic_value(|this| this.call_list_aggregate(&items, name, args, frame, me, *span));
+                    let receiver = self.eval(object, frame, me)?;
+                    if let Value::List(list) = receiver {
+                        let items = list.items.borrow().clone();
+                        return self.atomic_value(|this| this.call_list_aggregate(&items, name, args, frame, me, *span));
+                    }
+                    extreme_receiver = Some(receiver);
                 }
                 // A call argument's parameter type is the inference
                 // context for an untyped `evaluate { ... }` in the
@@ -18204,6 +18233,7 @@ mod simulator_cleanup_tests {
         let result = run_inner(
             &elaborated,
             1,
+            &crate::solve::Solver::Auto,
             Some(crate::hdl::SignalSource::Real(Box::new(FailingFinish(
                 Rc::clone(&dropped),
             )))),

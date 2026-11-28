@@ -9,6 +9,8 @@ fn integrated_execution_fixtures_pass_typing_and_native_cli() {
         "entry-alias",
         "coverage-owners",
         "root-events",
+        "list-aggregates",
+        "constraint-fallback",
     ] {
         let path = directory.join(format!("{name}.e"));
         let source = fs::read_to_string(&path).unwrap();
@@ -108,6 +110,88 @@ fn cli_reproduces_complete_generated_objects_for_the_same_seed() {
         snapshots.len(),
         4,
         "each tested seed should vary the generated data"
+    );
+}
+
+#[test]
+fn cli_selects_each_available_constraint_solver() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/execution-integration/solver-selection.e");
+    let run = |options: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_e1647"))
+            .arg("run")
+            .arg(&path)
+            .args(["--seed", "3"])
+            .args(options)
+            .output()
+            .expect("CLI starts")
+    };
+    let enumerated = run(&["--solver", "enumerate"]);
+    assert!(enumerated.status.success(), "{enumerated:?}");
+    assert_eq!(enumerated.stdout, b"15\n");
+    let automatic = run(&["--solver=auto"]);
+    assert!(automatic.status.success(), "{automatic:?}");
+    assert_eq!(automatic, run(&[]));
+
+    let pumpkin = run(&["--solver=pumpkin"]);
+    if cfg!(feature = "solver-pumpkin") {
+        assert_eq!(pumpkin, automatic);
+    } else {
+        assert!(!pumpkin.status.success());
+        assert!(String::from_utf8_lossy(&pumpkin.stderr).contains("requires the solver-pumpkin"));
+    }
+    let invalid = run(&["--solver=missing"]);
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid solver 'missing'"));
+}
+
+#[test]
+fn library_generation_accepts_an_external_solver_backend() {
+    use e1647::solve::{Problem, SolveOutcome, SolverBackend};
+
+    struct FixedSolver;
+    impl SolverBackend for FixedSolver {
+        fn solve(&self, problem: &Problem, seed: u64) -> SolveOutcome {
+            assert_eq!(seed, 3);
+            assert_eq!(problem.vars.len(), 1);
+            assert_eq!(problem.vars[0].name, "code");
+            SolveOutcome::Solved(vec![18])
+        }
+    }
+
+    let parsed = e1647::parser::parse(include_str!(
+        "fixtures/execution-integration/solver-selection.e"
+    ));
+    assert!(parsed.diagnostics.is_empty());
+    let elaborated = e1647::elab::elaborate(&parsed.declarations);
+    assert!(elaborated.diagnostics.is_empty());
+    let result = e1647::interp::run_with_solver(&elaborated, 3, &FixedSolver);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(result.output, "18\n");
+}
+
+#[test]
+fn unsupported_constraint_declines_the_whole_translation() {
+    use e1647::solve::{Problem, SolveOutcome, SolverBackend};
+
+    struct UnexpectedSolver;
+    impl SolverBackend for UnexpectedSolver {
+        fn solve(&self, problem: &Problem, _: u64) -> SolveOutcome {
+            panic!("partially translated constraint reached the solver: {problem:?}");
+        }
+    }
+
+    let parsed = e1647::parser::parse(include_str!(
+        "fixtures/execution-integration/constraint-fallback.e"
+    ));
+    assert!(parsed.diagnostics.is_empty());
+    let elaborated = e1647::elab::elaborate(&parsed.declarations);
+    assert!(elaborated.diagnostics.is_empty());
+    let result = e1647::interp::run_with_solver(&elaborated, 0, &UnexpectedSolver);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(
+        result.output,
+        include_str!("fixtures/execution-integration/constraint-fallback.out")
     );
 }
 

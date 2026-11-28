@@ -152,6 +152,8 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   nested objects and lists across separate processes for both implicit
   generation and explicit `gen`. `select` distributions
   (weights/min/max/edges/others/normal) bias the sampler.
+  The CLI can select `enumerate` or `pumpkin` through `--solver`.
+  Library callers can supply a `SolverBackend` to `run_with_solver`.
 - **Observability.** Coverage groups (clause 14) collect basic-item
   buckets and grades on their sampling event after
   `set_config(cover, mode, normal)` enables collection. Collection
@@ -161,6 +163,7 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   ranges and Boolean buckets retain their declared/default shapes.
   `run --coverage` reports collected groups; `print`/`out` and the
   message hooks produce the run log.
+  Unknown or unsupported declarative options report `E0224` during elaboration.
   `per_unit_instance [= unit_type]` collects separate groups for the
   nearest containing unit of that type, including unsampled units.
   Group/basic-item `when` expressions gate sampling in their owning
@@ -177,8 +180,9 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   per-unit groups (14.3/14.3.4). Ignored/illegal values add neither hits nor
   derived samples; wholly excluded buckets leave grade denominators and
   hole lists. Illegal values produce DUT errors after check hooks, or at
-  observation when `check_illegal_immediately` is TRUE (29.9). Ignore wins
-  overlapping matches; that policy and exact reporting phase are unqualified.
+  observation when `check_illegal_immediately` is TRUE (29.9). The per-unit
+  fixture verifies that ignore wins overlapping matches and deferred
+  errors appear after `check()` and before `finalize()`.
   Integral/Boolean bucket masks classify comparisons/membership/Boolean
   compositions symbolically, or enumerate at most 65536 candidate visits
   per item refresh for other pure expressions. Wider arithmetic reports

@@ -1,0 +1,8 @@
+channel_u.cg@sys.a samples=3 grade=0.667
+accepted samples=3 hits=[2,1]
+paired samples=3 combinations=3
+changes samples=1 combinations=1
+channel_u.cg@sys.b samples=3 grade=0.500
+accepted samples=3 hits=[3,0]
+paired samples=3 combinations=2
+changes samples=2 combinations=2
