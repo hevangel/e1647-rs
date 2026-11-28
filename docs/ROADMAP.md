@@ -333,8 +333,9 @@ not imply full language support or IEEE conformance.
       event declarations, `on` actions and supported `@sim` triggers.
       `start` and `compute` retain the selected method and entry event across
       suspension. Joint constraint solving across base and subtype fields,
-      dynamic range-generated fields, HDL event ports, coverage and temporal
-      rule registration remain partial.
+      dynamic range-generated fields, and HDL event ports remain partial.
+      Coverage and temporal rules lack dynamic registration for
+      subtypes yet; the conservative type pass checks composed views
 - [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer
       fields into a solver problem; range membership (`x in [lo..hi]`)
