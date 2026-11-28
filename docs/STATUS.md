@@ -51,9 +51,12 @@ designs behind the claims are [ARCHITECTURE.md](ARCHITECTURE.md).
   does not extend escaped/indexed HDL path parsing or execute MVL numerals.
 - **Elaboration.** The composed types feed the interpreter: `when`
   subtypes synthesize subtype views whose members apply. Whole-object
-  generation samples the base first and then generates ordinary fields
-  of active views under their local constraints. Dynamic event declarations,
-  `on` actions, and supported `@sim` triggers follow the live determinant.
+  generation fixes the sampled determinants and solves coupled constraints
+  across the base and a selected `when` branch. Range-generated fields in
+  active views produce their own reduced sets. Dynamic event declarations,
+  `on` actions, HDL event ports, coverage groups, and temporal rules follow
+  live determinants. Independent active branches retain separate generation
+  passes.
   Type positions such as `typeof()` and `typeof_item()` resolve. Template
   instances monomorphize (actuals substitute for formals, method bodies included)
   and `template extend` blocks apply to the instances whose actuals

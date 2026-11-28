@@ -6131,6 +6131,14 @@ an inactive subtype event reports `E0413`. The
 injected HDL fixture checks that a dynamic `@sim` trigger samples while
 active and establishes a fresh edge baseline after reactivation.
 
+`dynamic-when-joint-rgf` checks coupled base and subtype fields in both
+solver profiles. It checks reduced ranges based on subtype values,
+qualified `rgf=` writes, and separate sibling range state.
+`dynamic-when-registrations` drives a subtype event port with injected HDL
+values while its determinant changes. It checks edge selection, per-unit
+coverage sampling, two rule activations, and cancellation of a pending
+obligation when its subtype deactivates.
+
 ## Integer subtype range reflection
 
 `set_of_values` reflects constant integer bounds, including through

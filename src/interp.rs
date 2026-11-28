@@ -483,6 +483,7 @@ struct ObjectInstance {
     /// the field's reduced set. The clause 29.13 rgf routines and the
     /// `rgf=` operator (18.6) read it.
     rgf: BTreeMap<String, RgfState>,
+    subtype_rgf: BTreeMap<(usize, usize), RgfState>,
 }
 
 /// The generated state of one range-generated field: the reduced set as
@@ -578,6 +579,10 @@ struct Frame {
 }
 
 struct InstanceRule {
+    // Dynamic rules monitor one contiguous activation interval.
+    view: Option<String>,
+    end: Option<usize>,
+    last_sampled: Option<usize>,
     declaration: crate::ast::ExpectDecl,
     owner: usize,
     te: crate::ast::TemporalExpr,
@@ -850,6 +855,18 @@ struct SimTrigger {
     subtype_local: bool,
 }
 
+struct BoundEventPort {
+    owner: usize,
+    key: String,
+    view: String,
+    name: String,
+    path: String,
+    edge: String,
+}
+
+type RangeConstraints = BTreeMap<String, Vec<Expr>>;
+type SharedIntegerDomain = (BTreeSet<String>, Vec<(i128, i128)>);
+
 struct CoverageAxis {
     binding: String,
     source: String,
@@ -984,7 +1001,7 @@ struct Interp<'a> {
     /// The last sampled value per monitored trigger, keyed by (instance,
     /// event-or-port path) — the edge detection's baseline. `None` marks
     /// a trigger whose expression has not been sampleable yet.
-    sim_prev: BTreeMap<(usize, String), Option<i128>>,
+    sim_prev: BTreeMap<String, i128>,
     sim_trigger_prev: BTreeMap<(usize, String, String), i128>,
     /// The `keep <port>.edge() == <value>` attribute values (9.7.3)
     /// per (type name, port name); the sampling default is `change`.
@@ -996,6 +1013,7 @@ struct Interp<'a> {
     temporal_log: Vec<crate::temporal::State>,
     instance_rules: Vec<InstanceRule>,
     next_rule_instance: usize,
+    active_subtype_rules: BTreeMap<(usize, usize, usize), usize>,
     rules_enabled: bool,
     sampling_temporal: bool,
     temporal_wait_contexts: BTreeMap<(Option<u64>, usize, usize, Option<usize>), u64>,
@@ -1455,6 +1473,7 @@ fn run_inner(
         temporal_log: Vec::new(),
         instance_rules: Vec::new(),
         next_rule_instance: 0,
+        active_subtype_rules: BTreeMap::new(),
         rules_enabled: false,
         sampling_temporal: false,
         temporal_wait_contexts: BTreeMap::new(),
@@ -1843,6 +1862,7 @@ fn check_expect_rules(interp: &mut Interp, at_quit: bool) {
             (interp.cycle as usize).min(interp.temporal_log.len())
         };
         let rule = &mut interp.instance_rules[context];
+        let end = rule.end.map_or(end, |closed| end.min(closed));
         let start = rule.start.min(end);
         let verdict = rule
             .monitor
@@ -1850,11 +1870,14 @@ fn check_expect_rules(interp: &mut Interp, at_quit: bool) {
         let kind = format!("{:?}", rule.declaration.kind).to_lowercase();
         match verdict {
             Ok(failed) => {
-                if failed || (at_quit && rule.monitor.failed_at_end()) {
+                if failed || (at_quit && rule.end.is_none() && rule.monitor.failed_at_end()) {
                     rule.retired = true;
                     let owner = rule.owner;
                     let declaration = rule.declaration.clone();
-                    fire_expect_rule(interp, &declaration, &kind, owner);
+                    let view = rule.view.clone();
+                    fire_expect_rule(interp, &declaration, &kind, owner, view);
+                } else if rule.end == Some(end) {
+                    rule.retired = true;
                 }
             }
             Err(err) => {
@@ -1875,6 +1898,7 @@ fn fire_expect_rule(
     expect_rule: &crate::ast::ExpectDecl,
     kind: &str,
     owner: usize,
+    view: Option<String>,
 ) {
     if expect_rule.else_body.is_empty() {
         // No `dut_error` clause: the failure itself is the check error
@@ -1884,7 +1908,10 @@ fn fire_expect_rule(
             "{kind} rule failed: temporal property not satisfied, no else body\n"
         ));
     } else {
-        let mut frame = Frame::default();
+        let mut frame = Frame {
+            method_owner: view,
+            ..Frame::default()
+        };
         if let Err(diagnostic) = interp.exec_block(&expect_rule.else_body, &mut frame, Some(owner))
         {
             interp
@@ -2169,6 +2196,7 @@ impl<'a> Interp<'a> {
             subtype_fields: BTreeMap::new(),
             ports,
             rgf: BTreeMap::new(),
+            subtype_rgf: BTreeMap::new(),
         });
         // A subtype view instance carries its determinant values (6.7):
         // the view's (field id, value) pairs hold from instantiation on,
@@ -3317,13 +3345,13 @@ impl<'a> Interp<'a> {
                     // `emit Type::event` (clause 11.2): the static
                     // event of the type itself — one occurrence, no
                     // instance, the static `on` blocks run with no `me`.
-                    self.fire_static_event(type_name, member, *span, frame)?;
+                    self.fire_static_event(type_name, member, *span)?;
                 } else {
                     let (path, owner) = self.resolve_emitted_event(target, frame, me)?;
                     if let Some(owner) = owner {
                         self.check_subtype_event(owner, &path, *span)?;
                     }
-                    self.fire_event(&path, owner, *span, frame)?;
+                    self.fire_event(&path, owner, *span, None)?;
                 }
                 Ok(Flow::Normal)
             }
@@ -3659,7 +3687,7 @@ impl<'a> Interp<'a> {
         let declared_ty = &field_types[0].1;
         let mut passes = generation_constraint_passes(&constraints).peekable();
         while let Some((_, constraints)) = passes.next() {
-            match self.try_solve_fields(&field_types, &constraints, &obj_type_name, span) {
+            match self.try_solve_fields(&field_types, &constraints, &obj_type_name, span, false) {
                 Ok(Some(assignment)) => {
                     if let [(_, value)] = assignment.as_slice() {
                         self.store(
@@ -4130,13 +4158,13 @@ impl<'a> Interp<'a> {
         me: Option<usize>,
         span: crate::ast::Span,
     ) -> Result<(), ExecError> {
-        let (instance, field) = self.rgf_target_instance_field(target, frame, me, span)?;
-        let field_decl = self.rgf_field_declaration(instance, &field, span)?;
+        let (instance, field, scope) = self.rgf_target_instance_field(target, frame, me, span)?;
+        let field_decl = self.rgf_field_declaration(instance, scope.as_deref(), &field, span)?;
         if !field_decl.range_gen {
             return Err(self.error("E0130", "rgf= target is not a range-generated field", span));
         }
         let type_name = self.instances[instance].type_name.clone();
-        let Some(state) = self.instances[instance].rgf.get(&field).cloned() else {
+        let Some(state) = self.rgf_state(instance, scope.as_deref(), &field).cloned() else {
             return Err(self.error(
                 "E0416",
                 format!(
@@ -4185,7 +4213,12 @@ impl<'a> Interp<'a> {
             ));
         }
         let concrete = self.rgf_concrete_value(&field_decl.ty, numeric, span)?;
-        self.instances[instance].set(&field, concrete);
+        self.set_generated_field(
+            instance,
+            scope.as_deref().unwrap_or(&type_name),
+            &field,
+            concrete,
+        );
         Ok(())
     }
 
@@ -4214,8 +4247,8 @@ impl<'a> Interp<'a> {
                 span,
             ));
         };
-        let (instance, field) = self.rgf_target_instance_field(arg, frame, me, span)?;
-        let field_decl = self.rgf_field_declaration(instance, &field, span)?;
+        let (instance, field, scope) = self.rgf_target_instance_field(arg, frame, me, span)?;
+        let field_decl = self.rgf_field_declaration(instance, scope.as_deref(), &field, span)?;
         if !field_decl.range_gen {
             return Err(self.error(
                 "E0130",
@@ -4224,7 +4257,7 @@ impl<'a> Interp<'a> {
             ));
         }
         let type_name = self.instances[instance].type_name.clone();
-        let state = self.instances[instance].rgf.get(&field).cloned();
+        let state = self.rgf_state(instance, scope.as_deref(), &field).cloned();
         if name == "rgf_was_generated" {
             // TRUE iff the solver generated the field; a query on a
             // generated-yet field is FALSE, not an error (clause 29.13).
@@ -4246,15 +4279,24 @@ impl<'a> Interp<'a> {
         }
     }
 
+    fn rgf_state(&self, instance: usize, scope: Option<&str>, field: &str) -> Option<&RgfState> {
+        if let Some((slot, _)) = self.subtype_field_slot(instance, scope, field) {
+            self.instances[instance].subtype_rgf.get(&slot)
+        } else {
+            self.instances[instance].rgf.get(field)
+        }
+    }
+
     /// The declared field one rgf target names: the (instance, field)
     /// path resolved, the field looked up in its instance's type.
     fn rgf_field_declaration(
         &self,
         instance: usize,
+        scope: Option<&str>,
         field: &str,
         span: crate::ast::Span,
     ) -> Result<crate::ast::Field, ExecError> {
-        let type_name = self.instances[instance].type_name.clone();
+        let type_name = scope.unwrap_or(&self.instances[instance].type_name);
         let types: &[crate::elab::ElaboratedType] = self.types;
         let Some(ty) = types.iter().find(|t| t.name == type_name) else {
             return Err(self.error("E0401", format!("unknown type '{type_name}'"), span));
@@ -4275,12 +4317,16 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         me: Option<usize>,
         span: crate::ast::Span,
-    ) -> Result<(usize, String), ExecError> {
+    ) -> Result<(usize, String, Option<String>), ExecError> {
         match target {
             Expr::MemberAccess { object, name, .. } => {
                 let base = self.eval(object, frame, me)?;
                 match base {
-                    Value::Object(index) => Ok((index, name.clone())),
+                    Value::Object(index) => Ok((
+                        index,
+                        name.clone(),
+                        frame.method_owner.clone().filter(|_| me == Some(index)),
+                    )),
                     other => Err(self.error(
                         "E0402",
                         format!(
@@ -4300,12 +4346,38 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 match me {
-                    Some(index) => Ok((index, name.clone())),
+                    Some(index) => Ok((index, name.clone(), frame.method_owner.clone())),
                     None => {
                         Err(self.error("E0402", "rgf target requires an enclosing instance", span))
                     }
                 }
             }
+            Expr::QualifiedField {
+                base,
+                qualifiers,
+                field,
+                ..
+            } => {
+                let Value::Object(index) = self.eval(base, frame, me)? else {
+                    return Err(self.error(
+                        "E0402",
+                        "rgf target requires an object receiver",
+                        span,
+                    ));
+                };
+                let Some(view) = self.find_qualified_field_view(index, qualifiers, field) else {
+                    return Err(self.error("E0401", format!("unknown field '{field}'"), span));
+                };
+                if !self.instance_matches_view(index, view, true) {
+                    return Err(self.error(
+                        "E0413",
+                        format!("field '{field}' is not present on the active subtype"),
+                        span,
+                    ));
+                }
+                Ok((index, field.clone(), Some(view.name.clone())))
+            }
+            Expr::Paren { expr, .. } => self.rgf_target_instance_field(expr, frame, me, span),
             _ => Err(self.error("E0402", "rgf target must be a field path", span)),
         }
     }
@@ -4349,15 +4421,43 @@ impl<'a> Interp<'a> {
             (!ty.whens.is_empty()).then(|| (self.instances.len(), self.instances[index].clone()));
         let mut passes = generation_constraint_passes(&constraints).peekable();
         while let Some((include_soft, constraints)) = passes.next() {
-            let outcome = self
-                .gen_object_with_constraints(index, ty, enclosing, &constraints, include_soft)
-                .and_then(|()| self.gen_active_subtypes(index, &ty.name));
-            if outcome.is_err()
-                && let Some((len, instance)) = &checkpoint
-            {
-                self.instances.truncate(*len);
-                self.instances[index] = instance.clone();
-            }
+            let retry_determinants = ty.fields.iter().any(|field| {
+                !field.is_const
+                    && !field.no_gen
+                    && !ty.when_of.iter().any(|(name, _)| *name == field.name)
+                    && types.iter().any(|view| {
+                        view.base.as_deref() == Some(&ty.name)
+                            && view.when_of.iter().any(|(name, _)| *name == field.name)
+                    })
+            });
+            let mut attempts = if retry_determinants { 32 } else { 1 };
+            let outcome = loop {
+                let base = self.gen_object_with_constraints(
+                    index,
+                    ty,
+                    enclosing,
+                    &constraints,
+                    include_soft,
+                );
+                let base_succeeded = base.is_ok();
+                let outcome = base
+                    .and_then(|()| self.gen_active_subtypes(index, ty, enclosing, include_soft));
+                if outcome.is_err()
+                    && let Some(checkpoint) = &checkpoint
+                {
+                    self.restore_generation_candidate(index, checkpoint);
+                }
+                attempts -= 1;
+                if !base_succeeded
+                    || attempts == 0
+                    || !matches!(
+                        outcome,
+                        Err(ExecError::Diagnostic(Diagnostic { code: "E0407", .. }))
+                    )
+                {
+                    break outcome;
+                }
+            };
             match outcome {
                 Err(ExecError::Diagnostic(Diagnostic {
                     code: "E0407" | "E0417",
@@ -4369,28 +4469,89 @@ impl<'a> Interp<'a> {
         unreachable!("generation always attempts its declared constraints")
     }
 
-    fn gen_active_subtypes(&mut self, index: usize, parent: &str) -> Result<(), ExecError> {
-        let types = self.types;
-        let Some(parent) = types.iter().find(|ty| ty.name == parent) else {
-            return Ok(());
-        };
+    fn gen_active_subtypes(
+        &mut self,
+        index: usize,
+        parent: &'a crate::elab::ElaboratedType,
+        enclosing: &[KeepConstraint],
+        include_soft: bool,
+    ) -> Result<(), ExecError> {
         if parent.whens.is_empty() {
             return Ok(());
         }
-        for view in types.iter().filter(|view| {
-            !view.when_of.is_empty() && view.base.as_deref() == Some(parent.name.as_str())
-        }) {
-            if !self.instance_matches_view(index, view, false) {
-                continue;
-            }
+        let active: Vec<_> = self
+            .types
+            .iter()
+            .filter(|view| {
+                !view.when_of.is_empty()
+                    && view.base.as_deref() == Some(parent.name.as_str())
+                    && self.instance_matches_view(index, view, false)
+            })
+            .collect();
+        let parent_fields = parent
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect();
+        for view in &active {
             let fields = &view.fields[parent.fields.len()..];
             let constraints = &view.constraints[parent.constraints.len()..];
-            if !fields.is_empty() || !constraints.is_empty() {
+            let couples_parent = constraints.iter().any(|keep| {
+                !keep.is_bind
+                    && !generation_metadata(&keep.expr)
+                    && !rgf_field_refs(&keep.expr, &parent_fields).is_empty()
+            });
+            if active.len() == 1 && couples_parent {
+                for field in fields.iter().filter(|field| field.no_gen || field.is_const) {
+                    self.read_instance_field(index, Some(&view.name), &field.name)?;
+                }
+                let constraints = view
+                    .constraints
+                    .iter()
+                    .chain(enclosing)
+                    .filter(|keep| include_soft || !keep.is_soft)
+                    .collect::<Vec<_>>();
+                let checkpoint = (self.instances.len(), self.instances[index].clone());
+                let mut passes = generation_constraint_passes(&constraints).peekable();
+                while let Some((with_soft, expressions)) = passes.next() {
+                    match self.gen_object_with_constraints(
+                        index,
+                        view,
+                        enclosing,
+                        &expressions,
+                        with_soft,
+                    ) {
+                        Err(ExecError::Diagnostic(Diagnostic {
+                            code: "E0407" | "E0417",
+                            ..
+                        })) if passes.peek().is_some() => {
+                            self.restore_generation_candidate(index, &checkpoint)
+                        }
+                        result => {
+                            result?;
+                            break;
+                        }
+                    }
+                }
+            } else if !fields.is_empty() || !constraints.is_empty() {
                 self.gen_subtype_fields(index, view, fields, constraints, true)?;
             }
-            self.gen_active_subtypes(index, &view.name)?;
+            self.gen_active_subtypes(index, view, enclosing, include_soft)?;
         }
         Ok(())
+    }
+
+    fn restore_generation_candidate(&mut self, index: usize, checkpoint: &(usize, ObjectInstance)) {
+        self.instances.truncate(checkpoint.0);
+        self.instances[index] = checkpoint.1.clone();
+    }
+
+    fn set_generated_field(&mut self, index: usize, view: &str, name: &str, value: Value) {
+        if let Some((slot, _)) = self.subtype_field_slot(index, Some(view), name) {
+            self.instances[index].subtype_fields.insert(slot, value);
+        } else {
+            self.instances[index].set(name, value);
+        }
     }
 
     fn gen_subtype_fields(
@@ -4402,6 +4563,7 @@ impl<'a> Interp<'a> {
         regenerate: bool,
     ) -> Result<(), ExecError> {
         let mut fields = Vec::new();
+        let mut rgf_fields = Vec::new();
         for field in added {
             let Some((slot, _)) = self.subtype_field_slot(index, Some(&view.name), &field.name)
             else {
@@ -4418,7 +4580,12 @@ impl<'a> Interp<'a> {
                 self.instances[index].subtype_fields.insert(slot, value);
             }
             if generative && (regenerate || !present) {
-                fields.push((slot, (field.name.clone(), field.ty.clone())));
+                let layout = (field.name.clone(), field.ty.clone());
+                if field.range_gen {
+                    rgf_fields.push(layout);
+                } else {
+                    fields.push((slot, layout));
+                }
             }
         }
         let field_types: Vec<_> = fields.iter().map(|(_, field)| field.clone()).collect();
@@ -4428,12 +4595,15 @@ impl<'a> Interp<'a> {
             ..Frame::default()
         };
         for (_, constraints) in generation_constraint_passes(&constraints) {
-            let domains = self.constraint_domains(&constraints, &field_types)?;
-            let predicates = generation_predicates(&constraints);
+            let (plain, per_field) =
+                self.split_rgf_constraints(&constraints, &rgf_fields, view.span)?;
+            let domains = self.constraint_domains(&plain, &field_types)?;
+            let predicates = generation_predicates(&plain);
             let attempts = if fields.is_empty() { 1 } else { 1000 };
             for _ in 0..attempts {
                 let len = self.instances.len();
                 let saved = self.instances[index].subtype_fields.clone();
+                let saved_rgf = self.instances[index].subtype_rgf.clone();
                 let outcome = (|| {
                     let alternative_domains =
                         self.sample_integer_alternatives(&domains.integer_alternatives);
@@ -4452,9 +4622,14 @@ impl<'a> Interp<'a> {
                     )
                 })();
                 if matches!(outcome, Ok(true)) {
-                    return Ok(());
+                    match self.generate_rgf_fields(index, &rgf_fields, &per_field, view) {
+                        Ok(()) => return Ok(()),
+                        Err(ExecError::Diagnostic(Diagnostic { code: "E0407", .. })) => {}
+                        Err(error) => return Err(error),
+                    }
                 }
                 self.instances[index].subtype_fields = saved;
+                self.instances[index].subtype_rgf = saved_rgf;
                 self.instances.truncate(len);
                 outcome?;
             }
@@ -4479,6 +4654,31 @@ impl<'a> Interp<'a> {
     ) -> Result<(), ExecError> {
         let type_name = &ty.name;
         let type_span = ty.span;
+        let dynamic = self.instances[index].type_name != ty.name;
+        let mut frame = Frame {
+            method_owner: dynamic.then(|| ty.name.clone()),
+            ..Frame::default()
+        };
+        // Keep the sampled selector values stable while solving the selected view.
+        let nominal = &self.instances[index].type_name;
+        let selectors: BTreeSet<_> = if dynamic {
+            self.types
+                .iter()
+                .filter(|view| !view.when_of.is_empty() && view.base.as_deref() == Some(nominal))
+                .flat_map(|view| view.when_of.iter().map(|(name, _)| name.as_str()))
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let referenced = if dynamic {
+            let names = ty.fields.iter().map(|field| field.name.clone()).collect();
+            constraints
+                .iter()
+                .flat_map(|expr| rgf_field_refs(expr, &names))
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
         // The range-generated (`~`) fields (clause 6.9.7), declaration
         // order. They are excluded from sampling below exactly like `!`
         // fields: their values come from the reduced-set pass after the
@@ -4489,7 +4689,6 @@ impl<'a> Interp<'a> {
             .filter(|field| field.range_gen && !field.is_static)
             .map(|field| (field.name.clone(), field.ty.clone()))
             .collect();
-        let rgf_names: BTreeSet<String> = rgf_fields.iter().map(|(name, _)| name.clone()).collect();
         // `!` fields keep their value; instance (unit-typed) fields are
         // not generated — they are instantiated structurally. A `const`
         // field keeps its value too: it is initialised once (by its init
@@ -4510,6 +4709,12 @@ impl<'a> Interp<'a> {
                     && !self.is_unit_typed(&field.ty)
                     && !self.is_non_generatable_builtin(&field.ty)
                     && !ty.when_of.iter().any(|(id, _)| id == &field.name)
+                    && !selectors.contains(field.name.as_str())
+                    && (!dynamic
+                        || referenced.contains(&field.name)
+                        || self
+                            .subtype_field_slot(index, Some(type_name), &field.name)
+                            .is_some())
             })
             .map(|field| (field.name.clone(), field.ty.clone()))
             .collect();
@@ -4527,7 +4732,7 @@ impl<'a> Interp<'a> {
             let Expr::ChosenFrom { target, list, .. } = constraint else {
                 continue;
             };
-            if !ty.when_of.is_empty() {
+            if !dynamic && !ty.when_of.is_empty() {
                 return Err(self.error(
                     "E0402",
                     "chosen_from is not allowed under a when subtype (10.5.8)",
@@ -4557,6 +4762,220 @@ impl<'a> Interp<'a> {
             .iter()
             .map(|(field, _)| field.clone())
             .collect();
+        let (plain_constraints, per_field) =
+            self.split_rgf_constraints(constraints, &rgf_fields, type_span)?;
+        // Simple range/equality constraints narrow the per-field sampling
+        // domains; everything else is enforced by the rejection predicate.
+        let domains = self.constraint_domains(&plain_constraints, &field_types)?;
+        let predicates = generation_predicates(&plain_constraints);
+        let checkpoint = dynamic.then(|| (self.instances.len(), self.instances[index].clone()));
+        // Solver-backed path: linear problems go to the backend
+        // conjunction solver (pumpkin with the cargo feature; without it
+        // the outcome is Unsupported), non-linear problems to the
+        // bounded enumeration solver in every build.
+        if let Some(assignment) = self.try_solve_fields(
+            &field_types,
+            &plain_constraints,
+            type_name,
+            type_span,
+            dynamic,
+        )? {
+            for (name, field_ty) in &field_types {
+                match assignment.iter().find(|(assigned, _)| assigned == name) {
+                    Some((_, value)) => {
+                        self.set_generated_field(index, type_name, name, Value::Int(*value));
+                    }
+                    None => {
+                        // A chosen_from target is assigned a list element
+                        // below, not sampled.
+                        if chosen_names.contains(name) {
+                            continue;
+                        }
+                        let value = self.sample_generation_field(name, field_ty, &domains)?;
+                        self.set_generated_field(index, type_name, name, value);
+                    }
+                }
+            }
+            for (field, list_expr) in &chosen_specs {
+                let other = self.chosen_from_other_constraints(
+                    index,
+                    std::slice::from_ref(field),
+                    include_soft,
+                );
+                let mut other = other;
+                other.extend(
+                    enclosing
+                        .iter()
+                        .filter(|keep| include_soft || !keep.is_soft)
+                        .filter(|keep| expr_extends_path(&keep.expr, std::slice::from_ref(field)))
+                        .map(|keep| (index, keep.clone())),
+                );
+                self.gen_chosen_from(
+                    index,
+                    std::slice::from_ref(field),
+                    list_expr,
+                    &other,
+                    false,
+                    type_span,
+                )?;
+            }
+            match self.generate_rgf_fields(index, &rgf_fields, &per_field, ty) {
+                Err(ExecError::Diagnostic(Diagnostic { code: "E0407", .. }))
+                    if let Some(checkpoint) = &checkpoint =>
+                {
+                    self.restore_generation_candidate(index, checkpoint)
+                }
+                result => return result,
+            }
+        }
+        let equalities = if dynamic {
+            self.joint_field_equalities(&field_types, &predicates)?
+        } else {
+            Vec::new()
+        };
+        for _ in 0..1000 {
+            let mut alternative_domains =
+                self.sample_integer_alternatives(&domains.integer_alternatives);
+            for (names, natural) in &equalities {
+                let allowed = names.iter().fold(natural.clone(), |allowed, name| {
+                    let bounds = alternative_domains
+                        .get(name)
+                        .or_else(|| domains.integers.get(name));
+                    if let Some(bounds) = bounds {
+                        intersect_interval_sets(&allowed, bounds)
+                    } else {
+                        allowed
+                    }
+                });
+                if let Some(value) = self.draw_integer_domain(&allowed) {
+                    for name in names {
+                        alternative_domains.insert(name.clone(), vec![(value, value)]);
+                    }
+                }
+            }
+            for (name, field_ty) in &field_types {
+                // A chosen_from target is assigned a list element after
+                // the other fields are sampled (so co-constraints see
+                // their values), not sampled here.
+                if chosen_names.contains(name) {
+                    continue;
+                }
+                let value = match alternative_domains.get(name) {
+                    Some(allowed) => self.sample_int_in(field_ty, allowed)?,
+                    None => self.sample_generation_field(name, field_ty, &domains)?,
+                };
+                self.set_generated_field(index, type_name, name, value);
+            }
+            // Clause 10.5.8: assign each chosen_from target now — the
+            // other fields carry their sampled values, so the constraints
+            // co-constraining paths through the target and another field
+            // evaluate meaningfully.
+            for (field, list_expr) in &chosen_specs {
+                let other = self.chosen_from_other_constraints(
+                    index,
+                    std::slice::from_ref(field),
+                    include_soft,
+                );
+                let mut other = other;
+                other.extend(
+                    enclosing
+                        .iter()
+                        .filter(|keep| include_soft || !keep.is_soft)
+                        .filter(|keep| expr_extends_path(&keep.expr, std::slice::from_ref(field)))
+                        .map(|keep| (index, keep.clone())),
+                );
+                self.gen_chosen_from(
+                    index,
+                    std::slice::from_ref(field),
+                    list_expr,
+                    &other,
+                    false,
+                    type_span,
+                )?;
+            }
+            if self.generation_candidate_matches(&predicates, Some(&mut frame), index, type_span)? {
+                match self.generate_rgf_fields(index, &rgf_fields, &per_field, ty) {
+                    Err(ExecError::Diagnostic(Diagnostic { code: "E0407", .. })) if dynamic => {}
+                    result => return result,
+                }
+            }
+            if let Some(checkpoint) = &checkpoint {
+                self.restore_generation_candidate(index, checkpoint);
+            }
+        }
+        Err(self.error(
+            "E0407",
+            format!("no solution found for the constraints of '{type_name}' after 1000 attempts"),
+            type_span,
+        ))
+    }
+
+    /// Sample fields tied by bare integer equalities from one shared domain
+    /// when the backend cannot handle the wider problem.
+    fn joint_field_equalities(
+        &self,
+        field_types: &[(String, TypeExpr)],
+        predicates: &[&Expr],
+    ) -> Result<Vec<SharedIntegerDomain>, ExecError> {
+        let mut integer_bounds = BTreeMap::new();
+        for (name, ty) in field_types {
+            if let Some(bounds) = self.generation_int_range(ty)? {
+                integer_bounds.insert(name, bounds);
+            }
+        }
+        let mut groups: Vec<BTreeSet<String>> = Vec::new();
+        for predicate in predicates {
+            let Expr::Binary {
+                op: BinaryOp::Eq,
+                lhs,
+                rhs,
+                ..
+            } = predicate
+            else {
+                continue;
+            };
+            let (Expr::Ident { name: first, .. }, Expr::Ident { name: second, .. }) =
+                (lhs.as_ref(), rhs.as_ref())
+            else {
+                continue;
+            };
+            if first == second
+                || !integer_bounds.contains_key(first)
+                || !integer_bounds.contains_key(second)
+            {
+                continue;
+            }
+            let mut merged = BTreeSet::from([first.clone(), second.clone()]);
+            groups.retain(|group| {
+                if group.contains(first) || group.contains(second) {
+                    merged.extend(group.iter().cloned());
+                    false
+                } else {
+                    true
+                }
+            });
+            groups.push(merged);
+        }
+        Ok(groups
+            .into_iter()
+            .map(|names| {
+                let bounds = names
+                    .iter()
+                    .fold(vec![(i128::MIN, i128::MAX)], |bounds, name| {
+                        intersect_interval_sets(&bounds, &[integer_bounds[name]])
+                    });
+                (names, bounds)
+            })
+            .collect())
+    }
+
+    fn split_rgf_constraints(
+        &self,
+        constraints: &[Expr],
+        rgf_fields: &[(String, TypeExpr)],
+        type_span: crate::ast::Span,
+    ) -> Result<(Vec<Expr>, RangeConstraints), ExecError> {
+        let rgf_names = rgf_fields.iter().map(|(name, _)| name.clone()).collect();
         // The constraint split (10.3.13): constraints referencing an rgf
         // field drive that field's reduced set; the rest gate the
         // sampling of the non-rgf fields as before.
@@ -4591,116 +5010,7 @@ impl<'a> Interp<'a> {
                 per_field.entry(field).or_default().push(constraint.clone());
             }
         }
-        // Simple range/equality constraints narrow the per-field sampling
-        // domains; everything else is enforced by the rejection predicate.
-        let domains = self.constraint_domains(&plain_constraints, &field_types)?;
-        let predicates = generation_predicates(&plain_constraints);
-        // Solver-backed path: linear problems go to the backend
-        // conjunction solver (pumpkin with the cargo feature; without it
-        // the outcome is Unsupported), non-linear problems to the
-        // bounded enumeration solver in every build.
-        if let Some(assignment) =
-            self.try_solve_fields(&field_types, &plain_constraints, type_name, type_span)?
-        {
-            for (name, field_ty) in &field_types {
-                match assignment.iter().find(|(assigned, _)| assigned == name) {
-                    Some((_, value)) => {
-                        self.instances[index].set(name, Value::Int(*value));
-                    }
-                    None => {
-                        // A chosen_from target is assigned a list element
-                        // below, not sampled.
-                        if chosen_names.contains(name) {
-                            continue;
-                        }
-                        let value = self.sample_generation_field(name, field_ty, &domains)?;
-                        self.instances[index].set(name, value);
-                    }
-                }
-            }
-            for (field, list_expr) in &chosen_specs {
-                let other = self.chosen_from_other_constraints(
-                    index,
-                    std::slice::from_ref(field),
-                    include_soft,
-                );
-                let mut other = other;
-                other.extend(
-                    enclosing
-                        .iter()
-                        .filter(|keep| include_soft || !keep.is_soft)
-                        .filter(|keep| expr_extends_path(&keep.expr, std::slice::from_ref(field)))
-                        .map(|keep| (index, keep.clone())),
-                );
-                self.gen_chosen_from(
-                    index,
-                    std::slice::from_ref(field),
-                    list_expr,
-                    &other,
-                    false,
-                    type_span,
-                )?;
-            }
-            return self.generate_rgf_fields(index, &rgf_fields, &per_field, type_name, type_span);
-        }
-        for _ in 0..1000 {
-            let alternative_domains =
-                self.sample_integer_alternatives(&domains.integer_alternatives);
-            for (name, field_ty) in &field_types {
-                // A chosen_from target is assigned a list element after
-                // the other fields are sampled (so co-constraints see
-                // their values), not sampled here.
-                if chosen_names.contains(name) {
-                    continue;
-                }
-                let value = match alternative_domains.get(name) {
-                    Some(allowed) => self.sample_int_in(field_ty, allowed)?,
-                    None => self.sample_generation_field(name, field_ty, &domains)?,
-                };
-                self.instances[index].set(name, value);
-            }
-            // Clause 10.5.8: assign each chosen_from target now — the
-            // other fields carry their sampled values, so the constraints
-            // co-constraining paths through the target and another field
-            // evaluate meaningfully.
-            for (field, list_expr) in &chosen_specs {
-                let other = self.chosen_from_other_constraints(
-                    index,
-                    std::slice::from_ref(field),
-                    include_soft,
-                );
-                let mut other = other;
-                other.extend(
-                    enclosing
-                        .iter()
-                        .filter(|keep| include_soft || !keep.is_soft)
-                        .filter(|keep| expr_extends_path(&keep.expr, std::slice::from_ref(field)))
-                        .map(|keep| (index, keep.clone())),
-                );
-                self.gen_chosen_from(
-                    index,
-                    std::slice::from_ref(field),
-                    list_expr,
-                    &other,
-                    false,
-                    type_span,
-                )?;
-            }
-            if self.generation_candidate_matches(&predicates, None, index, type_span)? {
-                return self.generate_rgf_fields(
-                    index,
-                    &rgf_fields,
-                    &per_field,
-                    type_name,
-                    type_span,
-                );
-            }
-        }
-        Err(self.error(
-            "E0407",
-            format!("no solution found for the constraints of '{type_name}' after 1000 attempts"),
-            type_span,
-        ))
+        Ok((plain_constraints, per_field))
     }
 
     fn generation_candidate_matches(
@@ -4752,10 +5062,15 @@ impl<'a> Interp<'a> {
         &mut self,
         index: usize,
         rgf_fields: &[(String, TypeExpr)],
-        per_field: &BTreeMap<String, Vec<Expr>>,
-        type_name: &str,
-        span: crate::ast::Span,
+        per_field: &RangeConstraints,
+        view: &crate::elab::ElaboratedType,
     ) -> Result<(), ExecError> {
+        let span = view.span;
+        let type_name = &view.name;
+        let mut frame = Frame {
+            method_owner: Some(view.name.clone()),
+            ..Frame::default()
+        };
         for (name, field_ty) in rgf_fields {
             let Some(full_range) = self.type_value_range_at(field_ty, false, 0) else {
                 return Err(self.error(
@@ -4768,7 +5083,7 @@ impl<'a> Interp<'a> {
             let mut set = full_set.clone();
             for constraint in per_field.get(name).into_iter().flatten() {
                 let contribution =
-                    self.rgf_contribution(constraint, name, index, &full_set, span)?;
+                    self.rgf_contribution(constraint, name, index, &full_set, span, &mut frame)?;
                 set = intersect_interval_sets(&set, &contribution);
             }
             if set.is_empty() {
@@ -4782,14 +5097,16 @@ impl<'a> Interp<'a> {
             }
             let reduced = set != full_set;
             let concrete = self.rgf_concrete_value(field_ty, set[0].0, span)?;
-            self.instances[index].set(name, concrete);
-            self.instances[index].rgf.insert(
-                name.clone(),
-                RgfState {
-                    ranges: set,
-                    reduced,
-                },
-            );
+            self.set_generated_field(index, type_name, name, concrete);
+            let state = RgfState {
+                ranges: set,
+                reduced,
+            };
+            if let Some((slot, _)) = self.subtype_field_slot(index, Some(type_name), name) {
+                self.instances[index].subtype_rgf.insert(slot, state);
+            } else {
+                self.instances[index].rgf.insert(name.clone(), state);
+            }
         }
         Ok(())
     }
@@ -4806,17 +5123,20 @@ impl<'a> Interp<'a> {
         index: usize,
         full_set: &[(i128, i128)],
         span: crate::ast::Span,
+        frame: &mut Frame,
     ) -> Result<Vec<(i128, i128)>, ExecError> {
         match expr {
-            Expr::Paren { expr, .. } => self.rgf_contribution(expr, field, index, full_set, span),
+            Expr::Paren { expr, .. } => {
+                self.rgf_contribution(expr, field, index, full_set, span, frame)
+            }
             Expr::Binary {
                 op: BinaryOp::LogicalAnd,
                 lhs,
                 rhs,
                 ..
             } => {
-                let left = self.rgf_contribution(lhs, field, index, full_set, span)?;
-                let right = self.rgf_contribution(rhs, field, index, full_set, span)?;
+                let left = self.rgf_contribution(lhs, field, index, full_set, span, frame)?;
+                let right = self.rgf_contribution(rhs, field, index, full_set, span, frame)?;
                 Ok(intersect_interval_sets(&left, &right))
             }
             Expr::Binary {
@@ -4825,8 +5145,8 @@ impl<'a> Interp<'a> {
                 rhs,
                 ..
             } => {
-                let left = self.rgf_contribution(lhs, field, index, full_set, span)?;
-                let right = self.rgf_contribution(rhs, field, index, full_set, span)?;
+                let left = self.rgf_contribution(lhs, field, index, full_set, span, frame)?;
+                let right = self.rgf_contribution(rhs, field, index, full_set, span, frame)?;
                 Ok(union_interval_sets(&left, &right))
             }
             // An implication whose antecedent is FALSE contributes the
@@ -4836,8 +5156,10 @@ impl<'a> Interp<'a> {
                 lhs,
                 rhs,
                 ..
-            } => match self.eval(lhs, &mut Frame::default(), Some(index))? {
-                Value::Bool(true) => self.rgf_contribution(rhs, field, index, full_set, span),
+            } => match self.eval(lhs, frame, Some(index))? {
+                Value::Bool(true) => {
+                    self.rgf_contribution(rhs, field, index, full_set, span, frame)
+                }
                 Value::Bool(false) => Ok(full_set.to_vec()),
                 other => Err(self.error(
                     "E0402",
@@ -4859,10 +5181,10 @@ impl<'a> Interp<'a> {
                 if let Some((element, set)) = rgf_inset_parts(inner)
                     && rgf_bare_ref(element, field)
                 {
-                    let contained = self.rgf_set_contribution(set, index, span)?;
+                    let contained = self.rgf_set_contribution(set, index, span, frame)?;
                     return Ok(complement_interval_set(&contained, full_set[0]));
                 }
-                match self.eval(expr, &mut Frame::default(), Some(index))? {
+                match self.eval(expr, frame, Some(index))? {
                     Value::Bool(true) => Ok(full_set.to_vec()),
                     Value::Bool(false) => Ok(Vec::new()),
                     other => Err(self.error(
@@ -4889,9 +5211,9 @@ impl<'a> Interp<'a> {
                 // One side is the bare rgf reference (shape-checked); the
                 // other evaluates to a constant scalar.
                 let (value, rgf_is_lhs) = if rgf_bare_ref(lhs, field) {
-                    (self.rgf_scalar_operand(rhs, index, span)?, true)
+                    (self.rgf_scalar_operand(rhs, index, span, frame)?, true)
                 } else {
-                    (self.rgf_scalar_operand(lhs, index, span)?, false)
+                    (self.rgf_scalar_operand(lhs, index, span, frame)?, false)
                 };
                 let interval = match (op, rgf_is_lhs) {
                     (BinaryOp::Eq, _) => (value, value),
@@ -4911,14 +5233,14 @@ impl<'a> Interp<'a> {
                 Ok(vec![interval])
             }
             Expr::InSet { element, set, .. } if rgf_bare_ref(element, field) => {
-                let contained = self.rgf_set_contribution(set, index, span)?;
+                let contained = self.rgf_set_contribution(set, index, span, frame)?;
                 Ok(contained)
             }
             // Any node that does not involve the field is rgf-free (the
             // shape check guarantees at most one rgf atom per
             // constraint): it evaluates to a Boolean constant — TRUE
             // contributes the full range, FALSE the empty set.
-            _ => match self.eval(expr, &mut Frame::default(), Some(index))? {
+            _ => match self.eval(expr, frame, Some(index))? {
                 Value::Bool(true) => Ok(full_set.to_vec()),
                 Value::Bool(false) => Ok(Vec::new()),
                 other => Err(self.error(
@@ -4941,23 +5263,24 @@ impl<'a> Interp<'a> {
         set: &crate::ast::InSetExpr,
         index: usize,
         span: crate::ast::Span,
+        frame: &mut Frame,
     ) -> Result<Vec<(i128, i128)>, ExecError> {
         match set {
             crate::ast::InSetExpr::Range(low, high) => {
-                let low = self.rgf_scalar_operand(low, index, span)?;
-                let high = self.rgf_scalar_operand(high, index, span)?;
+                let low = self.rgf_scalar_operand(low, index, span, frame)?;
+                let high = self.rgf_scalar_operand(high, index, span, frame)?;
                 Ok(vec![(low, high)])
             }
             crate::ast::InSetExpr::Items(items) => {
                 let mut intervals = Vec::with_capacity(items.len());
                 for item in items {
-                    let value = self.rgf_scalar_operand(item, index, span)?;
+                    let value = self.rgf_scalar_operand(item, index, span, frame)?;
                     intervals.push((value, value));
                 }
                 Ok(canonical_set(intervals))
             }
             crate::ast::InSetExpr::Expr(expr) => {
-                let value = self.eval(expr, &mut Frame::default(), Some(index))?;
+                let value = self.eval(expr, frame, Some(index))?;
                 let Value::Set(intervals) = value else {
                     return Err(self.error(
                         "E0402",
@@ -4981,8 +5304,9 @@ impl<'a> Interp<'a> {
         expr: &Expr,
         index: usize,
         span: crate::ast::Span,
+        frame: &mut Frame,
     ) -> Result<i128, ExecError> {
-        let value = self.eval(expr, &mut Frame::default(), Some(index))?;
+        let value = self.eval(expr, frame, Some(index))?;
         match &value {
             Value::Int(v) => Ok(*v),
             Value::Bool(b) => Ok(*b as i128),
@@ -5074,6 +5398,7 @@ impl<'a> Interp<'a> {
         constraints: &[Expr],
         type_name: &str,
         span: crate::ast::Span,
+        enumerate_linear: bool,
     ) -> Result<Option<Vec<(String, i128)>>, ExecError> {
         let mut bounds = BTreeMap::new();
         for (name, ty) in field_types {
@@ -5108,7 +5433,14 @@ impl<'a> Interp<'a> {
             Ok(problem) => problem,
             Err(_) => return Ok(None),
         };
-        match crate::solve::solve(&problem, self.seed) {
+        let outcome = crate::solve::solve(&problem, self.seed);
+        let outcome = match outcome {
+            crate::solve::SolveOutcome::Unsupported if enumerate_linear => {
+                crate::solve::solve_by_enumeration(&problem, self.seed)
+            }
+            outcome => outcome,
+        };
+        match outcome {
             crate::solve::SolveOutcome::Solved(assignment) => Ok(Some(
                 problem
                     .vars
@@ -5889,9 +6221,6 @@ impl<'a> Interp<'a> {
                             .all(|field| self.is_dynamic_subtype_field(field))
                     })
                 && (view.constraints == base.constraints || view.fields.len() > base.fields.len())
-                && view.ports == base.ports
-                && view.covers == base.covers
-                && view.expects == base.expects
                 && self.when_root_base(view).as_deref() == Some(nominal)
                 && self.instance_matches_view(receiver, view, false)
         }) {
@@ -6898,12 +7227,38 @@ impl<'a> Interp<'a> {
     /// lookup, not the instance's HDL-bound subset — every declared
     /// port is a member, bound or not.
     fn instance_has_port(&self, index: usize, name: &str) -> bool {
-        let type_name = self.instances[index].type_name.clone();
-        let types: &[crate::elab::ElaboratedType] = self.types;
-        types
+        self.instance_port_declarations(index)
+            .any(|(_, port)| port.name == name)
+    }
+
+    fn instance_port_declarations(
+        &self,
+        index: usize,
+    ) -> impl Iterator<Item = (&'a crate::elab::ElaboratedType, &'a crate::elab::PortInfo)> + '_
+    {
+        let nominal = &self.instances[index].type_name;
+        self.types
             .iter()
-            .find(|t| t.name == type_name)
-            .is_some_and(|ty| ty.ports.iter().any(|port| port.name == name))
+            .filter_map(move |view| {
+                let start = if &view.name == nominal {
+                    0
+                } else if self.active_when_view(index, view) {
+                    self.when_parent(view)
+                        .map_or(0, |parent| parent.ports.len())
+                } else {
+                    return None;
+                };
+                Some((view, &view.ports[start..]))
+            })
+            .flat_map(|(view, ports)| ports.iter().map(move |port| (view, port)))
+    }
+
+    fn instance_hdl_path(&self, index: usize, name: &str) -> Option<&str> {
+        self.instances[index].port_path(name).or_else(|| {
+            self.instance_port_declarations(index)
+                .find(|(_, port)| port.name == name)
+                .and_then(|(_, port)| port.hdl_path.as_deref())
+        })
     }
 
     /// The predefined any_unit instance-path query (7.4): the dotted
@@ -7000,13 +7355,14 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        if with_ports && let Some(ty) = types.iter().find(|t| t.name == type_name) {
-            for port in &ty.ports {
-                children.push(Value::Port {
-                    owner: index,
-                    name: port.name.clone(),
-                });
-            }
+        if with_ports {
+            children.extend(
+                self.instance_port_declarations(index)
+                    .map(|(_, port)| Value::Port {
+                        owner: index,
+                        name: port.name.clone(),
+                    }),
+            );
         }
         Value::List(ListValue {
             items: Rc::new(RefCell::new(children)),
@@ -7017,21 +7373,13 @@ impl<'a> Interp<'a> {
     /// `get_ports()` (7.4.5): the unit's own ports as `any_port`
     /// handles, in declaration order.
     fn instance_ports(&self, index: usize) -> Value {
-        let type_name = self.instances[index].type_name.clone();
-        let types: &[crate::elab::ElaboratedType] = self.types;
-        let ports: Vec<Value> = types
-            .iter()
-            .find(|t| t.name == type_name)
-            .map(|ty| {
-                ty.ports
-                    .iter()
-                    .map(|port| Value::Port {
-                        owner: index,
-                        name: port.name.clone(),
-                    })
-                    .collect()
+        let ports = self
+            .instance_port_declarations(index)
+            .map(|(_, port)| Value::Port {
+                owner: index,
+                name: port.name.clone(),
             })
-            .unwrap_or_default();
+            .collect();
         Value::List(ListValue {
             items: Rc::new(RefCell::new(ports)),
             element: Some("any_port".to_owned()),
@@ -7041,19 +7389,17 @@ impl<'a> Interp<'a> {
     /// `get_ports_recursively()` (7.4.6): the unit's ports followed by
     /// every sub-instance's, in field-tree order.
     fn instance_ports_recursively(&self, index: usize) -> Value {
-        let mut ports: Vec<Value> = Vec::new();
-        for member in self.field_tree(index) {
-            let type_name = self.instances[member].type_name.clone();
-            let types: &[crate::elab::ElaboratedType] = self.types;
-            if let Some(ty) = types.iter().find(|t| t.name == type_name) {
-                for port in &ty.ports {
-                    ports.push(Value::Port {
-                        owner: member,
+        let ports = self
+            .field_tree(index)
+            .into_iter()
+            .flat_map(|owner| {
+                self.instance_port_declarations(owner)
+                    .map(move |(_, port)| Value::Port {
+                        owner,
                         name: port.name.clone(),
-                    });
-                }
-            }
-        }
+                    })
+            })
+            .collect();
         Value::List(ListValue {
             items: Rc::new(RefCell::new(ports)),
             element: Some("any_port".to_owned()),
@@ -7191,7 +7537,7 @@ impl<'a> Interp<'a> {
         if self.port_bound_set(owner, port).len() > 1 {
             return true;
         }
-        self.instances[owner].port_path(port).is_some()
+        self.instance_hdl_path(owner, port).is_some()
     }
 
     /// Coverage configuration (29.9). Category and option arguments
@@ -7497,13 +7843,17 @@ impl<'a> Interp<'a> {
             .instances
             .iter()
             .enumerate()
-            .filter(|(_, instance)| instance.type_name == type_name)
+            .filter(|(owner, _)| {
+                self.types
+                    .iter()
+                    .find(|ty| ty.name == type_name)
+                    .is_some_and(|ty| self.instance_carries_type(*owner, ty))
+            })
             .map(|(index, _)| index)
             .collect();
-        let mut frame = Frame::default();
         for owner in instance_indices {
             for group_index in &group_indices {
-                self.sample_group_on_instance(entry_index, *group_index, owner, &mut frame, span);
+                self.sample_group_on_instance(entry_index, *group_index, owner, span);
             }
         }
         Ok(())
@@ -10818,34 +11168,100 @@ impl<'a> Interp<'a> {
             else {
                 continue;
             };
-            let declarations = ty.expects.clone();
-            for declaration in declarations {
-                let te = self.bind_temporal_events(&declaration.te, &Frame::default(), Some(owner));
-                self.instance_rules.push(InstanceRule {
-                    monitor: crate::temporal::RuleMonitor::new(&te),
-                    declaration,
-                    owner,
-                    te,
-                    start: self.cycle as usize,
-                    retired: false,
-                });
+            for declaration in &ty.expects {
+                self.register_instance_rule(owner, None, declaration);
             }
         }
+
+        let types = self.types;
+        let mut active = BTreeSet::new();
+        for (type_index, ty) in types
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| !ty.when_of.is_empty() && !ty.expects.is_empty())
+        {
+            let start = self
+                .when_parent(ty)
+                .map_or(0, |parent| parent.expects.len());
+            if start == ty.expects.len() {
+                continue;
+            }
+            for owner in 0..self.instances.len() {
+                if !self.active_when_view(owner, ty) {
+                    continue;
+                }
+                for (position, declaration) in ty.expects.iter().enumerate().skip(start) {
+                    let key = (owner, type_index, position);
+                    active.insert(key);
+                    if !self.active_subtype_rules.contains_key(&key) {
+                        let context = self.instance_rules.len();
+                        self.register_instance_rule(owner, Some(ty.name.clone()), declaration);
+                        self.active_subtype_rules.insert(key, context);
+                    }
+                }
+            }
+        }
+        self.active_subtype_rules.retain(|key, context| {
+            if active.contains(key) {
+                return true;
+            }
+            let rule = &mut self.instance_rules[*context];
+            let end = rule.last_sampled.map_or(self.cycle as usize, |last| {
+                (self.cycle as usize).max(last + 1)
+            });
+            rule.end = Some(end);
+            false
+        });
+    }
+
+    fn register_instance_rule(
+        &mut self,
+        owner: usize,
+        view: Option<String>,
+        declaration: &crate::ast::ExpectDecl,
+    ) {
+        let frame = Frame {
+            method_owner: view.clone(),
+            ..Frame::default()
+        };
+        let te = self.bind_temporal_events(&declaration.te, &frame, Some(owner));
+        self.instance_rules.push(InstanceRule {
+            monitor: crate::temporal::RuleMonitor::new(&te),
+            declaration: declaration.clone(),
+            view,
+            owner,
+            te,
+            start: self.cycle as usize,
+            end: None,
+            last_sampled: None,
+            retired: false,
+        });
     }
 
     fn sample_rule_values(&mut self) {
+        self.sample_active_rules(false);
+    }
+
+    fn sample_active_rules(&mut self, subtype_only: bool) {
         if !self.rules_enabled || self.sampling_temporal {
             return;
         }
-        self.refresh_instance_rules();
+        if !subtype_only {
+            self.refresh_instance_rules();
+        }
         self.sampling_temporal = true;
         for context in 0..self.instance_rules.len() {
-            let rule = &self.instance_rules[context];
-            if rule.retired {
+            let rule = &mut self.instance_rules[context];
+            if rule.retired || rule.end.is_some() || (subtype_only && rule.view.is_none()) {
                 continue;
             }
+            rule.last_sampled = Some(self.cycle as usize);
             let (te, owner) = (rule.te.clone(), rule.owner);
-            self.sample_temporal_values(&te, &mut Frame::default(), Some(owner), context as u64);
+            let mut frame = Frame {
+                method_owner: rule.view.clone(),
+                ..Frame::default()
+            };
+            self.sample_temporal_values(&te, &mut frame, Some(owner), context as u64);
         }
         self.sampling_temporal = false;
     }
@@ -10986,7 +11402,7 @@ impl<'a> Interp<'a> {
         path: &str,
         owner: Option<usize>,
         span: crate::ast::Span,
-        frame: &mut Frame,
+        view: Option<&str>,
     ) -> Result<(), ExecError> {
         let key = if is_every_cycle_event(path) {
             path.to_owned()
@@ -10994,16 +11410,25 @@ impl<'a> Interp<'a> {
             owner.map_or_else(
                 || path.to_owned(),
                 |owner| {
-                    self.registered_event_key(owner, path.rsplit('.').next().unwrap_or(path), None)
+                    self.registered_event_key(owner, path.rsplit('.').next().unwrap_or(path), view)
                 },
             )
         };
+        self.refresh_instance_rules();
         self.emitted.insert(key.clone());
         self.pad_log();
         self.temporal_log[self.cycle as usize].record(&key);
+        if !self.active_subtype_rules.is_empty() {
+            self.sample_active_rules(true);
+        }
         self.wake_tcm_listeners(&key);
+        let coverage = owner.map(|owner| self.event_cover_groups(owner, &key));
         self.run_on_blocks(path, owner, span)?;
-        self.sample_cover_groups(path, owner, frame, span);
+        if let (Some(owner), Some(groups)) = (owner, coverage) {
+            for (entry, group) in groups {
+                self.sample_group_on_instance(entry, group, owner, span);
+            }
+        }
         Ok(())
     }
 
@@ -11106,7 +11531,7 @@ impl<'a> Interp<'a> {
                         &trigger.event_name,
                         Some(owner),
                         trigger.span,
-                        &mut Frame::default(),
+                        Some(&trigger.type_name),
                     )
                 {
                     self.output.push_str(&format!(
@@ -11125,23 +11550,25 @@ impl<'a> Interp<'a> {
         // `p$` into one identifier), which is the event path `emit p$`
         // and `on p$` use.
         let port_samples = self.collect_bound_event_ports();
-        for (owner, port_name, path, edge) in port_samples {
-            let value = match self.hdl.as_mut().unwrap().get(&path, cycle) {
+        let active: BTreeSet<_> = port_samples.iter().map(|port| port.key.clone()).collect();
+        self.sim_prev.retain(|key, _| active.contains(key));
+        for port in port_samples {
+            let value = match self.hdl.as_mut().unwrap().get(&port.path, cycle) {
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            let key = (owner, port_name.clone());
-            let previous = self.sim_prev.insert(key, Some(value)).flatten();
-            if edge_fires(&edge, previous, value)
+            let previous = self.sim_prev.insert(port.key, value);
+            if edge_fires(&port.edge, previous, value)
                 && let Err(diagnostic) = self.fire_event(
-                    &port_name,
-                    Some(owner),
+                    &port.name,
+                    Some(port.owner),
                     origin_span(),
-                    &mut Frame::default(),
+                    Some(&port.view),
                 )
             {
                 self.output.push_str(&format!(
-                    "event port {port_name}: {}\n",
+                    "event port {}: {}\n",
+                    port.name,
                     diagnostic.render()
                 ));
             }
@@ -11153,26 +11580,32 @@ impl<'a> Interp<'a> {
     /// [`Interp::sample_sim_events`]. The edge attribute comes from the
     /// type's `keep <port>.edge() == <value>` constraint (9.7.3) and
     /// defaults to `change`.
-    fn collect_bound_event_ports(&self) -> Vec<(usize, String, String, String)> {
-        let types: &[crate::elab::ElaboratedType] = self.types;
+    fn collect_bound_event_ports(&self) -> Vec<BoundEventPort> {
         let mut samples = Vec::new();
-        for (index, instance) in self.instances.iter().enumerate() {
-            let Some(declared) = types.iter().find(|t| t.name == instance.type_name) else {
-                continue;
-            };
-            for (name, path) in &instance.ports {
-                let Some(info) = declared.ports.iter().find(|p| &p.name == name) else {
+        for (owner, _) in self.instances.iter().enumerate() {
+            for (view, port) in self.instance_port_declarations(owner) {
+                if !port.is_event {
+                    continue;
+                }
+                let Some(path) = port.hdl_path.as_ref() else {
                     continue;
                 };
-                if !info.is_event || path.is_empty() {
+                if path.is_empty() {
                     continue;
                 }
                 let edge = self
                     .port_edges
-                    .get(&(instance.type_name.clone(), name.clone()))
+                    .get(&(view.name.clone(), port.name.clone()))
                     .cloned()
                     .unwrap_or_else(|| "change".to_owned());
-                samples.push((index, name.clone(), path.clone(), edge));
+                samples.push(BoundEventPort {
+                    owner,
+                    key: self.registered_event_key(owner, &port.name, Some(&view.name)),
+                    view: view.name.clone(),
+                    name: port.name.clone(),
+                    path: path.clone(),
+                    edge,
+                });
             }
         }
         samples
@@ -11188,44 +11621,50 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Sample the coverage groups (14.2) of the instance whose event
-    /// fired: each item's recorded expression evaluates in the emitting
-    /// frame, or the item's field is read from the owner, and the value
-    /// lands in the item's buckets.
-    fn sample_cover_groups(
-        &mut self,
-        path: &str,
-        owner: Option<usize>,
-        frame: &mut Frame,
-        span: crate::ast::Span,
-    ) {
-        let Some(owner) = owner else {
-            return;
-        };
-        let type_name = self.instances[owner].type_name.clone();
-        let Some(entry_index) = self
-            .coverage
-            .iter()
-            .position(|entry| entry.type_name == type_name)
-        else {
-            return;
-        };
-        let key = instance_event_key(owner, path.rsplit('.').next().unwrap_or(path));
-        let group_indices: Vec<usize> = self.coverage[entry_index]
-            .groups
-            .iter()
-            .enumerate()
-            .filter(|(_, group)| {
-                group.unit_owner.is_none()
-                    && group.event_path.as_deref().is_some_and(|event| {
-                        self.scoped_event_key(event, &Frame::default(), Some(owner)) == key
+    /// The active schemas for a physical event occurrence. Inherited groups
+    /// stay with the nominal type unless an active view contributes to them.
+    fn event_cover_groups(&self, owner: usize, key: &str) -> Vec<(usize, usize)> {
+        let mut samples = Vec::new();
+        for (entry, coverage) in self.coverage.iter().enumerate() {
+            let Some(ty) = self.types.iter().find(|ty| ty.name == coverage.type_name) else {
+                continue;
+            };
+            if !self.instance_carries_type(owner, ty) {
+                continue;
+            }
+            let nominal = self.instances[owner].type_name == ty.name;
+            let start = if nominal {
+                0
+            } else {
+                self.when_parent(ty).map_or(0, |parent| parent.covers.len())
+            };
+            for (position, group) in coverage.groups.iter().enumerate() {
+                if group.unit_owner.is_some()
+                    || !ty.covers[start..]
+                        .iter()
+                        .any(|decl| decl.name == group.name)
+                    || !group.event_path.as_deref().is_some_and(|event| {
+                        let frame = Frame {
+                            method_owner: Some(ty.name.clone()),
+                            ..Frame::default()
+                        };
+                        self.scoped_event_key(event, &frame, Some(owner)) == key
                     })
-            })
-            .map(|(index, _)| index)
-            .collect();
-        for group_index in group_indices {
-            self.sample_group_on_instance(entry_index, group_index, owner, frame, span);
+                {
+                    continue;
+                }
+                // A deeper schema carries the inherited group's items as well.
+                samples.retain(|&(entry, group_index): &(usize, usize)| {
+                    let ancestor = &self.coverage[entry];
+                    let previous = &ancestor.groups[group_index];
+                    previous.name != group.name
+                        || previous.event_path != group.event_path
+                        || !self.type_is_a(&ty.name, &ancestor.type_name)
+                });
+                samples.push((entry, position));
+            }
         }
+        samples
     }
 
     /// One sampling event of one group on one instance: the group's
@@ -11258,7 +11697,11 @@ impl<'a> Interp<'a> {
                 .types
                 .iter()
                 .any(|ty| ty.name == *name && ty.kind == DeclarationKind::Unit)
-                && self.type_is_a(name, scope)
+                && (self.type_is_a(name, scope)
+                    || self
+                        .types
+                        .iter()
+                        .any(|ty| ty.name == scope && self.active_when_view(unit, ty)))
             {
                 return Some((unit, render_iterator_path(&path[..=position], "sys")));
             }
@@ -11271,10 +11714,14 @@ impl<'a> Interp<'a> {
         expr: &Expr,
         owner: usize,
         unit: Option<usize>,
+        entry: usize,
     ) -> Result<bool, ExecError> {
         // Coverage options use their declaring struct context, never
         // the locals of the method that happened to emit the event.
-        let mut frame = Frame::default();
+        let mut frame = Frame {
+            method_owner: Some(self.coverage[entry].type_name.clone()),
+            ..Frame::default()
+        };
         if let Some(unit) = unit {
             frame.locals.insert("inst".to_owned(), Value::Object(unit));
         }
@@ -11952,7 +12399,11 @@ impl<'a> Interp<'a> {
                         .last()
                         .expect("instance walk path is nonempty")
                         .instance;
-                    if self.instances[owner].type_name == entry.type_name
+                    if self
+                        .types
+                        .iter()
+                        .find(|ty| ty.name == entry.type_name)
+                        .is_some_and(|ty| self.instance_carries_type(owner, ty))
                         && let Some((unit, label)) = self.coverage_unit_on_path(path, scope)
                     {
                         plans.push((entry_index, group_index, owner, unit, label));
@@ -11965,22 +12416,7 @@ impl<'a> Interp<'a> {
             if !refreshed.insert((entry, base, unit)) {
                 continue;
             }
-            let name = self.coverage[entry].groups[base].name.clone();
-            let index = if let Some(index) = self.coverage[entry]
-                .groups
-                .iter()
-                .position(|group| group.name == name && group.unit_owner == Some(unit))
-            {
-                index
-            } else {
-                let mut group = self.coverage[entry].groups[base].clone();
-                group.unit_owner = Some(unit);
-                self.coverage[entry].groups.push(group);
-                self.coverage[entry].groups.len() - 1
-            };
-            // Counts follow the physical unit. The path is its current
-            // display label and may change after rebinding an alias.
-            self.coverage[entry].groups[index].unit_instance = Some(path);
+            let index = self.ensure_coverage_instance(entry, base, unit, path);
             if !refresh_visibility {
                 continue;
             }
@@ -11991,7 +12427,7 @@ impl<'a> Interp<'a> {
                 .map(|item| item.options.clone())
                 .collect();
             let hidden = match &options.instance_no_collect {
-                Some(expr) => match self.coverage_boolean(expr, owner, Some(unit)) {
+                Some(expr) => match self.coverage_boolean(expr, owner, Some(unit), entry) {
                     Ok(value) => value,
                     Err(diagnostic) => {
                         self.pending_diagnostics.push(diagnostic);
@@ -12008,7 +12444,7 @@ impl<'a> Interp<'a> {
                 .collect();
             for (item_index, item) in derived.iter().enumerate() {
                 let hidden = match &item.instance_no_collect {
-                    Some(expr) => match self.coverage_boolean(expr, owner, Some(unit)) {
+                    Some(expr) => match self.coverage_boolean(expr, owner, Some(unit), entry) {
                         Ok(value) => value,
                         Err(diagnostic) => {
                             self.pending_diagnostics.push(diagnostic);
@@ -12023,7 +12459,7 @@ impl<'a> Interp<'a> {
             }
             for (item_index, item) in items.iter().enumerate() {
                 let hidden = match &item.instance_no_collect {
-                    Some(expr) => match self.coverage_boolean(expr, owner, Some(unit)) {
+                    Some(expr) => match self.coverage_boolean(expr, owner, Some(unit), entry) {
                         Ok(value) => value,
                         Err(diagnostic) => {
                             self.pending_diagnostics.push(diagnostic);
@@ -12039,12 +12475,38 @@ impl<'a> Interp<'a> {
         }
     }
 
+    fn ensure_coverage_instance(
+        &mut self,
+        entry: usize,
+        base: usize,
+        unit: usize,
+        path: String,
+    ) -> usize {
+        let name = self.coverage[entry].groups[base].name.clone();
+        let index = if let Some(index) = self.coverage[entry]
+            .groups
+            .iter()
+            .position(|group| group.name == name && group.unit_owner == Some(unit))
+        {
+            index
+        } else {
+            let mut group = self.coverage[entry].groups[base].clone();
+            group.unit_owner = Some(unit);
+            self.coverage[entry].groups.push(group);
+            self.coverage[entry].groups.len() - 1
+        };
+        // Counts follow the physical unit. The path is its current
+        // display label and may change after rebinding an alias.
+        self.coverage[entry].groups[index].unit_instance = Some(path);
+        index
+    }
+
     fn prepare_derived_item(&mut self, entry: usize, group: usize, owner: usize, index: usize) {
         let options = self.coverage[entry].groups[group].derived[index]
             .options
             .clone();
         let mut collect = match options.when {
-            Some(expr) => match self.coverage_boolean(&expr, owner, None) {
+            Some(expr) => match self.coverage_boolean(&expr, owner, None, entry) {
                 Ok(value) => value,
                 Err(diagnostic) => {
                     self.pending_diagnostics.push(diagnostic);
@@ -12124,7 +12586,6 @@ impl<'a> Interp<'a> {
         entry_index: usize,
         mut group_index: usize,
         owner: usize,
-        _emitting_frame: &mut Frame,
         span: crate::ast::Span,
     ) {
         if !self.coverage_config.mode {
@@ -12134,7 +12595,7 @@ impl<'a> Interp<'a> {
             .options
             .clone();
         if let Some(scope) = &settings.unit_scope {
-            let Some((unit, _)) = self.coverage_unit_for(owner, scope) else {
+            let Some((unit, path)) = self.coverage_unit_for(owner, scope) else {
                 self.pending_diagnostics.push(self.error(
                     "E0402",
                     format!("coverage owner has no containing unit of type '{scope}' (14.2)"),
@@ -12142,16 +12603,10 @@ impl<'a> Interp<'a> {
                 ));
                 return;
             };
-            self.prepare_coverage_instances(false);
-            let name = self.coverage[entry_index].groups[group_index].name.clone();
-            group_index = self.coverage[entry_index]
-                .groups
-                .iter()
-                .position(|group| group.name == name && group.unit_owner == Some(unit))
-                .expect("prepared coverage instance");
+            group_index = self.ensure_coverage_instance(entry_index, group_index, unit, path);
         }
         if let Some(expr) = &settings.when {
-            match self.coverage_boolean(expr, owner, None) {
+            match self.coverage_boolean(expr, owner, None, entry_index) {
                 Ok(true) => {}
                 Ok(false) => return,
                 Err(diagnostic) => {
@@ -12167,7 +12622,7 @@ impl<'a> Interp<'a> {
             return;
         }
         let unit = self.coverage[entry_index].groups[group_index].unit_owner;
-        let type_name = self.instances[owner].type_name.clone();
+        let type_name = self.coverage[entry_index].type_name.clone();
         let group_name = self.coverage[entry_index].groups[group_index].name.clone();
         let sources: Vec<_> = self
             .types
@@ -12192,10 +12647,13 @@ impl<'a> Interp<'a> {
             })
             .collect();
         self.coverage[entry_index].groups[group_index].begin_sample();
-        let mut frame = Frame::default();
+        let mut frame = Frame {
+            method_owner: Some(type_name.clone()),
+            ..Frame::default()
+        };
         for (name, options, real) in items {
             if let Some(expr) = &options.when {
-                match self.coverage_boolean(expr, owner, None) {
+                match self.coverage_boolean(expr, owner, None, entry_index) {
                     Ok(true) => {}
                     Ok(false) => continue,
                     Err(diagnostic) => {
@@ -12209,9 +12667,13 @@ impl<'a> Interp<'a> {
             };
             let value = match expr {
                 Some(expr) => self.eval_coverage_expression(expr, &mut frame, Some(owner)),
-                None => self.instances[owner].get(&name).cloned().ok_or_else(|| {
-                    self.error("E0401", format!("unknown coverage field '{name}'"), span)
-                }),
+                None => self
+                    .read_instance_field(owner, Some(&type_name), &name)
+                    .and_then(|value| {
+                        value.ok_or_else(|| {
+                            self.error("E0401", format!("unknown coverage field '{name}'"), span)
+                        })
+                    }),
             };
             match value {
                 Ok(value) => {
@@ -13176,7 +13638,6 @@ impl<'a> Interp<'a> {
         type_name: &str,
         event_name: &str,
         span: crate::ast::Span,
-        frame: &mut Frame,
     ) -> Result<(), ExecError> {
         // The well-formedness pass validated the spelling; the runtime
         // check is the backstop for the documented gaps (statics inside
@@ -13241,7 +13702,6 @@ impl<'a> Interp<'a> {
             self.atomic_depth -= 1;
             self.depth -= 1;
         }
-        self.sample_cover_groups(&path, None, frame, span);
         Ok(())
     }
 
@@ -15729,7 +16189,6 @@ impl<'a> Interp<'a> {
 
     fn is_dynamic_subtype_field(&self, field: &crate::ast::Field) -> bool {
         !field.is_static
-            && !field.range_gen
             && !self.is_unit_typed(&field.ty)
             && !self.is_non_generatable_builtin(&field.ty)
     }
@@ -15801,7 +16260,7 @@ impl<'a> Interp<'a> {
         if let Some(value) = self.instances[index].subtype_fields.get(&slot) {
             return Ok(Some(value.clone()));
         }
-        if field.no_gen || field.is_const {
+        if field.no_gen || field.is_const || field.range_gen {
             let value = self.initial_field_value(field)?;
             self.instances[index].subtype_fields.insert(slot, value);
         } else {
@@ -15812,8 +16271,7 @@ impl<'a> Interp<'a> {
                 .and_then(|base| self.types.iter().find(|ty| ty.name == base));
             let field_start = parent.map_or(0, |ty| ty.fields.len());
             let constraint_start = parent.map_or(0, |ty| ty.constraints.len());
-            let len = self.instances.len();
-            let saved = self.instances[index].subtype_fields.clone();
+            let checkpoint = (self.instances.len(), self.instances[index].clone());
             let result = self.gen_subtype_fields(
                 index,
                 declaring_view,
@@ -15822,8 +16280,7 @@ impl<'a> Interp<'a> {
                 false,
             );
             if let Err(error) = result {
-                self.instances.truncate(len);
-                self.instances[index].subtype_fields = saved;
+                self.restore_generation_candidate(index, &checkpoint);
                 if matches!(
                     error,
                     ExecError::Diagnostic(Diagnostic { code: "E0407", .. })
@@ -15992,6 +16449,10 @@ impl<'a> Interp<'a> {
             && self.instance_matches_view(owner, view, false)
     }
 
+    fn instance_carries_type(&self, owner: usize, ty: &crate::elab::ElaboratedType) -> bool {
+        self.instances[owner].type_name == ty.name || self.active_when_view(owner, ty)
+    }
+
     fn active_instance_fields(&self, owner: usize) -> Vec<(String, Value)> {
         let instance = &self.instances[owner];
         let mut fields = instance.fields.clone();
@@ -16020,6 +16481,10 @@ impl<'a> Interp<'a> {
             ty.events
                 .iter()
                 .any(|event| !event.is_static && event.name == name)
+                || ty
+                    .ports
+                    .iter()
+                    .any(|port| port.is_event && port.name == name)
         };
         let mut inactive = false;
         for ty in self.types.iter().filter(|ty| has_event(ty)) {
@@ -16041,24 +16506,37 @@ impl<'a> Interp<'a> {
     fn registered_event_key(&self, owner: usize, name: &str, scope: Option<&str>) -> String {
         let nominal = &self.instances[owner].type_name;
         let declares = |event: &crate::ast::EventDecl| !event.is_static && event.name == name;
-        if self
-            .types
-            .iter()
-            .any(|ty| &ty.name == nominal && ty.events.iter().any(declares))
-        {
+        if self.types.iter().any(|ty| {
+            &ty.name == nominal
+                && (ty.events.iter().any(declares)
+                    || ty
+                        .ports
+                        .iter()
+                        .any(|port| port.is_event && port.name == name))
+        }) {
             return instance_event_key(owner, name);
         }
-        let view = self.types.iter().enumerate().find(|(_, ty)| {
+        let declarations = self.types.iter().enumerate().filter(|(_, ty)| {
             !ty.when_of.is_empty()
                 && self.type_is_a(&ty.name, nominal)
-                && scope.map_or_else(
-                    || self.active_when_view(owner, ty),
-                    |scope| self.type_is_a(scope, &ty.name) || self.active_when_view(owner, ty),
-                )
-                && self
-                    .when_parent(ty)
-                    .is_some_and(|parent| ty.events[parent.events.len()..].iter().any(declares))
+                && self.when_parent(ty).is_some_and(|parent| {
+                    ty.events[parent.events.len()..].iter().any(declares)
+                        || ty.ports[parent.ports.len()..]
+                            .iter()
+                            .any(|port| port.is_event && port.name == name)
+                })
         });
+        let view = scope
+            .and_then(|scope| {
+                declarations
+                    .clone()
+                    .find(|(_, ty)| self.type_is_a(scope, &ty.name))
+            })
+            .or_else(|| {
+                declarations
+                    .clone()
+                    .find(|(_, ty)| self.active_when_view(owner, ty))
+            });
         match view {
             Some((position, _)) => instance_event_key(owner, &format!("{name}@{position}")),
             None => instance_event_key(owner, name),
@@ -16450,7 +16928,7 @@ impl<'a> Interp<'a> {
         let Some(index) = me else {
             return Err(self.error("E0402", "port access requires an enclosing instance", span));
         };
-        let Some(path) = self.instances[index].port_path(port).map(str::to_owned) else {
+        let Some(path) = self.instance_hdl_path(index, port).map(str::to_owned) else {
             return Err(self.error("E0401", format!("unknown port '{port}'"), span));
         };
         if self.hdl.is_none() {
@@ -16474,7 +16952,7 @@ impl<'a> Interp<'a> {
         let Some(index) = me else {
             return Err(self.error("E0402", "port access requires an enclosing instance", span));
         };
-        let Some(path) = self.instances[index].port_path(port).map(str::to_owned) else {
+        let Some(path) = self.instance_hdl_path(index, port).map(str::to_owned) else {
             return Err(self.error("E0401", format!("unknown port '{port}'"), span));
         };
         let Some(int_value) = as_i64(&value) else {

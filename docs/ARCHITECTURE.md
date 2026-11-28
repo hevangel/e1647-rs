@@ -330,10 +330,12 @@ single-source browser sandbox API runs in disposable workers (see
   `f: LO pkt` or chained `f: LO HI pkt` — parsed as nested
   qualifiers) instantiate the view, so those members apply for the
   instance. `is a` also checks live determinants on base-typed instances.
-  Whole-object generation samples each active view after its parent and
-  stores its ordinary fields by declaring view and field slot. The scheduler
-  resolves active event declarations and `on` actions at emission and
-  samples supported subtype `@sim` triggers at cycle boundaries. The
+  Whole-object generation selects a branch before solving constraints that
+  refer to its parent fields. Values and reduced sets use the declaring view
+  and field slot. The scheduler resolves active events, `on` actions, and
+  coverage groups at emission. It samples HDL event ports and supported
+  `@sim` triggers at cycle boundaries. Temporal rule monitors retain the
+  expression scope and log interval of one activation. The
   separate conservative type pass checks composed views.
 - `src/builtins.rs` — predeclared names the executed subset relies on:
   the `sys` unit, sequence bases (`any_sequence_item` and siblings), and

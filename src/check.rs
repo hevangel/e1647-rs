@@ -3445,11 +3445,15 @@ fn check_constraint_fields(
     // declaration. The recording pass (elab) reads them as written.
     let attribute_constraint =
         crate::interp::expr_calls_any(&constraint.expr, &["pack_options", "per_inst_cover"]);
+    let edge_constraint = crate::interp::expr_calls_any(&constraint.expr, &["edge"]);
     for (name, span) in roots {
         if name == "me" || name == "self" {
             continue;
         }
         if attribute_constraint && matches!(name.as_str(), "packing" | "DEFAULT" | "YES" | "NO") {
+            continue;
+        }
+        if edge_constraint && matches!(name.as_str(), "change" | "rise" | "fall" | "any_change") {
             continue;
         }
         if !field_names.contains(name.as_str())

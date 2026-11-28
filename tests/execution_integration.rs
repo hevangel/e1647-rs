@@ -9,6 +9,7 @@ fn integrated_execution_fixtures_pass_typing_and_native_cli() {
         "live-when-types",
         "live-when-methods",
         "dynamic-when-generation-events",
+        "dynamic-when-joint-rgf",
         "nested-edges",
         "entry-alias",
         "coverage-owners",
@@ -54,6 +55,57 @@ fn integrated_execution_fixtures_pass_typing_and_native_cli() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn dynamic_subtype_port_drives_coverage_and_rule_lifetimes() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/execution-integration/dynamic-when-registrations.e");
+    let parsed = e1647::parser::parse(&fs::read_to_string(path).unwrap());
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let elaborated = e1647::elab::elaborate(&parsed.declarations);
+    assert!(
+        elaborated.diagnostics.is_empty(),
+        "{:?}",
+        elaborated.diagnostics
+    );
+    let typing = e1647::typing::check_types(&elaborated);
+    assert!(typing.is_empty(), "{typing:?}");
+    let mut signals = e1647::hdl::InjectedSignals::new();
+    signals
+        .at("top.clock", 0, 0)
+        .at("top.clock", 2, 1)
+        .at("top.clock", 3, 0)
+        .at("top.clock", 4, 1)
+        .at("top.clock", 6, 0)
+        .at("top.clock", 7, 1);
+    let result = e1647::interp::run_with_signals(&elaborated, 1, signals);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(result.output, "edge 2\nrule 2\nedge 2\nrule 2\n");
+    let group = |ty: &str, group: &str| {
+        result
+            .coverage
+            .iter()
+            .find(|entry| entry.type_name == ty)
+            .unwrap()
+            .groups
+            .iter()
+            .find(|entry| entry.name == group)
+            .unwrap()
+    };
+    assert_eq!(group("probe_u", "base_tick").samples, 2);
+    let covered = group("active probe_u", "edge$");
+    assert_eq!(covered.unit_instance.as_deref(), Some("sys.probe"));
+    assert_eq!(covered.samples, 2);
+    assert_eq!(
+        covered.items[0]
+            .buckets
+            .iter()
+            .find(|bucket| bucket.lo == 2)
+            .unwrap()
+            .hits,
+        2
+    );
 }
 
 #[test]

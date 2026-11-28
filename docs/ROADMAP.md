@@ -327,14 +327,13 @@ not imply full language support or IEEE conformance.
       blocks) apply for those instances; a `when` member nested inside
       a when block applies on top of the enclosing view (a further
       combined view, budget-capped). `is a` checks use live determinants
-      on base and `like` instances. Generation fills active `when` fields
-      under their local constraints after sampling the base. Sibling
-      declarations have independent storage. The active view controls its
-      event declarations, `on` actions and supported `@sim` triggers.
-      `start` and `compute` retain the selected method and entry event across
-      suspension. Joint constraint solving across base and subtype fields,
-      dynamic range-generated fields, and HDL event ports remain partial.
-      Coverage and temporal rules lack dynamic registration for
+      on base and `like` instances. Generation holds the selected
+      determinants while solving coupled base and active-branch fields.
+      Reduced ranges and sibling field values use declaration-specific
+      storage. Event declarations, `on` actions, HDL event ports, coverage
+      groups and temporal rules follow the live view. `start` and `compute`
+      retain the selected method and entry event across suspension.
+      The solver cannot combine arbitrary constraints across independent active
       subtypes yet; the conservative type pass checks composed views
 - [~] Constraint IR for `keep` expressions — started: `src/solve.rs`
       translates conjunctions of linear comparisons over bounded integer

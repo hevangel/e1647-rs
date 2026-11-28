@@ -887,7 +887,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                     // sets keep the within-set pairs from re-reporting).
                     elaborator.check_duplicate_fields(declaration.name.as_str(), &composed);
                 }
-                let port_paths = elaborator.extract_port_paths(declaration);
+                let port_paths = elaborator.extract_port_paths(&declaration.members);
                 let unit_attributes = elaborator.extract_unit_attributes(declaration);
                 // The `implementing` entries render to the canonical
                 // names the conformance checks and the interpreter read;
@@ -1122,6 +1122,7 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
             // not refinements of this one — the view composes only the
             // when-in-when members of the block it came from.
             view.whens = Vec::new();
+            let port_paths = elaborator.extract_port_paths(&when.members);
             for member in &when.members {
                 match member {
                     crate::ast::Member::Field(field) => view.fields.push(field.clone()),
@@ -1130,6 +1131,14 @@ pub fn elaborate(declarations: &[Declaration]) -> Elaborated {
                     }
                     crate::ast::Member::Method(method) => view.methods.push(method.clone()),
                     crate::ast::Member::Event(event) => view.events.push(event.clone()),
+                    crate::ast::Member::Port(port) => view.ports.push(PortInfo {
+                        name: port.name.clone(),
+                        hdl_path: port_paths.get(&port.name).cloned(),
+                        is_event: matches!(
+                            &port.element,
+                            crate::ast::TypeExpr::Named { name, .. } if name == "event"
+                        ),
+                    }),
                     crate::ast::Member::On(on) => view.ons.push(on.clone()),
                     crate::ast::Member::Cover(cover) => view.covers.push(cover.clone()),
                     crate::ast::Member::Expect(expect) => view.expects.push(expect.clone()),
@@ -2198,7 +2207,7 @@ impl<'a> Elaborator<'a> {
             for extend_index in &extend_indices {
                 let extend = &self.declarations[*extend_index];
                 Self::push_members(extend, *extend_index, &mut composed);
-                port_paths.extend(self.extract_port_paths(extend));
+                port_paths.extend(self.extract_port_paths(&extend.members));
             }
             // `sys` is a unit: the injected any_unit hooks (24.9.2.14)
             // apply to it as well, base-first.
@@ -2273,10 +2282,9 @@ impl<'a> Elaborator<'a> {
 
     /// Resolve `keep <port>.hdl_path() == "path"` constraints of one
     /// declaration into a port-name → HDL-location map.
-    fn extract_port_paths(&self, declaration: &'a Declaration) -> BTreeMap<String, String> {
+    fn extract_port_paths(&self, members: &[Member]) -> BTreeMap<String, String> {
         use crate::ast::{BinaryOp, Expr};
-        let port_names: Vec<&str> = declaration
-            .members
+        let port_names: Vec<&str> = members
             .iter()
             .filter_map(|member| match member {
                 Member::Port(port) => Some(port.name.as_str()),
@@ -2287,7 +2295,7 @@ impl<'a> Elaborator<'a> {
             return BTreeMap::new();
         }
         let mut paths = BTreeMap::new();
-        for member in &declaration.members {
+        for member in members {
             let Member::Constraint(constraint) = member else {
                 continue;
             };

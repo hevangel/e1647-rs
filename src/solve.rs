@@ -1105,7 +1105,7 @@ pub fn solve(problem: &Problem, seed: u64) -> SolveOutcome {
 /// pruned, and the `seed`-th satisfying assignment is the answer. Two
 /// passes over the capped space — count, then walk to the target index —
 /// keep the memory flat.
-fn solve_by_enumeration(problem: &Problem, seed: u64) -> SolveOutcome {
+pub(crate) fn solve_by_enumeration(problem: &Problem, seed: u64) -> SolveOutcome {
     let mut domain_product: u128 = 1;
     for var in &problem.vars {
         if var.lower > var.upper {
